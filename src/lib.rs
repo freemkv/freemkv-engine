@@ -41,16 +41,23 @@
 
 mod job;
 mod outcome;
+mod preflight;
 // The relocated recovery strategy (sweep/patch/mapfile/read_error/
-// section_recover). Until the engine's public `run()` API (task #6/#7) drives
-// it, most of it has no in-crate caller yet, so allow dead_code at the module
-// boundary. This allow is removed once `run()` consumes it.
+// section_recover). `run()` drives the multipass dispatch (`recovery::copy`);
+// some producer/consumer plumbing and Pass-N-only helpers still have no
+// in-crate caller until the full run() surface lands, so allow dead_code at
+// the module boundary for now.
 #[allow(dead_code)]
 mod recovery;
+mod resolve;
+mod run;
 mod sink;
 
 pub use job::{Job, RipMode, Selection};
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
+pub use preflight::{Preflight, Reason, preflight};
+pub use resolve::resolve_keys;
+pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────

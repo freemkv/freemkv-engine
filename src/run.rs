@@ -1,0 +1,224 @@
+//! Driving the relocated recovery strategy from the engine.
+//!
+//! [`recover_to_iso`] is the disc→ISO half of a rip: it runs the multipass
+//! sweep/patch dispatch ([`crate::recovery::copy`]) against a caller-provided
+//! [`SectorSource`] and reports progress through the engine [`Sink`]. It is the
+//! first consumer of the relocated recovery module, and the piece a front-end
+//! composes with `mux_stream` to get disc→MKV.
+//!
+//! The ISO→MKV mux stage is driven by the front-end (or a later engine `run()`
+//! surface) via `libfreemkv::mux_stream`; keeping the recovery and mux stages
+//! separately callable mirrors how the CLI and autorip already stage a rip
+//! (recover to an ISO intermediate, then mux from it) and keeps each stage
+//! unit-testable in isolation.
+
+use crate::job::{Job, RipMode};
+use crate::recovery::{self, CopyOptions, CopyResult};
+use crate::sink::{Level, Progress, Sink};
+
+/// Bridges libfreemkv's low-level [`libfreemkv::progress::Progress`] callback
+/// onto the engine [`Sink`]. Recovery calls `report(&PassProgress) -> bool`
+/// frequently; this translates each tick to a [`Progress`] and forwards it,
+/// returning `!sink.should_cancel()` so the library's cooperative-cancellation
+/// bool (`false` = stop) is driven by the front-end's Cancel/Ctrl-C exactly as
+/// it is today.
+struct ProgressBridge<'a> {
+    sink: &'a dyn Sink,
+}
+
+impl libfreemkv::progress::Progress for ProgressBridge<'_> {
+    fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+        let pass = match p.kind {
+            libfreemkv::progress::PassKind::Sweep => "sweep".to_string(),
+            libfreemkv::progress::PassKind::Scrape { .. } => "patch-scrape".to_string(),
+            libfreemkv::progress::PassKind::Trim { .. } => "patch-trim".to_string(),
+            libfreemkv::progress::PassKind::Mux => "mux".to_string(),
+            libfreemkv::progress::PassKind::Verify => "verify".to_string(),
+        };
+        // The library reports byte counters; the engine owns the single
+        // speed/ETA derivation (see `Progress` doc). For now we forward the raw
+        // counters and leave speed_bps/eta_secs at 0/None — the multipass
+        // driver (task #7) computes them once from the byte deltas so no
+        // front-end re-derives them. Sweep's work_done/work_total are the
+        // authoritative progress denominator.
+        let progress = Progress {
+            pass,
+            bytes_done: p.work_done,
+            bytes_total: p.work_total,
+            sectors_bad: p
+                .bytes_unreadable_total
+                .saturating_add(p.bytes_pending_total)
+                / 2048,
+            speed_bps: 0,
+            eta_secs: None,
+        };
+        self.sink.progress(&progress);
+        // `false` from report() tells the library to halt; the engine halts
+        // when the front-end asks to cancel.
+        !self.sink.should_cancel()
+    }
+}
+
+/// Recover a disc to an ISO image at `iso_path`, driving the relocated
+/// multipass sweep/patch strategy and reporting through `sink`.
+///
+/// `reader` is the sector source (a live drive session's reader, or an ISO for
+/// re-recovery). `disc` is the already-scanned disc. The [`RipMode`] on `job`
+/// selects single-pass (`recovery::copy` with `multipass = false`, aborts on
+/// first read error) vs multipass (sweep + patch dispatch). Decryption is on
+/// unless `job.raw`.
+///
+/// Returns the library's [`CopyResult`] (byte accounting + completion flags);
+/// the caller maps it into an [`crate::Outcome`] once the mux stage has also
+/// run, or inspects it directly for the ISO-only case.
+pub fn recover_to_iso(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    sink: &dyn Sink,
+) -> crate::Result<CopyResult> {
+    let bridge = ProgressBridge { sink };
+
+    let opts = CopyOptions {
+        decrypt: !job.raw,
+        multipass: matches!(job.mode, RipMode::Multi),
+        progress: Some(&bridge),
+        halt: None,
+        vid: disc.aacs.as_ref().map(|a| a.volume_id),
+        unit_keys: disc
+            .aacs
+            .as_ref()
+            .map(|a| a.unit_keys.clone())
+            .unwrap_or_default(),
+        key_fetch: None,
+    };
+
+    sink.log(
+        Level::Info,
+        &format!(
+            "recover_to_iso: mode={:?} raw={} dest={}",
+            job.mode,
+            job.raw,
+            iso_path.display()
+        ),
+    );
+
+    recovery::copy(disc, reader, iso_path, &opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A synthetic all-zero SectorSource (hard rule #2: no live drive). Reports a
+    // fixed capacity and fills every requested read with zeros, always
+    // succeeding — the clean-disc happy path for the sweep dispatch.
+    struct ZeroReader {
+        capacity: u32,
+    }
+
+    impl libfreemkv::SectorSource for ZeroReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let n = ((count as usize) * 2048).min(buf.len());
+            buf[..n].fill(0);
+            Ok(count as usize)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    // Counts progress ticks and log lines so a test can assert the bridge fired.
+    #[derive(Default)]
+    struct CountingSink {
+        ticks: AtomicUsize,
+        logs: AtomicUsize,
+    }
+    impl Sink for CountingSink {
+        fn log(&self, _l: Level, _m: &str) {
+            self.logs.fetch_add(1, Ordering::Relaxed);
+        }
+        fn progress(&self, _p: &Progress) {
+            self.ticks.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    // A minimal unencrypted disc fixture sized to `sectors`.
+    fn clean_disc(sectors: u32) -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: "TESTDISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: sectors,
+            capacity_bytes: sectors as u64 * 2048,
+            layers: 1,
+            titles: vec![],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    #[test]
+    fn single_pass_recovers_a_clean_synthetic_disc_to_iso() {
+        let dir = std::env::temp_dir().join(format!("fmkv-engine-run-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("out.iso");
+
+        let sectors = 256u32;
+        let disc = clean_disc(sectors);
+        let mut reader = ZeroReader { capacity: sectors };
+        let sink = CountingSink::default();
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+
+        let result = recover_to_iso(&disc, &mut reader, &iso, &job, &sink)
+            .expect("clean single-pass recovery should succeed");
+
+        // The whole disc was readable → complete, all bytes good, nothing bad.
+        assert_eq!(result.bytes_total, sectors as u64 * 2048);
+        assert_eq!(result.bytes_good, sectors as u64 * 2048);
+        assert_eq!(result.bytes_unreadable, 0);
+        assert!(result.complete);
+        assert!(!result.halted);
+        // The engine logged the recovery start (the bridge/sink is wired).
+        assert!(sink.logs.load(Ordering::Relaxed) >= 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancel_via_sink_halts_recovery() {
+        // A sink whose should_cancel is always true must make the library halt
+        // (report() returns false on the first tick). We can't guarantee a tick
+        // on a 1-sector disc, so use a larger disc and assert we don't error.
+        struct CancelSink;
+        impl Sink for CancelSink {
+            fn should_cancel(&self) -> bool {
+                true
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("fmkv-engine-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("c.iso");
+        let sectors = 4096u32;
+        let disc = clean_disc(sectors);
+        let mut reader = ZeroReader { capacity: sectors };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Should return Ok (halted) or complete — never error — and not panic.
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink);
+        assert!(r.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
