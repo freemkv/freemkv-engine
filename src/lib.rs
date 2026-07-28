@@ -56,7 +56,7 @@ mod run;
 mod sink;
 mod streams;
 
-pub use job::{Job, RipMode, Selection, StreamSel};
+pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use multipass::{
     MultipassResult, classify_damage, effective_abort_secs, loss_aborts, run_multipass,
     should_abort_for_loss,

@@ -52,12 +52,30 @@ pub struct Job {
     pub abort_on_lost_secs: u32,
     /// Skip decryption and write ciphertext through (forensic / raw backup).
     pub raw: bool,
-    /// Which audio streams to keep in each ripped title. Video is always kept.
-    /// Default [`StreamSel::All`] (archival — keep everything).
-    pub audio: StreamSel,
-    /// Which subtitle streams to keep in each ripped title. Default
-    /// [`StreamSel::All`].
-    pub subtitles: StreamSel,
+    /// Which audio + subtitle streams to keep in each ripped title (video is
+    /// always kept). One bundle so the two travel together. Default keeps
+    /// everything (archival).
+    pub streams: StreamChoice,
+}
+
+/// The audio + subtitle stream choice for a rip — the two selections that
+/// travel together (from the CLI's `-a`/`-s`, autorip's config, the desktop
+/// UI's checkboxes). [`resolve`](StreamChoice::resolve) turns it into the
+/// library's PID primitive for one scanned title.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StreamChoice {
+    /// Audio streams to keep. Default [`StreamFilter::All`].
+    pub audio: StreamFilter,
+    /// Subtitle streams to keep. Default [`StreamFilter::All`].
+    pub subtitles: StreamFilter,
+}
+
+impl StreamChoice {
+    /// True when both classes keep everything — the apply/resolve is a no-op and
+    /// callers can skip it entirely (byte-identical to no selection).
+    pub fn is_all(&self) -> bool {
+        matches!(self.audio, StreamFilter::All) && matches!(self.subtitles, StreamFilter::All)
+    }
 }
 
 /// Which streams of one class (audio or subtitle) to keep in a ripped title.
@@ -65,7 +83,7 @@ pub struct Job {
 /// scanned title via [`crate::resolve_stream_selection`]. A [`Job`] stays pure
 /// data — language tags are raw here and normalized at resolve time.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum StreamSel {
+pub enum StreamFilter {
     /// Keep every stream of the class (today's behavior; the archival default).
     #[default]
     All,
@@ -88,8 +106,7 @@ impl Job {
             mode: RipMode::default(),
             abort_on_lost_secs: 0,
             raw: false,
-            audio: StreamSel::default(),
-            subtitles: StreamSel::default(),
+            streams: StreamChoice::default(),
         }
     }
 
@@ -106,14 +123,20 @@ impl Job {
     }
 
     /// Builder: set the audio stream selection.
-    pub fn with_audio(mut self, audio: StreamSel) -> Self {
-        self.audio = audio;
+    pub fn with_audio(mut self, audio: StreamFilter) -> Self {
+        self.streams.audio = audio;
         self
     }
 
     /// Builder: set the subtitle stream selection.
-    pub fn with_subtitles(mut self, subtitles: StreamSel) -> Self {
-        self.subtitles = subtitles;
+    pub fn with_subtitles(mut self, subtitles: StreamFilter) -> Self {
+        self.streams.subtitles = subtitles;
+        self
+    }
+
+    /// Builder: set the whole audio+subtitle stream choice at once.
+    pub fn with_streams(mut self, streams: StreamChoice) -> Self {
+        self.streams = streams;
         self
     }
 }
