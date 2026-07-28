@@ -40,6 +40,7 @@
 // diagnostics. Front-ends localize via the message + code carried on events.
 
 mod job;
+mod multipass;
 mod outcome;
 mod preflight;
 // The relocated recovery strategy (sweep/patch/mapfile/read_error/
@@ -54,6 +55,10 @@ mod run;
 mod sink;
 
 pub use job::{Job, RipMode, Selection};
+pub use multipass::{
+    MultipassResult, classify_damage, effective_abort_secs, loss_aborts, run_multipass,
+    should_abort_for_loss,
+};
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
 pub use resolve::resolve_keys;

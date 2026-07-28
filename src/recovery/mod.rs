@@ -1149,6 +1149,10 @@ mod read_error;
 mod section_recover;
 mod sweep;
 
+// The mapfile-backed main-title bad-byte reader, used by the multipass
+// abort-on-loss gate (the same figure the CLI/autorip abort gate reads).
+pub(crate) use patch::bytes_bad_in_title_from_mapfile;
+
 #[cfg(test)]
 mod tests {
     use super::*;
