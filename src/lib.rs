@@ -71,6 +71,7 @@ pub use recovery::{
 mod resolve;
 mod run;
 mod sink;
+mod speed;
 mod streams;
 
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
