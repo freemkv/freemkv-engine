@@ -22,10 +22,10 @@
 //!    └── freemkv-gui ← desktop front-end (future)
 //! ```
 //!
-//! See `freemkv-private/audit/engine-split/DESIGN.md` for the full boundary
-//! rationale (why sweep/patch/mapfile/damage-classification are strategy, not
-//! primitives, and what's a small deliberate `pub` promotion in the lib vs a
-//! physical relocation here).
+//! The boundary rationale — why sweep/patch/mapfile/damage-classification are
+//! strategy, not primitives, and what's a small deliberate `pub` promotion in
+//! the lib vs a physical relocation here — is captured in the project's
+//! internal design notes.
 //!
 //! ## Two hard rules the API enforces
 //!
@@ -88,6 +88,7 @@ pub use preflight::{Preflight, Reason, preflight};
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
+pub use speed::SpeedEstimator;
 pub use streams::{StreamSelError, resolve_stream_selection};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────
