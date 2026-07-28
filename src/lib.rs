@@ -1,20 +1,31 @@
 //! # freemkv-engine
 //!
-//! The freemkv **rip engine**: the disc→MKV orchestration strategy that every
-//! front-end shares. It sits *above* [`libfreemkv`]'s public API — composing
-//! `DiscSession`, `scan_iso`, `resolve_keys_for`, `Disc::sweep`/`patch`, and
-//! `mux_stream` — and *below* the front-ends (CLI, autorip, desktop UI), each
-//! of which is a thin shell that supplies a [`Sink`] and a [`Job`].
+//! The freemkv **rip engine**: freemkv's recovery STRATEGY (sweep, patch, the
+//! retry-decision state machine, mapfile bookkeeping, damage-severity
+//! judgment) plus the rip ORCHESTRATION shared by every front-end. It sits
+//! *above* [`libfreemkv`]'s public API — composing `DiscSession`, `scan_iso`,
+//! `resolve_keys_for`, and `mux_stream` — and *below* the front-ends (CLI,
+//! autorip, desktop UI), each of which is a thin shell that supplies a
+//! [`Sink`] and a [`Job`].
 //!
 //! ## Layering
 //!
 //! ```text
-//! libfreemkv     ← library: SCSI, parse, decrypt, mux highway, recovery PRIMITIVES
-//! freemkv-engine ← THIS crate: rip STRATEGY (multipass, job model, preflight, Sink)
+//! libfreemkv     ← library: SCSI, parse, decrypt, mux highway, the raw read
+//!                  primitive (single-shot, no retries) + SCSI-fact
+//!                  translation (SenseFamily)
+//! freemkv-engine ← THIS crate: recovery STRATEGY (sweep/patch/mapfile/
+//!                  retry-decisions/damage-severity) + rip ORCHESTRATION
+//!                  (multipass, job model, preflight, Sink)
 //!    ├── freemkv   ← CLI front-end
 //!    ├── autorip   ← service front-end (polling/staging/resume/web)
 //!    └── freemkv-gui ← desktop front-end (future)
 //! ```
+//!
+//! See `freemkv-private/audit/engine-split/DESIGN.md` for the full boundary
+//! rationale (why sweep/patch/mapfile/damage-classification are strategy, not
+//! primitives, and what's a small deliberate `pub` promotion in the lib vs a
+//! physical relocation here).
 //!
 //! ## Two hard rules the API enforces
 //!
@@ -30,6 +41,12 @@
 
 mod job;
 mod outcome;
+// The relocated recovery strategy (sweep/patch/mapfile/read_error/
+// section_recover). Until the engine's public `run()` API (task #6/#7) drives
+// it, most of it has no in-crate caller yet, so allow dead_code at the module
+// boundary. This allow is removed once `run()` consumes it.
+#[allow(dead_code)]
+mod recovery;
 mod sink;
 
 pub use job::{Job, RipMode, Selection};
