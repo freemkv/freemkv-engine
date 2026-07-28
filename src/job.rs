@@ -52,6 +52,29 @@ pub struct Job {
     pub abort_on_lost_secs: u32,
     /// Skip decryption and write ciphertext through (forensic / raw backup).
     pub raw: bool,
+    /// Which audio streams to keep in each ripped title. Video is always kept.
+    /// Default [`StreamSel::All`] (archival — keep everything).
+    pub audio: StreamSel,
+    /// Which subtitle streams to keep in each ripped title. Default
+    /// [`StreamSel::All`].
+    pub subtitles: StreamSel,
+}
+
+/// Which streams of one class (audio or subtitle) to keep in a ripped title.
+/// The engine translates this to a `libfreemkv::StreamSelection` (PIDs) per
+/// scanned title via [`crate::resolve_stream_selection`]. A [`Job`] stays pure
+/// data — language tags are raw here and normalized at resolve time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum StreamSel {
+    /// Keep every stream of the class (today's behavior; the archival default).
+    #[default]
+    All,
+    /// Keep no streams of the class (video-only when both classes are `None`).
+    None,
+    /// Keep streams whose language matches any listed tag. Tags are raw user
+    /// input — a name (`"English"`), 639-1 (`"en"`), or 639-2/3 (`"eng"`) —
+    /// normalized by language identity at resolve time (case-insensitive).
+    Langs(Vec<String>),
 }
 
 impl Job {
@@ -65,6 +88,8 @@ impl Job {
             mode: RipMode::default(),
             abort_on_lost_secs: 0,
             raw: false,
+            audio: StreamSel::default(),
+            subtitles: StreamSel::default(),
         }
     }
 
@@ -77,6 +102,18 @@ impl Job {
     /// Builder: set the title selection.
     pub fn with_selection(mut self, sel: Selection) -> Self {
         self.selection = sel;
+        self
+    }
+
+    /// Builder: set the audio stream selection.
+    pub fn with_audio(mut self, audio: StreamSel) -> Self {
+        self.audio = audio;
+        self
+    }
+
+    /// Builder: set the subtitle stream selection.
+    pub fn with_subtitles(mut self, subtitles: StreamSel) -> Self {
+        self.subtitles = subtitles;
         self
     }
 }
