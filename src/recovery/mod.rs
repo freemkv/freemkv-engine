@@ -1,5 +1,5 @@
 //! freemkv's recovery strategy — relocated here from libfreemkv per the
-//! engine-split design (`freemkv-private/audit/engine-split/DESIGN.md` §1).
+//! engine-split design (see this crate's top-level docs).
 //!
 //! Mirrors the original `disc/` module topology 1:1 so the relocation is a
 //! faithful move, not a rewrite: `mapfile.rs`, `read_error.rs`,
