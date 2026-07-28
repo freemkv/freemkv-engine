@@ -1,0 +1,34 @@
+[package]
+name = "freemkv-engine"
+version = "1.6.0"
+edition = "2024"
+rust-version = "1.86"
+license = "MIT"
+description = "freemkv rip engine — disc→MKV orchestration over libfreemkv, shared by every front-end (CLI, autorip, desktop UI)"
+repository = "https://github.com/freemkv/freemkv-engine"
+keywords = ["bluray", "uhd", "dvd", "ripper", "backup"]
+categories = ["multimedia"]
+exclude = ["CLAUDE.md"]
+# OFF crates.io: transitively git-deps libfreemkv (which git-deps the firmware
+# crate). Consumed only by git tag / local path, exactly like libfreemkv and
+# freemkv-keysources.
+publish = false
+
+[dependencies]
+libfreemkv = "1.5"
+freemkv-keysources = "1.5"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Resolve libfreemkv + freemkv-keysources from their GIT TAGS (both OFF
+# crates.io — see libfreemkv/Cargo.toml). This committed [patch.crates-io] is
+# the CI resolution path; the release script rewrites the tags on bump. Local
+# dev overrides it with a path patch via the gitignored .cargo/config.toml.
+[patch.crates-io]
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.5.2" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.5.2" }
