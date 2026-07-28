@@ -61,7 +61,8 @@ pub use multipass::{
     should_abort_for_loss,
 };
 pub use mux::{
-    RipOutcome, TitleResult, classify_title_error, mux_title, resolve_selection, run_titles,
+    RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
+    resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
