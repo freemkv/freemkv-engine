@@ -18,7 +18,7 @@ use libfreemkv::error::{Error, Result};
 use libfreemkv::extract_scsi_context;
 use libfreemkv::sector::SectorSource;
 
-use patch::patch;
+pub use patch::patch;
 
 pub fn copy(
     disc: &libfreemkv::Disc,
