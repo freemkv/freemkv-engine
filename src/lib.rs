@@ -64,6 +64,7 @@ mod recovery;
 // between passes (autorip, whose staging/resume/watchdog state advances at pass
 // boundaries) drives `sweep`/`patch` directly. These are the same primitives
 // libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
+pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions, copy, patch, sweep,
 };
