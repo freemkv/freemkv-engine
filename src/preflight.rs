@@ -99,14 +99,14 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     }
 
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key.
-    // `disc.encrypted` is the library's authoritative "needs decryption" flag;
-    // a resolved key shows up as `aacs.is_some()` (AACS) or `css.is_some()`
-    // (CSS). Raw passes (the user wants ciphertext); unencrypted passes.
-    if disc.encrypted && !job.raw {
-        let has_key = disc.aacs.is_some() || disc.css.is_some();
-        if !has_key {
-            reasons.push(Reason::new("encrypted-no-key"));
-        }
+    // `disc.encrypted` is the library's authoritative "needs decryption" flag.
+    // Delegate the "do we actually have a key?" judgment to `resolve_keys` — the
+    // ONE place that decides it — so preflight and the key-status report can
+    // never disagree (a bare `aacs.is_some()` here would pass a VID-only
+    // placeholder scan that `resolve_keys` correctly reports as unresolved).
+    // Raw passes (the user wants ciphertext); unencrypted passes.
+    if disc.encrypted && !job.raw && !crate::resolve::resolve_keys(disc).resolved {
+        reasons.push(Reason::new("encrypted-no-key"));
     }
 
     if reasons.is_empty() {
@@ -121,9 +121,9 @@ mod tests {
     use super::*;
     use crate::job::Job;
 
-    // A present (all-zero) AacsState — enough to signal "key resolved" to the
-    // preflight gate, which only checks `aacs.is_some()`. All fields spelled
-    // out because the lib's plain-data types deliberately don't derive Default.
+    // A resolved AacsState carrying real key material (non-empty unit_keys) —
+    // what the preflight decrypt gate (via resolve_keys) accepts as "keyed". All
+    // fields spelled out because the lib's plain-data types don't derive Default.
     fn resolved_aacs() -> libfreemkv::AacsState {
         libfreemkv::AacsState {
             version: 1,
@@ -202,6 +202,21 @@ mod tests {
         let d = disc_with(2, true, true);
         let j = Job::new("iso://x.iso", "/out");
         assert_eq!(preflight(&d, &j), Preflight::Ready);
+    }
+
+    #[test]
+    fn blocks_encrypted_placeholder_aacs_without_key_material() {
+        // A VID-only scan leaves `aacs = Some(..)` with EMPTY unit_keys and no
+        // VUK. preflight must NOT treat that as keyed (the bug: gating on
+        // `aacs.is_some()` passed it) — it now delegates to resolve_keys, which
+        // reports unresolved, so the decrypt gate blocks.
+        let mut d = disc_with(2, true, true);
+        if let Some(a) = d.aacs.as_mut() {
+            a.unit_keys = Vec::new();
+            a.vuk = None;
+        }
+        let pf = preflight(&d, &Job::new("iso://x.iso", "/out"));
+        assert!(pf.reasons().iter().any(|r| r.key == "encrypted-no-key"));
     }
 
     #[test]
