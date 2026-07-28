@@ -49,8 +49,24 @@ mod preflight;
 // some producer/consumer plumbing and Pass-N-only helpers still have no
 // in-crate caller until the full run() surface lands, so allow dead_code at
 // the module boundary for now.
+// Some faithfully-relocated recovery internals (mapfile `vid`/`unit_keys`/
+// `next_with`, `ReadCtx::for_patch`, `PATCH_DAMAGE_THRESHOLD_PCT`) had lib
+// callers that aren't reachable in-crate until autorip's resume path consumes
+// the exposed `sweep`/`patch` — allow dead_code at the module boundary rather
+// than diverge from the byte-faithful move.
 #[allow(dead_code)]
 mod recovery;
+
+// ─── Recovery primitives (relocated from libfreemkv) ────────────────────────
+//
+// The sweep/patch passes and their option/result types. `run_multipass` drives
+// them for the common case; a consumer that must interleave its own work
+// between passes (autorip, whose staging/resume/watchdog state advances at pass
+// boundaries) drives `sweep`/`patch` directly. These are the same primitives
+// libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
+pub use recovery::{
+    CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions, copy, patch, sweep,
+};
 mod resolve;
 mod run;
 mod sink;
