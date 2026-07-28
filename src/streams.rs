@@ -3,9 +3,20 @@
 //! title. Pure — no I/O. Language identity is resolved with `isolang` so
 //! `-a English`, `-a en`, and `-a eng` all match a stream tagged `eng`.
 
-use crate::job::StreamSel;
+use crate::job::{StreamChoice, StreamFilter};
 use isolang::Language;
-use libfreemkv::{PidFilter, Stream, StreamSelection};
+use libfreemkv::{PidFilter, StreamSelection};
+
+impl StreamChoice {
+    /// Translate this choice into the library's PID [`StreamSelection`] for one
+    /// scanned title. See [`resolve_stream_selection`].
+    pub fn resolve(
+        &self,
+        title: &libfreemkv::DiscTitle,
+    ) -> Result<StreamSelection, StreamSelError> {
+        resolve_stream_selection(title, &self.audio, &self.subtitles)
+    }
+}
 
 /// What can go wrong translating a language policy. `Sink`-renderable data, not
 /// prose — the front-end localizes.
@@ -23,8 +34,8 @@ pub enum StreamSelError {
 /// (preflight) decides whether that is a disc-wide error or a per-title skip.
 pub fn resolve_stream_selection(
     title: &libfreemkv::DiscTitle,
-    audio: &StreamSel,
-    subtitles: &StreamSel,
+    audio: &StreamFilter,
+    subtitles: &StreamFilter,
 ) -> Result<StreamSelection, StreamSelError> {
     Ok(StreamSelection {
         audio: resolve_class(title, audio, StreamClass::Audio)?,
@@ -40,13 +51,13 @@ enum StreamClass {
 
 fn resolve_class(
     title: &libfreemkv::DiscTitle,
-    sel: &StreamSel,
+    sel: &StreamFilter,
     class: StreamClass,
 ) -> Result<PidFilter, StreamSelError> {
     match sel {
-        StreamSel::All => Ok(PidFilter::All),
-        StreamSel::None => Ok(PidFilter::Only(vec![])),
-        StreamSel::Langs(tags) => {
+        StreamFilter::All => Ok(PidFilter::All),
+        StreamFilter::None => Ok(PidFilter::Only(vec![])),
+        StreamFilter::Langs(tags) => {
             // Resolve every tag first (surfacing typos before touching streams).
             let wanted: Vec<Language> = tags
                 .iter()
@@ -56,25 +67,25 @@ fn resolve_class(
                 })
                 .collect::<Result<_, _>>()?;
 
-            let pids = title
-                .streams
-                .iter()
-                .filter_map(|s| stream_lang_and_pid(s, class))
-                .filter(|(lang, _)| normalize_lang(lang).is_some_and(|l| wanted.contains(&l)))
-                .map(|(_, pid)| pid)
-                .collect();
+            // Iterate the class's streams via the lib accessors (cleaner than a
+            // Stream-enum match); keep those whose language matches any tag.
+            let matches = |lang: &str, pid: u16| -> Option<u16> {
+                normalize_lang(lang)
+                    .filter(|l| wanted.contains(l))
+                    .map(|_| pid)
+            };
+            let pids: Vec<u16> = match class {
+                StreamClass::Audio => title
+                    .audio_streams()
+                    .filter_map(|a| matches(&a.language, a.pid))
+                    .collect(),
+                StreamClass::Subtitle => title
+                    .subtitle_streams()
+                    .filter_map(|s| matches(&s.language, s.pid))
+                    .collect(),
+            };
             Ok(PidFilter::Only(pids))
         }
-    }
-}
-
-/// The (language-code, pid) of a stream of the requested class; `None` for
-/// other classes (video, or audio when asking about subtitles).
-fn stream_lang_and_pid(stream: &Stream, class: StreamClass) -> Option<(&str, u16)> {
-    match (stream, class) {
-        (Stream::Audio(a), StreamClass::Audio) => Some((a.language.as_str(), a.pid)),
-        (Stream::Subtitle(s), StreamClass::Subtitle) => Some((s.language.as_str(), s.pid)),
-        _ => None,
     }
 }
 
@@ -127,7 +138,7 @@ fn bib_to_terminologic(code: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
     use libfreemkv::{
-        AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, SubtitleStream,
+        AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, Stream, SubtitleStream,
     };
 
     fn audio(pid: u16, lang: &str) -> Stream {
@@ -169,14 +180,16 @@ mod tests {
 
     #[test]
     fn all_maps_to_pidfilter_all() {
-        let sel = resolve_stream_selection(&title(), &StreamSel::All, &StreamSel::All).unwrap();
+        let sel =
+            resolve_stream_selection(&title(), &StreamFilter::All, &StreamFilter::All).unwrap();
         assert_eq!(sel.audio, PidFilter::All);
         assert_eq!(sel.subtitle, PidFilter::All);
     }
 
     #[test]
     fn none_maps_to_only_empty() {
-        let sel = resolve_stream_selection(&title(), &StreamSel::None, &StreamSel::None).unwrap();
+        let sel =
+            resolve_stream_selection(&title(), &StreamFilter::None, &StreamFilter::None).unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![]));
         assert_eq!(sel.subtitle, PidFilter::Only(vec![]));
     }
@@ -186,8 +199,8 @@ mod tests {
         for tag in ["English", "english", "en", "eng", "ENG"] {
             let sel = resolve_stream_selection(
                 &title(),
-                &StreamSel::Langs(vec![tag.into()]),
-                &StreamSel::All,
+                &StreamFilter::Langs(vec![tag.into()]),
+                &StreamFilter::All,
             )
             .unwrap();
             // Both eng audio streams (0x1100 and the 0x1103 commentary) match.
@@ -204,8 +217,8 @@ mod tests {
         // Request "fre" (639-2/B); stream tagged "fra" (639-2/T) must match.
         let sel = resolve_stream_selection(
             &title(),
-            &StreamSel::Langs(vec!["fre".into()]),
-            &StreamSel::All,
+            &StreamFilter::Langs(vec!["fre".into()]),
+            &StreamFilter::All,
         )
         .unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![0x1102]));
@@ -215,8 +228,8 @@ mod tests {
     fn multiple_langs_select_union_in_stream_order() {
         let sel = resolve_stream_selection(
             &title(),
-            &StreamSel::Langs(vec!["spa".into(), "fra".into()]),
-            &StreamSel::All,
+            &StreamFilter::Langs(vec!["spa".into(), "fra".into()]),
+            &StreamFilter::All,
         )
         .unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![0x1101, 0x1102]));
@@ -226,8 +239,8 @@ mod tests {
     fn subtitle_langs_are_independent_of_audio() {
         let sel = resolve_stream_selection(
             &title(),
-            &StreamSel::Langs(vec!["eng".into()]),
-            &StreamSel::Langs(vec!["fra".into()]),
+            &StreamFilter::Langs(vec!["eng".into()]),
+            &StreamFilter::Langs(vec!["fra".into()]),
         )
         .unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![0x1100, 0x1103]));
@@ -238,8 +251,8 @@ mod tests {
     fn unknown_language_tag_errors() {
         let err = resolve_stream_selection(
             &title(),
-            &StreamSel::Langs(vec!["Klingonish".into()]),
-            &StreamSel::All,
+            &StreamFilter::Langs(vec!["Klingonish".into()]),
+            &StreamFilter::All,
         )
         .unwrap_err();
         assert_eq!(
@@ -256,8 +269,8 @@ mod tests {
         // nothing here. Preflight decides if that's a disc-wide error.
         let sel = resolve_stream_selection(
             &title(),
-            &StreamSel::Langs(vec!["jpn".into()]),
-            &StreamSel::All,
+            &StreamFilter::Langs(vec!["jpn".into()]),
+            &StreamFilter::All,
         )
         .unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![]));
