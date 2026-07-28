@@ -18,6 +18,7 @@ publish = false
 libfreemkv = "1.5"
 freemkv-keysources = "1.5"
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
 
 [dev-dependencies]
 
