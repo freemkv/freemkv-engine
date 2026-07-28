@@ -1,9 +1,25 @@
 //! What a rip produced, and where key resolution landed — both as data.
 
-/// Canonical damage classification. Re-exported from libfreemkv so there is a
-/// single source of truth (`libfreemkv::classify_damage` produces it); the
-/// engine and every front-end speak the same severity.
-pub use libfreemkv::DamageSeverity;
+/// Coarse damage tier for a finished or in-progress rip. Maps the observable
+/// signals (bad sector count + lost wallclock playback time) onto a small
+/// discrete classification so UIs can render a colored badge and operators can
+/// decide whether to rescan / replug / accept. Produced by
+/// [`crate::classify_damage`] — the freemkv product judgment, owned by the
+/// engine (it moved here from libfreemkv in the engine split, so the strategy
+/// and its severity type live together).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DamageSeverity {
+    /// No bad sectors at all.
+    Clean,
+    /// 1–50 bad sectors AND <1 sec lost. Likely unnoticeable.
+    Cosmetic,
+    /// 51–500 sectors OR 1–30 sec lost. Visible artifacts possible.
+    Moderate,
+    /// 500+ sectors OR 30+ sec lost. Significant damage; consider rescan
+    /// or different drive.
+    Serious,
+}
 
 /// One output file a rip produced.
 #[derive(Clone, Debug)]

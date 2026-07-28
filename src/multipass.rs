@@ -24,7 +24,7 @@ const MILLIS_PER_SEC: f64 = 1000.0;
 /// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
 /// any lost byte (or an unquantifiable NaN loss) aborts; exactly zero proceeds.
 /// A positive threshold switches to the seconds gate (bytes not consulted).
-pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
+pub(crate) fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     if abort_on_lost_secs == 0 {
         lost_bytes > 0 || lost_ms.is_nan()
     } else {
@@ -34,21 +34,20 @@ pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bo
 
 /// The seconds-threshold half of the gate: strictly-greater-than aborts, and a
 /// NaN (unquantifiable) loss fails safe to abort.
-pub fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
+pub(crate) fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms.is_nan() || lost_ms > abort_threshold_ms
 }
 
 /// An ISO-image output is a whole-disc backup and always requires 100% (the
 /// `abort_on_lost_secs` tolerance is a muxed-output setting). Front-ends that
 /// target an ISO pass their configured value through this to force 0.
-pub fn effective_abort_secs(is_iso_output: bool, configured: u64) -> u64 {
+pub(crate) fn effective_abort_secs(is_iso_output: bool, configured: u64) -> u64 {
     if is_iso_output { 0 } else { configured }
 }
 
 /// Coarse damage tier from raw counters — the freemkv product judgment
-/// (thresholds), relocated from libfreemkv. Returns the crate's
-/// [`crate::DamageSeverity`] (still re-exported from the library during the
-/// duplication window; the definition moves here in the deletion step).
+/// (thresholds), relocated from libfreemkv. Returns the engine-owned
+/// [`crate::DamageSeverity`] (defined in `outcome.rs`).
 pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity {
     use crate::DamageSeverity::*;
     if bad_sectors == 0 {

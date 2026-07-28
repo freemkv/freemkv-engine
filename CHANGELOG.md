@@ -26,6 +26,16 @@ the consumers.
   and cancellation is one bit.
 - **`Job` / `preflight` / `resolve_keys`** — the front-end's request as pure
   data, a validate-without-executing check, and key-resolution status as data.
+  `resolve_keys` reports `resolved` only when there is real key material
+  (non-empty unit keys or a VUK), so a VID-only placeholder scan
+  (`KeyOrigin::ExternalUk`, empty unit keys) reads as unresolved rather than
+  falsely "resolved"; `ExternalUk` is summarized `resolved-external` (it is
+  source-agnostic — not necessarily online).
+- **Mapfile-backed reporting helpers** for front-ends: `Mapfile` / `SectorStatus`
+  / `MapStats`, `bytes_bad_in_title_from_mapfile` (bad bytes in a title from a
+  mapfile path), and `progress_snapshot_from_mapfile` (a one-shot
+  `PassProgress` for the pass-boundary paint / done-card). `DamageSeverity` is
+  owned here alongside `classify_damage`.
 - **Stream selection policy**: `StreamChoice` / `StreamFilter` on the `Job` and
   `resolve_stream_selection` (language tags → the library's PID selection, via
   isolang).

@@ -66,7 +66,8 @@ mod recovery;
 // libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus};
 pub use recovery::{
-    CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions, copy, patch, sweep,
+    CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
+    bytes_bad_in_title_from_mapfile, copy, patch, progress_snapshot_from_mapfile, sweep,
 };
 mod resolve;
 mod run;
@@ -75,10 +76,7 @@ mod speed;
 mod streams;
 
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
-pub use multipass::{
-    MultipassResult, classify_damage, effective_abort_secs, loss_aborts, run_multipass,
-    should_abort_for_loss,
-};
+pub use multipass::{MultipassResult, classify_damage, run_multipass};
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
     resolve_selection, run_titles,

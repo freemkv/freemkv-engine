@@ -1150,8 +1150,50 @@ mod section_recover;
 mod sweep;
 
 // The mapfile-backed main-title bad-byte reader, used by the multipass
-// abort-on-loss gate (the same figure the CLI/autorip abort gate reads).
-pub(crate) use patch::bytes_bad_in_title_from_mapfile;
+// abort-on-loss gate (the same figure the CLI/autorip abort gate reads). `pub`
+// so the engine can re-export it: a front-end computing "how much of the main
+// title is bad" after a rip reads it here rather than the (now-removed)
+// libfreemkv method.
+pub use patch::bytes_bad_in_title_from_mapfile;
+
+/// One-shot progress snapshot built from a mapfile on disk plus the title.
+/// Reads + parses the mapfile HERE so a front-end (autorip) gets a fully
+/// rendered [`libfreemkv::progress::PassProgress`] without ever touching
+/// mapfile internals — used for the pass-boundary paint (before the live
+/// callback stream begins) and the terminal done-card verdict. Returns `None`
+/// if the mapfile can't be read. `work_done`/`work_total` are `0`: this is a
+/// point-in-time snapshot, not a per-pass progress tick. Relocated from
+/// libfreemkv in the engine split (the mapfile it reads now lives here).
+pub fn progress_snapshot_from_mapfile(
+    mapfile_path: &std::path::Path,
+    title: Option<&libfreemkv::DiscTitle>,
+    kind: libfreemkv::progress::PassKind,
+    bytes_total_disc: u64,
+) -> Option<libfreemkv::progress::PassProgress> {
+    use mapfile::SectorStatus::{NonScraped, NonTrimmed, Unreadable};
+    let map = mapfile::Mapfile::load(mapfile_path).ok()?;
+    let stats = map.stats();
+    // MAYBE set = not-yet-good (NonTrimmed/NonScraped/Unreadable), excluding
+    // NonTried (the unread remainder) — same set the live patch emitter uses.
+    let maybe = map.ranges_with(&[NonTrimmed, NonScraped, Unreadable]);
+    let located = title.map(|t| locate_ranges(&maybe, t)).unwrap_or_default();
+    let main_bad = title.map(|t| bytes_bad_in_title(t, &maybe)).unwrap_or(0);
+    Some(libfreemkv::progress::PassProgress {
+        kind,
+        work_done: 0,
+        work_total: 0,
+        bytes_good_total: stats.bytes_good,
+        bytes_unreadable_total: stats.bytes_unreadable,
+        bytes_pending_total: stats.bytes_pending,
+        bytes_retryable_total: stats.bytes_retryable,
+        bytes_total_disc,
+        disc_duration_secs: title.map(|t| t.duration_secs),
+        bytes_bad_in_main_title: main_bad,
+        main_title_duration_secs: title.map(|t| t.duration_secs),
+        main_title_size_bytes: title.map(|t| t.size_bytes),
+        located,
+    })
+}
 
 #[cfg(test)]
 mod tests {
