@@ -259,8 +259,17 @@ pub fn mux_title(
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
             loop {
-                // Drain any progress ticks that arrived.
-                while let Ok((done_b, total_b)) = rx.try_recv() {
+                // Coalesce all progress ticks that queued up since the last
+                // wake to the LATEST, then sample ONCE. Sampling per-message
+                // would measure `dt` as the microseconds between tight-loop
+                // iterations against a byte-delta representing ~100 ms of real
+                // work — yielding absurd multi-GB/s speeds. One sample per drain
+                // makes `dt` the real ~100 ms wake interval.
+                let mut latest = None;
+                while let Ok(m) = rx.try_recv() {
+                    latest = Some(m);
+                }
+                if let Some((done_b, total_b)) = latest {
                     let (speed_bps, eta_secs) = speed.sample(done_b, total_b);
                     let p = crate::sink::Progress {
                         pass: "mux".to_string(),
