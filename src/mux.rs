@@ -14,7 +14,7 @@
 //! 3. **Main-title default** (via [`Selection`]) so an obfuscated disc with 50+
 //!    similar-length playlists doesn't rip everything by accident.
 
-use crate::job::{Job, Selection};
+use crate::job::Selection;
 use crate::sink::{Level, Sink};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +56,10 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
 pub enum TitleResult {
     /// Muxed successfully.
     Ok,
+    /// A DISC-LEVEL key failure — the whole disc can't be decrypted, so every
+    /// remaining title would fail identically. The loop stops immediately
+    /// (fail-fast) instead of iterating and re-printing the same error.
+    DiscLevelNoKey,
     /// Failed, but skippably — an uncrackable/empty per-title stub (a menu
     /// loop, an FBI-warning nav title). Skipped on a non-feature title in a
     /// multi-title rip; fatal if it's the feature or an explicit selection.
@@ -67,10 +71,14 @@ pub enum TitleResult {
 }
 
 /// Classify the `io::Error` a single-title mux returned into a [`TitleResult`].
-/// Uses libfreemkv's typed classifiers — never string-matches E-codes.
+/// Uses libfreemkv's typed classifiers — never string-matches E-codes. Order
+/// matters: halt first (a user stop wins), then disc-level no-key (fail-fast),
+/// then the per-title skippable stub, else a hard failure.
 pub fn classify_title_error(e: &std::io::Error) -> TitleResult {
     if libfreemkv::is_halt(e) {
         TitleResult::Halted
+    } else if libfreemkv::is_disc_level_no_key(e) {
+        TitleResult::DiscLevelNoKey
     } else if libfreemkv::is_skippable_title_stub(e) {
         TitleResult::SkippableStub
     } else {
@@ -84,8 +92,8 @@ pub enum RipOutcome {
     /// Every selected title that mattered succeeded (skippable stubs may have
     /// been skipped). Carries the count actually written.
     Ok { titles_written: usize },
-    /// The disc needs decryption but no key resolved — refused before muxing
-    /// any title (fail-fast; nothing was attempted).
+    /// A disc-level key failure surfaced — the whole disc can't be decrypted,
+    /// so the loop stopped (fail-fast) rather than iterate every title.
     NoKey,
     /// A title the user wanted (the feature, or an explicit `-t`) failed hard.
     Failed { title_index: usize },
@@ -96,41 +104,37 @@ pub enum RipOutcome {
 /// Drive the multi-title rip loop. `mux_one(idx) -> io::Result<()>` muxes a
 /// single title; injecting it keeps the loop's control flow (fail-fast, skip,
 /// halt-break) unit-testable without a real ISO. Production passes
-/// [`mux_title`].
+/// [`mux_title`] (or the consumer's own single-title mux).
 ///
-/// `should_cancel` is polled between titles for the full-stop behaviour; the
-/// per-title `mux_one` is also expected to observe cancellation internally (it
-/// returns a halt error), which the loop treats as a full stop too.
+/// Self-contained — no `Disc` needed. The three behaviours (user feedback
+/// 2026-07-28):
+/// 1. **Fail-fast on a disc-level key failure**: the FIRST title that fails
+///    with a whole-disc key error (`is_disc_level_no_key`) stops the whole rip
+///    — every remaining title would fail identically. No 54× error spew.
+/// 2. **Cancel is a full stop**: `should_cancel()` between titles, OR a halt
+///    error from inside a title's mux, returns [`RipOutcome::Halted`] and does
+///    NOT continue to the next title.
+/// 3. Skippable stubs (empty/uncrackable non-feature titles) are skipped in a
+///    multi-title, non-explicit rip; fatal on the feature / explicit `-t` /
+///    single-title.
+///
+/// `explicit_selection` is `true` when the user named specific titles (so a
+/// stub there is what they asked for → fatal). For an all-titles rip pass
+/// `false`.
 pub fn run_titles<F>(
-    disc: &libfreemkv::Disc,
-    job: &Job,
     indices: &[usize],
+    explicit_selection: bool,
     sink: &dyn Sink,
     mut mux_one: F,
 ) -> RipOutcome
 where
     F: FnMut(usize) -> std::io::Result<()>,
 {
-    // (1) FAIL-FAST: a disc-level key failure means every title fails. Refuse
-    // once, up front — do NOT iterate N titles printing a per-title error.
-    if disc.encrypted && !job.raw {
-        let has_key = disc.aacs.is_some() || disc.css.is_some();
-        if !has_key {
-            sink.log(
-                Level::Error,
-                "disc is encrypted and no decryption key resolved — refusing before muxing \
-                 (every title would fail); provide a keydb or key source",
-            );
-            return RipOutcome::NoKey;
-        }
-    }
-
-    let explicit_selection = matches!(job.selection, Selection::Titles(_));
     let multi_title = indices.len() > 1;
     let mut titles_written = 0usize;
 
     for &idx in indices {
-        // Poll for a full-stop between titles (2).
+        // (2) Poll for a full-stop between titles.
         if sink.should_cancel() {
             sink.log(Level::Info, "cancelled — stopping the whole rip");
             return RipOutcome::Halted;
@@ -142,15 +146,23 @@ where
         match mux_one(idx) {
             Ok(()) => titles_written += 1,
             Err(e) => match classify_title_error(&e) {
-                // (2) A halt from inside the mux is a FULL STOP — break the
-                // whole loop, do not continue to the next title.
+                // (2) A halt from inside the mux is a FULL STOP.
                 TitleResult::Halted => {
                     sink.log(Level::Info, "cancelled during mux — stopping the whole rip");
                     return RipOutcome::Halted;
                 }
+                // (1) FAIL-FAST: the disc as a whole has no key → every title
+                // fails identically. Stop now instead of iterating them all.
+                TitleResult::DiscLevelNoKey => {
+                    sink.log(
+                        Level::Error,
+                        "disc has no decryption key — every title would fail; stopping",
+                    );
+                    return RipOutcome::NoKey;
+                }
+                // (3) An incidental extra title that's an uncrackable/empty stub
+                // in an all-titles rip. Skip it, keep going.
                 TitleResult::SkippableStub if !is_feature && multi_title && !explicit_selection => {
-                    // An incidental extra title that's an uncrackable/empty stub
-                    // in an all-titles rip. Skip it, keep going.
                     sink.log(
                         Level::Info,
                         &format!("title {} skipped (empty/uncrackable stub)", idx + 1),
@@ -259,7 +271,6 @@ pub fn mux_title(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{Job, RipMode};
     use crate::sink::NoopSink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -343,31 +354,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fail_fast_no_key_refuses_before_muxing_any_title() {
-        // The user's scenario: 54 titles, encrypted, no key. Must NOT iterate.
-        let d = disc(54, true, false);
-        let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o");
-        let calls = AtomicUsize::new(0);
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |_| {
-            calls.fetch_add(1, Ordering::Relaxed);
-            Ok(())
-        });
-        assert_eq!(outcome, RipOutcome::NoKey);
-        assert_eq!(calls.load(Ordering::Relaxed), 0, "no title was muxed");
+    fn disc_no_key_err() -> std::io::Error {
+        // E_NO_DISC_KEY — a disc-level key failure (keydb has no entry).
+        libfreemkv::Error::NoDiscKey {
+            disc_hash: "deadbeef".to_string(),
+        }
+        .into()
     }
 
     #[test]
-    fn raw_bypasses_the_no_key_fail_fast() {
-        let d = disc(2, true, false);
+    fn fail_fast_on_disc_level_no_key_stops_after_first_title() {
+        // The user's scenario: 54 titles, no key. The FIRST title's mux returns
+        // a disc-level no-key error → stop; do NOT iterate the other 53.
+        let d = disc(54, true, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job {
-            raw: true,
-            ..Job::new("iso://x", "/o")
-        };
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |_| Ok(()));
-        assert_eq!(outcome, RipOutcome::Ok { titles_written: 2 });
+        let calls = AtomicUsize::new(0);
+        let outcome = run_titles(&indices, false, &NoopSink, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Err(disc_no_key_err())
+        });
+        assert_eq!(outcome, RipOutcome::NoKey);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "must stop after the first no-key title, not iterate all 54"
+        );
     }
 
     #[test]
@@ -375,9 +386,8 @@ mod tests {
         // First title halts → the loop stops immediately, does NOT visit title 2.
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o");
         let visited = AtomicUsize::new(0);
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |idx| {
+        let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             visited.fetch_add(1, Ordering::Relaxed);
             if idx == 0 {
                 Err(libfreemkv::Error::Halted.into())
@@ -395,11 +405,11 @@ mod tests {
 
     #[test]
     fn skippable_stub_on_non_feature_multi_title_is_skipped() {
-        // All-titles rip: title 0 ok, title 1 a stub (skipped), title 2 ok.
+        // All-titles rip (explicit=false): title 0 ok, title 1 a stub (skipped),
+        // title 2 ok.
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o").with_mode(RipMode::Single);
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |idx| {
+        let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             if idx == 1 { Err(stub_err()) } else { Ok(()) }
         });
         assert_eq!(outcome, RipOutcome::Ok { titles_written: 2 });
@@ -409,8 +419,7 @@ mod tests {
     fn stub_on_the_feature_is_fatal() {
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o");
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |idx| {
+        let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             if idx == 0 { Err(stub_err()) } else { Ok(()) }
         });
         assert_eq!(outcome, RipOutcome::Failed { title_index: 0 });
@@ -418,14 +427,11 @@ mod tests {
 
     #[test]
     fn explicit_single_title_stub_is_fatal() {
-        // `-t 2` explicitly: a stub there is what the user asked for → fatal.
+        // `-t 2` explicitly (explicit=true): a stub there is what the user asked
+        // for → fatal.
         let d = disc(3, false, false);
-        let job = Job {
-            selection: Selection::Titles(vec![1]),
-            ..Job::new("iso://x", "/o")
-        };
-        let indices = resolve_selection(&d, &job.selection);
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |_| Err(stub_err()));
+        let indices = resolve_selection(&d, &Selection::Titles(vec![1]));
+        let outcome = run_titles(&indices, true, &NoopSink, |_| Err(stub_err()));
         assert_eq!(outcome, RipOutcome::Failed { title_index: 1 });
     }
 
@@ -434,8 +440,7 @@ mod tests {
         // A non-stub hard error is never skippable, even on a bonus title.
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o");
-        let outcome = run_titles(&d, &job, &indices, &NoopSink, |idx| {
+        let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             if idx == 1 { Err(hard_err()) } else { Ok(()) }
         });
         assert_eq!(outcome, RipOutcome::Failed { title_index: 1 });
@@ -454,11 +459,10 @@ mod tests {
         }
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::All);
-        let job = Job::new("iso://x", "/o");
         let sink = CancelAfterFirst {
             seen: AtomicUsize::new(0),
         };
-        let outcome = run_titles(&d, &job, &indices, &sink, |_| {
+        let outcome = run_titles(&indices, false, &sink, |_| {
             sink.seen.fetch_add(1, Ordering::Relaxed);
             Ok(())
         });
