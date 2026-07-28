@@ -19,6 +19,10 @@ libfreemkv = "1.5"
 freemkv-keysources = "1.5"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
+# Language-tag normalization for stream selection (name / 639-1 / 639-2/3 →
+# language identity). `lowercase_names` enables case-insensitive name matching
+# (`from_name_lowercase`) so `-a english` works, not just `-a English`.
+isolang = { version = "2", features = ["lowercase_names"] }
 
 [dev-dependencies]
 
