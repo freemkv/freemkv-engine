@@ -54,8 +54,9 @@ mod recovery;
 mod resolve;
 mod run;
 mod sink;
+mod streams;
 
-pub use job::{Job, RipMode, Selection};
+pub use job::{Job, RipMode, Selection, StreamSel};
 pub use multipass::{
     MultipassResult, classify_damage, effective_abort_secs, loss_aborts, run_multipass,
     should_abort_for_loss,
@@ -69,6 +70,7 @@ pub use preflight::{Preflight, Reason, preflight};
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
+pub use streams::{StreamSelError, resolve_stream_selection};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────
 //
