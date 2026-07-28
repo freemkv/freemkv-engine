@@ -255,16 +255,20 @@ pub fn mux_title(
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
         s.spawn(move || {
+            // The engine's ONE speed/ETA derivation for the mux stage. Owned by
+            // this single watcher thread, so a plain `mut` — no lock needed.
+            let mut speed = crate::speed::SpeedEstimator::new();
             loop {
                 // Drain any progress ticks that arrived.
                 while let Ok((done_b, total_b)) = rx.try_recv() {
+                    let (speed_bps, eta_secs) = speed.sample(done_b, total_b);
                     let p = crate::sink::Progress {
                         pass: "mux".to_string(),
                         bytes_done: done_b,
                         bytes_total: total_b,
                         sectors_bad: 0,
-                        speed_bps: 0,
-                        eta_secs: None,
+                        speed_bps,
+                        eta_secs,
                     };
                     sink.progress(&p);
                 }
