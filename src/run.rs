@@ -24,6 +24,10 @@ use crate::sink::{Level, Progress, Sink};
 /// it is today.
 struct ProgressBridge<'a> {
     sink: &'a dyn Sink,
+    // The engine's ONE speed/ETA derivation. `report` takes `&self`, and the
+    // library may hold the `&dyn Progress` across threads, so guard the
+    // estimator with a Mutex.
+    speed: std::sync::Mutex<crate::speed::SpeedEstimator>,
 }
 
 impl libfreemkv::progress::Progress for ProgressBridge<'_> {
@@ -35,12 +39,13 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
             libfreemkv::progress::PassKind::Mux => "mux".to_string(),
             libfreemkv::progress::PassKind::Verify => "verify".to_string(),
         };
-        // The library reports byte counters; the engine owns the single
-        // speed/ETA derivation (see `Progress` doc). For now we forward the raw
-        // counters and leave speed_bps/eta_secs at 0/None — the multipass
-        // driver (task #7) computes them once from the byte deltas so no
-        // front-end re-derives them. Sweep's work_done/work_total are the
-        // authoritative progress denominator.
+        // Derive speed/ETA ONCE, here — the front-end just formats it. Sweep's
+        // work_done/work_total are the authoritative progress denominator.
+        let (speed_bps, eta_secs) = self
+            .speed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sample(p.work_done, p.work_total);
         let progress = Progress {
             pass,
             bytes_done: p.work_done,
@@ -49,8 +54,8 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
                 .bytes_unreadable_total
                 .saturating_add(p.bytes_pending_total)
                 / 2048,
-            speed_bps: 0,
-            eta_secs: None,
+            speed_bps,
+            eta_secs,
         };
         self.sink.progress(&progress);
         // `false` from report() tells the library to halt; the engine halts
@@ -78,7 +83,10 @@ pub fn recover_to_iso(
     job: &Job,
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
-    let bridge = ProgressBridge { sink };
+    let bridge = ProgressBridge {
+        sink,
+        speed: std::sync::Mutex::new(crate::speed::SpeedEstimator::new()),
+    };
 
     let opts = CopyOptions {
         decrypt: !job.raw,
