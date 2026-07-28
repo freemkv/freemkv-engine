@@ -86,6 +86,46 @@ pub fn classify_title_error(e: &std::io::Error) -> TitleResult {
     }
 }
 
+/// What the loop should DO about one title's [`TitleResult`]. The single
+/// source of the multi-title loop policy — [`run_titles`] uses it, and a
+/// front-end with its own loop + error rendering (the CLI) calls it directly so
+/// the policy is never duplicated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleAction {
+    /// The title muxed (or should be treated as done); move on.
+    Continue,
+    /// A skippable stub on a non-feature title in a multi-title, non-explicit
+    /// rip — skip it with a notice and keep going.
+    Skip,
+    /// Cancelled — stop the WHOLE rip (full stop, not per-title).
+    StopHalt,
+    /// Disc-level key failure — stop; every remaining title fails identically.
+    StopNoKey,
+    /// A hard failure on a title the user wanted — stop and surface it.
+    StopFatal,
+}
+
+/// Decide what to do about one title's result. `is_feature` = title index 0;
+/// `multi_title` = more than one title selected; `explicit_selection` = the
+/// user named specific titles. This is THE loop policy, shared by [`run_titles`]
+/// and any front-end that drives its own loop.
+pub fn decide_title(
+    result: &TitleResult,
+    is_feature: bool,
+    multi_title: bool,
+    explicit_selection: bool,
+) -> TitleAction {
+    match result {
+        TitleResult::Ok => TitleAction::Continue,
+        TitleResult::Halted => TitleAction::StopHalt,
+        TitleResult::DiscLevelNoKey => TitleAction::StopNoKey,
+        TitleResult::SkippableStub if !is_feature && multi_title && !explicit_selection => {
+            TitleAction::Skip
+        }
+        TitleResult::SkippableStub | TitleResult::Failed => TitleAction::StopFatal,
+    }
+}
+
 /// The terminal outcome of a whole multi-title rip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RipOutcome {
@@ -140,42 +180,32 @@ where
             return RipOutcome::Halted;
         }
 
-        // The main FEATURE is title index 0; a failure there is always fatal.
         let is_feature = idx == 0;
+        let result = match mux_one(idx) {
+            Ok(()) => TitleResult::Ok,
+            Err(e) => classify_title_error(&e),
+        };
 
-        match mux_one(idx) {
-            Ok(()) => titles_written += 1,
-            Err(e) => match classify_title_error(&e) {
-                // (2) A halt from inside the mux is a FULL STOP.
-                TitleResult::Halted => {
-                    sink.log(Level::Info, "cancelled during mux — stopping the whole rip");
-                    return RipOutcome::Halted;
-                }
-                // (1) FAIL-FAST: the disc as a whole has no key → every title
-                // fails identically. Stop now instead of iterating them all.
-                TitleResult::DiscLevelNoKey => {
-                    sink.log(
-                        Level::Error,
-                        "disc has no decryption key — every title would fail; stopping",
-                    );
-                    return RipOutcome::NoKey;
-                }
-                // (3) An incidental extra title that's an uncrackable/empty stub
-                // in an all-titles rip. Skip it, keep going.
-                TitleResult::SkippableStub if !is_feature && multi_title && !explicit_selection => {
-                    sink.log(
-                        Level::Info,
-                        &format!("title {} skipped (empty/uncrackable stub)", idx + 1),
-                    );
-                }
-                // The feature, an explicitly-requested title, a single-title
-                // rip, or a non-stub failure → hard error for a title the user
-                // wanted.
-                TitleResult::SkippableStub | TitleResult::Failed => {
-                    return RipOutcome::Failed { title_index: idx };
-                }
-                TitleResult::Ok => unreachable!("Ok is the Ok(()) arm"),
-            },
+        match decide_title(&result, is_feature, multi_title, explicit_selection) {
+            TitleAction::Continue => titles_written += 1,
+            TitleAction::Skip => {
+                sink.log(
+                    Level::Info,
+                    &format!("title {} skipped (empty/uncrackable stub)", idx + 1),
+                );
+            }
+            TitleAction::StopHalt => {
+                sink.log(Level::Info, "cancelled — stopping the whole rip");
+                return RipOutcome::Halted;
+            }
+            TitleAction::StopNoKey => {
+                sink.log(
+                    Level::Error,
+                    "disc has no decryption key — every title would fail; stopping",
+                );
+                return RipOutcome::NoKey;
+            }
+            TitleAction::StopFatal => return RipOutcome::Failed { title_index: idx },
         }
     }
 
