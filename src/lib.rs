@@ -41,6 +41,7 @@
 
 mod job;
 mod multipass;
+mod mux;
 mod outcome;
 mod preflight;
 // The relocated recovery strategy (sweep/patch/mapfile/read_error/
@@ -58,6 +59,9 @@ pub use job::{Job, RipMode, Selection};
 pub use multipass::{
     MultipassResult, classify_damage, effective_abort_secs, loss_aborts, run_multipass,
     should_abort_for_loss,
+};
+pub use mux::{
+    RipOutcome, TitleResult, classify_title_error, mux_title, resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
