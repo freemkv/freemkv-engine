@@ -39,6 +39,7 @@
 // The engine is app-layer, so (unlike libfreemkv) it may carry English text in
 // diagnostics. Front-ends localize via the message + code carried on events.
 
+mod extract;
 mod job;
 mod multipass;
 mod mux;
@@ -75,6 +76,7 @@ mod sink;
 mod speed;
 mod streams;
 
+pub use extract::extract_tree;
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use multipass::{
     MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms, bad_sector_statuses,
