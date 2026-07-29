@@ -330,6 +330,41 @@ pub fn mux_title(
     })
 }
 
+/// Open a live optical drive and get it ready to rip: open the session, lock
+/// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
+/// session (its `disc()` is populated and its drive is still owned, ready to be
+/// staged for a `MuxInput::Session` mux) plus the resolution trace.
+///
+/// This is the ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and
+/// the desktop GUI's disc:// path — neither reimplements it. Presentation
+/// (rendering the trace, per-step error messages, preflight gates) stays in each
+/// shell; the key-source `factory` and `credentials` are supplied by the caller,
+/// so a shell can log key attempts (the CLI) or stay quiet (the GUI) without
+/// this core knowing. `disc_to_iso`'s image copy uses a different lower-level
+/// `Drive` API and is intentionally not covered here.
+pub fn open_scan_resolve(
+    target: libfreemkv::DeviceTarget,
+    credentials: Option<libfreemkv::DriveCredentials>,
+    factory: libfreemkv::KeySourceFactory,
+) -> Result<
+    (
+        libfreemkv::DiscSession,
+        libfreemkv::aacs::trace::ResolutionTrace,
+    ),
+    libfreemkv::Error,
+> {
+    let keyspec = libfreemkv::KeySpec {
+        credentials,
+        ..Default::default()
+    };
+    let mut session = libfreemkv::DiscSession::open(target, keyspec)?;
+    // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
+    session.lock_tray();
+    session.scan(libfreemkv::ScanOptions::default())?;
+    let trace = session.resolve_keys(factory)?;
+    Ok((session, trace))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
