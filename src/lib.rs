@@ -41,6 +41,7 @@
 
 mod extract;
 mod job;
+mod keys;
 mod multipass;
 mod mux;
 mod outcome;
@@ -78,6 +79,7 @@ mod streams;
 
 pub use extract::extract_tree;
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
+pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
 pub use multipass::{
     MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms, bad_sector_statuses,
     classify_damage, effective_abort_secs, end_of_recovery_promotion, loss_aborts,
