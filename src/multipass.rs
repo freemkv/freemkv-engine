@@ -24,7 +24,7 @@ const MILLIS_PER_SEC: f64 = 1000.0;
 /// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
 /// any lost byte (or an unquantifiable NaN loss) aborts; exactly zero proceeds.
 /// A positive threshold switches to the seconds gate (bytes not consulted).
-pub(crate) fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
+pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     if abort_on_lost_secs == 0 {
         lost_bytes > 0 || lost_ms.is_nan()
     } else {
@@ -34,15 +34,49 @@ pub(crate) fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64
 
 /// The seconds-threshold half of the gate: strictly-greater-than aborts, and a
 /// NaN (unquantifiable) loss fails safe to abort.
-pub(crate) fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
+pub fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
     lost_ms.is_nan() || lost_ms > abort_threshold_ms
 }
 
 /// An ISO-image output is a whole-disc backup and always requires 100% (the
 /// `abort_on_lost_secs` tolerance is a muxed-output setting). Front-ends that
 /// target an ISO pass their configured value through this to force 0.
-pub(crate) fn effective_abort_secs(is_iso_output: bool, configured: u64) -> u64 {
+pub fn effective_abort_secs(is_iso_output: bool, configured: u64) -> u64 {
     if is_iso_output { 0 } else { configured }
+}
+
+/// The unreadable byte count that the abort gate scopes to: whole-disc for an
+/// ISO deliverable, in-title only for a muxed output (a scratched menu/trailer
+/// outside the muxed title does not count for an MKV/M2TS mux). This is the RAW
+/// source of truth the `abort_on_lost_secs == 0` ("perfect") gate keys on — no
+/// bitrate, no float — so a zero-bitrate title can never hide unreadable loss.
+///
+/// Ported verbatim from autorip's `abort_lost_bytes`.
+pub fn abort_lost_bytes(
+    output_is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+) -> u64 {
+    if output_is_iso {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum::<u64>()
+    } else {
+        libfreemkv::disc::bytes_bad_in_title(title, bad_ranges)
+    }
+}
+
+/// Milliseconds of playback lost, scoped by [`abort_lost_bytes`] and converted
+/// via the title's own bytes/sec bitrate. Ported verbatim from autorip's
+/// `abort_lost_ms`.
+pub fn abort_lost_ms(
+    output_is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+    title_bytes_per_sec: f64,
+) -> f64 {
+    if title_bytes_per_sec <= 0.0 {
+        return 0.0;
+    }
+    abort_lost_bytes(output_is_iso, title, bad_ranges) as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
 /// Coarse damage tier from raw counters — the freemkv product judgment

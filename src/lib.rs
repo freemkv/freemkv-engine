@@ -76,7 +76,10 @@ mod speed;
 mod streams;
 
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
-pub use multipass::{MultipassResult, classify_damage, run_multipass};
+pub use multipass::{
+    MultipassResult, abort_lost_bytes, abort_lost_ms, classify_damage, effective_abort_secs,
+    loss_aborts, run_multipass, should_abort_for_loss,
+};
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
     mux_title_session, open_scan_resolve, resolve_selection, run_titles,
