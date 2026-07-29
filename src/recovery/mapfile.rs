@@ -34,6 +34,21 @@ use std::time::{Duration, Instant};
 /// is one interval's worth of records.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
+/// Mapfile path for a regular output file: appends `.mapfile` to the output
+/// path.
+///
+/// The engine owns mapfiles now, so it owns the naming rule too. libfreemkv
+/// keeps its own copy of this rule private (`pub(crate)`) purely to back
+/// [`libfreemkv::Disc::mapfile_for`], which additionally special-cases
+/// `/dev/null` (benchmark output) to a temp-dir path derived from the disc
+/// title. Callers that hold a `Disc` should prefer `Disc::mapfile_for`; this
+/// is the plain-path rule for callers that only have an output path.
+pub fn mapfile_path_for(iso_path: &Path) -> PathBuf {
+    let mut s = iso_path.as_os_str().to_os_string();
+    s.push(".mapfile");
+    PathBuf::from(s)
+}
+
 /// Status of a byte range in the mapfile. ddrescue-compatible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SectorStatus {
@@ -681,6 +696,55 @@ fn parse_hex(s: &str) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This crate's `mapfile_path_for` must agree with libfreemkv's
+    /// `Disc::mapfile_for` for any ordinary output path.
+    ///
+    /// The rule genuinely exists twice: libfreemkv needs it to back
+    /// `Disc::mapfile_for`, and it cannot call into this crate (the dependency
+    /// runs the other way). So the duplication is structural, not an oversight —
+    /// but two copies of a naming rule are exactly how a rip ends up writing its
+    /// mapfile to one path and looking for it at another, which reads downstream
+    /// as "no mapfile" and silently restarts a recovered disc from sector 0.
+    /// This pins them together so a change to either side fails here.
+    ///
+    /// `/dev/null` is deliberately NOT compared: `Disc::mapfile_for`
+    /// special-cases benchmark output to a temp-dir path derived from the disc
+    /// title, which is a `Disc`-dependent rule this plain-path helper does not
+    /// and should not reproduce.
+    #[test]
+    fn agrees_with_libfreemkv_disc_mapfile_for() {
+        let disc = libfreemkv::Disc {
+            volume_id: "TEST_VOL".into(),
+            meta_title: Some("TEST_VOL".into()),
+            format: libfreemkv::DiscFormat::Uhd,
+            capacity_sectors: 1024,
+            capacity_bytes: 1024 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        };
+        for p in [
+            "/tmp/movie.iso",
+            "/staging/Some Disc (2024).iso",
+            "relative.iso",
+            "/tmp/no_extension",
+            "/tmp/dots.in.name.iso",
+        ] {
+            let path = Path::new(p);
+            assert_eq!(
+                mapfile_path_for(path),
+                disc.mapfile_for(path),
+                "mapfile naming drifted from libfreemkv for {p}"
+            );
+        }
+    }
 
     fn tmpfile(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
