@@ -19,6 +19,22 @@ use crate::sink::{Level, Sink};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Human-readable byte count for a diagnostic line — GB/MB/KB, so a rip size
+/// reads "~51.6 GB" instead of "~55460235264 bytes".
+fn human_bytes(b: u64) -> String {
+    const K: f64 = 1024.0;
+    let f = b as f64;
+    if f >= K * K * K {
+        format!("{:.1} GB", f / (K * K * K))
+    } else if f >= K * K {
+        format!("{:.0} MB", f / (K * K))
+    } else if f >= K {
+        format!("{:.0} KB", f / K)
+    } else {
+        format!("{b} B")
+    }
+}
+
 /// Resolve a [`Selection`] to concrete 0-based title indices against a scanned
 /// disc. Out-of-range explicit indices are dropped here (preflight surfaces
 /// them as blocking reasons before we get here). `MainMovie` is title 0 (the
@@ -293,7 +309,10 @@ pub fn mux_title(
 
         sink.log(
             Level::Info,
-            &format!("mux: {source_url} -> {dest} (~{total_bytes_hint} bytes)"),
+            &format!(
+                "mux: {source_url} -> {dest} (~{})",
+                human_bytes(total_bytes_hint)
+            ),
         );
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
         let outcome = libfreemkv::mux_stream(
