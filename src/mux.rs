@@ -245,6 +245,51 @@ pub fn mux_title(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
+    let input = libfreemkv::MuxInput::Url {
+        url: source_url,
+        opts: input_opts,
+    };
+    mux_with_input(input, source_url, dest, mux_opts, total_bytes_hint, sink)
+}
+
+/// Mux a single title live off an opened, scanned, key-resolved
+/// [`libfreemkv::DiscSession`] (the drive's staged reader), driving
+/// `libfreemkv::mux_stream` and reporting through the engine [`Sink`] —
+/// the disc:// analogue of [`mux_title`]. Shares the exact same
+/// watcher/speed/halt/done scaffolding via [`mux_with_input`], so a live-drive
+/// rip gets the same speed/ETA reporting a file/ISO rip does.
+pub fn mux_title_session(
+    session: &mut libfreemkv::DiscSession,
+    title_index: usize,
+    dest: &str,
+    mux_opts: &libfreemkv::MuxOptions,
+    total_bytes_hint: u64,
+    sink: &dyn Sink,
+) -> std::io::Result<libfreemkv::MuxOutcome> {
+    let source_label = format!("disc title {}", title_index + 1);
+    let input = libfreemkv::MuxInput::Session {
+        session,
+        title_index,
+    };
+    mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
+}
+
+/// Shared scaffolding behind [`mux_title`] and [`mux_title_session`]: drives
+/// `libfreemkv::mux_stream` for an already-built [`libfreemkv::MuxInput`],
+/// bridging the two libfreemkv seams onto the Sink:
+/// - `MuxEvents` write-progress → `Sink::progress` (via a channel + a scoped
+///   watcher thread, because `mux_stream` takes an `Arc<dyn MuxEvents + 'static>`
+///   that cannot borrow the `&dyn Sink` directly).
+/// - `Sink::should_cancel()` → the `Halt` token the mux polls (the watcher sets
+///   it), so a UI Cancel / Ctrl-C stops the pump exactly as today.
+fn mux_with_input(
+    input: libfreemkv::MuxInput<'_>,
+    source_label: &str,
+    dest: &str,
+    mux_opts: &libfreemkv::MuxOptions,
+    total_bytes_hint: u64,
+    sink: &dyn Sink,
+) -> std::io::Result<libfreemkv::MuxOutcome> {
     use std::sync::mpsc;
 
     let halt = libfreemkv::Halt::new();
@@ -310,21 +355,12 @@ pub fn mux_title(
         sink.log(
             Level::Info,
             &format!(
-                "mux: {source_url} -> {dest} (~{})",
+                "mux: {source_label} -> {dest} (~{})",
                 human_bytes(total_bytes_hint)
             ),
         );
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
-        let outcome = libfreemkv::mux_stream(
-            libfreemkv::MuxInput::Url {
-                url: source_url,
-                opts: input_opts,
-            },
-            dest,
-            mux_opts,
-            &halt,
-            events,
-        );
+        let outcome = libfreemkv::mux_stream(input, dest, mux_opts, &halt, events);
         done.store(true, Ordering::Relaxed);
         outcome
     })
