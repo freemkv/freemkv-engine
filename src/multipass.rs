@@ -13,8 +13,10 @@
 //! main-movie loss, and an unquantifiable (NaN) loss always fails safe to
 //! abort. These are pure functions, ported verbatim with their tests.
 
-use crate::job::{Job, RipMode};
-use crate::recovery::mapfile::SectorStatus;
+use crate::job::Job;
+use crate::recovery::mapfile::{Mapfile, SectorStatus};
+use crate::recovery::{CopyOptions, PatchOptions, SweepOptions};
+use crate::run::ProgressBridge;
 use crate::sink::{Level, Sink};
 
 /// Milliseconds per second — the byte-loss→time conversion base.
@@ -262,104 +264,280 @@ pub struct MultipassResult {
     pub main_lost_ms: f64,
     /// Damage classification from the residual loss.
     pub severity: crate::DamageSeverity,
-    /// Number of passes executed (1 sweep + N patch).
+    /// Number of passes executed (1 sweep + N patch in multipass mode; 1 in
+    /// single-pass mode).
     pub passes: u32,
     /// Whether the abort-on-loss gate fired (loss exceeded tolerance after
     /// retries were exhausted).
     pub aborted_for_loss: bool,
     /// Whether the rip was cancelled (halt) mid-pass.
     pub halted: bool,
+    /// True when the disc (or the scoped muxable portion of it, per
+    /// [`MultipassOpts::is_iso_output`]) ended with zero unreadable and zero
+    /// pending bytes, and the run was neither halted nor aborted for loss.
+    pub complete: bool,
 }
 
-/// Drive the full multipass strategy: sweep, then patch passes until the disc
-/// is clean or recovery stops making progress or `max_passes` is reached, then
-/// apply the abort-on-loss gate.
+/// Options controlling a [`multipass_rip`] run.
+#[derive(Clone, Copy, Debug)]
+pub struct MultipassOpts {
+    /// Patch-retry pass cap — autorip's `max_retries` analogue, fed straight
+    /// into [`plan_passes`]. `0` selects single-pass mode: one
+    /// `recovery::copy` dispatch (sweep-or-resume), no sweep/patch split, no
+    /// convergence loop, no abort-on-loss gate.
+    pub max_passes: u32,
+    /// Seconds of main-title playback loss tolerated once patch retries are
+    /// exhausted. `0` requires a perfect rip (any residual loss aborts).
+    /// Forced to `0` when `is_iso_output` regardless of the configured value
+    /// (see [`effective_abort_secs`]) — an ISO deliverable is a whole-disc
+    /// backup and always requires 100%.
+    pub abort_on_lost_secs: u64,
+    /// True when the deliverable is a whole-disc ISO image. Scopes both the
+    /// per-pass convergence check ([`scope_bad_bytes`]) and the end-of-
+    /// recovery abort gate ([`abort_lost_bytes`]/[`abort_lost_ms`]) to the
+    /// whole disc instead of just the muxed title's extents, and forces
+    /// `abort_on_lost_secs` to `0` via [`effective_abort_secs`].
+    pub is_iso_output: bool,
+}
+
+/// Drive the full multipass STRATEGY LOOP: sweep, then patch passes until the
+/// muxable scope is clean or a pass makes no progress or `opts.max_passes` is
+/// reached, then apply the end-of-recovery promotion and the abort-on-loss
+/// gate. This is the shared composition every front-end (CLI, autorip, the
+/// future GUI) drives instead of carrying its own copy of the loop — mirrors
+/// autorip's `rip_disc` pass sequence exactly (sweep via `recovery::sweep`,
+/// then `for` patch passes via `recovery::patch`, gated by
+/// [`patch_pass_decision`] at loop-top and loop-bottom, promoted via
+/// [`end_of_recovery_promotion`], gated by [`loss_aborts`]) with the
+/// hardware/UI touch-points (transport-crash retry, `spin_cycle`, watchdogs,
+/// per-pass STATE painting) omitted — those are autorip-shell concerns, not
+/// strategy.
 ///
-/// Only meaningful for [`RipMode::Multi`]; a `Single` job does one pass with no
-/// retries and no abort gate (the caller should use [`crate::recover_to_iso`]
-/// directly for that). `max_passes` bounds the patch retries (autorip's
-/// `max_retries` analogue). The disc is re-read from `reader` each pass exactly
-/// as the drive is today.
-pub fn run_multipass(
+/// `opts.max_passes == 0` (via [`plan_passes`]) takes the single-pass branch:
+/// one `recovery::copy` dispatch, decrypting unless `job.raw`, no retry loop.
+/// Otherwise Pass 1 is a fresh (non-resume) `recovery::sweep` with
+/// `skip_on_error: true`, followed by up to `opts.max_passes` `recovery::patch`
+/// passes. The disc is re-read from `reader` each pass exactly as the drive is
+/// today. Progress flows through `sink` via the same [`ProgressBridge`]
+/// `recover_to_iso` uses — one bridge (fresh speed/ETA estimator) per
+/// primitive call.
+pub fn multipass_rip(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
     iso_path: &std::path::Path,
     job: &Job,
-    max_passes: u32,
-    is_iso_output: bool,
+    opts: &MultipassOpts,
     sink: &dyn Sink,
 ) -> crate::Result<MultipassResult> {
-    debug_assert!(matches!(job.mode, RipMode::Multi));
+    let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
+    let empty_title = libfreemkv::DiscTitle::empty();
+    let main_title = disc.titles.first().unwrap_or(&empty_title);
+    let vid = disc.aacs.as_ref().map(|a| a.volume_id);
+    let unit_keys = disc
+        .aacs
+        .as_ref()
+        .map(|a| a.unit_keys.clone())
+        .unwrap_or_default();
 
-    let mut passes = 0u32;
-    let mut last_pending = u64::MAX;
-    let mut last: crate::recovery::CopyResult;
-
-    loop {
-        last = crate::recover_to_iso(disc, reader, iso_path, job, sink)?;
-        passes += 1;
-
-        if last.halted {
-            return Ok(MultipassResult {
-                unreadable_bytes: last.bytes_unreadable,
-                pending_bytes: last.bytes_pending,
-                good_bytes: last.bytes_good,
-                main_lost_ms: 0.0,
-                severity: crate::DamageSeverity::Clean,
-                passes,
-                aborted_for_loss: false,
-                halted: true,
-            });
-        }
-
-        // Auto-exit early on a perfect rip (hard rule #6): no bad bytes at all.
-        if last.bytes_unreadable == 0 && last.bytes_pending == 0 {
-            break;
-        }
-        // Stop when a pass made no forward progress on the pending set (patch
-        // has converged — grinding further won't recover more) or we hit the
-        // retry cap.
-        if last.bytes_pending >= last_pending || passes >= max_passes {
-            break;
-        }
-        last_pending = last.bytes_pending;
-        sink.log(
-            Level::Info,
-            &format!(
-                "multipass: pass {passes} done, {} bytes still pending — retrying",
-                last.bytes_pending
-            ),
-        );
+    if !plan.multipass {
+        // Single-pass: one `copy` dispatch (sweep-or-resume via mapfile
+        // state), no retry loop, no ISO-multipass semantics, no abort gate —
+        // mirrors `RipMode::Single`.
+        let bridge = ProgressBridge::new(sink);
+        let copy_opts = CopyOptions {
+            decrypt: !job.raw,
+            multipass: false,
+            progress: Some(&bridge),
+            halt: None,
+            vid,
+            unit_keys,
+            key_fetch: None,
+        };
+        let cr = crate::recovery::copy(disc, reader, iso_path, &copy_opts)?;
+        return Ok(MultipassResult {
+            unreadable_bytes: cr.bytes_unreadable,
+            pending_bytes: cr.bytes_pending,
+            good_bytes: cr.bytes_good,
+            main_lost_ms: 0.0,
+            severity: crate::DamageSeverity::Clean,
+            passes: 1,
+            aborted_for_loss: false,
+            halted: cr.halted,
+            complete: cr.complete,
+        });
     }
 
-    // After retries are exhausted, any still-pending bytes are confirmed lost.
-    let confirmed_lost_bytes = last.bytes_unreadable.saturating_add(last.bytes_pending);
-    let main_bad = disc
-        .titles
-        .first()
-        .map(|t| {
-            // Reconstruct the main-title bad bytes from the mapfile the passes
-            // wrote (the same source autorip's abort gate reads).
-            crate::recovery::bytes_bad_in_title_from_mapfile(&disc.mapfile_for(iso_path), t)
-        })
-        .unwrap_or(0);
-    let main_lost_ms = main_title_lost_ms(disc, main_bad);
+    // ── Pass 1: the forward sweep. ──
+    let mut passes = 0u32;
+    let (mut last_good, mut last_unreadable, mut last_pending, mut halted);
+    {
+        let bridge = ProgressBridge::new(sink);
+        let sweep_opts = SweepOptions {
+            decrypt: !job.raw,
+            resume: false,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: Some(&bridge),
+            halt: None,
+            vid,
+            unit_keys: unit_keys.clone(),
+            key_fetch: None,
+        };
+        let sr = crate::recovery::sweep(disc, reader, iso_path, &sweep_opts)?;
+        passes += 1;
+        last_good = sr.bytes_good;
+        last_unreadable = sr.bytes_unreadable;
+        last_pending = sr.bytes_pending;
+        halted = sr.halted;
+    }
 
-    let abort_secs = effective_abort_secs(is_iso_output, job.abort_on_lost_secs as u64);
-    let aborted_for_loss = loss_aborts(confirmed_lost_bytes, main_lost_ms, abort_secs);
+    // ── Pass 2..N: patch passes over the mapfile's bad ranges. ──
+    let mapfile_path = disc.mapfile_for(iso_path);
+    if !halted {
+        for _ in 1..=plan.patch_passes {
+            if sink.should_cancel() {
+                halted = true;
+                break;
+            }
 
-    let bad_sectors = confirmed_lost_bytes / 2048;
+            // Loop-top convergence gate: the muxable scope is already clean
+            // in the mapfile — skip remaining passes and proceed to mux.
+            // Conservative fallback (whole in-flight bad count) if the
+            // mapfile can't be read, so a transient load error never skips a
+            // needed pass.
+            let mux_scope_bad = match Mapfile::load(&mapfile_path) {
+                Ok(map) => {
+                    let bad = map.ranges_with(&bad_sector_statuses());
+                    scope_bad_bytes(opts.is_iso_output, &bad, main_title)
+                }
+                Err(_) => last_pending.saturating_add(last_unreadable),
+            };
+            if patch_pass_decision(mux_scope_bad, None) == PatchDecision::Converged {
+                sink.log(
+                    Level::Info,
+                    "multipass_rip: muxable scope 100% recovered — skipping remaining patch passes",
+                );
+                break;
+            }
+
+            let bridge = ProgressBridge::new(sink);
+            let patch_opts = PatchOptions {
+                decrypt: !job.raw,
+                block_sectors: Some(32),
+                full_recovery: true,
+                reverse: true,
+                wedged_threshold: 50,
+                progress: Some(&bridge),
+                halt: None,
+                key_fetch: None,
+            };
+            let pr = crate::recovery::patch(disc, reader, iso_path, &patch_opts)?;
+            passes += 1;
+            last_good = pr.bytes_good;
+            last_unreadable = pr.bytes_unreadable;
+            last_pending = pr.bytes_pending;
+            let recovered = pr.bytes_recovered_this_pass;
+
+            if pr.halted {
+                halted = true;
+                break;
+            }
+            sink.log(
+                Level::Info,
+                &format!(
+                    "multipass_rip: pass {passes} recovered {recovered} bytes; {} bytes still pending",
+                    last_pending
+                ),
+            );
+            // Loop-bottom exhaustion gate, evaluated against the SAME
+            // pre-pass `mux_scope_bad` the top-of-loop check used (see
+            // `patch_pass_decision`'s doc): a pass that recovered nothing
+            // won't be helped by another pass with the same drive state.
+            if patch_pass_decision(mux_scope_bad, Some(recovered)) == PatchDecision::NoProgress {
+                sink.log(
+                    Level::Info,
+                    "multipass_rip: patch pass made no progress — exhausted, muxing on what we have",
+                );
+                break;
+            }
+        }
+    }
+
+    if halted {
+        return Ok(MultipassResult {
+            unreadable_bytes: last_unreadable,
+            pending_bytes: last_pending,
+            good_bytes: last_good,
+            main_lost_ms: 0.0,
+            severity: crate::DamageSeverity::Clean,
+            passes,
+            aborted_for_loss: false,
+            halted: true,
+            complete: false,
+        });
+    }
+
+    // ── End-of-recovery promotion + abort-on-loss gate. ──
+    let (main_lost_ms, main_lost_bytes, good_bytes, unreadable_bytes, pending_bytes) =
+        match Mapfile::load(&mapfile_path) {
+            Ok(mut map) => {
+                let (promote_from, promote_to) = end_of_recovery_promotion();
+                for (pos, size) in map.ranges_with(&[promote_from]) {
+                    if let Err(e) = map.record(pos, size, promote_to) {
+                        sink.log(
+                            Level::Warn,
+                            &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
+                        );
+                    }
+                }
+                if let Err(e) = map.flush() {
+                    sink.log(
+                        Level::Warn,
+                        &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
+                    );
+                }
+                let stats = map.stats();
+                let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+                let lost_bytes = abort_lost_bytes(opts.is_iso_output, main_title, &bad_ranges);
+                let lost_ms = main_title_lost_ms(disc, lost_bytes);
+                (
+                    lost_ms,
+                    lost_bytes,
+                    stats.bytes_good,
+                    stats.bytes_unreadable,
+                    stats.bytes_pending,
+                )
+            }
+            Err(_) => {
+                // Fail-safe (mirrors autorip): the mapfile — the rip's only
+                // damage record — could not be read at the abort-decision
+                // point. Report the loss as unquantifiable (NaN) so
+                // `loss_aborts` fires regardless of threshold, rather than
+                // silently delivering a possibly-lossy rip as perfect.
+                sink.log(
+                    Level::Error,
+                    "multipass_rip: mapfile could not be loaded to verify loss — forcing abort",
+                );
+                (f64::NAN, 0, last_good, last_unreadable, last_pending)
+            }
+        };
+
+    let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
+    let aborted_for_loss = loss_aborts(main_lost_bytes, main_lost_ms, effective_abort);
+    let bad_sectors = unreadable_bytes.saturating_add(pending_bytes) / 2048;
     let severity = classify_damage(bad_sectors, main_lost_ms);
+    let complete = !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0;
 
     Ok(MultipassResult {
-        unreadable_bytes: last.bytes_unreadable,
-        pending_bytes: last.bytes_pending,
-        good_bytes: last.bytes_good,
+        unreadable_bytes,
+        pending_bytes,
+        good_bytes,
         main_lost_ms,
         severity,
         passes,
         aborted_for_loss,
         halted: false,
+        complete,
     })
 }
 
@@ -580,5 +758,452 @@ mod tests {
             content_format: libfreemkv::ContentFormat::BdTs,
         };
         assert!(main_title_lost_ms(&disc, 4096).is_nan());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // multipass_rip — the composed strategy LOOP, exercised headlessly
+    // against synthetic `SectorSource`s (hard rule #2: no live drive).
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A `SectorSource` whose entire capacity reads back as zeros — the
+    /// clean-disc path. Mirrors `run.rs`'s private `ZeroReader`.
+    struct ZeroReader {
+        capacity: u32,
+    }
+    impl libfreemkv::SectorSource for ZeroReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let n = ((count as usize) * 2048).min(buf.len());
+            buf[..n].fill(0);
+            Ok(count as usize)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// One deliberately-bad single-sector LBA: fails every read that
+    /// overlaps it until it has been touched `heal_after` times, then reads
+    /// clean forever after. `heal_after: 1` is "recoverable on the very
+    /// first re-read" (Pass 1's own touch is attempt #1 and fails; Pass 2's
+    /// re-read is attempt #2 and succeeds). `heal_after: u32::MAX` never
+    /// heals within a test — permanent loss. Reports `SENSE_KEY_
+    /// RECOVERED_ERROR` (a real "distrust and re-read" sense, not a
+    /// transport/wedge fault) so Pass 1 marks it NonTrimmed via a plain
+    /// `SkipBlock` — no 30s zone-entry cooldown, no wedge escalation —
+    /// keeping the test fast.
+    struct Spot {
+        lba: u32,
+        heal_after: u32,
+        attempts: u32,
+    }
+
+    /// A `SectorSource` that is clean everywhere except a fixed set of
+    /// [`Spot`]s.
+    struct MultiSpotReader {
+        capacity: u32,
+        spots: Vec<Spot>,
+    }
+    impl libfreemkv::SectorSource for MultiSpotReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let end = lba + count as u32;
+            for spot in &mut self.spots {
+                if lba <= spot.lba && spot.lba < end {
+                    spot.attempts += 1;
+                    if spot.attempts <= spot.heal_after {
+                        return Err(libfreemkv::Error::DiscRead {
+                            sector: spot.lba as u64,
+                            status: Some(2),
+                            sense: Some(libfreemkv::scsi::ScsiSense {
+                                sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
+                                asc: 0x17,
+                                ascq: 0x01,
+                            }),
+                        });
+                    }
+                }
+            }
+            let n = ((count as usize) * 2048).min(buf.len());
+            buf[..n].fill(0);
+            Ok(count as usize)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    /// A minimal unencrypted `sectors`-sized disc with the given titles (may
+    /// be empty — several tests don't need a title at all).
+    fn test_disc(sectors: u32, titles: Vec<libfreemkv::DiscTitle>) -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: "TESTDISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: sectors,
+            capacity_bytes: sectors as u64 * 2048,
+            layers: 1,
+            titles,
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    /// A fresh scratch dir + `out.iso` path for one test, so parallel test
+    /// threads never collide on the same mapfile.
+    fn scratch_iso(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "fmkv-engine-multipass-rip-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("out.iso");
+        (dir, iso)
+    }
+
+    #[test]
+    fn multipass_rip_single_pass_mode_is_one_dispatch_no_retry_loop() {
+        // max_passes == 0 -> plan_passes(0).multipass == false: one
+        // `recovery::copy` dispatch, no sweep/patch split, no abort gate.
+        let (dir, iso) = scratch_iso("single-pass");
+        let sectors = 256u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = ZeroReader { capacity: sectors };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        let opts = MultipassOpts {
+            max_passes: 0,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("single-pass dispatch should succeed on a clean synthetic disc");
+
+        assert_eq!(result.passes, 1, "single-pass mode is exactly one pass");
+        assert_eq!(result.unreadable_bytes, 0);
+        assert_eq!(result.pending_bytes, 0);
+        assert_eq!(result.good_bytes, sectors as u64 * 2048);
+        assert!(result.complete);
+        assert!(!result.halted);
+        assert!(
+            !result.aborted_for_loss,
+            "single-pass never applies the abort gate"
+        );
+        // No mapfile-driven patch pass ever ran — no NonTrimmed/Unreadable
+        // promotion logic touched, no bad_ranges built.
+        assert_eq!(result.main_lost_ms, 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_clean_disc_converges_with_zero_patch_passes() {
+        // A fully-readable disc: Pass 1 sweep finds nothing bad, so the
+        // patch loop's very first top-of-loop `scope_bad_bytes` check is
+        // already 0 -> Converged -> break before any `recovery::patch` call.
+        let (dir, iso) = scratch_iso("clean");
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = ZeroReader { capacity: sectors };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("clean multipass recovery should succeed");
+
+        assert_eq!(result.passes, 1, "sweep only — no patch pass needed");
+        assert_eq!(result.unreadable_bytes, 0);
+        assert_eq!(result.pending_bytes, 0);
+        assert_eq!(result.good_bytes, sectors as u64 * 2048);
+        assert!(result.complete);
+        assert!(!result.halted);
+        assert!(!result.aborted_for_loss);
+        assert_eq!(result.main_lost_ms, 0.0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_recoverable_bad_sector_converges_after_a_patch_pass() {
+        // One sector fails Pass 1's touch, then reads clean from Pass 2 on:
+        // the patch pass recovers it, the muxable scope goes to 0 bad bytes,
+        // and the NEXT loop-top check (Converged) stops the loop early —
+        // well under the 5-patch-pass cap.
+        let (dir, iso) = scratch_iso("recoverable");
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = MultiSpotReader {
+            capacity: sectors,
+            spots: vec![Spot {
+                lba: 1000,
+                heal_after: 1,
+                attempts: 0,
+            }],
+        };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("recoverable bad sector should converge");
+
+        assert_eq!(result.passes, 2, "sweep + exactly 1 patch pass to converge");
+        assert_eq!(result.unreadable_bytes, 0, "fully recovered — nothing lost");
+        assert_eq!(result.pending_bytes, 0);
+        assert!(result.complete);
+        assert!(!result.halted);
+        assert!(!result.aborted_for_loss);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_permanent_loss_past_tolerance_aborts() {
+        // A sector that NEVER heals: Pass 1 marks it NonTrimmed, the one
+        // patch pass recovers nothing (NoProgress -> stop retrying early),
+        // end-of-recovery promotion turns it Unreadable, and — with a
+        // whole-disc (ISO) scope and a zero-tolerance threshold — the
+        // abort-on-loss gate fires.
+        let (dir, iso) = scratch_iso("permanent-loss");
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = MultiSpotReader {
+            capacity: sectors,
+            spots: vec![Spot {
+                lba: 1000,
+                heal_after: u32::MAX,
+                attempts: 0,
+            }],
+        };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("a permanently-bad sector is a reported result, not an Err");
+
+        // NoProgress stops the retry loop before the 5-pass cap is reached:
+        // the first patch pass still recovers the bad sector's readable ECC-
+        // block neighbours (real progress), so NoProgress fires one pass
+        // later than the target sector itself heals — pin "stopped early",
+        // not the exact pass count that depends on the ECC block size.
+        assert!(
+            result.passes > 1 && result.passes < 1 + opts.max_passes,
+            "expected the retry loop to exhaust progress before the pass cap, got {} passes",
+            result.passes
+        );
+        assert!(
+            result.unreadable_bytes > 0,
+            "the sector was never recovered"
+        );
+        assert!(!result.halted);
+        assert!(
+            result.aborted_for_loss,
+            "zero tolerance + confirmed loss must abort"
+        );
+        assert!(!result.complete);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_respects_max_passes_bound_even_with_ongoing_progress() {
+        // Two bad sectors: one heals on the very next touch (so the patch
+        // pass DOES recover bytes — NoProgress never fires), the other never
+        // heals (so the muxable scope never reaches 0 — Converged never
+        // fires either). With max_passes == 1, only ONE patch pass is
+        // allowed to run; the `for` loop must stop there purely because the
+        // pass budget is exhausted, not because of either strategy gate.
+        let (dir, iso) = scratch_iso("max-passes-bound");
+        let sectors = 200_000u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = MultiSpotReader {
+            capacity: sectors,
+            spots: vec![
+                Spot {
+                    lba: 1_000,
+                    heal_after: 1,
+                    attempts: 0,
+                },
+                Spot {
+                    lba: 100_000,
+                    heal_after: u32::MAX,
+                    attempts: 0,
+                },
+            ],
+        };
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        let opts = MultipassOpts {
+            max_passes: 1,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("bounded run is a reported result, not an Err");
+
+        assert_eq!(
+            result.passes, 2,
+            "sweep + exactly the 1 allowed patch pass, no more"
+        );
+        assert!(
+            !result.complete,
+            "the permanent spot is still bad — never converged"
+        );
+        assert!(result.unreadable_bytes > 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_scope_bad_bytes_wiring_drives_convergence_by_output_kind() {
+        // A permanently-bad sector OUTSIDE the muxed title's extents. For an
+        // MKV/M2TS deliverable (is_iso_output=false) that byte is out of
+        // scope: the loop-top `scope_bad_bytes` check sees 0 bad bytes in
+        // scope and converges immediately, without ever calling
+        // `recovery::patch`. For an ISO deliverable (is_iso_output=true) the
+        // SAME byte counts (whole-disc scope): the loop grinds a patch pass,
+        // makes no progress, and the promoted loss aborts.
+        let title = test_title(0, 2_000); // extents [0, 2000)
+        let bad_lba = 50_000; // outside the title's extents
+        let sectors = 200_000u32;
+        let job = Job::new("disc:///dev/null", "placeholder");
+
+        // MKV/M2TS scope: out-of-title damage doesn't earn a retry pass.
+        {
+            let (dir, iso) = scratch_iso("scope-mkv");
+            let disc = test_disc(sectors, vec![title.clone()]);
+            let mut reader = MultiSpotReader {
+                capacity: sectors,
+                spots: vec![Spot {
+                    lba: bad_lba,
+                    heal_after: u32::MAX,
+                    attempts: 0,
+                }],
+            };
+            let opts = MultipassOpts {
+                max_passes: 5,
+                abort_on_lost_secs: 0,
+                is_iso_output: false,
+            };
+            let result = multipass_rip(
+                &disc,
+                &mut reader,
+                &iso,
+                &job,
+                &opts,
+                &crate::sink::NoopSink,
+            )
+            .expect("out-of-title loss must not fail the rip");
+            assert_eq!(
+                result.passes, 1,
+                "muxable scope was already 0 bad bytes — no patch pass ran"
+            );
+            assert!(!result.aborted_for_loss, "loss is entirely out of scope");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ISO scope: the SAME out-of-title byte counts whole-disc and aborts.
+        {
+            let (dir, iso) = scratch_iso("scope-iso");
+            let disc = test_disc(sectors, vec![title.clone()]);
+            let mut reader = MultiSpotReader {
+                capacity: sectors,
+                spots: vec![Spot {
+                    lba: bad_lba,
+                    heal_after: u32::MAX,
+                    attempts: 0,
+                }],
+            };
+            let opts = MultipassOpts {
+                max_passes: 5,
+                abort_on_lost_secs: 0,
+                is_iso_output: true,
+            };
+            let result = multipass_rip(
+                &disc,
+                &mut reader,
+                &iso,
+                &job,
+                &opts,
+                &crate::sink::NoopSink,
+            )
+            .expect("whole-disc-scoped loss is still a reported result");
+            // See the permanent-loss test above for why this isn't pinned to
+            // an exact pass count: the ECC block's readable neighbours give
+            // the first patch pass real progress before NoProgress fires.
+            assert!(
+                result.passes > 1 && result.passes < 1 + opts.max_passes,
+                "whole-disc scope must see the bad byte and run at least one patch pass \
+                 before NoProgress stops the retry loop, got {} passes",
+                result.passes
+            );
+            assert!(
+                result.aborted_for_loss,
+                "ISO scope counts every byte — this loss must abort"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

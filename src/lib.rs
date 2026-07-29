@@ -61,11 +61,11 @@ mod recovery;
 
 // ─── Recovery primitives (relocated from libfreemkv) ────────────────────────
 //
-// The sweep/patch passes and their option/result types. `run_multipass` drives
-// them for the common case; a consumer that must interleave its own work
-// between passes (autorip, whose staging/resume/watchdog state advances at pass
-// boundaries) drives `sweep`/`patch` directly. These are the same primitives
-// libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
+// The sweep/patch passes and their option/result types. `multipass_rip`
+// drives them for the common case; a consumer that must interleave its own
+// work between passes (autorip, whose staging/resume/watchdog state advances
+// at pass boundaries) drives `sweep`/`patch` directly. These are the same
+// primitives libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
@@ -81,10 +81,10 @@ pub use extract::extract_tree;
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
 pub use multipass::{
-    MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms, bad_sector_statuses,
-    classify_damage, effective_abort_secs, end_of_recovery_promotion, loss_aborts,
-    patch_made_progress, patch_pass_decision, plan_passes, run_multipass, scope_bad_bytes,
-    scope_converged, should_abort_for_loss,
+    MultipassOpts, MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms,
+    bad_sector_statuses, classify_damage, effective_abort_secs, end_of_recovery_promotion,
+    loss_aborts, multipass_rip, patch_made_progress, patch_pass_decision, plan_passes,
+    scope_bad_bytes, scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
