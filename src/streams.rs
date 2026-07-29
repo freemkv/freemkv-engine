@@ -16,6 +16,86 @@ impl StreamChoice {
     ) -> Result<StreamSelection, StreamSelError> {
         resolve_stream_selection(title, &self.audio, &self.subtitles)
     }
+
+    /// Report the language-filtered classes that matched NO stream on `title`
+    /// while the title HAS streams of that class — i.e. the user asked for a
+    /// language that isn't present, so an unguarded rip would ship a file
+    /// missing that whole track class with no hint why. See [`UnmatchedClass`].
+    ///
+    /// Empty result = nothing to warn about: every class was `all`/`none`, or
+    /// its language filter matched at least one stream, or the title simply has
+    /// no streams of that class (nothing could match).
+    pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
+        let mut out = Vec::new();
+        check_class(title, &self.audio, StreamClass::Audio, &mut out);
+        check_class(title, &self.subtitles, StreamClass::Subtitle, &mut out);
+        out
+    }
+}
+
+/// A language-filtered class (audio or subtitle) where the requested languages
+/// matched no stream on a title that DOES carry that class. The front-end turns
+/// this into a hard error (a single-title rip) or a warn-and-skip (a batch), so
+/// a typo — or a language simply absent from one title — never silently ships a
+/// track-less file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnmatchedClass {
+    /// Stable class key the front-end localizes: `"audio"` or `"subtitle"`.
+    pub class: &'static str,
+    /// The language tags the user requested, verbatim.
+    pub requested: Vec<String>,
+    /// The languages actually present on the title for this class (sorted,
+    /// deduped) — what to show so the user can correct the request.
+    pub available: Vec<String>,
+}
+
+fn check_class(
+    title: &libfreemkv::DiscTitle,
+    sel: &StreamFilter,
+    class: StreamClass,
+    out: &mut Vec<UnmatchedClass>,
+) {
+    // Only an explicit language filter can "miss"; all/none are always honored.
+    let StreamFilter::Langs(tags) = sel else {
+        return;
+    };
+    let present: Vec<String> = class_languages(title, class);
+    if present.is_empty() {
+        // The title has no streams of this class at all — nothing to match, and
+        // not a "wrong file": there was never a track to keep.
+        return;
+    }
+    let wanted: Vec<Language> = tags.iter().filter_map(|t| normalize_lang(t)).collect();
+    let any_match = present
+        .iter()
+        .any(|l| normalize_lang(l).is_some_and(|pl| wanted.contains(&pl)));
+    if !any_match {
+        let mut available = present;
+        available.sort();
+        available.dedup();
+        out.push(UnmatchedClass {
+            class: class.key(),
+            requested: tags.clone(),
+            available,
+        });
+    }
+}
+
+/// The raw language tags of every stream of `class` on `title` (order preserved,
+/// not yet deduped).
+fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<String> {
+    match class {
+        StreamClass::Audio => title
+            .audio_streams()
+            .map(|a| a.language.clone())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        StreamClass::Subtitle => title
+            .subtitle_streams()
+            .map(|s| s.language.clone())
+            .filter(|l| !l.is_empty())
+            .collect(),
+    }
 }
 
 /// What can go wrong translating a language policy. `Sink`-renderable data, not
@@ -47,6 +127,16 @@ pub fn resolve_stream_selection(
 enum StreamClass {
     Audio,
     Subtitle,
+}
+
+impl StreamClass {
+    /// Stable, localizable key for this class.
+    fn key(self) -> &'static str {
+        match self {
+            StreamClass::Audio => "audio",
+            StreamClass::Subtitle => "subtitle",
+        }
+    }
 }
 
 fn resolve_class(
@@ -274,5 +364,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sel.audio, PidFilter::Only(vec![]));
+    }
+
+    fn choice(audio: StreamFilter, subtitles: StreamFilter) -> StreamChoice {
+        StreamChoice { audio, subtitles }
+    }
+
+    #[test]
+    fn unmatched_flags_a_language_absent_from_a_present_class() {
+        // Audio jpn is absent (title has eng/spa/fra) → flagged, with the real
+        // languages listed. Subtitles All → never flagged.
+        let u =
+            choice(StreamFilter::Langs(vec!["jpn".into()]), StreamFilter::All).unmatched(&title());
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].class, "audio");
+        assert_eq!(u[0].requested, vec!["jpn".to_string()]);
+        assert_eq!(
+            u[0].available,
+            vec!["eng".to_string(), "fra".into(), "spa".into()]
+        );
+    }
+
+    #[test]
+    fn unmatched_is_empty_when_a_requested_language_is_present() {
+        // eng present → no audio flag; fra present as a subtitle → no sub flag.
+        let u = choice(
+            StreamFilter::Langs(vec!["eng".into()]),
+            StreamFilter::Langs(vec!["fra".into()]),
+        )
+        .unmatched(&title());
+        assert!(u.is_empty(), "got {u:?}");
+    }
+
+    #[test]
+    fn unmatched_ignores_all_and_none() {
+        // all/none are always honored — a user asking for none WANTS none.
+        assert!(
+            choice(StreamFilter::All, StreamFilter::None)
+                .unmatched(&title())
+                .is_empty()
+        );
+        assert!(
+            choice(StreamFilter::None, StreamFilter::All)
+                .unmatched(&title())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn unmatched_skips_a_class_the_title_lacks_entirely() {
+        // A title with audio but NO subtitles: -s eng can't "miss" — there was
+        // never a subtitle track to keep, so it is not flagged.
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.streams = vec![audio(0x1100, "eng")];
+        let u = choice(StreamFilter::All, StreamFilter::Langs(vec!["eng".into()])).unmatched(&t);
+        assert!(u.is_empty(), "got {u:?}");
+    }
+
+    #[test]
+    fn unmatched_flags_both_classes_independently() {
+        let u = choice(
+            StreamFilter::Langs(vec!["jpn".into()]),
+            StreamFilter::Langs(vec!["kor".into()]),
+        )
+        .unmatched(&title());
+        assert_eq!(u.len(), 2);
+        assert!(u.iter().any(|c| c.class == "audio"));
+        assert!(u.iter().any(|c| c.class == "subtitle"));
     }
 }
