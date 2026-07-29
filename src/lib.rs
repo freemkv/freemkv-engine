@@ -77,8 +77,10 @@ mod streams;
 
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use multipass::{
-    MultipassResult, abort_lost_bytes, abort_lost_ms, classify_damage, effective_abort_secs,
-    loss_aborts, run_multipass, should_abort_for_loss,
+    MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms, bad_sector_statuses,
+    classify_damage, effective_abort_secs, end_of_recovery_promotion, loss_aborts,
+    patch_made_progress, patch_pass_decision, plan_passes, run_multipass, scope_bad_bytes,
+    scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
