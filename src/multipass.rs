@@ -14,6 +14,7 @@
 //! abort. These are pure functions, ported verbatim with their tests.
 
 use crate::job::{Job, RipMode};
+use crate::recovery::mapfile::SectorStatus;
 use crate::sink::{Level, Sink};
 
 /// Milliseconds per second — the byte-loss→time conversion base.
@@ -77,6 +78,137 @@ pub fn abort_lost_ms(
         return 0.0;
     }
     abort_lost_bytes(output_is_iso, title, bad_ranges) as f64 / title_bytes_per_sec * MILLIS_PER_SEC
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MULTIPASS STRATEGY DECISIONS — relocated verbatim from autorip's `rip_disc`.
+//
+// These pure functions are the loop's decision surface: pass ordering, the
+// scope-aware convergence check, the no-progress exhaustion gate, and the
+// end-of-recovery status promotion. They were characterized in place inside
+// autorip (its `char_*` tests pin them byte-for-byte) before this move, so a
+// relocation with identical signatures/bodies is behavior-preserving by
+// construction. autorip now calls these directly instead of carrying its own
+// copies; the freemkv GUI (a future front-end) will use the same
+// implementation without duplicating it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The pass plan for a rip, derived purely from `max_retries`.
+///
+/// Pins the loop's pass ordering: multipass (`max_retries > 0`) runs exactly one
+/// Pass-1 sweep (disc → ISO) followed by `max_retries` patch passes, and the UI
+/// counts `max_retries + 2` total passes (sweep + N patch + mux). Single-pass
+/// (`max_retries == 0`) is the direct disc → MKV stream: no sweep pass, no patch
+/// passes, no ISO intermediate, and a `total_passes` of 0 (the mux-progress
+/// helper falls through to mux-pct passthrough).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PassPlan {
+    /// True when the rip goes through the ISO intermediate + recovery loop.
+    pub multipass: bool,
+    /// Number of Pass-1 sweep passes (1 in multipass, 0 in single-pass).
+    pub sweep_passes: u8,
+    /// Number of patch retry passes (`max_retries` in multipass, 0 otherwise).
+    pub patch_passes: u8,
+    /// Total passes reported to the UI (sweep + N patch + mux, else 0).
+    pub total_passes: u8,
+}
+
+pub fn plan_passes(max_retries: u8) -> PassPlan {
+    if max_retries > 0 {
+        PassPlan {
+            multipass: true,
+            sweep_passes: 1,
+            patch_passes: max_retries,
+            total_passes: max_retries + 2, // pass 1 + retries + mux
+        }
+    } else {
+        PassPlan {
+            multipass: false,
+            sweep_passes: 0,
+            patch_passes: 0,
+            total_passes: 0,
+        }
+    }
+}
+
+/// The mapfile sector statuses that count as "still bad" (not yet recovered)
+/// for the muxable-scope convergence check. Pins the exact status set the loop
+/// treats as unfinished: not-tried, not-trimmed, not-scraped, and unreadable.
+pub fn bad_sector_statuses() -> [SectorStatus; 4] {
+    [
+        SectorStatus::NonTried,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+    ]
+}
+
+/// Scope-aware bad-byte count for the convergence check.
+///
+/// For ISO output the deliverable is the whole-disc image, so EVERY bad byte
+/// counts (menus / trailers / anything outside a title still has to be clean).
+/// For MKV/M2TS only bytes inside the muxed title's extents count — bad ranges
+/// in deleted scenes / menus / trailers are not going into the output and do not
+/// earn retry passes. Same scoping the abort gate uses ([`abort_lost_bytes`]) —
+/// this delegates to it rather than duplicating the sum.
+pub fn scope_bad_bytes(
+    is_iso: bool,
+    bad_ranges: &[(u64, u64)],
+    title: &libfreemkv::DiscTitle,
+) -> u64 {
+    abort_lost_bytes(is_iso, title, bad_ranges)
+}
+
+/// Loop-top convergence gate: the muxable scope is 100% recovered (nothing left
+/// to retry) exactly when its scope-aware bad-byte count is zero.
+pub fn scope_converged(mux_scope_bad: u64) -> bool {
+    mux_scope_bad == 0
+}
+
+/// Loop-bottom exhaustion gate: a patch pass made progress iff it recovered a
+/// non-zero number of bytes. `recovered == 0` means no future pass with the same
+/// drive state will help, so the loop gives up and muxes on what it has.
+pub fn patch_made_progress(recovered: u64) -> bool {
+    recovered != 0
+}
+
+/// The unified per-pass convergence decision, composed from the two gates the
+/// loop applies ([`scope_converged`] at the top of each iteration and
+/// [`patch_made_progress`] at the bottom). This is the single canonical
+/// multipass strategy fn every front-end shares.
+///
+/// `mux_scope_bad` is the scope-aware bad-byte count observed BEFORE a pass runs
+/// (0 ⇒ the scope is already clean ⇒ `Converged`). `recovered` is what a pass
+/// recovered, consulted only when the scope is still bad: `None` models the
+/// loop-top evaluation (no pass has run yet ⇒ `Continue`); `Some(0)` is a pass
+/// that recovered nothing ⇒ `NoProgress`; `Some(n>0)` ⇒ `Continue`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchDecision {
+    /// Muxable scope fully recovered — stop retrying, proceed to mux.
+    Converged,
+    /// Last pass recovered nothing — stop retrying, mux on what we have.
+    NoProgress,
+    /// Keep retrying.
+    Continue,
+}
+
+pub fn patch_pass_decision(mux_scope_bad: u64, recovered: Option<u64>) -> PatchDecision {
+    if scope_converged(mux_scope_bad) {
+        PatchDecision::Converged
+    } else if matches!(recovered, Some(r) if !patch_made_progress(r)) {
+        PatchDecision::NoProgress
+    } else {
+        PatchDecision::Continue
+    }
+}
+
+/// The end-of-recovery promotion: after the final patch pass, bytes still left
+/// `NonTrimmed` in the mapfile (i.e. "maybe" across every pass) are promoted to
+/// `Unreadable` (confirmed lost) BEFORE the abort/loss gate reads them. Returns
+/// the `(from, to)` status pair the loop applies. libfreemkv's patch loop
+/// intentionally defers this final-verdict step to the orchestrator.
+pub fn end_of_recovery_promotion() -> (SectorStatus, SectorStatus) {
+    (SectorStatus::NonTrimmed, SectorStatus::Unreadable)
 }
 
 /// Coarse damage tier from raw counters — the freemkv product judgment
@@ -321,6 +453,111 @@ mod tests {
         assert!((main_title_lost_ms(&disc, 100_000) - 10_000.0).abs() < 1e-6);
         // No loss → 0.
         assert_eq!(main_title_lost_ms(&disc, 0), 0.0);
+    }
+
+    /// Minimal `DiscTitle` whose single extent spans `[start_lba, start_lba +
+    /// sector_count)`. Mirrors autorip's `test_title` helper — only `extents`
+    /// matters for `bytes_bad_in_title` / the scope-aware gates.
+    fn test_title(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
+        libfreemkv::DiscTitle {
+            playlist: "00800.mpls".to_string(),
+            playlist_id: 800,
+            duration_secs: 7200.0,
+            size_bytes: (sector_count as u64) * 2048,
+            clips: Vec::new(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+            extents: vec![libfreemkv::disc::Extent {
+                start_lba,
+                sector_count,
+            }],
+            content_format: libfreemkv::disc::ContentFormat::BdTs,
+            codec_privates: Vec::new(),
+        }
+    }
+
+    // ── Multipass strategy decisions — relocated from autorip's char_* tests.
+    //    autorip keeps its own characterization coverage exercising these same
+    //    fns through its call path; these are the engine's own unit coverage
+    //    now that it owns the implementation. ──
+
+    #[test]
+    fn plan_passes_single_vs_multipass() {
+        let single = plan_passes(0);
+        assert!(!single.multipass);
+        assert_eq!(single.sweep_passes, 0);
+        assert_eq!(single.patch_passes, 0);
+        assert_eq!(single.total_passes, 0);
+
+        for n in 1u8..=10 {
+            let plan = plan_passes(n);
+            assert!(plan.multipass);
+            assert_eq!(plan.sweep_passes, 1);
+            assert_eq!(plan.patch_passes, n);
+            assert_eq!(plan.total_passes, n + 2);
+        }
+    }
+
+    #[test]
+    fn scope_bad_bytes_mkv_scopes_to_title() {
+        let title = test_title(0, 48_829);
+
+        let out_of_title = [(500_000_000u64, 2048u64)];
+        let bad = scope_bad_bytes(false, &out_of_title, &title);
+        assert_eq!(bad, 0);
+        assert!(scope_converged(bad));
+
+        let in_title = [(1_000_000u64, 2048u64)];
+        let bad_in = scope_bad_bytes(false, &in_title, &title);
+        assert_eq!(bad_in, 2048);
+        assert!(!scope_converged(bad_in));
+    }
+
+    #[test]
+    fn scope_bad_bytes_iso_scopes_whole_disc() {
+        let title = test_title(0, 48_829);
+
+        let out_of_title = [(500_000_000u64, 2048u64)];
+        let bad = scope_bad_bytes(true, &out_of_title, &title);
+        assert_eq!(bad, 2048);
+        assert!(!scope_converged(bad));
+
+        assert!(scope_converged(scope_bad_bytes(true, &[], &title)));
+    }
+
+    #[test]
+    fn patch_made_progress_zero_vs_nonzero() {
+        assert!(!patch_made_progress(0));
+        assert!(patch_made_progress(1));
+        assert!(patch_made_progress(2048));
+    }
+
+    #[test]
+    fn patch_pass_decision_matrix() {
+        assert_eq!(patch_pass_decision(0, None), PatchDecision::Converged);
+        assert_eq!(patch_pass_decision(0, Some(0)), PatchDecision::Converged);
+        assert_eq!(patch_pass_decision(0, Some(999)), PatchDecision::Converged);
+        assert_eq!(patch_pass_decision(2048, None), PatchDecision::Continue);
+        assert_eq!(
+            patch_pass_decision(2048, Some(0)),
+            PatchDecision::NoProgress
+        );
+        assert_eq!(
+            patch_pass_decision(2048, Some(4096)),
+            PatchDecision::Continue
+        );
+    }
+
+    #[test]
+    fn end_of_recovery_promotion_is_nontrimmed_to_unreadable() {
+        assert_eq!(
+            end_of_recovery_promotion(),
+            (SectorStatus::NonTrimmed, SectorStatus::Unreadable)
+        );
+        let bad_set = bad_sector_statuses();
+        assert!(bad_set.contains(&SectorStatus::NonTrimmed));
+        assert!(bad_set.contains(&SectorStatus::Unreadable));
+        assert!(!bad_set.contains(&SectorStatus::Finished));
     }
 
     #[test]
