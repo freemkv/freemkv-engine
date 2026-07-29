@@ -96,7 +96,7 @@ pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;
-pub use streams::{StreamSelError, resolve_stream_selection};
+pub use streams::{StreamSelError, UnmatchedClass, resolve_stream_selection};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────
 //
