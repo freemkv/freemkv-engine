@@ -22,12 +22,31 @@ use crate::sink::{Level, Progress, Sink};
 /// returning `!sink.should_cancel()` so the library's cooperative-cancellation
 /// bool (`false` = stop) is driven by the front-end's Cancel/Ctrl-C exactly as
 /// it is today.
-struct ProgressBridge<'a> {
+/// Bridges libfreemkv's low-level `Progress` callback onto the engine
+/// [`Sink`]. `pub(crate)` so [`crate::multipass::multipass_rip`] can reuse the
+/// exact same bridge — one speed/ETA derivation, shared by every caller that
+/// drives a recovery primitive directly (see the struct-level doc above for
+/// why there is only ever one of these).
+pub(crate) struct ProgressBridge<'a> {
     sink: &'a dyn Sink,
     // The engine's ONE speed/ETA derivation. `report` takes `&self`, and the
     // library may hold the `&dyn Progress` across threads, so guard the
     // estimator with a Mutex.
     speed: std::sync::Mutex<crate::speed::SpeedEstimator>,
+}
+
+impl<'a> ProgressBridge<'a> {
+    /// Build a fresh bridge (fresh speed/ETA estimator) for one recovery
+    /// primitive call (`sweep`, `patch`, or `copy`). Each primitive call gets
+    /// its own estimator — matching `recover_to_iso`'s one-bridge-per-call
+    /// convention — so a new pass's speed reading doesn't inherit the
+    /// previous pass's smoothing state.
+    pub(crate) fn new(sink: &'a dyn Sink) -> Self {
+        ProgressBridge {
+            sink,
+            speed: std::sync::Mutex::new(crate::speed::SpeedEstimator::new()),
+        }
+    }
 }
 
 impl libfreemkv::progress::Progress for ProgressBridge<'_> {
@@ -83,10 +102,7 @@ pub fn recover_to_iso(
     job: &Job,
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
-    let bridge = ProgressBridge {
-        sink,
-        speed: std::sync::Mutex::new(crate::speed::SpeedEstimator::new()),
-    };
+    let bridge = ProgressBridge::new(sink);
 
     let opts = CopyOptions {
         decrypt: !job.raw,
