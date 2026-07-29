@@ -25,6 +25,9 @@ tracing = "0.1"
 isolang = { version = "2", features = ["lowercase_names"] }
 
 [dev-dependencies]
+# Temp dirs / files for the relocated recovery regression suites (mirrors
+# libfreemkv's dev-dependency).
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

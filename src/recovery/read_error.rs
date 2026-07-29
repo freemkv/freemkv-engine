@@ -1520,4 +1520,116 @@ mod tests {
             "saturated jump distance must equal base*batch*64"
         );
     }
+
+    // ── Regression tests for bisect inner-loop ReadAction dispatch ───────────
+    //
+    // Before the fix the bisect inner loop discarded the ReadAction returned by
+    // handle_read_error:
+    //
+    //   let _ = read_error::handle_read_error(&inner_err, &mut read_ctx);
+    //
+    // Consequences:
+    //   (a) Retry{pause_secs} — cooldown skipped; sector immediately marked
+    //       BisectBad, hammering a degraded drive (violates Hard Rule #2).
+    //   (b) AbortPass — ignored; loop kept issuing reads against a crashed drive.
+    //
+    // The fix replaces the discard with a match.  The tests below prove the
+    // required ReadAction values are produced by handle_read_error in the
+    // bisect-inner context (bisecting=true, batch=1), so that any regression
+    // to `let _ = ...` would break real behaviour on the tested error paths.
+
+    /// NOT_READY inside a bisect must return Retry, not SkipBlock.
+    /// If the inner loop discarded the action the 3-second cooldown would be
+    /// skipped, hammering the drive during a transient NOT_READY condition.
+    #[test]
+    fn bisect_inner_not_ready_returns_retry_with_pause() {
+        let not_ready_err = Error::DiscRead {
+            sector: 500,
+            status: Some(scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_NOT_READY,
+                asc: 0x04,
+                ascq: 0x00, // not 0x3E — generic NOT_READY, not bridge degradation
+            }),
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true; // simulate being inside the bisect inner loop
+
+        let action = handle_read_error(&not_ready_err, &mut ctx);
+        match action {
+            ReadAction::Retry { pause_secs } => {
+                assert!(
+                    pause_secs > 0,
+                    "NOT_READY retry must carry a non-zero pause; got {pause_secs}s"
+                );
+            }
+            other => panic!(
+                "bisect inner NOT_READY must return Retry{{pause_secs}}, got {other:?}; \
+                 a discard (`let _ = ...`) would skip this pause and hammer the drive"
+            ),
+        }
+    }
+
+    /// A transport failure inside a bisect must return AbortPass.
+    /// If the inner loop discarded the action the loop would continue
+    /// issuing reads against a crashed bridge, producing spurious BisectBad
+    /// entries and potentially looping until the batch is exhausted.
+    #[test]
+    fn bisect_inner_transport_failure_returns_abort_pass() {
+        let transport_err = Error::DiscRead {
+            sector: 500,
+            status: Some(scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+            sense: None,
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true;
+
+        let action = handle_read_error(&transport_err, &mut ctx);
+        assert_eq!(
+            action,
+            ReadAction::AbortPass,
+            "bisect inner transport failure must return AbortPass; \
+             a discard (`let _ = ...`) would silently keep looping against a crashed drive"
+        );
+    }
+
+    /// After enough consecutive wedge errors with bisecting=true the handler
+    /// must eventually return AbortPass.  Before the fix, the inner loop
+    /// discarded the returned action and kept issuing reads against a permanently
+    /// wedged drive at full rate.
+    ///
+    /// The threshold is 16 consecutive wedges (WEDGE_ABORT_THRESHOLD in
+    /// read_error.rs); we drive 20 iterations to give the assertion headroom
+    /// without hard-coding the internal constant here.
+    #[test]
+    fn bisect_inner_wedge_abort_threshold_reached_returns_abort_pass() {
+        let hardware_err = || Error::DiscRead {
+            sector: 500,
+            status: Some(scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_HARDWARE_ERROR,
+                asc: 0x44,
+                ascq: 0x00,
+            }),
+        };
+
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.bisecting = true;
+
+        let mut aborted = false;
+        for _ in 0..20 {
+            let action = handle_read_error(&hardware_err(), &mut ctx);
+            if action == ReadAction::AbortPass {
+                aborted = true;
+                break;
+            }
+        }
+        assert!(
+            aborted,
+            "bisect inner wedge loop must reach AbortPass after consecutive hardware errors; \
+             a discard (`let _ = ...`) would loop forever on a bricked drive"
+        );
+    }
 }
