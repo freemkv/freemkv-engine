@@ -59,6 +59,15 @@ fn check_class(
     let StreamFilter::Langs(tags) = sel else {
         return;
     };
+    // Keep EVERY stream of the class, including ones with an empty language tag.
+    // The distinction matters: "this title has no audio at all" is not a miss,
+    // but "this title has audio that carries no language tag" is — a language
+    // filter cannot match an untagged track, so the resolved selection keeps
+    // nothing. Filtering the empties out here made the two cases identical, so
+    // an untagged title returned early, reported no miss, and shipped a
+    // video-only file at exit 0 — the exact silent-loss this check exists to
+    // prevent. DVDs authored with zero language bytes hit it (libfreemkv emits
+    // `language: ""` for them).
     let present: Vec<String> = class_languages(title, class);
     if present.is_empty() {
         // The title has no streams of this class at all — nothing to match, and
@@ -70,7 +79,14 @@ fn check_class(
         .iter()
         .any(|l| normalize_lang(l).is_some_and(|pl| wanted.contains(&pl)));
     if !any_match {
-        let mut available = present;
+        // Report an untagged track as "und" (ISO 639-2 undetermined) rather than
+        // as a blank, so the message reads "available audio: und" instead of
+        // trailing off — the user needs to see that tracks exist but carry no
+        // language, which is why their filter matched nothing.
+        let mut available: Vec<String> = present
+            .into_iter()
+            .map(|l| if l.is_empty() { "und".to_string() } else { l })
+            .collect();
         available.sort();
         available.dedup();
         out.push(UnmatchedClass {
@@ -82,18 +98,15 @@ fn check_class(
 }
 
 /// The raw language tags of every stream of `class` on `title` (order preserved,
-/// not yet deduped).
+/// not yet deduped). Empty tags are RETAINED — see `unmatched_for_class`: an
+/// untagged stream still counts as a stream of the class, and dropping it here
+/// makes "no tracks" indistinguishable from "no *tagged* tracks".
 fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<String> {
     match class {
-        StreamClass::Audio => title
-            .audio_streams()
-            .map(|a| a.language.clone())
-            .filter(|l| !l.is_empty())
-            .collect(),
+        StreamClass::Audio => title.audio_streams().map(|a| a.language.clone()).collect(),
         StreamClass::Subtitle => title
             .subtitle_streams()
             .map(|s| s.language.clone())
-            .filter(|l| !l.is_empty())
             .collect(),
     }
 }
@@ -419,6 +432,35 @@ mod tests {
         t.streams = vec![audio(0x1100, "eng")];
         let u = choice(StreamFilter::All, StreamFilter::Langs(vec!["eng".into()])).unmatched(&t);
         assert!(u.is_empty(), "got {u:?}");
+    }
+
+    /// A class whose streams exist but carry NO language tag is a MISS, not an
+    /// absent class.
+    ///
+    /// Regression: `class_languages` used to filter empty tags out, so a title
+    /// with untagged audio looked identical to a title with no audio — the
+    /// unmatched check returned early, nothing was reported, and `resolve`
+    /// produced `Only([])`, i.e. keep nothing. `-a eng` on such a disc therefore
+    /// wrote a video-only file and exited 0, which is precisely the silent
+    /// track-loss the fail-loud work was meant to end. DVDs authored with zero
+    /// language bytes reach this (libfreemkv emits `language: ""`).
+    #[test]
+    fn unmatched_flags_a_class_whose_streams_are_all_untagged() {
+        let mut t = libfreemkv::DiscTitle::empty();
+        // Two real audio tracks, neither carrying a language tag.
+        t.streams = vec![audio(0x1100, ""), audio(0x1101, "")];
+        let u = choice(StreamFilter::Langs(vec!["eng".into()]), StreamFilter::All).unmatched(&t);
+        assert_eq!(
+            u.len(),
+            1,
+            "untagged audio must be reported as unmatched, got {u:?}"
+        );
+        assert_eq!(u[0].class, "audio");
+        assert_eq!(
+            u[0].available,
+            vec!["und".to_string()],
+            "an untagged track must surface as 'und', not as a blank"
+        );
     }
 
     #[test]
