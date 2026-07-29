@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# freemkv-engine git-deps BOTH libfreemkv and freemkv-keysources through the
+# committed [patch.crates-io] table in Cargo.toml (neither is on crates.io).
+# Those tags are public, so cargo fetches them directly — no sibling-repo
+# checkout is needed here.
+#
+# Cargo.lock is gitignored for this crate (library convention), so `--locked`
+# is deliberately NOT used: with no committed lockfile it would fail rather
+# than resolve. The release cascade regenerates and verifies a lock in each
+# consuming binary, which is where the pin actually has to hold.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+        with:
+          components: clippy, rustfmt
+      # Cache ~/.cargo/registry + target/ across runs.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-engine-ci
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: freemkv-engine-ci
+      - run: cargo test
