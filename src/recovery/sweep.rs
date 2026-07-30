@@ -202,13 +202,13 @@ impl Sink<WorkItem> for SweepSink {
         // Drain the writeback pipeline + fsync the ISO, then persist
         // any pending mapfile state. Same finalisation order as the
         // pre-Pipeline consumer loop.
-        if let Err(e) = self.file.sync_all() {
-            if self.is_regular {
-                return Err(Error::IoError { source: e });
-            }
-            // Non-regular outputs (/dev/null, pipes) always fail
-            // sync_all; that's not a real error.
+        if let Err(e) = self.file.sync_all()
+            && self.is_regular
+        {
+            return Err(Error::IoError { source: e });
         }
+        // Non-regular outputs (/dev/null, pipes) always fail
+        // sync_all; that's not a real error.
         self.map.flush()?;
 
         Ok(ConsumerSummary {
