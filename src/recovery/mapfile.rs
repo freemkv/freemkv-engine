@@ -443,11 +443,12 @@ impl Mapfile {
         // Coalesce adjacent same-status entries.
         let mut merged: Vec<MapEntry> = Vec::with_capacity(new_entries.len());
         for e in new_entries {
-            if let Some(last) = merged.last_mut() {
-                if last.pos.saturating_add(last.size) == e.pos && last.status == e.status {
-                    last.size = last.size.saturating_add(e.size);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && last.pos.saturating_add(last.size) == e.pos
+                && last.status == e.status
+            {
+                last.size = last.size.saturating_add(e.size);
+                continue;
             }
             merged.push(e);
         }
