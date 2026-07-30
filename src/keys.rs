@@ -46,19 +46,19 @@ pub struct KeyParams {
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
-    if !p.online_only {
-        if let Some(path) = &p.keydb_path {
-            sources.push(Box::new(freemkv_keysources::KeydbSource::new(path.clone())));
-        }
+    if !p.online_only
+        && let Some(path) = &p.keydb_path
+    {
+        sources.push(Box::new(freemkv_keysources::KeydbSource::new(path.clone())));
     }
 
-    if let Some(url) = &p.key_url {
-        if freemkv_keysources::validate_keyserver_url(url).is_ok() {
-            sources.push(Box::new(freemkv_keysources::OnlineSource::new(
-                url.clone(),
-                p.key_auth.clone().unwrap_or_default(),
-            )));
-        }
+    if let Some(url) = &p.key_url
+        && freemkv_keysources::validate_keyserver_url(url).is_ok()
+    {
+        sources.push(Box::new(freemkv_keysources::OnlineSource::new(
+            url.clone(),
+            p.key_auth.clone().unwrap_or_default(),
+        )));
     }
 
     sources

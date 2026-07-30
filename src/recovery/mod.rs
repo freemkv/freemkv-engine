@@ -464,7 +464,7 @@ pub fn sweep(
     // unit boundary in the loop below; a fresh sweep starts at LBA 0 (already
     // aligned), so alignment only bites on resume NonTried regions.
     const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16; // 3
-    if decrypt_is_aacs && batch % UNIT_SECTORS != 0 {
+    if decrypt_is_aacs && !batch.is_multiple_of(UNIT_SECTORS) {
         batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
     }
 
@@ -560,11 +560,11 @@ pub fn sweep(
         );
 
         while pos < region_end {
-            if let Some(ref h) = opts.halt {
-                if h.load(std::sync::atomic::Ordering::Relaxed) {
-                    halt_requested = true;
-                    break 'outer;
-                }
+            if let Some(ref h) = opts.halt
+                && h.load(std::sync::atomic::Ordering::Relaxed)
+            {
+                halt_requested = true;
+                break 'outer;
             }
 
             let block_bytes = (region_end - pos).min(batch as u64 * 2048);
@@ -639,12 +639,12 @@ pub fn sweep(
                             read_ctx.batch = 1;
                             let mut bisect_aborted = false;
                             for sector_offset in 0..block_count {
-                                if let Some(ref h) = opts.halt {
-                                    if h.load(std::sync::atomic::Ordering::Relaxed) {
-                                        halt_requested = true;
-                                        bisect_aborted = true;
-                                        break;
-                                    }
+                                if let Some(ref h) = opts.halt
+                                    && h.load(std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    halt_requested = true;
+                                    bisect_aborted = true;
+                                    break;
                                 }
                                 let sector_lba = block_lba + (sector_offset as u32);
                                 let mut sector_buf = [0u8; 2048];

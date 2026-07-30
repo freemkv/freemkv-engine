@@ -244,12 +244,11 @@ impl PatchSink {
     /// publishes the final state.
     fn republish(&mut self, force: bool) {
         let now = std::time::Instant::now();
-        if !force {
-            if let Some(prev) = self.last_republish {
-                if now.duration_since(prev) < REPUBLISH_CADENCE {
-                    return;
-                }
-            }
+        if !force
+            && let Some(prev) = self.last_republish
+            && now.duration_since(prev) < REPUBLISH_CADENCE
+        {
+            return;
         }
         self.last_republish = Some(now);
         self.publish_now();
@@ -451,7 +450,7 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     fua: bool,
 ) -> Result<usize> {
     let bytes = count as usize * 2048;
-    if decrypt_is_aacs && (lba % 3 != 0 || count % 3 != 0) {
+    if decrypt_is_aacs && (!lba.is_multiple_of(3) || !count.is_multiple_of(3)) {
         const U: u32 = 3;
         let aligned_lba = lba - (lba % U);
         let head = (lba - aligned_lba) as usize; // lead-in sectors

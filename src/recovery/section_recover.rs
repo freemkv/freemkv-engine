@@ -308,7 +308,7 @@ fn read_span(
     // that invariant: a zero `count` (span < SECTOR) would be a 0-sector read
     // that silently "recovers" nothing — surface the caller bug in tests.
     debug_assert!(
-        count >= 1 && pos % SECTOR == 0,
+        count >= 1 && pos.is_multiple_of(SECTOR),
         "read_span requires a sector-aligned, >=1-sector span (pos={pos}, count={count})"
     );
     // Program the spindle speed ONLY when it changes — a `SET CD SPEED` per read
@@ -891,12 +891,11 @@ impl SectionHandler for Oscillate {
                 let pos = rp + off;
                 // Forward-into: prime from the sector below, then read the target
                 // (the head approaches from a lower LBA).
-                if pos >= SECTOR {
-                    if let ReadHit::Transport =
+                if pos >= SECTOR
+                    && let ReadHit::Transport =
                         read_span(ctx, &mut probe, pos - SECTOR, 1, self.params)
-                    {
-                        return HandlerOutcome::TransportFault;
-                    }
+                {
+                    return HandlerOutcome::TransportFault;
                 }
                 let mut recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                     ReadHit::Good => {
