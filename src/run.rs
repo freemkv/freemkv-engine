@@ -224,9 +224,11 @@ mod tests {
 
     #[test]
     fn cancel_via_sink_halts_recovery() {
-        // A sink whose should_cancel is always true must make the library halt
-        // (report() returns false on the first tick). We can't guarantee a tick
-        // on a 1-sector disc, so use a larger disc and assert we don't error.
+        // A sink whose should_cancel is always true must make the library
+        // halt. The sweep's progress reporter is called on EVERY batch
+        // iteration (only the tracing heartbeat is throttled), so a tick — and
+        // therefore the halt — is guaranteed on the first iteration of any
+        // disc with at least one sector.
         struct CancelSink;
         impl Sink for CancelSink {
             fn should_cancel(&self) -> bool {
@@ -240,9 +242,14 @@ mod tests {
         let disc = clean_disc(sectors);
         let mut reader = ZeroReader { capacity: sectors };
         let job = Job::new("disc:///dev/null", iso.to_string_lossy());
-        // Should return Ok (halted) or complete — never error — and not panic.
-        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink);
-        assert!(r.is_ok());
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink)
+            .expect("a cancelled rip halts, it does not error");
+        // Assert the actual property. `is_ok()` alone passed even if
+        // should_cancel was never consulted, since a clean synthetic disc
+        // completes either way. Deliberately NOT asserting byte counts:
+        // wiring a halt token would legitimately change them.
+        assert!(r.halted, "a cancelling sink must halt the rip");
+        assert!(!r.complete, "a halted rip is not complete");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

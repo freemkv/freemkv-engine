@@ -63,7 +63,22 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             })
             .map(|(i, _)| vec![i])
             .unwrap_or_default(),
-        Selection::Titles(indices) => indices.iter().copied().filter(|&i| i < n).collect(),
+        Selection::Titles(indices) => {
+            // Range-filter AND de-duplicate. A repeated index (a UI adding the
+            // same title twice, or `-t 1 -t 1`) would otherwise mux the same
+            // title twice and count it twice in `titles_written`, while a
+            // front-end naming files from `title_index` writes one file — a
+            // success count that does not match what is on disk. It also
+            // flips `multi_title` on what is really a single-title rip.
+            // First-seen order is preserved so the feature title stays first.
+            let mut seen = std::collections::HashSet::new();
+            indices
+                .iter()
+                .copied()
+                .filter(|&i| i < n)
+                .filter(|&i| seen.insert(i))
+                .collect()
+        }
     }
 }
 
@@ -197,9 +212,16 @@ where
         }
 
         let is_feature = idx == 0;
+        // Keep the rendered cause alive past the classification: the error
+        // itself is consumed by `classify_title_error` and was then dropped,
+        // taking the only description of WHY the title failed with it.
+        let mut fail_detail = String::new();
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
-            Err(e) => classify_title_error(&e),
+            Err(e) => {
+                fail_detail = e.to_string();
+                classify_title_error(&e)
+            }
         };
 
         match decide_title(&result, is_feature, multi_title, explicit_selection) {
@@ -221,7 +243,17 @@ where
                 );
                 return RipOutcome::NoKey;
             }
-            TitleAction::StopFatal => return RipOutcome::Failed { title_index: idx },
+            TitleAction::StopFatal => {
+                // Every other arm of this match reports through the Sink;
+                // this one returned silently, so a hard failure (disk full,
+                // permission denied) reached the front-end as a bare title
+                // index with no diagnostic anywhere.
+                sink.log(
+                    Level::Error,
+                    &format!("title {} failed — stopping the rip: {fail_detail}", idx + 1),
+                );
+                return RipOutcome::Failed { title_index: idx };
+            }
         }
     }
 
@@ -600,5 +632,30 @@ mod tests {
             Ok(())
         });
         assert_eq!(outcome, RipOutcome::Halted);
+    }
+
+    /// A repeated `-t` index must produce ONE entry. Muxing the same title
+    /// twice counts it twice in `titles_written` while a front-end naming
+    /// files from `title_index` writes a single file — a success count that
+    /// does not match the disk — and flips `multi_title` on what is really a
+    /// single-title rip.
+    #[test]
+    fn duplicate_title_indices_are_deduped_preserving_first_seen_order() {
+        let d = disc(4, false, true);
+        assert_eq!(
+            resolve_selection(&d, &Selection::Titles(vec![1, 1])),
+            vec![1],
+            "a repeated index must collapse to one"
+        );
+        assert_eq!(
+            resolve_selection(&d, &Selection::Titles(vec![2, 0, 2, 1, 0])),
+            vec![2, 0, 1],
+            "de-duplication must keep first-seen order"
+        );
+        // Out-of-range entries are still dropped, and dedupe applies after.
+        assert_eq!(
+            resolve_selection(&d, &Selection::Titles(vec![9, 3, 9, 3])),
+            vec![3]
+        );
     }
 }
