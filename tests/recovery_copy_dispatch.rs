@@ -1159,6 +1159,61 @@ fn complete_mapfile_with_a_missing_iso_re_reads_instead_of_claiming_success() {
     assert_eq!(r.bytes_good, disc_size);
 }
 
+/// A resume against a SHORT ISO must re-read, not leave a hole.
+///
+/// The inconsistent-resume guard's own comment says "missing or truncated",
+/// but it only ever tested for zero length. An ISO truncated to a non-zero
+/// length — a partial copy, a full disk, an interrupted transfer — therefore
+/// passed the guard and resumed. Since the producer builds work only from
+/// NonTried ranges, every Finished range beyond the truncation point is never
+/// re-read, so it stays a hole in an image the mapfile calls complete.
+#[test]
+fn resume_against_a_truncated_iso_re_reads_instead_of_leaving_a_hole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("short.iso");
+    let sectors: u32 = 200;
+    let disc = make_test_disc(sectors, "Short");
+    let disc_size = sectors as u64 * 2048;
+
+    // The mapfile says the first half is already written and the rest is
+    // un-swept.
+    let mf_path = disc.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, disc_size, "test").unwrap();
+        mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+    }
+    // ...but the ISO on disk is far shorter than the Finished prefix claims.
+    // Non-zero, so the old `iso_len == 0` guard did not fire.
+    std::fs::write(&iso_path, vec![0xAAu8; 10 * 2048]).unwrap();
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).unwrap();
+
+    // Assert CONTENT, not length. Writing the NonTried tail extends the file
+    // to full size either way, so a length check passes even when the middle
+    // is a hole — the defect is that sectors 10..100 are marked Finished, were
+    // never actually written, and are left as zero-fill.
+    let img = std::fs::read(&iso_path).unwrap();
+    assert_eq!(img.len() as u64, disc_size, "ISO must be full length");
+    let first_hole = img.iter().position(|&b| b != 0xAA);
+    assert_eq!(
+        first_hole, None,
+        "hole at byte {:?}: a Finished range past the truncation point was \
+         never re-read, so it stayed zero in an image the mapfile calls good",
+        first_hole
+    );
+    assert_eq!(r.bytes_good, disc_size);
+}
+
 /// A resumed sweep that clears the NonTried tail but leaves pre-existing
 /// Unreadable bytes must NOT report `complete: true`. `complete` means
 /// "nothing pending AND nothing permanently lost" — reporting a lossy rip as
