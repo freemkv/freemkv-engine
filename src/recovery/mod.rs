@@ -369,12 +369,31 @@ pub fn sweep(
                     // never be re-read and would stay ZERO in the fresh ISO,
                     // silently holed. Downgrade to a fresh full sweep (mirror
                     // the total_size-mismatch case) so the rip self-heals.
-                    let iso_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                    // The comment above says "missing OR TRUNCATED", but this
+                    // only ever tested for zero length, so an ISO truncated to
+                    // a non-zero length — a partial copy, a full disk, a
+                    // half-finished transfer — passed the guard and resumed.
+                    // The producer builds work only from NonTried ranges, so
+                    // every Finished range beyond the truncation point is
+                    // never re-read and stays a hole in the final image. Short
+                    // is as inconsistent as absent; compare against the size
+                    // the mapfile claims to describe.
+                    //
+                    // A metadata ERROR is likewise not a length. Treating it
+                    // as 0 silently threw away a good resume and re-ripped
+                    // hours of work on a transient stat failure.
+                    let iso_len = match std::fs::metadata(path) {
+                        Ok(m) => Some(m.len()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+                        Err(e) => return Err(Error::IoError { source: e }),
+                    };
                     let claims_progress = existing.stats().bytes_pending != existing.total_size();
-                    if iso_len == 0 && claims_progress {
+                    if iso_len.is_some_and(|len| len < existing.total_size()) && claims_progress {
                         tracing::info!(
-                            "sweep: mapfile claims prior progress (pending {} of {}) but ISO is missing/zero-length; forcing fresh sweep",
+                            "sweep: mapfile claims prior progress (pending {} of {}) but the ISO is {} of {} bytes; forcing fresh sweep",
                             existing.stats().bytes_pending,
+                            existing.total_size(),
+                            iso_len.unwrap_or(0),
                             existing.total_size(),
                         );
                         resume = false;
