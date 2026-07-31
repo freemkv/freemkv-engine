@@ -16,6 +16,48 @@ use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
+/// Run `f` with a halt token that mirrors `sink.should_cancel()`.
+///
+/// Cancellation needs BOTH channels, not just the progress callback.
+/// [`ProgressBridge::report`] returns `!should_cancel()`, which stops the
+/// library — but only on a tick, and a damaged disc produces no ticks while it
+/// is sitting in a cooldown (`ReadAction::Retry { pause_secs }`: 3 s on a NOT
+/// READY retry, 30 s on zone entry). With no halt token the user's Stop went
+/// unheard for the whole pause, so the button looked broken exactly when the
+/// rip was going badly and someone most wanted to abort it.
+///
+/// `sleep_secs_or_halt` polls the token every 100 ms, so wiring one bounds Stop
+/// latency at ~100 ms regardless of pause length. The watcher is the same
+/// `should_cancel` → halt bridge `mux_with_input` and `extract_tree` already
+/// use, and the scope joins it before returning.
+pub(crate) fn with_cancel_watcher<T>(
+    sink: &dyn Sink,
+    f: impl FnOnce(&std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
+) -> T {
+    use std::sync::atomic::Ordering;
+
+    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    std::thread::scope(|s| {
+        let watcher_halt = halt.clone();
+        let watcher_done = done.clone();
+        s.spawn(move || {
+            while !watcher_done.load(Ordering::Relaxed) {
+                if sink.should_cancel() {
+                    watcher_halt.store(true, Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+
+        let outcome = f(&halt);
+        done.store(true, Ordering::Relaxed);
+        outcome
+    })
+}
+
 /// Bridges libfreemkv's low-level [`libfreemkv::progress::Progress`] callback
 /// onto the engine [`Sink`]. Recovery calls `report(&PassProgress) -> bool`
 /// frequently; this translates each tick to a [`Progress`] and forwards it,
@@ -104,20 +146,6 @@ pub fn recover_to_iso(
 ) -> crate::Result<CopyResult> {
     let bridge = ProgressBridge::new(sink);
 
-    let opts = CopyOptions {
-        decrypt: !job.raw,
-        multipass: matches!(job.mode, RipMode::Multi),
-        progress: Some(&bridge),
-        halt: None,
-        vid: disc.aacs.as_ref().map(|a| a.volume_id),
-        unit_keys: disc
-            .aacs
-            .as_ref()
-            .map(|a| a.unit_keys.clone())
-            .unwrap_or_default(),
-        key_fetch: None,
-    };
-
     sink.log(
         Level::Info,
         &format!(
@@ -128,7 +156,23 @@ pub fn recover_to_iso(
         ),
     );
 
-    recovery::copy(disc, reader, iso_path, &opts)
+    with_cancel_watcher(sink, |halt| {
+        let opts = CopyOptions {
+            decrypt: !job.raw,
+            multipass: matches!(job.mode, RipMode::Multi),
+            progress: Some(&bridge),
+            halt: Some(halt.clone()),
+            vid: disc.aacs.as_ref().map(|a| a.volume_id),
+            unit_keys: disc
+                .aacs
+                .as_ref()
+                .map(|a| a.unit_keys.clone())
+                .unwrap_or_default(),
+            key_fetch: None,
+        };
+
+        recovery::copy(disc, reader, iso_path, &opts)
+    })
 }
 
 #[cfg(test)]
@@ -250,6 +294,80 @@ mod tests {
         // wiring a halt token would legitimately change them.
         assert!(r.halted, "a cancelling sink must halt the rip");
         assert!(!r.complete, "a halted rip is not complete");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Stop must be honoured DURING a damage cooldown, not after it.
+    ///
+    /// The recovery cooldowns (`ReadAction::Retry { pause_secs }`) are 3 s for a
+    /// NOT READY retry and 30 s on zone entry. Cancellation reaches the library
+    /// two ways: the progress callback's return value, which is only consulted
+    /// when a tick happens, and the halt token, which `sleep_secs_or_halt`
+    /// polls every 100 ms. A damaged disc produces no ticks while it is
+    /// sleeping, so with no halt token wired the user's Stop sat unheard for the
+    /// full pause — up to 30 s of a button that looks broken.
+    ///
+    /// This reader fails every read with the BU40N bad-sector signature
+    /// (NOT READY / 0x04 / 0x3E), so the first batch enters a cooldown
+    /// immediately. The assertion is wall-clock: with the halt token wired the
+    /// call returns in well under one pause.
+    #[test]
+    fn cancel_is_honoured_during_a_damage_cooldown() {
+        struct NotReadyReader {
+            capacity: u32,
+        }
+        impl libfreemkv::SectorSource for NotReadyReader {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> libfreemkv::Result<usize> {
+                Err(libfreemkv::error::Error::ScsiError {
+                    opcode: libfreemkv::scsi::SCSI_READ_10,
+                    status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
+                    sense: Some(libfreemkv::ScsiSense {
+                        sense_key: libfreemkv::scsi::SENSE_KEY_NOT_READY,
+                        asc: 0x04,
+                        ascq: 0x3E,
+                    }),
+                })
+            }
+            fn capacity_sectors(&self) -> u32 {
+                self.capacity
+            }
+        }
+
+        struct CancelSink;
+        impl Sink for CancelSink {
+            fn should_cancel(&self) -> bool {
+                true
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!("fmkv-engine-cooldown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("cd.iso");
+        let sectors = 4096u32;
+        let disc = clean_disc(sectors);
+        let mut reader = NotReadyReader { capacity: sectors };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Multipass, so the sweep skips on error and reaches the cooldown
+        // instead of aborting at the first failed read.
+        job.mode = RipMode::Multi;
+
+        let start = std::time::Instant::now();
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink)
+            .expect("a cancelled rip halts, it does not error");
+        let elapsed = start.elapsed();
+
+        assert!(r.halted, "a cancelling sink must halt the rip");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
+             token is polled every 100 ms and must break the pause"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
