@@ -424,9 +424,12 @@ fn mux_with_input(
             ),
         );
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
-        let outcome = libfreemkv::mux_stream(input, dest, mux_opts, &halt, events);
-        done.store(true, Ordering::Relaxed);
-        outcome
+        // Same guard the recovery paths use: `mux_stream` runs on damaged and
+        // malformed media, a panic there is in scope, and storing `done` after
+        // the call means an unwind skips it — leaving thread::scope joining a
+        // watcher that loops forever. The mux would hang instead of failing.
+        let _signal_done = crate::run::SignalDone(&done);
+        libfreemkv::mux_stream(input, dest, mux_opts, &halt, events)
     })
 }
 

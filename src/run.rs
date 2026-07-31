@@ -16,6 +16,25 @@ use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
+/// Sets a watcher's `done` flag on EVERY exit path, including a panic unwind.
+///
+/// A plain `done.store(true)` after the watched call is skipped by an unwind,
+/// and `std::thread::scope` joins its threads BEFORE propagating a panic — so
+/// the watcher keeps looping on a flag nobody will ever set, the join never
+/// finishes, and a panic becomes a permanent hang. For a service holding a
+/// drive open that is strictly worse than the crash it replaces.
+///
+/// Every scoped watcher in this crate must hold one of these rather than
+/// storing the flag by hand. Two hand-rolled copies of that pattern existed
+/// and both had the bug; this type is the single place the rule lives.
+pub(crate) struct SignalDone<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
+
+impl Drop for SignalDone<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Run `f` with a halt token that mirrors `sink.should_cancel()`.
 ///
 /// Cancellation needs BOTH channels, not just the progress callback.
@@ -47,20 +66,6 @@ pub(crate) fn with_cancel_watcher<T>(
     // something you have already been told to stop.
     if sink.should_cancel() {
         halt.store(true, Ordering::Relaxed);
-    }
-
-    // `done` has to be set on EVERY exit path, not just the normal one. A
-    // plain store after `f` is skipped by an unwind, and `thread::scope` joins
-    // its threads BEFORE propagating a panic — so the watcher would still be
-    // looping on `done`, the join would never finish, and a panic would become
-    // a permanent hang. For a service holding a drive open that is worse than
-    // the crash it replaces. Tying the store to a guard's Drop covers the
-    // normal return, the panic unwind, and any early exit added later.
-    struct SignalDone<'a>(&'a std::sync::atomic::AtomicBool);
-    impl Drop for SignalDone<'_> {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Relaxed);
-        }
     }
 
     std::thread::scope(|s| {
