@@ -46,6 +46,11 @@ pub fn copy(
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
         let map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
+        // BEFORE any resume decision — including the "already complete, return
+        // without reading a sector" branch below, which is the worst case to
+        // get wrong: a wrong disc whose predecessor finished would report the
+        // job done having never touched the disc in the drive.
+        mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
         let covers_disc = map.total_size() == disc_size;
@@ -312,6 +317,12 @@ pub fn sweep(
     if resume && mapfile_path.exists() {
         match mapfile::Mapfile::load(&mapfile_path) {
             Ok(existing) => {
+                // Identity first, and crucially BEFORE the unconditional
+                // set_vid/set_unit_keys overwrite further down: that overwrite
+                // stamps the CURRENT job's identity onto the loaded mapfile, so
+                // a check placed after it would compare a value against itself
+                // and never fire.
+                mapfile::check_mapfile_identity(&existing, disc)?;
                 if existing.total_size() != total_bytes {
                     tracing::info!(
                         "sweep: mapfile total_size {} != disc {}; forcing fresh sweep",
