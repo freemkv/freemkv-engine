@@ -22,8 +22,6 @@
 
 use crate::sink::Sink;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Extract `disc`'s decrypted UDF file tree to `dest`.
 ///
@@ -42,34 +40,19 @@ pub fn extract_tree(
     force: bool,
     sink: &dyn Sink,
 ) -> crate::Result<libfreemkv::ExtractResult> {
-    let halt = libfreemkv::Halt::new();
-    let done = Arc::new(AtomicBool::new(false));
-
-    std::thread::scope(|s| {
-        // Watcher: mirrors should_cancel → halt, exactly like mux_with_input's
-        // bridge. No progress channel here — extract_tree's `progress` option
-        // is unused by either shell today (both poll the returned per-file
-        // result at the end, not a live tick).
-        let watcher_halt = halt.clone();
-        let watcher_done = done.clone();
-        s.spawn(move || {
-            while !watcher_done.load(Ordering::Relaxed) {
-                if sink.should_cancel() {
-                    watcher_halt.cancel();
-                    return;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        });
-
+    // One should_cancel → halt bridge for the whole engine (see
+    // `with_cancel_watcher`), including its check-before-starting, which is
+    // what makes cancelling a small extraction deterministic instead of a race
+    // against the watcher thread's first scheduling. No progress channel here —
+    // extract_tree's `progress` option is unused by either shell today (both
+    // poll the returned per-file result at the end, not a live tick).
+    crate::run::with_cancel_watcher(sink, |halt| {
         let opts = libfreemkv::ExtractOptions {
             force,
             progress: None,
-            halt: Some(halt.clone()),
+            halt: Some(libfreemkv::Halt::from_arc(halt.clone())),
         };
-        let outcome = disc.extract_tree(reader, dest, &opts);
-        done.store(true, Ordering::Relaxed);
-        outcome
+        disc.extract_tree(reader, dest, &opts)
     })
 }
 
