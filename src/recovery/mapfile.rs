@@ -1820,3 +1820,66 @@ mod status_set_tests {
         }
     }
 }
+
+/// Load a mapfile, distinguishing "there isn't one" from "there is one and it
+/// is unreadable".
+///
+/// Three call sites classified this themselves and reached three different
+/// fail-safes: `progress_snapshot_from_mapfile` collapsed both cases into
+/// `None` via `.ok()?`, so a corrupt sidecar rendered as "no data yet" instead
+/// of surfacing that the damage record is unreadable;
+/// `bytes_bad_in_title_from_mapfile` correctly reports the whole title bad;
+/// and `multipass_rip` forces an abort. The CLASSIFICATION is shared here so
+/// corruption is never silently indistinguishable from absence — the fail-safe
+/// VALUE stays per-caller, because "assume clean", "assume all bad" and "abort"
+/// are genuinely different correct answers for those three questions.
+pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfile>> {
+    match Mapfile::load(path) {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                path = %path.display(),
+                error = %e,
+                "mapfile exists but could not be read; treating damage as unknown",
+            );
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod load_if_present_tests {
+    use super::*;
+
+    #[test]
+    fn absent_is_none_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("fmkv-lip-absent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("nope.map");
+        let _ = std::fs::remove_file(&p);
+        assert!(load_if_present(&p).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The distinction the three call sites kept re-deriving: a mapfile that
+    /// EXISTS but cannot be parsed is an error, never an indistinguishable
+    /// "nothing here".
+    #[test]
+    fn corrupt_is_an_error_not_none() {
+        let dir = std::env::temp_dir().join(format!("fmkv-lip-corrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad.map");
+        std::fs::write(&p, b"# Rescue Logfile. Created by test\n0x00 0xZZZZ +\n").unwrap();
+        match load_if_present(&p) {
+            Err(e) => assert_ne!(
+                e.kind(),
+                io::ErrorKind::NotFound,
+                "corruption must not masquerade as absence"
+            ),
+            Ok(_) => panic!("a corrupt mapfile must not load, nor read as absent"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
