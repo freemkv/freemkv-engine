@@ -1270,7 +1270,7 @@ mod tests {
         for format in [libfreemkv::DiscFormat::Uhd, libfreemkv::DiscFormat::BluRay] {
             let mut batch = ecc_sectors(format);
             assert_eq!(batch, 32);
-            if batch % UNIT_SECTORS != 0 {
+            if !batch.is_multiple_of(UNIT_SECTORS) {
                 batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
             }
             assert_eq!(batch, 33, "batch must round 32 -> 33 (a multiple of 3)");

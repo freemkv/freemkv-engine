@@ -1172,14 +1172,14 @@ mod tests {
             // failure move the head).
             let prev = self.last_lba;
             self.last_lba = Some(lba + count as u32 - 1);
-            if let Some(t) = self.transport_at {
-                if (lba..lba + count as u32).contains(&t) {
-                    return Err(Error::ScsiError {
-                        opcode: libfreemkv::scsi::SCSI_READ_10,
-                        status: libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
-                        sense: None,
-                    });
-                }
+            if let Some(t) = self.transport_at
+                && (lba..lba + count as u32).contains(&t)
+            {
+                return Err(Error::ScsiError {
+                    opcode: libfreemkv::scsi::SCSI_READ_10,
+                    status: libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+                    sense: None,
+                });
             }
             for l in lba..lba + count as u32 {
                 if self.wedge.contains(&l) {
