@@ -1304,3 +1304,42 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
         assert_eq!(size % 2048, 0, "Finished record has sub-sector size {size}");
     }
 }
+
+/// A disc that reports itself encrypted but resolved NO cipher state at all
+/// (`aacs: None`, `css: None` — scan sets `encrypted` from the presence of
+/// /AACS, and leaves `aacs: None` with `aacs_error: Some(..)` when the VID
+/// probe fails) must be REFUSED, not written out as ciphertext.
+///
+/// `ensure_decryptable` only errors when it has an aacs/css state to judge, so
+/// this disc slipped through, the decrypt wrapper became a pass-through, and
+/// the copy finished at `complete: true`, exit 0 — with an unplayable
+/// ciphertext ISO on disk. Preflight blocks this disc; the executor didn't.
+#[test]
+fn encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("cipher.iso");
+    let sectors: u32 = 300;
+    let mut disc = make_test_disc(sectors, "NoCipherState");
+    disc.encrypted = true;
+    disc.aacs = None;
+    disc.css = None;
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = CopyOptions {
+        decrypt: true,
+        multipass: true,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
+
+    assert!(
+        r.is_err(),
+        "a decrypting copy of an encrypted disc with no usable cipher state \
+         must refuse, not emit ciphertext at complete:true"
+    );
+    let wrote = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(wrote, 0, "nothing may be written before the refusal");
+}
