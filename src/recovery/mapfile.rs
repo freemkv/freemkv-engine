@@ -1883,3 +1883,71 @@ mod load_if_present_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Does this mapfile describe the disc currently in the drive?
+///
+/// Resume used to be gated on ONE fact: `map.total_size() == disc.capacity_bytes`.
+/// Two different discs authored at the same size — box-set reprints, or the
+/// same title pressed twice — satisfy that, so a mapfile left by disc A was
+/// trusted for disc B: A's `Finished` ranges were never re-read, and the output
+/// ISO silently spliced sectors from two physical discs while passing every
+/// completeness check.
+///
+/// The mapfile already persists a disc identity; nothing ever read it back.
+/// `Mapfile::vid()` had no caller outside this module's own tests.
+///
+/// Identity is keys-XOR-vid, matching how the mapfile stores it (`set_unit_keys`
+/// clears the VID — keys are the final answer, a VID is the "still unresolved"
+/// marker). Checking only the VID would have been nearly inert: a normally
+/// ripped AACS disc resolves unit keys, so it stores keys and NO vid, which is
+/// precisely the box-set case above.
+///
+/// A mapfile carrying neither is `Ok` — legacy files, unencrypted discs and CSS
+/// DVDs record no AACS identity, and refusing them would strand every existing
+/// in-flight rip. That residual gap is real and deliberate: this closes the
+/// AACS case, not the unencrypted one, which would need a new identity header.
+pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> io::Result<()> {
+    let mismatch = || -> io::Error {
+        libfreemkv::error::Error::MapfileInvalid {
+            kind: "disc-mismatch",
+        }
+        .into()
+    };
+
+    let map_keys = map.unit_keys();
+    if !map_keys.is_empty() {
+        let disc_keys: &[(u32, [u8; 16])] = disc
+            .aacs
+            .as_ref()
+            .map(|a| a.unit_keys.as_slice())
+            .unwrap_or(&[]);
+        // Order is not significant — compare as sets.
+        let mut a: Vec<_> = map_keys.to_vec();
+        let mut b: Vec<_> = disc_keys.to_vec();
+        a.sort_unstable();
+        b.sort_unstable();
+        if a != b {
+            tracing::warn!(
+                target: "freemkv::disc",
+                "mapfile unit keys do not match the disc in the drive — refusing to resume",
+            );
+            return Err(mismatch());
+        }
+        return Ok(());
+    }
+
+    if let Some(map_vid) = map.vid() {
+        match disc.aacs.as_ref().map(|a| a.volume_id) {
+            Some(disc_vid) if disc_vid == map_vid => return Ok(()),
+            _ => {
+                tracing::warn!(
+                    target: "freemkv::disc",
+                    "mapfile volume id does not match the disc in the drive — refusing to resume",
+                );
+                return Err(mismatch());
+            }
+        }
+    }
+
+    Ok(())
+}

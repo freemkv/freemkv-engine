@@ -1343,3 +1343,51 @@ fn encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext() {
     let wrote = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(wrote, 0, "nothing may be written before the refusal");
 }
+
+/// A mapfile left by a DIFFERENT disc of the same capacity must not be
+/// resumed. Two box-set reprints authored at the same size satisfy the old
+/// `total_size == capacity_bytes` gate, so disc A's Finished ranges were
+/// trusted for disc B — never re-read — and the ISO silently spliced sectors
+/// from two physical discs while passing every completeness check.
+#[test]
+fn mapfile_from_a_different_disc_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("swap.iso");
+    let sectors: u32 = 300;
+
+    // Disc A resolved one set of unit keys; disc B, same capacity, another.
+    let mut disc_a = make_test_disc(sectors, "DiscA");
+    disc_a.encrypted = true;
+    disc_a.aacs = Some(aacs_with(vec![(0u32, [0xAA; 16])]));
+    let mut disc_b = make_test_disc(sectors, "DiscB");
+    disc_b.encrypted = true;
+    disc_b.aacs = Some(aacs_with(vec![(0u32, [0xBB; 16])]));
+
+    // A's mapfile, carrying A's identity and a Finished prefix.
+    let mf_path = disc_a.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+        mf.set_unit_keys(&[(0u32, [0xAA; 16])]);
+        mf.record(0, 200 * 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+    }
+    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+
+    // Same capacity, so the size gate alone would let this through.
+    assert_eq!(disc_a.capacity_bytes, disc_b.capacity_bytes);
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&disc_b, &mut reader, &iso_path, &opts);
+    assert!(
+        r.is_err(),
+        "resuming disc A's mapfile against disc B must be refused, not spliced"
+    );
+}
