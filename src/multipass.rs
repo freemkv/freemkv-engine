@@ -416,16 +416,7 @@ pub fn multipass_rip(
             }
 
             let bridge = ProgressBridge::new(sink);
-            let patch_opts = PatchOptions {
-                decrypt: !job.raw,
-                block_sectors: Some(32),
-                full_recovery: true,
-                reverse: true,
-                wedged_threshold: 50,
-                progress: Some(&bridge),
-                halt: None,
-                key_fetch: None,
-            };
+            let patch_opts = PatchOptions::for_patch_pass(!job.raw, Some(&bridge), None, None);
             let pr = crate::recovery::patch(disc, reader, iso_path, &patch_opts)?;
             passes += 1;
             last_good = pr.bytes_good;

@@ -195,24 +195,12 @@ fn patch_internal(
     path: &std::path::Path,
     opts: &CopyOptions,
 ) -> Result<CopyResult> {
-    let patch_opts = PatchOptions {
-        decrypt: opts.decrypt,
-        // 0.18.13: adaptive batching. patch() reads at 32 sectors
-        // when the drive is healthy, drops to 1 on failure to
-        // probe each sector individually, then climbs back after
-        // 16 consecutive clean singles. Walks NonTrimmed regions
-        // ~32x faster in clean stretches without sacrificing any
-        // per-sector recovery quality — the drop-to-1 retry from
-        // the same position guarantees every sector in a failed
-        // batch is individually probed. See Disc::patch body.
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: opts.progress,
-        halt: opts.halt.clone(),
-        key_fetch: opts.key_fetch.clone(),
-    };
+    let patch_opts = PatchOptions::for_patch_pass(
+        opts.decrypt,
+        opts.progress,
+        opts.halt.clone(),
+        opts.key_fetch.clone(),
+    );
     let pr = patch(disc, reader, path, &patch_opts)?;
     tracing::info!(
         target: "freemkv::disc",
@@ -1115,6 +1103,39 @@ pub struct PatchOptions<'a> {
     /// recover an orphan CPS unit's key when re-reading its bad range.
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
 }
+impl<'a> PatchOptions<'a> {
+    /// THE tuning preset for a Pass-N patch pass.
+    ///
+    /// Both entry points — `patch_internal` (copy's resume dispatch) and
+    /// `multipass_rip`'s patch loop — used to spell these four values out as
+    /// literals, so the two routes into the same underlying pass could drift
+    /// apart on a future tuning change with nothing to catch it. Only one of
+    /// the two copies even carried the rationale for `block_sectors`.
+    ///
+    /// Adaptive batching: patch reads at 32 sectors when the drive is healthy,
+    /// drops to 1 on failure to probe each sector individually, then climbs
+    /// back after 16 consecutive clean singles. Walks NonTrimmed regions ~32x
+    /// faster in clean stretches without sacrificing per-sector recovery
+    /// quality — the drop-to-1 retry from the same position guarantees every
+    /// sector in a failed batch is individually probed.
+    pub fn for_patch_pass(
+        decrypt: bool,
+        progress: Option<&'a dyn libfreemkv::progress::Progress>,
+        halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        key_fetch: Option<libfreemkv::sector::KeyFetch>,
+    ) -> Self {
+        PatchOptions {
+            decrypt,
+            block_sectors: Some(32),
+            full_recovery: true,
+            reverse: true,
+            wedged_threshold: 50,
+            progress,
+            halt,
+            key_fetch,
+        }
+    }
+}
 
 /// Result returned by [`Disc::patch`].
 pub struct PatchOutcome {
@@ -1197,7 +1218,10 @@ pub fn progress_snapshot_from_mapfile(
     kind: libfreemkv::progress::PassKind,
     bytes_total_disc: u64,
 ) -> Option<libfreemkv::progress::PassProgress> {
-    let map = mapfile::Mapfile::load(mapfile_path).ok()?;
+    // `None` here means "no card to paint" and makes no cleanliness claim, so
+    // absent and corrupt may both yield None — but corruption must not pass
+    // unremarked, which is what `.ok()?` did.
+    let map = mapfile::load_if_present(mapfile_path).ok().flatten()?;
     let stats = map.stats();
     // MAYBE set = not-yet-good (NonTrimmed/NonScraped/Unreadable), excluding
     // NonTried (the unread remainder) — same set the live patch emitter uses.
