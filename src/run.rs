@@ -39,6 +39,16 @@ pub(crate) fn with_cancel_watcher<T>(
     let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Check once BEFORE starting. A watcher alone makes cancellation a race
+    // the work can win: on a small job the call can finish before the watcher
+    // thread is first scheduled, and then an already-cancelled request runs to
+    // completion. Polling cannot close that window — only asking before the
+    // work begins can. It is also the obviously right behaviour: do not start
+    // something you have already been told to stop.
+    if sink.should_cancel() {
+        halt.store(true, Ordering::Relaxed);
+    }
+
     std::thread::scope(|s| {
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
