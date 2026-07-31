@@ -167,7 +167,29 @@ pub enum RipOutcome {
     /// so the loop stopped (fail-fast) rather than iterate every title.
     NoKey,
     /// A title the user wanted (the feature, or an explicit `-t`) failed hard.
-    Failed { title_index: usize },
+    ///
+    /// Without a cause this variant named only WHICH title died and never WHY,
+    /// so a front-end could not tell a full disk from a permission denial from
+    /// a malformed source — it had a title index and a log line, and the log
+    /// line is prose, not something it can branch on.
+    ///
+    /// The cause needs BOTH fields because libfreemkv reports it two ways.
+    /// `From<Error> for io::Error` stringifies a typed error as `E<code>: …`,
+    /// but it deliberately passes an `Error::IoError` straight through
+    /// unwrapped so the original `ErrorKind` and OS errno survive instead of
+    /// being flattened. So a genuine I/O failure — the full disk — has NO
+    /// `E<code>` prefix to parse and arrives as `code: None` with the truth in
+    /// `kind`, while a typed failure like a malformed stub arrives as
+    /// `code: Some(_)` with `kind` merely `Other`. Carrying one field would
+    /// have blinded the front-end to exactly one half of the failures.
+    Failed {
+        title_index: usize,
+        /// libfreemkv's numeric code, when the error carried one.
+        code: Option<u16>,
+        /// The `io::ErrorKind`, which is where a passthrough OS error
+        /// (`StorageFull`, `PermissionDenied`) keeps its meaning.
+        kind: std::io::ErrorKind,
+    },
     /// The rip was cancelled — a full stop, not a per-title cancel.
     Halted,
 }
@@ -216,10 +238,16 @@ where
         // itself is consumed by `classify_title_error` and was then dropped,
         // taking the only description of WHY the title failed with it.
         let mut fail_detail = String::new();
+        // The code has to be taken here too: `classify_title_error` consumes
+        // the error into a coarse verdict, and the typed cause is gone after.
+        let mut fail_code = None;
+        let mut fail_kind = std::io::ErrorKind::Other;
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
             Err(e) => {
                 fail_detail = e.to_string();
+                fail_code = libfreemkv::error_code(&e);
+                fail_kind = e.kind();
                 classify_title_error(&e)
             }
         };
@@ -252,7 +280,11 @@ where
                     Level::Error,
                     &format!("title {} failed — stopping the rip: {fail_detail}", idx + 1),
                 );
-                return RipOutcome::Failed { title_index: idx };
+                return RipOutcome::Failed {
+                    title_index: idx,
+                    code: fail_code,
+                    kind: fail_kind,
+                };
             }
         }
     }
@@ -580,6 +612,59 @@ mod tests {
         assert_eq!(outcome, RipOutcome::Ok { titles_written: 2 });
     }
 
+    /// The cause on `Failed` must actually discriminate — the assertions above
+    /// derive it from the same fixture they compare against, so on their own
+    /// they would still pass if every failure reported nothing.
+    ///
+    /// Three failures, three distinguishable causes, and each one legible
+    /// through the field that carries its meaning:
+    ///   - a malformed stub is typed, so it has a code and a bland kind;
+    ///   - a full disk is a passthrough OS error, so it has NO code and the
+    ///     kind is the whole story — this is the case a code-only field would
+    ///     have reported as an anonymous failure;
+    ///   - the two are not confusable.
+    #[test]
+    fn the_failure_cause_says_which_failure_it_was() {
+        let d = disc(3, false, false);
+        let indices = resolve_selection(&d, &Selection::All);
+
+        let run = |e: fn() -> std::io::Error| {
+            run_titles(&indices, false, &NoopSink, move |idx| {
+                if idx == 0 { Err(e()) } else { Ok(()) }
+            })
+        };
+        let cause = |o: &RipOutcome| match o {
+            RipOutcome::Failed { code, kind, .. } => (*code, *kind),
+            other => panic!("expected Failed, got {other:?}"),
+        };
+
+        // Typed failure: code present, kind uninformative.
+        let stub = cause(&run(stub_err));
+        assert_eq!(stub.0, Some(libfreemkv::error::E_MKV_INVALID));
+
+        // Passthrough OS failure: the disk filled mid-write. No E-code exists
+        // for it — `From<Error> for io::Error` hands the OS error straight
+        // back — so `kind` is the only channel carrying the reason.
+        let full = cause(&run(|| {
+            libfreemkv::Error::IoError {
+                source: std::io::Error::from(std::io::ErrorKind::StorageFull),
+            }
+            .into()
+        }));
+        assert_eq!(full.0, None, "a passthrough OS error carries no E-code");
+        assert_eq!(
+            full.1,
+            std::io::ErrorKind::StorageFull,
+            "a full disk must stay legible as a full disk"
+        );
+
+        assert_ne!(
+            stub, full,
+            "a cause that cannot tell a malformed title from a full disk \
+             carries no information"
+        );
+    }
+
     #[test]
     fn stub_on_the_feature_is_fatal() {
         let d = disc(3, false, false);
@@ -587,7 +672,14 @@ mod tests {
         let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             if idx == 0 { Err(stub_err()) } else { Ok(()) }
         });
-        assert_eq!(outcome, RipOutcome::Failed { title_index: 0 });
+        assert_eq!(
+            outcome,
+            RipOutcome::Failed {
+                title_index: 0,
+                code: libfreemkv::error_code(&stub_err()),
+                kind: stub_err().kind(),
+            }
+        );
     }
 
     #[test]
@@ -597,7 +689,14 @@ mod tests {
         let d = disc(3, false, false);
         let indices = resolve_selection(&d, &Selection::Titles(vec![1]));
         let outcome = run_titles(&indices, true, &NoopSink, |_| Err(stub_err()));
-        assert_eq!(outcome, RipOutcome::Failed { title_index: 1 });
+        assert_eq!(
+            outcome,
+            RipOutcome::Failed {
+                title_index: 1,
+                code: libfreemkv::error_code(&stub_err()),
+                kind: stub_err().kind(),
+            }
+        );
     }
 
     #[test]
@@ -608,7 +707,14 @@ mod tests {
         let outcome = run_titles(&indices, false, &NoopSink, |idx| {
             if idx == 1 { Err(hard_err()) } else { Ok(()) }
         });
-        assert_eq!(outcome, RipOutcome::Failed { title_index: 1 });
+        assert_eq!(
+            outcome,
+            RipOutcome::Failed {
+                title_index: 1,
+                code: libfreemkv::error_code(&hard_err()),
+                kind: hard_err().kind(),
+            }
+        );
     }
 
     #[test]
