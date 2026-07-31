@@ -1449,4 +1449,18 @@ fn mapfile_from_a_different_disc_is_refused() {
         r.is_err(),
         "resuming disc A's mapfile against disc B must be refused, not spliced"
     );
+
+    // The same guard must hold for a DIRECT patch() call. `copy` refuses
+    // above because mod.rs checks identity before dispatching, but `patch` is
+    // half of the exposed sweep/patch pair a front-end drives itself on a
+    // resume, and it used to load the mapfile and trust it. Without this, disc
+    // B's recovered ranges are written into disc A's ISO and recorded
+    // Finished — corruption presented as a successful recovery, and no test
+    // covered it.
+    let patch_opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
+    let r = freemkv_engine::patch(&disc_b, &mut reader, &iso_path, &patch_opts);
+    assert!(
+        r.is_err(),
+        "patch() must refuse disc A's mapfile against disc B, exactly as copy() does"
+    );
 }

@@ -435,11 +435,23 @@ pub fn sweep(
     // pre-create `metadata(path)` always fails (is_regular=false), which both
     // skips the pre-size AND makes `SweepSink::close` swallow a real
     // `sync_all()` failure on the just-written ISO as if it were /dev/null.
-    let (file, is_regular) = if resume
-        && std::fs::metadata(path)
-            .map(|m| m.len() > 0)
-            .unwrap_or(false)
-    {
+    // A metadata ERROR is not "the file is empty". Collapsing the two with
+    // unwrap_or(false) meant a transient stat failure on a populated ISO —
+    // an EIO from a flaky USB/NFS staging volume, a momentary permissions
+    // problem — fell through to the create-and-truncate branch below and
+    // permanently zeroed bytes the mapfile still records as Finished. A
+    // resume would then never re-read them, because the producer only builds
+    // work from NonTried ranges. Silent, total loss of the recovered data.
+    //
+    // NotFound is the one error that genuinely means "no file yet" (the
+    // fresh-rip case). Anything else is unknown, and destroying data on an
+    // unknown is not a decision this code gets to make.
+    let existing_len = match std::fs::metadata(path) {
+        Ok(m) => Some(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(Error::IoError { source: e }),
+    };
+    let (file, is_regular) = if resume && existing_len.is_some_and(|len| len > 0) {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(path)

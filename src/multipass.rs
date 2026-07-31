@@ -792,6 +792,47 @@ mod tests {
         );
     }
 
+    /// An unquantifiable loss must classify as SERIOUS, not Cosmetic.
+    ///
+    /// Every NaN comparison in Rust is false, so before this both tier tests
+    /// (`>= 30_000.0`, `>= 1_000.0`) fell through and a rip whose damage
+    /// record could not be read was badged Cosmetic — while `loss_aborts`,
+    /// which handles NaN explicitly, was simultaneously refusing to deliver
+    /// it. The two halves of the same decision disagreed.
+    #[test]
+    fn an_unquantifiable_loss_is_serious_not_cosmetic() {
+        // Few enough bad sectors that every sector-based tier is false, so the
+        // verdict rests entirely on the NaN.
+        assert_eq!(
+            classify_damage(10, f64::NAN),
+            crate::DamageSeverity::Serious,
+            "NaN must fail safe here exactly as it does in should_abort_for_loss"
+        );
+        // And a quantified small loss still classifies normally.
+        assert_eq!(classify_damage(10, 0.0), crate::DamageSeverity::Cosmetic);
+    }
+
+    /// The pass count must not overflow at the top of the u8 range.
+    ///
+    /// `multipass_rip_inner` clamps `max_passes` with `.min(u8::MAX as u32)`,
+    /// so 255 is reachable by construction. `max_retries + 2` then panicked in
+    /// dev and, with debug-assertions off in release, wrapped to 1 — leaving
+    /// the UI a total-pass denominator smaller than the number of passes about
+    /// to run. Saturating is the only answer that is correct in both profiles.
+    #[test]
+    fn the_pass_count_saturates_instead_of_wrapping() {
+        let plan = plan_passes(u8::MAX);
+        assert_eq!(plan.patch_passes, u8::MAX);
+        assert_eq!(
+            plan.total_passes,
+            u8::MAX,
+            "total_passes wrapped: in release this silently becomes 1"
+        );
+        assert!(plan.total_passes >= plan.patch_passes);
+        // The ordinary case is unchanged.
+        assert_eq!(plan_passes(5).total_passes, 7);
+    }
+
     #[test]
     fn end_of_recovery_promotion_covers_every_maybe_state() {
         let (from, to) = end_of_recovery_promotion();
