@@ -1100,6 +1100,65 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
     );
 }
 
+/// `copy()`'s "already complete, don't re-read a finished ISO" shortcut must
+/// verify the ISO is still THERE.
+///
+/// The shortcut trusts the mapfile alone: identity matches, every range is
+/// Finished, so it returns success without reading a sector. But the mapfile
+/// and the ISO are two files, and only one of them is being checked. Delete or
+/// truncate the ISO — a staging cleanup, a remount, an operator freeing space —
+/// and the mapfile still says "complete", so the call reports bytes_good = the
+/// whole disc with no image on disk at all. The caller then muxes from
+/// nothing.
+///
+/// `sweep()` already guards this exact case (see
+/// `sweep_resume_downgrades_on_zero_iso_with_progress_mapfile`); the dispatch
+/// shortcut in `copy()` simply never got the same check. The rip must
+/// self-heal into a fresh sweep instead of claiming a success it cannot back.
+#[test]
+fn complete_mapfile_with_a_missing_iso_re_reads_instead_of_claiming_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("vanished.iso");
+    let sectors: u32 = 200;
+    let disc = make_test_disc(sectors, "Vanished");
+    let disc_size = sectors as u64 * 2048;
+
+    // A mapfile from a rip that genuinely finished: every byte Finished.
+    let mf_path = disc.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, disc_size, "test").unwrap();
+        mf.record(0, disc_size, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+    }
+    // ...but the ISO it describes is gone.
+    assert!(!iso_path.exists(), "fixture: the ISO must be absent");
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).unwrap();
+
+    // The claim and the artifact have to agree. Asserting on bytes_good alone
+    // would pass on the broken behaviour, which reports a full disc of good
+    // bytes precisely because it skipped the work.
+    assert!(
+        iso_path.exists(),
+        "copy() reported success from a Finished mapfile but wrote no ISO"
+    );
+    assert_eq!(
+        std::fs::metadata(&iso_path).unwrap().len(),
+        disc_size,
+        "the re-read ISO must be the full disc, not a stub"
+    );
+    assert_eq!(r.bytes_good, disc_size);
+}
+
 /// A resumed sweep that clears the NonTried tail but leaves pre-existing
 /// Unreadable bytes must NOT report `complete: true`. `complete` means
 /// "nothing pending AND nothing permanently lost" — reporting a lossy rip as

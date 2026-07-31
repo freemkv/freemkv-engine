@@ -49,6 +49,20 @@ pub(crate) fn with_cancel_watcher<T>(
         halt.store(true, Ordering::Relaxed);
     }
 
+    // `done` has to be set on EVERY exit path, not just the normal one. A
+    // plain store after `f` is skipped by an unwind, and `thread::scope` joins
+    // its threads BEFORE propagating a panic — so the watcher would still be
+    // looping on `done`, the join would never finish, and a panic would become
+    // a permanent hang. For a service holding a drive open that is worse than
+    // the crash it replaces. Tying the store to a guard's Drop covers the
+    // normal return, the panic unwind, and any early exit added later.
+    struct SignalDone<'a>(&'a std::sync::atomic::AtomicBool);
+    impl Drop for SignalDone<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
     std::thread::scope(|s| {
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
@@ -62,9 +76,8 @@ pub(crate) fn with_cancel_watcher<T>(
             }
         });
 
-        let outcome = f(&halt);
-        done.store(true, Ordering::Relaxed);
-        outcome
+        let _signal_done = SignalDone(&done);
+        f(&halt)
     })
 }
 
@@ -121,9 +134,19 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
             pass,
             bytes_done: p.work_done,
             bytes_total: p.work_total,
+            // Damage only: permanently unreadable + queued-for-retry.
+            //
+            // NOT `bytes_pending_total`. That aggregate folds in NonTried —
+            // territory Pass 1 simply has not reached yet — so it counts the
+            // whole un-swept remainder as damage. On the first tick of a
+            // pristine 25 GB disc that is ~12 million "bad sectors" reported
+            // for a disc with none, falling toward zero as the sweep advances.
+            // The mapfile's own docs name `bytes_retryable` as the field for
+            // a "will retry" bucket and say `bytes_pending` over-counts for
+            // exactly this reason.
             sectors_bad: p
                 .bytes_unreadable_total
-                .saturating_add(p.bytes_pending_total)
+                .saturating_add(p.bytes_retryable_total)
                 / 2048,
             speed_bps,
             eta_secs,
@@ -305,6 +328,95 @@ mod tests {
         assert!(r.halted, "a cancelling sink must halt the rip");
         assert!(!r.complete, "a halted rip is not complete");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `sectors_bad` must count DAMAGE, not un-swept territory.
+    ///
+    /// The bridge used to derive it from `bytes_pending_total`, which folds in
+    /// NonTried — the part of the disc Pass 1 has not reached yet. On the
+    /// first progress tick of a flawless disc that reports essentially the
+    /// whole disc as bad sectors, and the number then falls as the sweep
+    /// advances. An operator watching a damage counter start at twelve million
+    /// and count down has no way to tell a pristine disc from a failing one.
+    #[test]
+    fn a_clean_disc_reports_no_bad_sectors_while_the_sweep_is_still_running() {
+        use libfreemkv::progress::Progress as _;
+
+        #[derive(Default)]
+        struct Captured(std::sync::Mutex<Vec<u64>>);
+        impl Sink for Captured {
+            fn progress(&self, p: &Progress) {
+                self.0.lock().unwrap().push(p.sectors_bad);
+            }
+        }
+
+        let sink = Captured::default();
+        let bridge = ProgressBridge::new(&sink);
+
+        // One tick, early in a 25 GB sweep of an undamaged disc: nothing read
+        // yet is NOT damage. `bytes_retryable_total` and
+        // `bytes_unreadable_total` are both zero because nothing has failed.
+        let disc = 25u64 * 1024 * 1024 * 1024;
+        bridge.report(&libfreemkv::progress::PassProgress {
+            kind: libfreemkv::progress::PassKind::Sweep,
+            work_done: 4096,
+            work_total: disc,
+            bytes_good_total: 4096,
+            bytes_unreadable_total: 0,
+            bytes_pending_total: disc - 4096, // the un-swept remainder
+            bytes_retryable_total: 0,
+            bytes_total_disc: disc,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 0,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located: libfreemkv::progress::LocatedProgress::default(),
+        });
+
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            &[0],
+            "a disc with nothing wrong reported bad sectors purely because the \
+             sweep had not finished yet"
+        );
+    }
+
+    /// A panic inside the watched call must PROPAGATE, not hang.
+    ///
+    /// `with_cancel_watcher` sets `done` after `f` returns. On a panic the
+    /// unwind skips that store, and `thread::scope` joins its threads before
+    /// propagating — so the watcher, still looping on `done`, is joined
+    /// forever and the panic becomes a permanent hang. A ripping service that
+    /// would have crashed and restarted instead sits there holding the drive.
+    ///
+    /// The failure mode is a deadlock, so this cannot simply call and assert:
+    /// a regression would hang the whole test binary rather than fail it. The
+    /// call runs on its own thread and the assertion is on a receive timeout.
+    #[test]
+    fn a_panic_inside_the_watched_call_propagates_instead_of_hanging() {
+        struct NeverCancel;
+        impl Sink for NeverCancel {}
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // The panic is deliberate; keep it off the test log.
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_cancel_watcher(&NeverCancel, |_halt| panic!("boom"));
+            }));
+            std::panic::set_hook(prev);
+            let _ = tx.send(caught.is_err());
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(panicked) => assert!(panicked, "the panic must reach the caller"),
+            Err(_) => panic!(
+                "with_cancel_watcher hung: `f` panicked, the unwind skipped the \
+                 `done` store, and thread::scope is joining a watcher that will \
+                 never stop looping"
+            ),
+        }
     }
 
     /// Stop must be honoured DURING a damage cooldown, not after it.
