@@ -34,7 +34,7 @@ pub fn copy(
     // single sector, so the failure is pre-flight and no partial ISO is
     // written. `opts.decrypt == false` is `--raw`: the gate is a no-op (the
     // user wants the encrypted image), and an unencrypted disc passes too.
-    disc.ensure_decryptable(!opts.decrypt)?;
+    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
     // Mapfile-driven resume dispatch. This runs for BOTH plain and
     // `--multipass` copies: an interrupted plain `disc:// → iso://` writes
     // a per-block-flushed mapfile (crash-safe), and re-issuing the SAME
@@ -257,7 +257,7 @@ pub fn sweep(
     // encrypted disc with no usable key would write ciphertext to the ISO at
     // exit 0; refuse before reading any sector. No-op for `--raw`
     // (`opts.decrypt == false`) and unencrypted discs.
-    disc.ensure_decryptable(!opts.decrypt)?;
+    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
 
     let total_bytes = disc.capacity_sectors as u64 * 2048;
     // Decrypt-aware read.
