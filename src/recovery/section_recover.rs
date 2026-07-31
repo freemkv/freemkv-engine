@@ -37,7 +37,7 @@ use libfreemkv::scsi::SenseFamily;
 use libfreemkv::sector::SectorSource;
 
 /// One 2048-byte sector.
-const SECTOR: u64 = 2048;
+pub(super) const SECTOR: u64 = 2048;
 /// Batch size a linear handler reads at once (sectors). A partially-dead batch
 /// falls back to single-sector reads, so this only trades throughput on clean
 /// spans against granularity on dead ones.
