@@ -1254,3 +1254,53 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
          is discarded)"
     );
 }
+
+/// A mapfile carrying unaligned ranges — e.g. imported from ddrescue run with
+/// `-b 512` — must not cause a shifted write. `read_span` computes
+/// `lba = pos / SECTOR`, so an unaligned `pos` reads the sector CONTAINING
+/// pos and then writes those 2048 real bytes at byte offset `pos`, recording
+/// them Finished: genuine payload at the wrong offset, marked good.
+#[test]
+fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("unaligned.iso");
+    let sectors: u32 = 300;
+    let disc = make_test_disc(sectors, "Unaligned");
+    let mf_path = disc.mapfile_for(&iso_path);
+
+    {
+        let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+        mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+        // 512-aligned, NOT 2048-aligned — what ddrescue -b 512 produces.
+        mf.record(100 * 2048 + 512, 1024, SectorStatus::NonTrimmed)
+            .unwrap();
+        mf.flush().unwrap();
+    }
+    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let popts = freemkv_engine::PatchOptions {
+        decrypt: false,
+        block_sectors: Some(32),
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: None,
+        halt: None,
+        key_fetch: None,
+    };
+    freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
+
+    let after = Mapfile::load(&mf_path).unwrap();
+    for (pos, size) in after.ranges_with(&[SectorStatus::Finished]) {
+        assert_eq!(
+            pos % 2048,
+            0,
+            "Finished record starts at unaligned offset {pos} — a shifted write"
+        );
+        assert_eq!(size % 2048, 0, "Finished record has sub-sector size {size}");
+    }
+}

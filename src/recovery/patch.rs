@@ -480,6 +480,39 @@ pub(super) struct SubRanges {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+/// Widen a mapfile byte-range outward to whole 2048-byte sectors.
+///
+/// This is the single ingress where mapfile byte-ranges become read requests,
+/// and it is where the "all offsets are sector multiples" invariant that
+/// `SubRanges` documents actually gets established. Nothing validated it
+/// before: `Mapfile::load` has no alignment check, so an imported ddrescue
+/// mapfile written with a 512-byte block size (`-b 512`) parses fine and
+/// yields unaligned ranges.
+///
+/// Two things went wrong downstream without this:
+///   * an unaligned `pos` — `read_span` does `lba = pos / SECTOR`, reads the
+///     sector CONTAINING `pos`, then writes those 2048 real bytes at byte
+///     offset `pos` and records them Finished. A shifted write of genuine
+///     payload, marked good. Silent corruption.
+///   * a sub-sector length — `count = (span / SECTOR) as u16` truncates to 0,
+///     and a zero-sector read reports Good. (Harmless in the mapfile, since
+///     `record` ignores a zero-size entry, but it credits the handler
+///     scorecard for a recovery that never happened.)
+///
+/// Widening is strictly conservative: the extra bytes are re-read from the
+/// disc and written with real data, so this recovers a 512-aligned mapfile
+/// rather than condemning its fragments as permanently unreadable — which is
+/// what rejecting them at load time, or failing the read here, would do.
+fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
+    use super::section_recover::SECTOR;
+    if len == 0 {
+        return (pos - pos % SECTOR, 0);
+    }
+    let start = pos - pos % SECTOR;
+    let end = (pos + len).div_ceil(SECTOR) * SECTOR;
+    (start, end - start)
+}
+
 impl SubRanges {
     /// One whole bad section.
     pub(super) fn from_section(pos: u64, len: u64) -> Self {
@@ -922,7 +955,10 @@ impl PatchCtx<'_, '_> {
         // tier N+1 works on exactly what tier N left behind.
         let mut sections: Vec<SubRanges> = ordered
             .iter()
-            .map(|&(p, l)| SubRanges::from_section(p, l))
+            .map(|&(p, l)| {
+                let (p, l) = snap_to_sectors(p, l);
+                SubRanges::from_section(p, l)
+            })
             .collect();
 
         // Two schedulers select the handler chain per range:
@@ -1692,5 +1728,45 @@ mod tests {
         assert_eq!(s.ranges(), &[(0, 1024), (2048, 2048)]);
         s.remove(512, 2048); // covers tail of first + head of second
         assert_eq!(s.ranges(), &[(0, 512), (2560, 1536)]);
+    }
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::snap_to_sectors;
+
+    /// An already-aligned range is untouched.
+    #[test]
+    fn aligned_ranges_pass_through() {
+        assert_eq!(snap_to_sectors(0, 2048), (0, 2048));
+        assert_eq!(snap_to_sectors(4096, 8192), (4096, 8192));
+    }
+
+    /// A 512-block ddrescue range widens outward to whole sectors. Both edges
+    /// move, and the result always covers the original span.
+    #[test]
+    fn unaligned_ranges_widen_outward_and_cover_the_original() {
+        for &(pos, len) in &[
+            (512u64, 1024u64),
+            (2048 + 512, 512),
+            (100 * 2048 + 1, 3000),
+            (1, 1),
+        ] {
+            let (p, l) = snap_to_sectors(pos, len);
+            assert_eq!(p % 2048, 0, "start {p} not sector-aligned");
+            assert_eq!(l % 2048, 0, "len {l} not a sector multiple");
+            assert!(p <= pos, "widening must not lose the head");
+            assert!(p + l >= pos + len, "widening must not lose the tail");
+            assert!(l >= 2048, "a non-empty span must be at least one sector");
+        }
+    }
+
+    /// A sub-sector span must never yield a zero-sector read: `count =
+    /// (span / SECTOR) as u16` would truncate to 0, and a zero-length read
+    /// reports Good, crediting a recovery that never happened.
+    #[test]
+    fn sub_sector_spans_never_truncate_to_zero_sectors() {
+        let (_, l) = snap_to_sectors(1000, 48);
+        assert!(l / 2048 >= 1, "span {l} truncates to a zero-sector read");
     }
 }
