@@ -183,11 +183,9 @@ impl Sink<WorkItem> for SweepSink {
                 // showed ~full-movie at-risk and melted to 0 as the sweep
                 // progressed. Matches the one-shot progress path, which already
                 // excludes NonTried.
-                let bad_ranges = self.map.ranges_with(&[
-                    SectorStatus::NonTrimmed,
-                    SectorStatus::Unreadable,
-                    SectorStatus::NonScraped,
-                ]);
+                let bad_ranges = self
+                    .map
+                    .ranges_with(&crate::recovery::mapfile::damage_sector_statuses());
                 // Best-effort: drop on backpressure; producer's cache
                 // stays current enough.
                 let _ = self

@@ -1197,12 +1197,11 @@ pub fn progress_snapshot_from_mapfile(
     kind: libfreemkv::progress::PassKind,
     bytes_total_disc: u64,
 ) -> Option<libfreemkv::progress::PassProgress> {
-    use mapfile::SectorStatus::{NonScraped, NonTrimmed, Unreadable};
     let map = mapfile::Mapfile::load(mapfile_path).ok()?;
     let stats = map.stats();
     // MAYBE set = not-yet-good (NonTrimmed/NonScraped/Unreadable), excluding
     // NonTried (the unread remainder) — same set the live patch emitter uses.
-    let maybe = map.ranges_with(&[NonTrimmed, NonScraped, Unreadable]);
+    let maybe = map.ranges_with(&mapfile::damage_sector_statuses());
     let located = title.map(|t| locate_ranges(&maybe, t)).unwrap_or_default();
     let main_bad = title.map(|t| bytes_bad_in_title(t, &maybe)).unwrap_or(0);
     Some(libfreemkv::progress::PassProgress {

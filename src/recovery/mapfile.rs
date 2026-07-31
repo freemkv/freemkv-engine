@@ -65,6 +65,50 @@ pub enum SectorStatus {
 }
 
 impl SectorStatus {
+    /// THE definition of "these bytes are confirmed good".
+    ///
+    /// Exhaustive on purpose: adding a sixth variant is a compile error here,
+    /// not a silently-omitted entry in one of the hand-written arrays that
+    /// used to be scattered across this crate.
+    pub fn is_finished(self) -> bool {
+        match self {
+            SectorStatus::Finished => true,
+            SectorStatus::NonTried
+            | SectorStatus::NonTrimmed
+            | SectorStatus::NonScraped
+            | SectorStatus::Unreadable => false,
+        }
+    }
+}
+
+/// Every status that is NOT [`SectorStatus::Finished`] — "not confirmed good".
+/// This is the convergence set: what the multipass loop treats as still
+/// unfinished, and what a front-end's loss report must count as bad.
+///
+/// Sibling of [`damage_sector_statuses`]; the difference is `NonTried`, and it
+/// matters. Both live here so the distinction is visible at every call site
+/// instead of being re-derived from a comment.
+pub fn bad_sector_statuses() -> [SectorStatus; 4] {
+    [
+        SectorStatus::NonTried,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+    ]
+}
+
+/// The DAMAGE set: attempted and failed. Excludes `NonTried`, which is the
+/// unread remainder rather than damage — counting it would report a whole
+/// unswept disc as confirmed loss.
+pub fn damage_sector_statuses() -> [SectorStatus; 3] {
+    [
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+    ]
+}
+
+impl SectorStatus {
     /// The single ddrescue status character for this status
     /// (`?`/`*`/`/`/`-`/`+`).
     pub fn to_char(self) -> char {
@@ -1734,5 +1778,45 @@ mod tests {
         assert_eq!(s2.bytes_retryable, 0);
 
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod status_set_tests {
+    use super::*;
+
+    /// The two sets differ by exactly `NonTried`, and neither may ever contain
+    /// `Finished`. Both used to be hand-written arrays scattered across five
+    /// call sites in three files — in two different orders — so this pins the
+    /// relationship that the comments used to assert individually.
+    #[test]
+    fn damage_set_is_the_bad_set_without_the_unread_remainder() {
+        let bad = bad_sector_statuses();
+        let damage = damage_sector_statuses();
+
+        for s in damage {
+            assert!(bad.contains(&s), "{s:?} is damage but not bad");
+        }
+        for s in bad {
+            assert!(
+                damage.contains(&s) || s == SectorStatus::NonTried,
+                "{s:?} is bad but not damage, and is not the unread remainder"
+            );
+        }
+        assert!(bad.contains(&SectorStatus::NonTried));
+        assert!(!damage.contains(&SectorStatus::NonTried));
+        for s in bad {
+            assert!(!s.is_finished(), "{s:?} must not count as good");
+        }
+    }
+
+    /// `is_finished` is the single arbiter of "confirmed good"; every other
+    /// status must disagree with it.
+    #[test]
+    fn only_finished_is_finished() {
+        assert!(SectorStatus::Finished.is_finished());
+        for s in bad_sector_statuses() {
+            assert!(!s.is_finished());
+        }
     }
 }

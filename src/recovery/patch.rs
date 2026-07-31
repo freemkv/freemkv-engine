@@ -161,17 +161,14 @@ pub(super) struct SharedPatchState {
 
 impl SharedPatchState {
     /// Cap on the republished `bad_ranges` Vec. Consumers (progress display,
-    /// scheduler) only sample the head of the list; the full set is bounded by
-    /// the mapfile entry cap so a pathologically fragmented disc can't make
-    /// every per-record republish allocate unboundedly.
+    /// scheduler) only sample the head of the list. NOTE: there is no mapfile
+    /// entry cap — `Mapfile.entries` is unbounded — so this truncation is the
+    /// only thing keeping a pathologically fragmented disc from making every
+    /// per-record republish allocate without limit.
     const MAX_BAD_RANGES: usize = 8192;
 
     fn from_map(map: &Mapfile) -> Self {
-        let mut bad_ranges = map.ranges_with(&[
-            SectorStatus::NonTrimmed,
-            SectorStatus::Unreadable,
-            SectorStatus::NonScraped,
-        ]);
+        let mut bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
         bad_ranges.truncate(Self::MAX_BAD_RANGES);
         Self {
             stats: map.stats(),
@@ -396,11 +393,7 @@ pub(super) fn compute_initial_state(
     // pass 5 jumps over the same zone as pass 2, fine. NonTried ranges
     // are intentionally excluded — they are covered by a preceding
     // sweep pass, not by patch.
-    let mut bad_ranges = map.ranges_with(&[
-        mapfile::SectorStatus::NonTrimmed,
-        mapfile::SectorStatus::NonScraped,
-        mapfile::SectorStatus::Unreadable,
-    ]);
+    let mut bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
     if opts.reverse {
         bad_ranges.reverse();
     }
@@ -1310,12 +1303,10 @@ pub fn bytes_bad_in_title_from_mapfile(
             return bytes_bad_in_title(title, &[(0, u64::MAX)]);
         }
     };
-    let bad_ranges = map.ranges_with(&[
-        mapfile::SectorStatus::NonTrimmed,
-        mapfile::SectorStatus::Unreadable,
-        mapfile::SectorStatus::NonScraped,
-        mapfile::SectorStatus::NonTried,
-    ]);
+    // The CONVERGENCE set (includes NonTried), not the damage set: a
+    // front-end asking "how much of the main title is still bad" must count
+    // the unread remainder too, or an interrupted rip reports as clean.
+    let bad_ranges = map.ranges_with(&mapfile::bad_sector_statuses());
     bytes_bad_in_title(title, &bad_ranges)
 }
 
