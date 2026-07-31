@@ -324,6 +324,26 @@ pub fn multipass_rip(
     opts: &MultipassOpts,
     sink: &dyn Sink,
 ) -> crate::Result<MultipassResult> {
+    // Every recovery primitive below sleeps through damage cooldowns, and a
+    // sleeping pass emits no progress ticks — so the progress callback's
+    // `should_cancel` return value cannot be consulted while it waits. Run the
+    // whole multipass under one halt token so Stop is honoured mid-cooldown in
+    // the sweep AND in every patch pass. See `with_cancel_watcher`.
+    crate::run::with_cancel_watcher(sink, |halt| {
+        multipass_rip_inner(disc, reader, iso_path, job, opts, sink, halt)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn multipass_rip_inner(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    opts: &MultipassOpts,
+    sink: &dyn Sink,
+    halt: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> crate::Result<MultipassResult> {
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
     let empty_title = libfreemkv::DiscTitle::empty();
     let main_title = disc.titles.first().unwrap_or(&empty_title);
@@ -343,7 +363,7 @@ pub fn multipass_rip(
             decrypt: !job.raw,
             multipass: false,
             progress: Some(&bridge),
-            halt: None,
+            halt: Some(halt.clone()),
             vid,
             unit_keys,
             key_fetch: None,
@@ -373,7 +393,7 @@ pub fn multipass_rip(
             batch_sectors: None,
             skip_on_error: true,
             progress: Some(&bridge),
-            halt: None,
+            halt: Some(halt.clone()),
             vid,
             unit_keys: unit_keys.clone(),
             key_fetch: None,
@@ -416,7 +436,8 @@ pub fn multipass_rip(
             }
 
             let bridge = ProgressBridge::new(sink);
-            let patch_opts = PatchOptions::for_patch_pass(!job.raw, Some(&bridge), None, None);
+            let patch_opts =
+                PatchOptions::for_patch_pass(!job.raw, Some(&bridge), Some(halt.clone()), None);
             let pr = crate::recovery::patch(disc, reader, iso_path, &patch_opts)?;
             passes += 1;
             last_good = pr.bytes_good;
