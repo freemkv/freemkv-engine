@@ -11,7 +11,8 @@ freemkv-engine    ← THIS: recovery strategy + rip orchestration + the Sink sea
    └── freemkv-gui ← you
 ```
 
-Status: the engine is built, green, and tested (132 tests on Rust 1.86). It is
+Status: the engine is built, green, and tested on Rust 1.97 (the toolchain CI
+pins and `Cargo.toml`'s `rust-version`). It is
 **off crates.io** — depend on it by path/git tag like the other freemkv crates.
 
 ```toml
@@ -44,7 +45,7 @@ impl Sink for UiSink {
     }
     fn title_opened(&self, t: &DiscTitle) {
         // Reserved for the future combined run(); NOT called by recover_to_iso/
-        // run_multipass today. Populate your tree from `disc.titles` after scan.
+        // multipass_rip today. Populate your tree from `disc.titles` after scan.
     }
     fn progress(&self, p: &Progress) {
         // Called frequently during recovery. Marshal to the UI thread; keep cheap.
@@ -53,7 +54,7 @@ impl Sink for UiSink {
     }
     fn completed(&self, outcome: &Outcome) {
         // Reserved for the future combined run(); NOT called by recover_to_iso/
-        // run_multipass today. For now, build your result page from the
+        // multipass_rip today. For now, build your result page from the
         // MultipassResult these return (see below).
     }
     fn should_cancel(&self) -> bool {
@@ -87,7 +88,7 @@ use freemkv_engine::{
     // the seam
     Sink, Level, Progress, NoopSink,
     // recovery / multipass
-    recover_to_iso, run_multipass, MultipassResult,
+    recover_to_iso, multipass_rip, MultipassOpts, MultipassResult,
     classify_damage, loss_aborts, effective_abort_secs,
     // re-exported disc model (no direct libfreemkv dep needed)
     Disc, DiscTitle, DiscFormat, Codec, Resolution, VideoStream, AudioStream,
@@ -132,8 +133,12 @@ let ks = resolve_keys(&disc);
 // ks.resolved: bool
 // ks.origin:   Option<KeyOrigin>   (where the key came from)
 // ks.summary:  stable key you localize:
-//   "unencrypted" | "resolved-keydb" | "resolved-online" | "resolved-css"
-//   | "no-key" | "no-keydb"      ← render the red "no KEYDB.cfg" strip on this
+//   "unencrypted" | "resolved-keydb" | "resolved-external" | "resolved-derived"
+//   | "resolved-css" | "no-key" | "no-keydb"   ← render the red "no KEYDB.cfg"
+//                                                 strip on "no-keydb"
+// "resolved-external" is source-agnostic (an externally supplied unit key —
+// not necessarily online); "resolved-derived" means the key was derived from
+// device/processing keys. There is no "resolved-online".
 ```
 
 No scraping logs for key state — it's here as data.
@@ -147,10 +152,13 @@ Two entry points, matching the two rip modes:
 let copy_result = recover_to_iso(&disc, &mut reader, iso_path, &job, &sink)?;
 
 // Multipass (RipMode::Multi): sweep -> N patch passes -> abort-on-loss gate.
-let mp: MultipassResult = run_multipass(
+let mp: MultipassResult = multipass_rip(
     &disc, &mut reader, iso_path, &job,
-    /*max_passes*/ 5,
-    /*is_iso_output*/ false,   // true forces 100% (ISO backup ignores the tolerance)
+    &MultipassOpts {
+        max_passes: 5,
+        abort_on_lost_secs: 0,   // 0 = require a perfect rip
+        is_iso_output: false,    // true forces 100% (an ISO backup ignores the tolerance)
+    },
     &sink,
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
@@ -236,7 +244,7 @@ let key = resolve_keys(&disc);
 update_keydb_strip(key);
 let sink = UiSink::new();                // your impl
 std::thread::spawn(move || {
-    let mp = run_multipass(&disc, &mut *reader, iso_path, &job, 5, false, &sink);
+    let mp = multipass_rip(&disc, &mut *reader, iso_path, &job, &opts, &sink);
     // Progress fired through the sink during the run. `mp` is the terminal
     // result — build your result page from it (or call your own
     // sink.completed(...) with a mapped Outcome). Handle Err for hard errors.
