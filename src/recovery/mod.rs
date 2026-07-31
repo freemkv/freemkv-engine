@@ -64,15 +64,14 @@ pub fn copy(
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 {
             // Every sector is Finished — a prior copy completed. Re-issuing
             // the command is a no-op (don't re-sweep a finished ISO).
-            return Ok(CopyResult {
-                bytes_total: disc_size,
-                bytes_good: stats.bytes_good,
-                bytes_unreadable: stats.bytes_unreadable,
-                bytes_pending: 0,
-                recovered_this_pass: 0,
-                complete: true,
-                halted: false,
-            });
+            return Ok(CopyResult::new(
+                disc_size,
+                stats.bytes_good,
+                stats.bytes_unreadable,
+                0,
+                0,
+                false,
+            ));
         }
         if !covers_disc {
             // Mapfile capacity != disc capacity. Force a full (non-
@@ -138,15 +137,14 @@ pub fn copy(
                 "copy dispatch: all bad sectors already Unreadable \
                  (retryable=0, nontried=0) — returning terminal result",
             );
-            return Ok(CopyResult {
-                bytes_total: disc_size,
-                bytes_good: stats.bytes_good,
-                bytes_unreadable: stats.bytes_unreadable,
-                bytes_pending: 0,
-                recovered_this_pass: 0,
-                complete: false,
-                halted: false,
-            });
+            return Ok(CopyResult::new(
+                disc_size,
+                stats.bytes_good,
+                stats.bytes_unreadable,
+                0,
+                0,
+                false,
+            ));
         }
         // Plain (non-multipass) copy: there is no patch pass and the sweep
         // aborts on the first read error, so a fully-attempted mapfile with
@@ -158,15 +156,14 @@ pub fn copy(
             "copy dispatch: plain copy, disc fully attempted (bad={}) — terminal result",
             bad_bytes,
         );
-        return Ok(CopyResult {
-            bytes_total: disc_size,
-            bytes_good: stats.bytes_good,
-            bytes_unreadable: stats.bytes_unreadable,
-            bytes_pending: stats.bytes_pending,
-            recovered_this_pass: 0,
-            complete: bad_bytes == 0,
-            halted: false,
-        });
+        return Ok(CopyResult::new(
+            disc_size,
+            stats.bytes_good,
+            stats.bytes_unreadable,
+            stats.bytes_pending,
+            0,
+            false,
+        ));
     }
     sweep_internal(disc, reader, path, opts, false)
 }
@@ -225,15 +222,14 @@ fn patch_internal(
         wedged_exit = pr.wedged_exit,
         "Patch completed"
     );
-    Ok(CopyResult {
-        bytes_total: pr.bytes_total,
-        bytes_good: pr.bytes_good,
-        bytes_unreadable: pr.bytes_unreadable,
-        bytes_pending: pr.bytes_pending,
-        recovered_this_pass: pr.bytes_recovered_this_pass,
-        complete: pr.bytes_pending == 0,
-        halted: pr.halted,
-    })
+    Ok(CopyResult::new(
+        pr.bytes_total,
+        pr.bytes_good,
+        pr.bytes_unreadable,
+        pr.bytes_pending,
+        pr.bytes_recovered_this_pass,
+        pr.halted,
+    ))
 }
 
 /// Pass 1 of a multipass rip: walk the disc forward, write
@@ -1007,15 +1003,14 @@ pub fn sweep(
         copy_elapsed_ms = copy_t0.elapsed().as_millis() as u64,
         "Pass 1 complete"
     );
-    Ok(CopyResult {
-        bytes_total: total_bytes,
-        bytes_good: stats.bytes_good,
-        bytes_unreadable: stats.bytes_unreadable,
-        bytes_pending: stats.bytes_pending,
-        recovered_this_pass: 0,
-        complete: stats.bytes_pending == 0 && !halt_requested,
-        halted: halt_requested,
-    })
+    Ok(CopyResult::new(
+        total_bytes,
+        stats.bytes_good,
+        stats.bytes_unreadable,
+        stats.bytes_pending,
+        0,
+        halt_requested,
+    ))
 }
 
 #[derive(Default)]
@@ -1052,8 +1047,40 @@ pub struct CopyResult {
     pub bytes_unreadable: u64,
     pub bytes_pending: u64,
     pub recovered_this_pass: u64,
+    /// Nothing pending AND nothing permanently lost AND not interrupted.
+    /// Derived by [`CopyResult::new`] — never set independently, so it can
+    /// never contradict the byte counts it ships beside.
     pub complete: bool,
     pub halted: bool,
+}
+
+impl CopyResult {
+    /// THE definition of a finished copy. Every construction site goes
+    /// through here so "complete" has exactly one meaning: no bytes left to
+    /// retry, no bytes permanently lost, and the pass was not interrupted.
+    ///
+    /// Previously each of the five call sites re-derived this from whichever
+    /// local happened to be in scope, and they disagreed on both the
+    /// unreadable and the halted term — reporting a lossy or cancelled rip as
+    /// complete.
+    pub(crate) fn new(
+        bytes_total: u64,
+        bytes_good: u64,
+        bytes_unreadable: u64,
+        bytes_pending: u64,
+        recovered_this_pass: u64,
+        halted: bool,
+    ) -> Self {
+        CopyResult {
+            bytes_total,
+            bytes_good,
+            bytes_unreadable,
+            bytes_pending,
+            recovered_this_pass,
+            complete: bytes_pending == 0 && bytes_unreadable == 0 && !halted,
+            halted,
+        }
+    }
 }
 
 /// Options for [`Disc::sweep`] (Pass 1 / forward sequential pass).

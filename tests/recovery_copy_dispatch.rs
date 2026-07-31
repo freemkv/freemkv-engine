@@ -1099,3 +1099,54 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
         half_bytes, half_bytes
     );
 }
+
+/// A resumed sweep that clears the NonTried tail but leaves pre-existing
+/// Unreadable bytes must NOT report `complete: true`. `complete` means
+/// "nothing pending AND nothing permanently lost" — reporting a lossy rip as
+/// finished is the silent-loss shape this crate exists to prevent.
+#[test]
+fn resume_with_pre_existing_unreadable_is_not_complete() {
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("lossy.iso");
+    let sectors: u32 = 200;
+    let disc = make_test_disc(sectors, "Lossy");
+
+    // [0..100)   Finished
+    // [100..150) Unreadable  (permanently lost on a previous run)
+    // [150..200) NonTried    (tail this resume will clear)
+    let mf_path = disc.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+        mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+        mf.record(100 * 2048, 50 * 2048, SectorStatus::Unreadable)
+            .unwrap();
+        mf.flush().unwrap();
+    }
+    // The ISO must already exist at full length: sweep's inconsistent-resume
+    // guard forces a FRESH sweep (dropping the mapfile) when the mapfile
+    // claims progress but the ISO is missing or zero-length.
+    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).unwrap();
+
+    assert!(
+        r.bytes_unreadable > 0,
+        "fixture must retain the Unreadable range (got {})",
+        r.bytes_unreadable
+    );
+    assert_eq!(r.bytes_pending, 0, "the NonTried tail should be swept");
+    assert!(
+        !r.complete,
+        "complete must be false while {} bytes are permanently unreadable",
+        r.bytes_unreadable
+    );
+}
