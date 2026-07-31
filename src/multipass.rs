@@ -134,16 +134,11 @@ pub fn plan_passes(max_retries: u8) -> PassPlan {
 }
 
 /// The mapfile sector statuses that count as "still bad" (not yet recovered)
-/// for the muxable-scope convergence check. Pins the exact status set the loop
-/// treats as unfinished: not-tried, not-trimmed, not-scraped, and unreadable.
-pub fn bad_sector_statuses() -> [SectorStatus; 4] {
-    [
-        SectorStatus::NonTried,
-        SectorStatus::NonTrimmed,
-        SectorStatus::NonScraped,
-        SectorStatus::Unreadable,
-    ]
-}
+/// for the muxable-scope convergence check.
+///
+/// Defined in [`crate::recovery::mapfile`] alongside the enum it describes;
+/// re-exported here because this is the public name front-ends already use.
+pub use crate::recovery::mapfile::bad_sector_statuses;
 
 /// Scope-aware bad-byte count for the convergence check.
 ///
