@@ -121,7 +121,11 @@ pub fn plan_passes(max_retries: u8) -> PassPlan {
             multipass: true,
             sweep_passes: 1,
             patch_passes: max_retries,
-            total_passes: max_retries + 2, // pass 1 + retries + mux
+            // saturating: max_retries is a u8 and the caller clamps to
+            // u8::MAX, so `+ 2` overflows for anything >= 254 — a panic in
+            // dev/test and a silent wrap to 1 under release, where the UI's
+            // pass denominator would then be smaller than the pass count.
+            total_passes: max_retries.saturating_add(2), // pass 1 + retries + mux
         }
     } else {
         PassPlan {
@@ -199,13 +203,24 @@ pub fn patch_pass_decision(mux_scope_bad: u64, recovered: Option<u64>) -> PatchD
     }
 }
 
-/// The end-of-recovery promotion: after the final patch pass, bytes still left
-/// `NonTrimmed` in the mapfile (i.e. "maybe" across every pass) are promoted to
-/// `Unreadable` (confirmed lost) BEFORE the abort/loss gate reads them. Returns
-/// the `(from, to)` status pair the loop applies. libfreemkv's patch loop
-/// intentionally defers this final-verdict step to the orchestrator.
-pub fn end_of_recovery_promotion() -> (SectorStatus, SectorStatus) {
-    (SectorStatus::NonTrimmed, SectorStatus::Unreadable)
+/// The end-of-recovery promotion: after the final patch pass, bytes still in a
+/// "maybe" state across every pass are promoted to `Unreadable` (confirmed
+/// lost) BEFORE the abort/loss gate reads them. Returns the `(from, to)`
+/// statuses the loop applies. libfreemkv's patch loop intentionally defers this
+/// final-verdict step to the orchestrator.
+///
+/// BOTH maybe-states are promoted. `NonScraped` ('/') is as much a failed read
+/// as `NonTrimmed`: `damage_sector_statuses` includes it, so every patch pass
+/// retries it, and `bad_sector_statuses` counts it as damage. Promoting only
+/// NonTrimmed left any surviving NonScraped range invisible to the abort gate,
+/// which reads `Unreadable` alone — so genuinely lost bytes could not fire the
+/// abort, and the rip was delivered as good. Such ranges arrive from an
+/// imported or ddrescue-written mapfile, an interop this module advertises.
+pub fn end_of_recovery_promotion() -> (&'static [SectorStatus], SectorStatus) {
+    (
+        &[SectorStatus::NonTrimmed, SectorStatus::NonScraped],
+        SectorStatus::Unreadable,
+    )
 }
 
 /// Coarse damage tier from raw counters — the freemkv product judgment
@@ -215,6 +230,13 @@ pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity 
     use crate::DamageSeverity::*;
     if bad_sectors == 0 {
         return Clean;
+    }
+    // An unquantifiable loss fails SAFE, matching `should_abort_for_loss`.
+    // Every NaN comparison is false, so without this a NaN fell through both
+    // tiers to Cosmetic — the badge would read "Cosmetic" on the very rip the
+    // abort gate is simultaneously refusing to deliver.
+    if lost_ms.is_nan() {
+        return Serious;
     }
     if bad_sectors >= 500 || lost_ms >= 30_000.0 {
         return Serious;
@@ -369,12 +391,16 @@ fn multipass_rip_inner(
             key_fetch: None,
         };
         let cr = crate::recovery::copy(disc, reader, iso_path, &copy_opts)?;
+        // Same reasoning as the halted branch: a single-pass run that came
+        // back with unreadable bytes is not Clean just because there was only
+        // one pass. Clean is a claim about the DISC, not about the plan.
+        let bad_sectors = cr.bytes_unreadable.saturating_add(cr.bytes_pending) / 2048;
         return Ok(MultipassResult {
             unreadable_bytes: cr.bytes_unreadable,
             pending_bytes: cr.bytes_pending,
             good_bytes: cr.bytes_good,
             main_lost_ms: 0.0,
-            severity: crate::DamageSeverity::Clean,
+            severity: classify_damage(bad_sectors, 0.0),
             passes: 1,
             aborted_for_loss: false,
             halted: cr.halted,
@@ -471,12 +497,23 @@ fn multipass_rip_inner(
     }
 
     if halted {
+        // Severity comes from the damage actually recorded so far. Hard-coding
+        // Clean here made a cancelled rip that had already found 300 MB of
+        // unreadable sectors render a "Clean" badge next to a non-zero
+        // unreadable count — the result contradicted itself, and Clean is the
+        // reading that gets believed.
+        //
+        // main_lost_ms stays 0.0 and is NOT a damage claim: main-title loss is
+        // only computable from the mapfile at end-of-recovery, which an
+        // interrupted run never reaches. `halted: true` is the flag that says
+        // this result is partial.
+        let bad_sectors = last_unreadable.saturating_add(last_pending) / 2048;
         return Ok(MultipassResult {
             unreadable_bytes: last_unreadable,
             pending_bytes: last_pending,
             good_bytes: last_good,
             main_lost_ms: 0.0,
-            severity: crate::DamageSeverity::Clean,
+            severity: classify_damage(bad_sectors, 0.0),
             passes,
             aborted_for_loss: false,
             halted: true,
@@ -488,9 +525,17 @@ fn multipass_rip_inner(
     let (main_lost_ms, main_lost_bytes, good_bytes, unreadable_bytes, pending_bytes) =
         match Mapfile::load(&mapfile_path) {
             Ok(mut map) => {
+                // Promotion is what MAKES the loss visible: the abort gate a
+                // few lines down reads Unreadable ranges only, so a range that
+                // fails to promote out of NonTrimmed is not counted as lost —
+                // it silently drops out of the very decision it should be
+                // driving. Logging and carrying on therefore turns a write
+                // error into a rip delivered as good.
+                let mut promotion_intact = true;
                 let (promote_from, promote_to) = end_of_recovery_promotion();
-                for (pos, size) in map.ranges_with(&[promote_from]) {
+                for (pos, size) in map.ranges_with(promote_from) {
                     if let Err(e) = map.record(pos, size, promote_to) {
+                        promotion_intact = false;
                         sink.log(
                             Level::Warn,
                             &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
@@ -498,6 +543,7 @@ fn multipass_rip_inner(
                     }
                 }
                 if let Err(e) = map.flush() {
+                    promotion_intact = false;
                     sink.log(
                         Level::Warn,
                         &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
@@ -506,7 +552,20 @@ fn multipass_rip_inner(
                 let stats = map.stats();
                 let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
                 let lost_bytes = abort_lost_bytes(opts.is_iso_output, main_title, &bad_ranges);
-                let lost_ms = main_title_lost_ms(disc, lost_bytes);
+                // Same fail-safe the unreadable-mapfile branch below uses: if
+                // the damage record is incomplete, the loss is unquantifiable,
+                // and NaN makes `loss_aborts` fire regardless of threshold
+                // rather than delivering a possibly-lossy rip as perfect.
+                let lost_ms = if promotion_intact {
+                    main_title_lost_ms(disc, lost_bytes)
+                } else {
+                    sink.log(
+                        Level::Error,
+                        "multipass_rip: damage record is incomplete after a failed \
+                         promotion — treating loss as unquantifiable",
+                    );
+                    f64::NAN
+                };
                 (
                     lost_ms,
                     lost_bytes,
@@ -734,11 +793,29 @@ mod tests {
     }
 
     #[test]
-    fn end_of_recovery_promotion_is_nontrimmed_to_unreadable() {
-        assert_eq!(
-            end_of_recovery_promotion(),
-            (SectorStatus::NonTrimmed, SectorStatus::Unreadable)
+    fn end_of_recovery_promotion_covers_every_maybe_state() {
+        let (from, to) = end_of_recovery_promotion();
+        assert_eq!(to, SectorStatus::Unreadable);
+        assert!(from.contains(&SectorStatus::NonTrimmed));
+        assert!(
+            from.contains(&SectorStatus::NonScraped),
+            "NonScraped survives every patch pass as a failed read; if it is \
+             not promoted it never reaches the abort gate, which reads only \
+             Unreadable, and the loss is delivered as a clean rip"
         );
+        assert!(!from.contains(&SectorStatus::Finished));
+        assert!(!from.contains(&SectorStatus::NonTried));
+
+        // The promotion source set must stay a subset of what the rest of the
+        // module already calls damage, or the two rules drift apart.
+        let damage = crate::recovery::mapfile::damage_sector_statuses();
+        for st in from {
+            assert!(
+                damage.contains(st),
+                "{st:?} promoted but not counted as damage"
+            );
+        }
+
         let bad_set = bad_sector_statuses();
         assert!(bad_set.contains(&SectorStatus::NonTrimmed));
         assert!(bad_set.contains(&SectorStatus::Unreadable));

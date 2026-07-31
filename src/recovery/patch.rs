@@ -1377,6 +1377,14 @@ pub fn patch(
     let mapfile_path = disc.mapfile_for(path);
     let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
         compute_initial_state(path, opts, &mapfile_path)?;
+    // Same reasoning as the decrypt gate above: `copy` and `sweep` both verify
+    // the mapfile actually describes THIS disc before acting on it, and a
+    // direct `patch` caller — the exposed sweep/patch resume pair — must not
+    // be able to skip that. Without it, a resume that resolves to a leftover
+    // mapfile from a different disc patches disc B's ranges into disc A's ISO
+    // and records them Finished, which is silent corruption presented as a
+    // successful recovery.
+    mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
     tracing::info!(
         target: "freemkv::scan",
         phase = "patch",

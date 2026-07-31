@@ -66,9 +66,38 @@ pub fn copy(
             stats.bytes_pending,
             stats.bytes_unreadable,
         );
-        if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 {
-            // Every sector is Finished — a prior copy completed. Re-issuing
-            // the command is a no-op (don't re-sweep a finished ISO).
+        // The mapfile and the ISO are two separate files and the shortcut
+        // below was checking only one of them. A staging cleanup, a remount,
+        // or an operator freeing space can remove or truncate the image while
+        // the mapfile survives — and then "every range is Finished" describes
+        // an ISO that is no longer there. `sweep()` already guards this exact
+        // inconsistency (see its inconsistent-resume guard); the dispatch
+        // shortcut needs it too, or a rip reports a full disc of good bytes
+        // having written nothing and the caller muxes from a missing file.
+        let iso_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let iso_is_intact = iso_len == disc_size;
+        if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && !iso_is_intact {
+            // Complete mapfile, but the image it describes is gone or short.
+            // A resume cannot repair this: the producer builds work only from
+            // NonTried ranges and there are none, so it would return a
+            // terminal success having written nothing. Force a fresh full
+            // sweep, exactly as the covers_disc=false case below does.
+            tracing::info!(
+                "copy dispatch: → sweep (mapfile complete but ISO is {} — {} of {} bytes)",
+                if iso_len == 0 {
+                    "missing/empty"
+                } else {
+                    "truncated"
+                },
+                iso_len,
+                disc_size,
+            );
+            return sweep_internal(disc, reader, path, opts, false);
+        }
+        if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && iso_is_intact {
+            // Every sector is Finished AND the image it describes is intact —
+            // a prior copy completed. Re-issuing the command is a no-op
+            // (don't re-sweep a finished ISO).
             return Ok(CopyResult::new(
                 disc_size,
                 stats.bytes_good,
