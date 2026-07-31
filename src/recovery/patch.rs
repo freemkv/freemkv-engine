@@ -1371,7 +1371,7 @@ pub fn patch(
     // encrypted disc with no usable key would write ciphertext into the ISO's
     // recovered ranges; refuse before reading any sector. No-op for `--raw`
     // (`opts.decrypt == false`) and unencrypted discs.
-    disc.ensure_decryptable(!opts.decrypt)?;
+    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);

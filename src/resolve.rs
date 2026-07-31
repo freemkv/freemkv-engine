@@ -199,3 +199,31 @@ mod tests {
         assert_eq!(ks.summary, "no-keydb");
     }
 }
+
+/// The decrypt gate the EXECUTORS use — [`libfreemkv::Disc::ensure_decryptable`]
+/// plus this crate's own [`resolve_keys`] judgement.
+///
+/// The library gate only errors when it has an AACS or CSS state to judge. A
+/// disc that reports `encrypted` but resolved NEITHER — which `Disc::scan`
+/// produces when the volume carries `/AACS` but the VID probe failed, leaving
+/// `aacs: None, aacs_error: Some(..)` — therefore passed it, the decrypt
+/// wrapper degraded to a pass-through, and the copy finished at
+/// `complete: true`, exit 0, having written an unplayable ciphertext image.
+///
+/// `preflight` already blocks that disc, via `resolve_keys`. The two predicates
+/// disagreed, and only the one NOT on the execution path was strict. Sharing
+/// the judgement here means "can this disc be decrypted" has a single answer
+/// whether it is asked before the rip or during it.
+pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
+    disc.ensure_decryptable(raw)?;
+    if disc.encrypted && !raw && !resolve_keys(disc).resolved {
+        return Err(libfreemkv::error::Error::NoDiscKey {
+            disc_hash: disc
+                .aacs
+                .as_ref()
+                .map(|a| a.disc_hash.clone())
+                .unwrap_or_default(),
+        });
+    }
+    Ok(())
+}
