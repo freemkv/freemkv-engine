@@ -1057,6 +1057,17 @@ impl PatchCtx<'_, '_> {
         };
 
         let bad_before = bad.total_len();
+        // Pass-local cancel latch. The progress tick below already asks the
+        // front-end `should_cancel()` every PROGRESS_TICK_MS, but its answer
+        // used to be discarded (`let _ = ...`), so the ONLY halt check a
+        // handler chain could see was `opts.halt` — which every caller in this
+        // crate except `extract` leaves as None. A Stop therefore had to wait
+        // out the remaining per-handler budgets (up to ~10 min on one bad
+        // range) before `report_patch_progress` was consulted at the section
+        // boundary. Latching the tick's answer here, and handing it to the
+        // handler chain as its halt token, makes cancellation land at the very
+        // next inter-read check instead.
+        let pass_cancel = std::sync::atomic::AtomicBool::new(false);
         let (outcome, wedge_after) = {
             // Progress heartbeat: a throttled closure that pushes a fresh
             // snapshot to the reporter as recovery happens (called from every
@@ -1069,21 +1080,43 @@ impl PatchCtx<'_, '_> {
             let shared = self.shared;
             let total_bytes = self.total_bytes;
             let state = &self.state;
-            let last_tick = std::cell::Cell::new(now_ptr());
+            // `None` = no tick yet, so the FIRST read ticks immediately
+            // instead of waiting out PROGRESS_TICK_MS. That makes a cancel
+            // observable on read 1 (rather than up to 250 ms in) and gets the
+            // progress bar moving at the start of a section instead of a
+            // quarter-second later.
+            let last_tick: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
+            let cancel = &pass_cancel;
+            let ext_halt = self.opts.halt.as_deref();
             let mut tick = move || {
+                // Mirror an externally-supplied halt on EVERY read, not just on
+                // a throttled tick, so a caller that does wire `opts.halt` is
+                // not made less responsive by routing through this latch.
+                if ext_halt.is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed)) {
+                    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let t = now_ptr();
-                if t.duration_since(last_tick.get())
-                    >= std::time::Duration::from_millis(PROGRESS_TICK_MS)
-                {
-                    last_tick.set(t);
-                    let _ = report_patch_progress(disc, state, opts, total_bytes, shared);
+                let due = match last_tick.get() {
+                    None => true,
+                    Some(prev) => {
+                        t.duration_since(prev) >= std::time::Duration::from_millis(PROGRESS_TICK_MS)
+                    }
+                };
+                if due {
+                    last_tick.set(Some(t));
+                    if report_patch_progress(disc, state, opts, total_bytes, shared) {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
             };
             let mut ctx = HandlerCtx {
                 reader: &mut *self.reader,
                 sink: &mut sink,
                 now: &now_fn,
-                halt: self.opts.halt.as_deref(),
+                // The latch, not `opts.halt` directly: it carries BOTH the
+                // external token (mirrored above) and the front-end's
+                // `should_cancel()` answer from the progress tick.
+                halt: Some(&pass_cancel),
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
                 unproductive: 0,

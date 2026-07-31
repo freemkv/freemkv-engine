@@ -1150,3 +1150,107 @@ fn resume_with_pre_existing_unreadable_is_not_complete() {
         r.bytes_unreadable
     );
 }
+
+/// A front-end that asks to cancel must stop the patch handler chain at the
+/// next inter-read check, not after the whole chain's per-handler budgets have
+/// run out. The tick already polls `should_cancel()`; it used to discard the
+/// answer, so the only halt check the chain could see was `opts.halt` — which
+/// every caller but `extract` leaves None.
+#[test]
+fn cancelling_reporter_stops_the_patch_chain_promptly() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingReader {
+        total_sectors: u32,
+        bad: std::collections::HashSet<u32>,
+        reads: Arc<AtomicUsize>,
+    }
+    impl libfreemkv::sector::SectorSource for CountingReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::error::Result<usize> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            for i in 0..count {
+                if self.bad.contains(&(lba + i as u32)) {
+                    return Err(libfreemkv::error::Error::DiscRead {
+                        sector: (lba + i as u32) as u64,
+                        status: Some(0x02),
+                        sense: Some(libfreemkv::ScsiSense {
+                            sense_key: 0x02,
+                            asc: 0x04,
+                            ascq: 0x3E,
+                        }),
+                    });
+                }
+            }
+            let n = count as usize * 2048;
+            buf[..n].fill(0xAA);
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.total_sectors
+        }
+    }
+
+    // A reporter that cancels on the very first tick.
+    struct CancelNow;
+    impl libfreemkv::progress::Progress for CancelNow {
+        fn report(&self, _p: &libfreemkv::progress::PassProgress) -> bool {
+            false // false == halt
+        }
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("cancel.iso");
+    let sectors: u32 = 500;
+    let bad: std::collections::HashSet<u32> = (100u32..160).collect();
+    let disc = make_test_disc(sectors, "Cancel");
+
+    // Pass 1: lay down a mapfile with a real bad range.
+    {
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: bad.clone(),
+        };
+        let opts = CopyOptions {
+            decrypt: false,
+            multipass: true,
+            ..Default::default()
+        };
+        freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).unwrap();
+    }
+
+    // Pass N: patch that bad range with a reporter that cancels immediately.
+    let reads = Arc::new(AtomicUsize::new(0));
+    let mut reader = CountingReader {
+        total_sectors: sectors,
+        bad: bad.clone(),
+        reads: Arc::clone(&reads),
+    };
+    let reporter = CancelNow;
+    let popts = freemkv_engine::PatchOptions {
+        decrypt: false,
+        block_sectors: Some(32),
+        full_recovery: true,
+        reverse: true,
+        wedged_threshold: 50,
+        progress: Some(&reporter),
+        halt: None,
+        key_fetch: None,
+    };
+    let out = freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
+
+    let n = reads.load(Ordering::Relaxed);
+    assert!(out.halted, "a cancelling reporter must halt the pass");
+    assert!(
+        n <= 8,
+        "cancel must stop the handler chain at the next inter-read check; \
+         took {n} reads (the whole chain grinds on when the tick's halt answer \
+         is discarded)"
+    );
+}
