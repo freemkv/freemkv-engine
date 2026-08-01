@@ -370,6 +370,74 @@ mod aacs_aligned_batch_tests {
     }
 }
 
+/// What the output image's length is, for a resume decision.
+///
+/// `NotFound` is the ONE error that genuinely means "no file yet" — the
+/// fresh-rip case. Every other error is unknown, and destroying data on an
+/// unknown is not a decision this code gets to make: an EIO from a flaky
+/// USB/NFS staging volume or a momentary permissions problem is not evidence
+/// that a populated ISO is empty, and treating it as zero sends the image
+/// through `File::create` and permanently zeroes bytes the mapfile still
+/// records `Finished`. The producer only builds work from `NonTried` ranges,
+/// so those bytes are never re-read: silent, total loss of the recovery.
+///
+/// Lifted out of `sweep` because the classification was written TWICE in that
+/// one function — once for the inconsistent-resume guard and once for the
+/// open-vs-create decision — and welded to a live `std::fs::metadata` call in
+/// both places, which is why neither copy could be tested. Two copies of one
+/// policy is exactly the shape that drifts.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum IsoLen {
+    /// The file is genuinely absent.
+    Missing,
+    /// The file exists and is this many bytes long.
+    Len(u64),
+}
+
+pub(crate) fn iso_len_from_metadata(m: std::io::Result<std::fs::Metadata>) -> Result<IsoLen> {
+    match m {
+        Ok(md) => Ok(IsoLen::Len(md.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(IsoLen::Missing),
+        Err(e) => Err(Error::IoError { source: e }),
+    }
+}
+
+/// Whether a fresh sweep may proceed after trying to delete a stale mapfile.
+///
+/// A fresh sweep MUST start from an empty mapfile: if the stale file survives,
+/// `open_or_create` loads it and the NEW disc inherits the OLD disc's
+/// `Finished` ranges, so the producer skips them and the ISO is silently
+/// zero-filled there. `NotFound` means it was already gone, which is fine;
+/// anything else must abort rather than inherit.
+pub(crate) fn stale_mapfile_removed(r: std::io::Result<()>) -> Result<()> {
+    match r {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::IoError { source: e }),
+    }
+}
+
+/// The batch size a sweep reads in, before AACS unit alignment.
+///
+/// `None` means "the mode's default", and the two defaults are a real
+/// read-shape decision, not a constant: a skip-on-error sweep reads exactly
+/// one ECC block at a time so one skipped batch loses exactly one ECC block,
+/// while a clean sweep prefers the larger optical batch for throughput. A zero
+/// request is clamped to 1 — a zero batch makes `block_bytes` zero every
+/// iteration, so `pos` never advances and the producer spins forever emitting
+/// zero-length reads. Composes with [`aacs_aligned_batch`].
+pub(crate) fn sweep_batch_sectors(
+    requested: Option<u16>,
+    skip_on_error: bool,
+    format: libfreemkv::DiscFormat,
+) -> u16 {
+    match requested {
+        Some(b) => b.max(1),
+        None if skip_on_error => ecc_sectors(format),
+        None => DEFAULT_BATCH_SECTORS_OPTICAL,
+    }
+}
+
 fn sweep_internal(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
@@ -550,10 +618,9 @@ pub fn sweep(
                     // A metadata ERROR is likewise not a length. Treating it
                     // as 0 silently threw away a good resume and re-ripped
                     // hours of work on a transient stat failure.
-                    let iso_len = match std::fs::metadata(path) {
-                        Ok(m) => Some(m.len()),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
-                        Err(e) => return Err(Error::IoError { source: e }),
+                    let iso_len = match iso_len_from_metadata(std::fs::metadata(path))? {
+                        IsoLen::Missing => Some(0),
+                        IsoLen::Len(n) => Some(n),
                     };
                     let claims_progress = existing.stats().bytes_pending != existing.total_size();
                     if iso_len.is_some_and(|len| len < existing.total_size()) && claims_progress {
@@ -589,11 +656,7 @@ pub fn sweep(
         // can't be removed, open_or_create would load it and the new disc
         // would inherit the old Finished ranges → silently zero-filled ISO.
         // ENOENT is fine (nothing to remove); any other error aborts.
-        match std::fs::remove_file(&mapfile_path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(Error::IoError { source: e }),
-        }
+        stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
     }
     let mut map = mapfile::Mapfile::open_or_create(
         &mapfile_path,
@@ -633,10 +696,9 @@ pub fn sweep(
     // NotFound is the one error that genuinely means "no file yet" (the
     // fresh-rip case). Anything else is unknown, and destroying data on an
     // unknown is not a decision this code gets to make.
-    let existing_len = match std::fs::metadata(path) {
-        Ok(m) => Some(m.len()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(Error::IoError { source: e }),
+    let existing_len = match iso_len_from_metadata(std::fs::metadata(path))? {
+        IsoLen::Missing => None,
+        IsoLen::Len(n) => Some(n),
     };
     let (file, is_regular) = if resume && existing_len.is_some_and(|len| len > 0) {
         let f = std::fs::OpenOptions::new()
@@ -667,14 +729,7 @@ pub fn sweep(
     // thread.
     let file =
         libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
-    let mut batch: u16 = match opts.batch_sectors {
-        // A zero batch makes `block_bytes` 0 every iteration, so `pos` never
-        // advances and the producer spins forever emitting zero-length reads.
-        // Clamp rather than error: the caller asked for "as small as possible".
-        Some(b) => b.max(1),
-        None if opts.skip_on_error => ecc_sectors(disc.format),
-        None => DEFAULT_BATCH_SECTORS_OPTICAL,
-    };
+    let mut batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
     // AACS unit alignment for a DECRYPTING sweep. AACS aligned units are 3
     // sectors (6144 bytes); `decrypt_sectors` anchors units at buffer offset
@@ -1616,6 +1671,121 @@ mod tests {
         for pos in [0u64, 2048, 8192, 67_583] {
             assert_eq!(aacs_aligned_region_start(pos, false), pos);
         }
+    }
+}
+
+#[cfg(test)]
+mod resume_decision_tests {
+    use super::*;
+    use std::io::ErrorKind;
+
+    fn err(kind: ErrorKind) -> std::io::Result<std::fs::Metadata> {
+        Err(std::io::Error::from(kind))
+    }
+
+    /// NotFound is the only error that means "no file yet".
+    ///
+    /// Every other error is UNKNOWN, and the difference matters more than any
+    /// other line in this file: the two call sites use this to decide whether
+    /// to open the existing image or `File::create` over it. Answer "missing"
+    /// on a transient EIO from a flaky staging volume and a populated ISO is
+    /// truncated to zeros — bytes the mapfile still records `Finished`, which
+    /// the producer will therefore never re-read.
+    ///
+    /// Not reachable through a filesystem fixture: any path that makes
+    /// `metadata()` fail with something other than NotFound also makes the
+    /// immediately following `File::create` fail the same way, so the original
+    /// and a mutant both come back `Err` with the same errno. Hence the
+    /// decision is a function taking the `io::Result` directly.
+    #[test]
+    fn only_not_found_means_the_image_is_missing() {
+        assert_eq!(
+            iso_len_from_metadata(err(ErrorKind::NotFound)).unwrap(),
+            IsoLen::Missing
+        );
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+            ErrorKind::TimedOut,
+            ErrorKind::InvalidInput,
+        ] {
+            assert!(
+                iso_len_from_metadata(err(kind)).is_err(),
+                "{kind:?} is not evidence that the image is absent — it must \
+                 abort, not fall through to a truncating create"
+            );
+        }
+    }
+
+    /// And a real length comes through as itself, including zero.
+    #[test]
+    fn a_readable_image_reports_its_own_length() {
+        let dir = std::env::temp_dir().join(format!("fmkv-isolen-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let empty = dir.join("empty.iso");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            iso_len_from_metadata(std::fs::metadata(&empty)).unwrap(),
+            IsoLen::Len(0),
+            "an existing zero-length image is NOT the same as an absent one"
+        );
+
+        let full = dir.join("full.iso");
+        std::fs::write(&full, vec![0u8; 4096]).unwrap();
+        assert_eq!(
+            iso_len_from_metadata(std::fs::metadata(&full)).unwrap(),
+            IsoLen::Len(4096)
+        );
+        assert_eq!(
+            iso_len_from_metadata(std::fs::metadata(dir.join("nope.iso"))).unwrap(),
+            IsoLen::Missing
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale mapfile that will not delete must abort the fresh sweep.
+    #[test]
+    fn a_stale_mapfile_that_cannot_be_removed_aborts_the_fresh_sweep() {
+        assert!(stale_mapfile_removed(Ok(())).is_ok());
+        assert!(
+            stale_mapfile_removed(Err(std::io::Error::from(ErrorKind::NotFound))).is_ok(),
+            "already gone is the same as removed"
+        );
+        for kind in [ErrorKind::PermissionDenied, ErrorKind::Other] {
+            assert!(
+                stale_mapfile_removed(Err(std::io::Error::from(kind))).is_err(),
+                "{kind:?}: proceeding would inherit the previous disc's Finished \
+                 ranges and silently zero-fill the new ISO there"
+            );
+        }
+    }
+
+    /// The default batch size is a mode decision, not a constant.
+    #[test]
+    fn the_sweep_batch_defaults_by_mode_and_format() {
+        use libfreemkv::DiscFormat::*;
+
+        // skip-on-error (multipass Pass 1): one ECC block, so one skipped
+        // batch loses exactly one ECC block.
+        assert_eq!(sweep_batch_sectors(None, true, Uhd), 32);
+        assert_eq!(sweep_batch_sectors(None, true, BluRay), 32);
+        assert_eq!(sweep_batch_sectors(None, true, Dvd), 16);
+        assert_eq!(sweep_batch_sectors(None, true, HdDvd), 16);
+
+        // Clean sweep: the larger optical batch, regardless of format.
+        assert_eq!(sweep_batch_sectors(None, false, Uhd), 60);
+        assert_eq!(sweep_batch_sectors(None, false, Dvd), 60);
+
+        // An explicit request wins in either mode.
+        assert_eq!(sweep_batch_sectors(Some(7), true, Uhd), 7);
+        assert_eq!(sweep_batch_sectors(Some(7), false, Uhd), 7);
+
+        // Zero is clamped: a zero batch makes block_bytes zero, so `pos` never
+        // advances and the producer spins forever.
+        assert_eq!(sweep_batch_sectors(Some(0), true, Uhd), 1);
+        assert_eq!(sweep_batch_sectors(Some(0), false, Dvd), 1);
     }
 }
 
