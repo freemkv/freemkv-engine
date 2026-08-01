@@ -224,10 +224,20 @@ fn copy_raw_aacs_no_key_proceeds() {
 
         key_fetch: None,
     };
-    assert!(
-        freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).is_ok(),
-        "--raw copy of an encrypted disc must proceed (encrypted image is the goal)"
+    let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
+        .expect("--raw copy of an encrypted disc must proceed (the encrypted image is the goal)");
+    // The mirror of the blocked case above, which checks the ISO is EMPTY.
+    // `is_ok()` alone let a gate that over-fires into a silent no-op — return
+    // Ok having written nothing — pass as "proceeded". Proceeding means the
+    // whole image is on disk.
+    assert!(result.complete, "a clean raw copy completes");
+    let produced = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(
+        produced,
+        sectors as u64 * 2048,
+        "the full ciphertext image must be written"
     );
+    assert_eq!(result.bytes_good, sectors as u64 * 2048);
 }
 
 #[test]
@@ -250,12 +260,27 @@ fn sweep_to_dev_null_real() {
 
         key_fetch: None,
     };
-    let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts);
+    let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
+        .expect("sweep to /dev/null must not fail with ENODEV");
+    // `is_ok()` alone constrained nothing — the identical fixture on a regular
+    // file (`sweep_to_dev_null_no_enodev`) was upgraded past that and this one,
+    // the test that actually exercises the character-device destination, was
+    // left behind. A `copy` that returned Ok having read nothing passed it.
+    // The accounting must be the SAME as on a regular file: the sink swallows
+    // the bytes, it does not excuse the bookkeeping.
     assert!(
-        result.is_ok(),
-        "sweep to /dev/null should not fail with ENODEV: {:?}",
-        result.err()
+        !result.complete,
+        "a disc with unreadable sectors is not complete, sink notwithstanding"
     );
+    assert!(
+        result.bytes_unreadable + result.bytes_pending > 0,
+        "three dead sectors must be accounted for even when writing to /dev/null"
+    );
+    assert!(
+        result.bytes_good > 0,
+        "the readable 997 sectors must be counted as read"
+    );
+    assert_eq!(result.bytes_total, sectors as u64 * 2048);
 }
 
 /// End-to-end Pass-1 sweep against a synthetic `MockReader` with an injected
@@ -956,55 +981,79 @@ fn patch_dev_null_after_sweep() {
     );
 }
 
+/// A patch pass whose destination is the `/dev/null` sink resumes from the
+/// mapfile and recovers what the sweep could not.
+///
+/// This test used to sweep to a tempdir ISO and then "patch" `/dev/null`, which
+/// patched nothing: `Disc::mapfile_for` deliberately redirects a `/dev/null`
+/// destination to `$TMPDIR/<title>.mapfile`, so the second call never saw the
+/// mapfile the first one wrote — it was a fresh full sweep of a clean reader
+/// wearing a patch pass's name. Deleting the entire sweep half left it green,
+/// and its only assertion was `is_ok()`, which a `copy` that read nothing also
+/// satisfies. It also had no `CleanupGuard`, so it leaked that fixed temp path
+/// on every run AND could resume a previous run's leftovers.
+///
+/// Both calls now target `/dev/null`, so they share one mapfile and the second
+/// really is a patch pass over the first's damage.
 #[test]
 fn patch_dev_null_direct() {
-    let tmp = tempfile::tempdir().unwrap();
-    let iso_path = tmp.path().join("test.iso");
+    let dev_null = std::path::Path::new("/dev/null");
     let sectors: u32 = 500;
     let bad: std::collections::HashSet<u32> = [100u32, 200, 300].into_iter().collect();
+    let disc = make_test_disc(sectors, "T5");
+    // Own the shared temp mapfile path for the whole test: removed up front so
+    // a leftover from an earlier run cannot be resumed, and on the way out so
+    // this run leaves nothing behind.
+    let map_path = disc.mapfile_for(dev_null);
+    let _ = std::fs::remove_file(&map_path);
+    let _cleanup = CleanupGuard(map_path.clone());
+
+    let opts = || CopyOptions {
+        decrypt: false,
+        multipass: true,
+        progress: None,
+        halt: None,
+        vid: None,
+        unit_keys: Vec::new(),
+        key_fetch: None,
+    };
+
+    // Pass 1: three dead sectors, so the sweep leaves real damage behind.
     let mut reader = MockReader {
         total_sectors: sectors,
         bad_sectors: bad.clone(),
     };
-    let disc = make_test_disc(sectors, "T5");
+    let sweep = freemkv_engine::copy(&disc, &mut reader, dev_null, &opts())
+        .expect("a sweep to /dev/null must not fail with ENODEV");
+    assert!(
+        !sweep.complete,
+        "three dead sectors must leave the sweep incomplete"
+    );
+    assert!(
+        sweep.bytes_unreadable + sweep.bytes_pending > 0,
+        "the damage must reach the mapfile, or the patch below has nothing to do"
+    );
+    assert!(
+        map_path.exists(),
+        "a /dev/null destination still gets a mapfile, at {}",
+        map_path.display()
+    );
 
-    let sweep_opts = CopyOptions {
-        decrypt: false,
-        multipass: true,
-        progress: None,
-        halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
-    };
-    let _sweep_result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &sweep_opts).unwrap();
-
+    // Pass 2: the same disc on a drive that can now read everything. The patch
+    // resumes from that mapfile and must clear the damage.
     let mut reader2 = MockReader {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let patch_opts = CopyOptions {
-        decrypt: false,
-        multipass: true,
-        progress: None,
-        halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
-    };
-    let patch_result = freemkv_engine::copy(
-        &disc,
-        &mut reader2,
-        std::path::Path::new("/dev/null"),
-        &patch_opts,
-    );
+    let patched = freemkv_engine::copy(&disc, &mut reader2, dev_null, &opts())
+        .expect("a patch pass to /dev/null must not fail");
     assert!(
-        patch_result.is_ok(),
-        "patch to /dev/null should succeed: {:?}",
-        patch_result.err()
+        patched.complete,
+        "a healthy re-read must clear the damage: pending={} unreadable={}",
+        patched.bytes_pending, patched.bytes_unreadable
     );
+    assert_eq!(patched.bytes_unreadable, 0);
+    assert_eq!(patched.bytes_total, sectors as u64 * 2048);
 }
 
 /// Synthetic regression test for the 0.18 SweepSink + Pipeline
@@ -1371,16 +1420,7 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         reads: Arc::clone(&reads),
     };
     let reporter = CancelNow;
-    let popts = freemkv_engine::PatchOptions {
-        decrypt: false,
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: Some(&reporter),
-        halt: None,
-        key_fetch: None,
-    };
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None, None);
     let out = freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let n = reads.load(Ordering::Relaxed);
@@ -1420,16 +1460,7 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let popts = freemkv_engine::PatchOptions {
-        decrypt: false,
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: None,
-        halt: None,
-        key_fetch: None,
-    };
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let after = Mapfile::load(&mf_path).unwrap();
