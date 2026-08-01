@@ -74,7 +74,19 @@ pub fn copy(
         // inconsistency (see its inconsistent-resume guard); the dispatch
         // shortcut needs it too, or a rip reports a full disc of good bytes
         // having written nothing and the caller muxes from a missing file.
-        let iso_len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        //
+        // Classified by `iso_len_from_metadata`, NOT `unwrap_or(0)`. This was
+        // the third copy of that classification and the only one still
+        // unhardened, which made it the dangerous one: on a FINISHED rip — an
+        // all-Finished mapfile and an intact image — a transient EIO/ESTALE
+        // from the staging volume read as "zero bytes", failed
+        // `iso_is_intact`, and routed to a fresh `sweep_internal`, which
+        // removes the mapfile and `File::create`s the image. A stat blip
+        // destroyed a completed recovery and re-ripped the disc from LBA 0.
+        let iso_len = match iso_len_from_metadata(std::fs::metadata(path))? {
+            IsoLen::Missing => 0,
+            IsoLen::Len(n) => n,
+        };
         let iso_is_intact = iso_len == disc_size;
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && !iso_is_intact {
             // Complete mapfile, but the image it describes is gone or short.
@@ -409,6 +421,23 @@ pub(crate) fn iso_len_from_metadata(m: std::io::Result<std::fs::Metadata>) -> Re
 /// `Finished` ranges, so the producer skips them and the ISO is silently
 /// zero-filled there. `NotFound` means it was already gone, which is fine;
 /// anything else must abort rather than inherit.
+/// Whether the output is a REGULAR FILE, and therefore whether a `sync_all`
+/// failure on it is a real error and whether it should be pre-sized.
+///
+/// `/dev/null` and pipes answer their metadata successfully and report
+/// not-a-file, so they map to `false` correctly and always did. The default
+/// only fires when the `metadata` call ITSELF fails — a transient NFS ESTALE
+/// on the staging volume — and there the two copies of this decision had
+/// drifted to OPPOSITE answers: `patch` defaulted to `true` and argued in its
+/// comment that surfacing the error is the right side for a data-integrity
+/// guard, while `sweep` defaulted to `false`, which silently skipped the
+/// pre-size AND made `SweepSink::close` swallow a genuine `sync_all` failure
+/// on the just-written image — the exact two failures the comment above
+/// sweep's call site says must not happen. Unified on `patch`'s answer.
+pub(crate) fn output_is_regular(m: std::io::Result<std::fs::Metadata>) -> bool {
+    m.map(|md| md.file_type().is_file()).unwrap_or(true)
+}
+
 pub(crate) fn stale_mapfile_removed(r: std::io::Result<()>) -> Result<()> {
     match r {
         Ok(()) => Ok(()),
@@ -618,17 +647,20 @@ pub fn sweep(
                     // A metadata ERROR is likewise not a length. Treating it
                     // as 0 silently threw away a good resume and re-ripped
                     // hours of work on a transient stat failure.
+                    // Missing counts as zero here: an absent image is as
+                    // inconsistent with a mapfile claiming progress as an
+                    // empty one, and both self-heal the same way.
                     let iso_len = match iso_len_from_metadata(std::fs::metadata(path))? {
-                        IsoLen::Missing => Some(0),
-                        IsoLen::Len(n) => Some(n),
+                        IsoLen::Missing => 0,
+                        IsoLen::Len(n) => n,
                     };
                     let claims_progress = existing.stats().bytes_pending != existing.total_size();
-                    if iso_len.is_some_and(|len| len < existing.total_size()) && claims_progress {
+                    if iso_len < existing.total_size() && claims_progress {
                         tracing::info!(
                             "sweep: mapfile claims prior progress (pending {} of {}) but the ISO is {} of {} bytes; forcing fresh sweep",
                             existing.stats().bytes_pending,
                             existing.total_size(),
-                            iso_len.unwrap_or(0),
+                            iso_len,
                             existing.total_size(),
                         );
                         resume = false;
@@ -705,17 +737,11 @@ pub fn sweep(
             .write(true)
             .open(path)
             .map_err(|e| Error::IoError { source: e })?;
-        let reg = f
-            .metadata()
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
+        let reg = output_is_regular(f.metadata());
         (f, reg)
     } else {
         let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
-        let reg = f
-            .metadata()
-            .map(|m| m.file_type().is_file())
-            .unwrap_or(false);
+        let reg = output_is_regular(f.metadata());
         if reg {
             f.set_len(total_bytes)
                 .map_err(|e| Error::IoError { source: e })?;

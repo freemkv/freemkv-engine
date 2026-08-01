@@ -855,6 +855,18 @@ impl SectionHandler for CachePrime {
     }
 }
 
+/// Is the sector ABOVE `pos` still inside the disc?
+///
+/// `capacity_sectors` is `0` when the source does not know its own size (the
+/// trait default), and an unknown size is not permission to invent a bound —
+/// in that case the prime goes ahead exactly as it always did.
+fn prime_above_is_in_range(pos: u64, capacity_sectors: u32) -> bool {
+    if capacity_sectors == 0 {
+        return true;
+    }
+    (pos / SECTOR) + 1 < capacity_sectors as u64
+}
+
 /// Oscillate — read each residual sector by ALTERNATING approach: forward-into
 /// (prime from the sector below, then read) and reverse-into (prime from the
 /// sector above, then read). *Failure mode:* direction-dependent tracking — a
@@ -907,7 +919,20 @@ impl SectionHandler for Oscillate {
                 };
                 // Reverse-into: prime from the sector above, then read the target
                 // (the head approaches from a higher LBA).
-                if !recovered {
+                //
+                // Bounded at the top of the image, mirroring the `pos >= SECTOR`
+                // guard on the forward-into prime above. Unbounded, a residual
+                // sector in the LAST sector of the disc primed from
+                // `capacity_sectors` — one past the end. A real drive answers
+                // that with ILLEGAL REQUEST, which is a wedge-family sense, so
+                // `read_span` feeds it into `wedge_streak` and the pass can
+                // abort on a firmware wedge the engine manufactured; a
+                // file-backed source (ISO re-recovery) answers with an IO error,
+                // which `is_scsi_transport_failure` reports as true, so the
+                // handler returns `TransportFault` and kills the pass outright.
+                // Skipping the prime just means this one sector gets the
+                // forward-into attempt only.
+                if !recovered && prime_above_is_in_range(pos, ctx.reader.capacity_sectors()) {
                     if let ReadHit::Transport =
                         read_span(ctx, &mut probe, pos + SECTOR, 1, self.params)
                     {
@@ -1142,6 +1167,13 @@ mod tests {
         /// LBA of the last sector physically accessed (success or fail) — the
         /// approach-direction / priming signal the specialists drive.
         last_lba: Option<u32>,
+        /// Disc capacity in sectors, or 0 for "unknown" (the trait default, and
+        /// what every pre-existing test here uses).
+        capacity: u32,
+        /// Reads that asked for an LBA at or past `capacity`. A real drive
+        /// answers those with ILLEGAL REQUEST — a wedge-family sense — so a
+        /// handler that issues one is feeding its own wedge detector.
+        past_end: Arc<AtomicU64>,
     }
 
     impl SectorSource for FakeDisc {
@@ -1156,6 +1188,10 @@ mod tests {
             self.read_sectors_fua(lba, count, buf, recovery, false)
         }
 
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+
         fn read_sectors_fua(
             &mut self,
             lba: u32,
@@ -1165,6 +1201,9 @@ mod tests {
             fua: bool,
         ) -> Result<usize> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            if self.capacity != 0 && lba + count as u32 > self.capacity {
+                self.past_end.fetch_add(1, Ordering::Relaxed);
+            }
             self.clock_nanos
                 .fetch_add(self.per_read.as_nanos() as u64, Ordering::Relaxed);
             // The head moved across this span; record where it ended so the NEXT
@@ -1290,6 +1329,8 @@ mod tests {
                 dir_reverse_only: HashSet::new(),
                 prime_only: HashSet::new(),
                 last_lba: None,
+                capacity: 0,
+                past_end: Arc::new(AtomicU64::new(0)),
             };
             (
                 Harness {
@@ -2088,6 +2129,62 @@ mod tests {
             "Oscillate must recover the direction-dependent sector"
         );
         assert_eq!(sink.got.get(&(13 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    /// Oscillate must not prime from past the end of the disc.
+    ///
+    /// The reverse-into approach reads the sector ABOVE the target first. For a
+    /// residual sector in the LAST sector of the image that is `capacity_sectors`
+    /// — one past the end. A drive answers ILLEGAL REQUEST, which is a
+    /// wedge-family sense, so the read lands in `wedge_streak` and the pass can
+    /// abort on a wedge that never happened; a file-backed source answers with
+    /// an IO error, which reads as a transport failure and kills the pass
+    /// outright. The forward-into prime has had the symmetric `pos >= SECTOR`
+    /// guard all along.
+    #[test]
+    fn oscillate_does_not_prime_past_the_end_of_the_disc() {
+        const CAP: u32 = 20;
+        let (h, disc) = Harness::build(&[CAP - 1], None, Duration::from_millis(1));
+        let mut disc = disc;
+        disc.capacity = CAP;
+        let past_end = disc.past_end.clone();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        // The residual sector is the very last one on the disc.
+        let mut bad = SubRanges::from_section((CAP as u64 - 1) * SECTOR, SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        let out = Oscillate {
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+
+        assert_eq!(
+            out,
+            HandlerOutcome::Remaining,
+            "the sector is genuinely dead"
+        );
+        assert_eq!(
+            past_end.load(Ordering::Relaxed),
+            0,
+            "Oscillate asked the drive for a sector past the last LBA — that \
+             comes back ILLEGAL REQUEST and feeds the wedge detector"
+        );
+    }
+
+    /// ...and a source that does NOT know its capacity still gets the prime.
+    #[test]
+    fn oscillate_still_primes_from_above_when_the_capacity_is_unknown() {
+        assert!(
+            prime_above_is_in_range(19 * SECTOR, 0),
+            "an unknown capacity is not permission to invent a bound"
+        );
+        assert!(prime_above_is_in_range(18 * SECTOR, 20));
+        assert!(
+            !prime_above_is_in_range(19 * SECTOR, 20),
+            "the last sector of a 20-sector disc has nothing above it"
+        );
     }
 
     #[test]

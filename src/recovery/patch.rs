@@ -405,9 +405,7 @@ pub(super) fn compute_initial_state(
     // `false`); only a genuine metadata error (e.g. transient NFS ESTALE) hits
     // the default, and for a data-integrity guard "surface the error" is the
     // right side to err on.
-    let is_regular = std::fs::metadata(path)
-        .map(|m| m.file_type().is_file())
-        .unwrap_or(true);
+    let is_regular = super::output_is_regular(std::fs::metadata(path));
     Ok((
         map,
         initial_stats,

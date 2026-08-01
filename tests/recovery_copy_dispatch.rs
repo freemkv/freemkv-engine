@@ -111,6 +111,11 @@ fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
     }
 }
 
+/// A multipass copy over a damaged region completes rather than erroring.
+///
+/// (Historic name: this once wrote to `/dev/null`, which returned ENODEV from
+/// `set_len`. It writes to a regular file now — `sweep_to_dev_null_real` below
+/// is the one that still exercises the character-device path.)
 #[test]
 fn sweep_to_dev_null_no_enodev() {
     let tmp = tempfile::tempdir().unwrap();
@@ -132,12 +137,23 @@ fn sweep_to_dev_null_no_enodev() {
 
         key_fetch: None,
     };
-    let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
+    let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
+        .expect("a multipass copy over bad sectors is a reported result, not an Err");
+    // `is_ok()` alone constrained nothing. Three bad sectors must show up as
+    // damage and the rip must not claim to be complete.
     assert!(
-        result.is_ok(),
-        "sweep to regular file should succeed: {:?}",
-        result.err()
+        !result.complete,
+        "a disc with unreadable sectors is not complete"
     );
+    assert!(
+        result.bytes_unreadable + result.bytes_pending > 0,
+        "three dead sectors must be accounted for somewhere"
+    );
+    assert!(
+        result.bytes_good > 0,
+        "the readable 997 sectors must be recovered"
+    );
+    assert_eq!(result.bytes_total, sectors as u64 * 2048);
 }
 
 /// disc→ISO correctness gate (the headline bug, at the copy entry point):
@@ -750,12 +766,20 @@ fn resume_sweeps_nontried_tail_even_with_retryable_present() {
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
     assert!(result.is_ok(), "resume copy failed: {:?}", result.err());
 
-    // The un-swept tail [150..200) MUST have been read by the resume sweep.
+    // The un-swept tail [150..200) MUST have been read by the resume sweep —
+    // ALL of it. `.any()` here accepted one sector of fifty, which is the
+    // shape of a resume that starts the tail and stops.
     let got = reads.lock().unwrap();
-    let tail_read = (150u32..200).any(|lba| got.contains(&lba));
+    let missed: Vec<u32> = (150u32..200).filter(|lba| !got.contains(lba)).collect();
     assert!(
-        tail_read,
-        "resume must sweep the NonTried tail; tail sectors were never read"
+        missed.is_empty(),
+        "resume must sweep the WHOLE NonTried tail; these sectors were never read: {missed:?}"
+    );
+    // And it must not have re-read the Finished prefix.
+    let refetched: Vec<u32> = (0u32..100).filter(|lba| got.contains(lba)).collect();
+    assert!(
+        refetched.is_empty(),
+        "the Finished prefix must not be re-read on a resume: {refetched:?}"
     );
 }
 
@@ -1417,6 +1441,24 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
         );
         assert_eq!(size % 2048, 0, "Finished record has sub-sector size {size}");
     }
+    // ...and the unaligned range must actually have been PROCESSED. The
+    // alignment loop above is vacuously satisfied by the pre-existing aligned
+    // prefix, so without this the test passed even if patch touched nothing.
+    let recovered = after.ranges_with(&[SectorStatus::Finished]);
+    assert!(
+        recovered
+            .iter()
+            .any(|&(pos, size)| pos <= 100 * 2048 + 512 && pos + size >= 100 * 2048 + 512 + 1024),
+        "the unaligned NonTrimmed range was never recovered — the alignment \
+         assertions above only saw the pre-existing prefix: {recovered:?}"
+    );
+    // And the payload landed at the SNAPPED offset, not the raw byte offset:
+    // a shifted write keeps the record aligned while putting bytes at 205312.
+    let img = std::fs::read(&iso_path).unwrap();
+    assert!(
+        img[100 * 2048..101 * 2048].iter().any(|&b| b != 0),
+        "the recovered sector is still all zeros — the write went somewhere else"
+    );
 }
 
 /// A disc that reports itself encrypted but resolved NO cipher state at all
@@ -1824,7 +1866,13 @@ fn a_fresh_sweep_truncates_the_image_left_by_a_previous_run() {
         halt: Some(halt.clone()),
         ..plain_sweep_opts(false, true)
     };
-    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("fresh sweep");
+    let r = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("fresh sweep");
+    assert!(
+        r.halted,
+        "the premise of this test is a region the sweep never reaches — if it \
+         ran to completion every byte was rewritten and the assertion below is \
+         vacuous"
+    );
 
     let after = std::fs::read(&iso_path).expect("read iso");
     assert_eq!(
@@ -2096,10 +2144,11 @@ fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
         .iter()
         .filter(|e| matches!(e, DriveEvent::Read { ok: true, .. }))
         .count();
-    assert!(
-        good_between >= 16,
-        "full speed came back after only {good_between} clean batches — the \
-         exit threshold is 16 consecutive good reads"
+    assert_eq!(
+        good_between, 16,
+        "the exit threshold is exactly 16 consecutive clean batches; a lower \
+         count means the hysteresis was skipped and the drive will oscillate \
+         across a damaged region, a higher one means it stayed slow too long"
     );
 }
 

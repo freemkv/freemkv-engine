@@ -229,9 +229,14 @@ fn test_disc_copy_progress_callback_fires() {
 
 #[test]
 fn test_halt_aborts_disc_copy_promptly() {
-    // 6000 sectors, 60-sector batches → 100 read_sectors() calls.
-    // 10 ms sleep per call → ~1 s total without halt.
-    let capacity_sectors: u32 = 6000;
+    // 60,000 sectors, 60-sector batches → 1000 read_sectors() calls at 10 ms
+    // each, so ~10 s if the halt is never observed. The disc has to be this
+    // large for the assertion to mean anything: at the original 6000 sectors
+    // the UN-halted run took ~1 s and the 2 s bound below could not tell a
+    // prompt halt from no halt polling at all — make the poll fire once per N
+    // batches instead of every batch and the copy ran to completion, still
+    // reported halted, and still landed inside the bound.
+    let capacity_sectors: u32 = 60_000;
     let mut reader = SlowZeroSectorReader::new(capacity_sectors, Duration::from_millis(10));
     let disc = synthetic_disc(capacity_sectors);
 
@@ -258,7 +263,8 @@ fn test_halt_aborts_disc_copy_promptly() {
     std::thread::sleep(Duration::from_millis(200));
     halt.store(true, Ordering::Relaxed);
 
-    // Bound the join: should exit far before the full 1 s otherwise needed.
+    // Bound the join: 2 s against a ~10 s un-halted runtime, so only a halt
+    // that is actually polled per batch can satisfy it.
     let started = Instant::now();
     let mut joined = None;
     while started.elapsed() < Duration::from_millis(2000) {
@@ -285,7 +291,8 @@ fn test_halt_aborts_disc_copy_promptly() {
     );
     assert!(
         elapsed < Duration::from_millis(2000),
-        "copy thread exit elapsed {elapsed:?} exceeded 2s"
+        "copy thread exit elapsed {elapsed:?} exceeded 2s — the un-halted run of \
+         this fixture is ~10s, so this is the halt not being polled"
     );
 }
 
