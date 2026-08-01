@@ -244,6 +244,61 @@ mod tests {
         AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, Stream, SubtitleStream,
     };
 
+    /// The 639-2/B codes the table claims to cover. Inputs only — the mapping
+    /// itself is never restated here, or this would be a second copy of the
+    /// table that agrees with any edit to it.
+    const BIB_CODES: [&str; 20] = [
+        "alb", "arm", "baq", "bur", "cze", "chi", "dut", "fre", "geo", "ger", "gre", "ice", "mac",
+        "mao", "may", "per", "rum", "slo", "tib", "wel",
+    ];
+
+    /// Discs label tracks with bibliographic codes (`ger`, `fre`, `chi`) as
+    /// often as terminologic ones, so `-a ger` has to reach a German track.
+    /// Only `fre` was covered: every other arm could be deleted and the suite
+    /// stayed green, which is a track the user asked for silently not matching.
+    ///
+    /// `isolang` is the oracle rather than a restated mapping — the property is
+    /// that a bibliographic tag and the /T form the table sends it to name the
+    /// SAME language.
+    #[test]
+    fn every_bibliographic_code_resolves_to_its_terminologic_language() {
+        for bib in BIB_CODES {
+            let via_bib =
+                normalize_lang(bib).unwrap_or_else(|| panic!("{bib}: no language resolved"));
+            let term = bib_to_terminologic(bib)
+                .unwrap_or_else(|| panic!("{bib}: not in the /B → /T table"));
+            let via_term = Language::from_639_3(term)
+                .unwrap_or_else(|| panic!("{bib} → {term}: not a 639-3 code"));
+            assert_eq!(
+                via_bib, via_term,
+                "{bib} resolved to {via_bib:?} but its /T form {term} is {via_term:?}"
+            );
+        }
+    }
+
+    /// Each arm has to be load-bearing. `normalize_lang` tries `from_639_3`
+    /// BEFORE the table, so an entry `isolang` already resolves on its own is
+    /// unreachable — and a table with dead rows in it is a table nobody can
+    /// tell is still correct.
+    #[test]
+    fn no_bibliographic_arm_is_dead() {
+        for bib in BIB_CODES {
+            assert!(
+                Language::from_639_1(bib).is_none() && Language::from_639_3(bib).is_none(),
+                "{bib} resolves without the table — its arm is unreachable"
+            );
+        }
+    }
+
+    /// The negative side: an unknown three-letter tag must stay unresolved
+    /// rather than fall through to some other language.
+    #[test]
+    fn unknown_three_letter_tags_do_not_resolve() {
+        for tag in ["zzz", "qqq", "xyz"] {
+            assert!(normalize_lang(tag).is_none(), "{tag} unexpectedly resolved");
+        }
+    }
+
     fn audio(pid: u16, lang: &str) -> Stream {
         Stream::Audio(AudioStream {
             pid,
