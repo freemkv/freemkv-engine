@@ -242,3 +242,63 @@ jobs:
           workspaces: freemkv-engine
       - run: cargo build --tests
         working-directory: freemkv-engine
+
+  # ── Did this change break the front-ends? ───────────────────────────────────
+  #
+  # Every other job here proves the ENGINE still builds. None of them proves
+  # its CONSUMERS do, and that gap is not theoretical: a signature change to
+  # `end_of_recovery_promotion` landed at 22:37 and broke autorip, whose last
+  # CI run had been at 21:06. Nothing rebuilt autorip against the new engine,
+  # so the breakage sat undetected — consumer CI only fires on a push to that
+  # consumer, and nobody had pushed one.
+  #
+  # Making each repo build its own branch tip fixed the first version of this
+  # problem; this fixes the same blind spot one level up, at the seam between
+  # repos. The library is the thing that changed, so the library is where the
+  # question gets asked.
+  #
+  # `cargo check --all-targets` rather than a full test run: the consumers have
+  # their own CI for their own behaviour. What is being answered here is only
+  # "does everything that depends on me still compile against this commit",
+  # which is exactly the failure that went unnoticed.
+  consumers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: freemkv-engine
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/libfreemkv, ref: dev, path: libfreemkv }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-keysources, ref: dev, path: freemkv-keysources }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-unlock, ref: dev, path: freemkv-unlock }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv-i18n, ref: dev, path: freemkv-i18n }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/freemkv, ref: dev, path: freemkv }
+      - uses: actions/checkout@v5
+        with: { repository: freemkv/autorip, ref: dev, path: autorip }
+      - name: Point both consumers at THIS engine commit
+        shell: bash
+        run: |
+          for c in freemkv autorip; do
+            mkdir -p "$c/.cargo"
+            cat > "$c/.cargo/config.toml" <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          freemkv-engine = { path = "../freemkv-engine" }
+          freemkv-i18n = { path = "../freemkv-i18n" }
+          EOF
+          done
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            freemkv
+            autorip
+      - run: cargo check --all-targets
+        working-directory: freemkv
+      - run: cargo check --all-targets
+        working-directory: autorip
