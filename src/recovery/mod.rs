@@ -202,6 +202,83 @@ pub fn copy(
     sweep_internal(disc, reader, path, opts, false)
 }
 
+/// Sectors in one AACS aligned unit (6144 bytes = 3 sectors).
+const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16;
+
+/// Round a sweep's batch size up to a whole number of AACS aligned units.
+///
+/// `decrypt_sectors` anchors units at buffer offset 0, so every read handed to
+/// the decrypting reader must span a whole number of units — otherwise units
+/// straddle batch boundaries, decrypt under the wrong unit alignment, and the
+/// verify gate either leaves the content encrypted or aborts `DecryptFailed`.
+/// `ecc_sectors()` is 32 for UHD/BD and 32 is not a multiple of 3, so without
+/// this every batch after the first would start mid-unit.
+///
+/// Pure and separate from [`sweep_internal`] because it is a real decision with
+/// a real failure mode, and inside a function that needs a live drive nothing
+/// could reach it: the mutation run replaced the `-` with `+` and the `%` with
+/// `/` here and the suite stayed green either way.
+pub(crate) fn aacs_aligned_batch(batch: u16, decrypt_is_aacs: bool) -> u16 {
+    if decrypt_is_aacs && !batch.is_multiple_of(UNIT_SECTORS) {
+        return batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
+    }
+    batch
+}
+
+#[cfg(test)]
+mod aacs_aligned_batch_tests {
+    use super::{UNIT_SECTORS, aacs_aligned_batch};
+
+    /// The case that actually happens: BD/UHD ecc_sectors() is 32.
+    #[test]
+    fn rounds_the_real_bd_batch_up_to_a_unit_boundary() {
+        assert_eq!(aacs_aligned_batch(32, true), 33);
+    }
+
+    /// Rounding UP, never down and never over a whole extra unit.
+    #[test]
+    fn result_is_the_next_multiple_of_a_unit() {
+        for batch in 1u16..=256 {
+            let aligned = aacs_aligned_batch(batch, true);
+            assert!(aligned >= batch, "{batch} rounded down to {aligned}");
+            assert!(
+                aligned.is_multiple_of(UNIT_SECTORS),
+                "{batch} → {aligned}, not a whole number of units"
+            );
+            assert!(
+                aligned - batch < UNIT_SECTORS,
+                "{batch} → {aligned} overshot by a whole unit or more"
+            );
+        }
+    }
+
+    /// Already aligned means untouched — a `+` in place of the `-` would push
+    /// an aligned batch off the boundary it is already on.
+    #[test]
+    fn an_aligned_batch_is_left_alone() {
+        for batch in [3u16, 33, 96, 300] {
+            assert_eq!(aacs_aligned_batch(batch, true), batch);
+        }
+    }
+
+    /// A non-AACS sweep has no unit geometry to respect; the batch is the
+    /// drive's ECC size and must not be altered.
+    #[test]
+    fn a_non_aacs_sweep_keeps_its_batch() {
+        for batch in [1u16, 32, 64, 65535] {
+            assert_eq!(aacs_aligned_batch(batch, false), batch);
+        }
+    }
+
+    /// Saturating, not wrapping: a batch near u16::MAX must not wrap to a tiny
+    /// read.
+    #[test]
+    fn near_max_saturates_instead_of_wrapping() {
+        let aligned = aacs_aligned_batch(u16::MAX - 1, true);
+        assert!(aligned >= u16::MAX - 1, "wrapped to {aligned}");
+    }
+}
+
 fn sweep_internal(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
@@ -518,10 +595,7 @@ pub fn sweep(
     // decrypts and is AACS-keyed. Region read-starts are aligned DOWN to a
     // unit boundary in the loop below; a fresh sweep starts at LBA 0 (already
     // aligned), so alignment only bites on resume NonTried regions.
-    const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16; // 3
-    if decrypt_is_aacs && !batch.is_multiple_of(UNIT_SECTORS) {
-        batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
-    }
+    batch = aacs_aligned_batch(batch, decrypt_is_aacs);
 
     // Pre-compute the list of NonTried regions before handing the
     // mapfile to the consumer thread. Each region is processed by
