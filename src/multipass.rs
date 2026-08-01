@@ -946,6 +946,87 @@ mod tests {
         assert!(!loss_is_unscopable(false, &t, &[(0, 4096)]));
     }
 
+    /// `main_title_lost_ms`'s bitrate guard, pinned in every direction.
+    ///
+    /// The mutation run flipped `t.size_bytes > 0 && t.duration_secs > 0.0` to
+    /// `true`, to `||`, and each `>` to `>=`, and the suite stayed green — so
+    /// nothing constrained the difference between "quantify it" and "admit we
+    /// cannot". Getting that wrong in the permissive direction divides by zero
+    /// and yields inf or NaN by accident rather than by decision.
+    #[test]
+    fn lost_ms_needs_both_a_size_and_a_duration() {
+        let damage = 4096u64;
+
+        // Both present -> a real number.
+        let mut ok = libfreemkv::DiscTitle::empty();
+        ok.size_bytes = 1_000_000;
+        ok.duration_secs = 100.0;
+        let ms = main_title_lost_ms(&disc_with(vec![ok]), damage);
+        assert!(
+            ms.is_finite() && ms > 0.0,
+            "expected a real figure, got {ms}"
+        );
+
+        // Size alone, duration alone, and neither: all unquantifiable. `||`
+        // would let the first two through; `true` would let all three.
+        let mut size_only = libfreemkv::DiscTitle::empty();
+        size_only.size_bytes = 1_000_000;
+        let mut dur_only = libfreemkv::DiscTitle::empty();
+        dur_only.duration_secs = 100.0;
+        for (name, t) in [
+            ("size only", size_only),
+            ("duration only", dur_only),
+            ("neither", libfreemkv::DiscTitle::empty()),
+        ] {
+            let ms = main_title_lost_ms(&disc_with(vec![t]), damage);
+            assert!(ms.is_nan(), "{name}: expected NaN, got {ms}");
+        }
+
+        // Exactly zero is NOT usable — `>=` would admit it and divide by zero.
+        let mut zero_size = libfreemkv::DiscTitle::empty();
+        zero_size.size_bytes = 0;
+        zero_size.duration_secs = 100.0;
+        assert!(main_title_lost_ms(&disc_with(vec![zero_size]), damage).is_nan());
+
+        let mut zero_dur = libfreemkv::DiscTitle::empty();
+        zero_dur.size_bytes = 1_000_000;
+        zero_dur.duration_secs = 0.0;
+        assert!(main_title_lost_ms(&disc_with(vec![zero_dur]), damage).is_nan());
+
+        // No titles at all.
+        assert!(main_title_lost_ms(&disc_with(vec![]), damage).is_nan());
+        // And no damage is genuinely zero regardless of the title.
+        assert_eq!(main_title_lost_ms(&disc_with(vec![]), 0), 0.0);
+    }
+
+    /// `abort_lost_ms`'s arithmetic, pinned so the operators cannot drift.
+    /// The run mutated `/` to `*`/`%` and `*` to `+`/`/` in the conversion and
+    /// nothing failed — the ms figure feeds the abort gate, so a wrong operator
+    /// is a wrong abort decision.
+    #[test]
+    fn abort_lost_ms_converts_bytes_to_milliseconds_exactly() {
+        let mut t = test_title(0, 100);
+        t.size_bytes = 1_000_000;
+        t.duration_secs = 100.0;
+        // Whole-disc scope so the figure is the bad-byte sum, not extent-scoped.
+        // 2 MB at 1 MB/s = 2 s = 2000 ms.
+        let ms = abort_lost_ms(true, &t, &[(0, 2_000_000)], 1_000_000.0);
+        assert!((ms - 2_000.0).abs() < 1e-6, "expected 2000 ms, got {ms}");
+        // Halving the rate doubles the time — pins the division, not just the
+        // magnitude.
+        let ms_slow = abort_lost_ms(true, &t, &[(0, 2_000_000)], 500_000.0);
+        assert!(
+            (ms_slow - 4_000.0).abs() < 1e-6,
+            "expected 4000 ms, got {ms_slow}"
+        );
+        // Doubling the bytes doubles the time — pins the multiplication.
+        let ms_more = abort_lost_ms(true, &t, &[(0, 4_000_000)], 1_000_000.0);
+        assert!(
+            (ms_more - 4_000.0).abs() < 1e-6,
+            "expected 4000 ms, got {ms_more}"
+        );
+    }
+
     #[test]
     fn classify_damage_tiers() {
         use crate::DamageSeverity::*;

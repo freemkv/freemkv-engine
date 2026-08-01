@@ -244,6 +244,79 @@ pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) 
 }
 
 #[cfg(test)]
+mod sleep_secs_or_halt_tests {
+    use super::sleep_secs_or_halt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// The pause must actually happen. The mutation run replaced this whole
+    /// function with `()` and the suite stayed green — so the wedge-avoidance
+    /// inter-error pause, the thing that stops a damaged disc being hammered,
+    /// was unconstrained. Same for mutating the loop condition to `==` or `>`,
+    /// both of which make the loop body unreachable.
+    #[test]
+    fn it_actually_sleeps_when_not_halted() {
+        let halt = Arc::new(AtomicBool::new(false));
+        let t0 = Instant::now();
+        sleep_secs_or_halt(1, Some(&halt));
+        let e = t0.elapsed();
+        // Generous lower bound: the point is "roughly a second", not precision.
+        assert!(
+            e >= Duration::from_millis(800),
+            "returned after {e:?} — the sleep did not happen"
+        );
+    }
+
+    /// And it must break out early when halt is already set, rather than
+    /// serving the full pause. This is the difference between Stop being
+    /// honoured and the operator waiting out a multi-second cooldown.
+    #[test]
+    fn an_already_set_halt_returns_promptly() {
+        let halt = Arc::new(AtomicBool::new(true));
+        let t0 = Instant::now();
+        sleep_secs_or_halt(30, Some(&halt));
+        let e = t0.elapsed();
+        assert!(
+            e < Duration::from_millis(500),
+            "waited {e:?} on an already-halted sleep"
+        );
+    }
+
+    /// A halt raised WHILE the pause is in progress must also cut it short —
+    /// the polling loop, not just the entry check.
+    #[test]
+    fn a_halt_raised_mid_sleep_cuts_it_short() {
+        let halt = Arc::new(AtomicBool::new(false));
+        let h = halt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            h.store(true, Ordering::Relaxed);
+        });
+        let t0 = Instant::now();
+        sleep_secs_or_halt(30, Some(&halt));
+        let e = t0.elapsed();
+        assert!(
+            e < Duration::from_secs(3),
+            "waited {e:?} — the loop did not observe the halt"
+        );
+        assert!(
+            e >= Duration::from_millis(150),
+            "returned in {e:?} — suspiciously early, did it sleep at all?"
+        );
+    }
+
+    /// Zero seconds is a no-op either way; pinned so the early return cannot
+    /// silently become a real sleep.
+    #[test]
+    fn zero_seconds_returns_immediately() {
+        let t0 = Instant::now();
+        sleep_secs_or_halt(0, None);
+        assert!(t0.elapsed() < Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
 mod aacs_aligned_batch_tests {
     use super::{UNIT_SECTORS, aacs_aligned_batch};
 
