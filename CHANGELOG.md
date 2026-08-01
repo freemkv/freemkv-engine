@@ -16,7 +16,7 @@ the consumers.
 
 - **Recovery strategy**, relocated from libfreemkv: the sweep and patch passes,
   the retry-decision state machine, mapfile bookkeeping, damage classification,
-  and the multipass sweep → patch → abort-on-loss loop (`run_multipass`, with
+  and the multipass sweep → patch → abort-on-loss loop (`multipass_rip`, with
   the `abort_on_lost_secs` gate).
 - **Rip orchestration**: `run_titles` / `decide_title` (the single multi-title
   loop policy — fail-fast on a disc-level no-key, Ctrl-C = full stop, skip an
