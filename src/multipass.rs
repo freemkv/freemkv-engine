@@ -367,6 +367,19 @@ fn multipass_rip_inner(
     halt: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> crate::Result<MultipassResult> {
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
+
+    // Multipass implies raw — but the test is the RESOLVED PLAN, not the
+    // entry point. `max_passes: 0` selects the single-pass branch below, which
+    // is an ordinary decrypting `copy` dispatch and must stay allowed;
+    // refusing on `!job.raw` here would have broken it. Only a real
+    // sweep-plus-patch plan is a whole-disc image recovery that cannot
+    // decrypt.
+    //
+    // Enforced here as well as in `preflight` because preflight is advisory by
+    // contract (callable without executing) and a front-end may skip it.
+    if plan.multipass && !job.raw {
+        return Err(crate::run::multipass_requires_raw());
+    }
     let empty_title = libfreemkv::DiscTitle::empty();
     let main_title = disc.titles.first().unwrap_or(&empty_title);
     let vid = disc.aacs.as_ref().map(|a| a.volume_id);
@@ -1053,7 +1066,10 @@ mod tests {
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = ZeroReader { capacity: sectors };
-        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Multipass implies raw (enforced in `multipass_rip`); a multipass
+        // fixture must say so.
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
         let opts = MultipassOpts {
             max_passes: 5,
             abort_on_lost_secs: 0,
@@ -1099,7 +1115,10 @@ mod tests {
                 attempts: 0,
             }],
         };
-        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Multipass implies raw (enforced in `multipass_rip`); a multipass
+        // fixture must say so.
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
         let opts = MultipassOpts {
             max_passes: 5,
             abort_on_lost_secs: 0,
@@ -1144,7 +1163,10 @@ mod tests {
                 attempts: 0,
             }],
         };
-        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Multipass implies raw (enforced in `multipass_rip`); a multipass
+        // fixture must say so.
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
         let opts = MultipassOpts {
             max_passes: 5,
             abort_on_lost_secs: 0,
@@ -1211,7 +1233,9 @@ mod tests {
                 },
             ],
         };
-        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        // Multipass implies raw (enforced in `multipass_rip`).
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
         let opts = MultipassOpts {
             max_passes: 1,
             abort_on_lost_secs: 0,
@@ -1253,7 +1277,9 @@ mod tests {
         let title = test_title(0, 2_000); // extents [0, 2000)
         let bad_lba = 50_000; // outside the title's extents
         let sectors = 200_000u32;
-        let job = Job::new("disc:///dev/null", "placeholder");
+        // Multipass implies raw (enforced in `multipass_rip`).
+        let mut job = Job::new("disc:///dev/null", "placeholder");
+        job.raw = true;
 
         // MKV/M2TS scope: out-of-title damage doesn't earn a retry pass.
         {
