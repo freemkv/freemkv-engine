@@ -329,6 +329,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The WATCHER, not the check-before-starting.
+    ///
+    /// `with_cancel_watcher` does two things: it asks once before the work
+    /// begins, and it polls on a thread while the work runs. The existing
+    /// `cancel_via_sink_halts_recovery` uses a sink that is cancelled from the
+    /// very first call, so the entry check alone satisfies it — and the
+    /// mutation run duly deleted the `!` from the watcher's loop condition
+    /// (`while !done` -> `while done`, so the loop body never runs) with the
+    /// suite still green. A cancel arriving AFTER start would then be missed
+    /// entirely.
+    ///
+    /// This sink stays uncancelled for the first few polls, so only a live
+    /// watcher can set the halt flag.
+    #[test]
+    fn a_cancel_raised_after_the_work_starts_is_still_observed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct LateCancelSink {
+            asks: AtomicUsize,
+        }
+        impl Sink for LateCancelSink {
+            fn should_cancel(&self) -> bool {
+                // False on the first ask (the pre-start check), true after —
+                // so passing this REQUIRES the polling watcher to run.
+                self.asks.fetch_add(1, Ordering::Relaxed) > 0
+            }
+        }
+
+        let sink = LateCancelSink {
+            asks: AtomicUsize::new(0),
+        };
+        let observed = with_cancel_watcher(&sink, |halt| {
+            // Give the watcher time to poll at least once (it sleeps 100 ms).
+            for _ in 0..40 {
+                if halt.load(std::sync::atomic::Ordering::Relaxed) {
+                    return true;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            false
+        });
+        assert!(
+            observed,
+            "the watcher never set the halt flag — a cancel raised after start \
+             would be lost"
+        );
+    }
+
     #[test]
     fn cancel_via_sink_halts_recovery() {
         // A sink whose should_cancel is always true must make the library
