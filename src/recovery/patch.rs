@@ -504,13 +504,7 @@ pub(super) struct SubRanges {
 /// rather than condemning its fragments as permanently unreadable — which is
 /// what rejecting them at load time, or failing the read here, would do.
 fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
-    use super::section_recover::SECTOR;
-    if len == 0 {
-        return (pos - pos % SECTOR, 0);
-    }
-    let start = pos - pos % SECTOR;
-    let end = (pos + len).div_ceil(SECTOR) * SECTOR;
-    (start, end - start)
+    super::snap_to_sectors(pos, len)
 }
 
 impl SubRanges {

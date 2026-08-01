@@ -591,6 +591,15 @@ pub fn sweep(
     reader.set_speed(0xFFFF);
 
     'outer: for (region_pos, region_size) in regions {
+        // Snap to whole sectors before the range becomes a read/write cursor.
+        // Mapfile ranges are BYTE ranges with no alignment guarantee (the
+        // format interoperates with ddrescue, whose `-b 512` emits
+        // 512-granular ranges), and an unaligned offset truncates to the wrong
+        // LBA and shifts real payload — which is then recorded Finished.
+        // `patch` has always snapped its ingress; this path did not, and the
+        // only alignment it had was gated on a decrypting AACS rip, a branch a
+        // multipass resume never takes because multipass implies raw.
+        let (region_pos, region_size) = snap_to_sectors(region_pos, region_size);
         let region_end = region_pos + region_size;
         // AACS unit alignment: anchor the region's read cursor DOWN to the
         // nearest 6144-byte unit boundary so the decrypting reader never gets
@@ -1220,6 +1229,36 @@ pub struct PatchOutcome {
     pub wedged_threshold: u64,
 }
 
+/// Snap a mapfile byte-range out to whole sectors: start down, end up.
+///
+/// Mapfile ranges are BYTE ranges and nothing guarantees they land on 2048-byte
+/// boundaries — the format interoperates with ddrescue, whose `-b 512` writes
+/// 512-byte-granular ranges, and a mapfile can be hand-edited or imported.
+/// Feeding an unaligned offset to a sector-addressed reader truncates the LBA
+/// and shifts real payload to the wrong place, which then gets recorded
+/// `Finished`: silent corruption presented as recovery.
+///
+/// `patch` has always snapped its ingress; `sweep`'s resume path did not, and
+/// its only alignment was gated on a decrypting AACS rip — a branch a
+/// multipass resume never takes, since multipass implies raw. One
+/// implementation here so the two ingresses cannot drift apart.
+///
+/// Saturating: `(pos + len).div_ceil(SECTOR) * SECTOR` overflows u64 for a
+/// range ending in the last sector of the address space, which `Mapfile::load`
+/// accepts (it checks `checked_add`, and that does not wrap).
+pub(super) fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
+    use section_recover::SECTOR;
+    let start = pos - pos % SECTOR;
+    if len == 0 {
+        return (start, 0);
+    }
+    let end = pos
+        .saturating_add(len)
+        .div_ceil(SECTOR)
+        .saturating_mul(SECTOR);
+    (start, end.saturating_sub(start))
+}
+
 /// Sleep `secs` seconds, but break early if `halt` flips to true.
 /// Used by Pass 1's wedge-avoidance inter-error pause so halt
 /// remains responsive regardless of how long the pause is.
@@ -1314,6 +1353,46 @@ pub fn progress_snapshot_from_mapfile(
         main_title_size_bytes: title.map(|t| t.size_bytes),
         located,
     })
+}
+
+#[cfg(test)]
+mod snap_tests {
+    use super::snap_to_sectors;
+
+    /// Both mapfile ingresses must widen a range to whole sectors.
+    ///
+    /// A byte range is not a sector range. ddrescue's `-b 512` writes
+    /// 512-granular ranges and the mapfile format advertises interop with it,
+    /// so an unaligned `pos` reaching a sector-addressed reader truncates the
+    /// LBA and shifts real payload — recorded afterwards as Finished.
+    #[test]
+    fn an_unaligned_range_widens_to_whole_sectors() {
+        // Mid-sector start: anchor down, and cover the tail.
+        assert_eq!(snap_to_sectors(512, 1024), (0, 2048));
+        // Spanning a boundary: cover both sectors.
+        assert_eq!(snap_to_sectors(2048 - 512, 1024), (0, 4096));
+        // Already aligned: unchanged.
+        assert_eq!(snap_to_sectors(4096, 2048), (4096, 2048));
+        // Zero length keeps the anchored start and stays empty.
+        assert_eq!(snap_to_sectors(700, 0), (0, 0));
+    }
+
+    /// Rounding up must not wrap at the top of the address space.
+    ///
+    /// `Mapfile::load` accepts a range ending in the last sector — it checks
+    /// `checked_add`, which does not wrap — and the old
+    /// `(pos + len).div_ceil(SECTOR) * SECTOR` then overflowed u64: a panic in
+    /// dev, and in release a wrap to 0 that hands the recovery handlers a
+    /// fabricated ~2^64-byte span to walk.
+    #[test]
+    fn rounding_up_saturates_at_the_end_of_the_address_space() {
+        let (start, len) = snap_to_sectors(u64::MAX - 1023, 1024);
+        assert_eq!(start % 2048, 0, "start stays sector-aligned");
+        assert!(
+            start.checked_add(len).is_some(),
+            "snapped range wrapped past u64::MAX: start={start} len={len}"
+        );
+    }
 }
 
 #[cfg(test)]
