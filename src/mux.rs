@@ -52,14 +52,29 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             }
         }
         Selection::All => (0..n).collect(),
+        // FIRST of the equal maxima, not the last. `Iterator::max_by` keeps
+        // the LAST element among ties, and ties are the normal case on exactly
+        // the discs this selection exists for: playlist obfuscation works by
+        // authoring dozens of decoy playlists with the SAME runtime as the
+        // feature, and the real one is conventionally the lowest index. Picking
+        // the last tied playlist rips a decoy and reports success.
         Selection::Longest => disc
             .titles
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.duration_secs
-                    .partial_cmp(&b.duration_secs)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+            // Drop non-finite durations BEFORE folding. Rejecting them only
+            // inside the comparison is not enough: `NaN > d` and `t > NaN` are
+            // both false, so a NaN that lands in the accumulator first is never
+            // displaced and wins outright. A disc whose first playlist has an
+            // unparseable runtime would then always rip that playlist.
+            .filter(|(_, t)| t.duration_secs.is_finite())
+            // `<=` rather than `!(_ > _)`: safe ONLY because the filter above
+            // has already removed every non-finite duration, so the two are
+            // equivalent here. Without that filter they differ — every NaN
+            // comparison is false — and clippy rejects the negated form.
+            .fold(None::<(usize, f64)>, |best, (i, t)| match best {
+                Some((_, d)) if t.duration_secs <= d => best,
+                _ => Some((i, t.duration_secs)),
             })
             .map(|(i, _)| vec![i])
             .unwrap_or_default(),
@@ -357,6 +372,16 @@ fn mux_with_input(
     use std::sync::mpsc;
 
     let halt = libfreemkv::Halt::new();
+    // Ask ONCE before starting, the same rule `with_cancel_watcher` states and
+    // enforces in `run.rs`. A watcher alone makes cancellation a race the work
+    // can win: on a short title the mux can finish before the watcher thread is
+    // first scheduled, and an already-cancelled request then runs to completion.
+    // Polling cannot close that window — only asking before the work begins can.
+    // This doc block already claimed to be the same bridge as
+    // `with_cancel_watcher`; now it is.
+    if sink.should_cancel() {
+        halt.cancel();
+    }
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
 
     // MuxEvents impl that forwards write-progress over the channel. Owned +
@@ -433,18 +458,6 @@ fn mux_with_input(
     })
 }
 
-/// Open a live optical drive and get it ready to rip: open the session, lock
-/// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
-/// session (its `disc()` is populated and its drive is still owned, ready to be
-/// staged for a `MuxInput::Session` mux) plus the resolution trace.
-///
-/// This is the ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and
-/// the desktop GUI's disc:// path — neither reimplements it. Presentation
-/// (rendering the trace, per-step error messages, preflight gates) stays in each
-/// shell; the key-source `factory` and `credentials` are supplied by the caller,
-/// so a shell can log key attempts (the CLI) or stay quiet (the GUI) without
-/// this core knowing. `disc_to_iso`'s image copy uses a different lower-level
-/// `Drive` API and is intentionally not covered here.
 /// The `KeySpec` a drive bring-up opens with.
 ///
 /// Lifted out of [`open_scan_resolve`]'s struct literal because that function
@@ -461,6 +474,18 @@ fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemk
     }
 }
 
+/// Open a live optical drive and get it ready to rip: open the session, lock
+/// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
+/// session (its `disc()` is populated and its drive is still owned, ready to be
+/// staged for a `MuxInput::Session` mux) plus the resolution trace.
+///
+/// This is the ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and
+/// the desktop GUI's disc:// path — neither reimplements it. Presentation
+/// (rendering the trace, per-step error messages, preflight gates) stays in each
+/// shell; the key-source `factory` and `credentials` are supplied by the caller,
+/// so a shell can log key attempts (the CLI) or stay quiet (the GUI) without
+/// this core knowing. `disc_to_iso`'s image copy uses a different lower-level
+/// `Drive` API and is intentionally not covered here.
 pub fn open_scan_resolve(
     target: libfreemkv::DeviceTarget,
     credentials: Option<libfreemkv::DriveCredentials>,
@@ -555,6 +580,74 @@ mod tests {
     fn selection_longest_picks_max_duration() {
         let d = disc(4, false, false); // durations 60,120,180,240 → index 3
         assert_eq!(resolve_selection(&d, &Selection::Longest), vec![3]);
+    }
+
+    /// Ties go to the FIRST title, not the last.
+    ///
+    /// Playlist obfuscation is the reason `Longest` exists, and it works by
+    /// authoring decoy playlists with the SAME runtime as the feature — so a
+    /// tie is the normal case on exactly the discs this selection is for, and
+    /// the real playlist is conventionally the lowest index.
+    /// `Iterator::max_by` returns the LAST of equal maxima, which picks a
+    /// decoy, rips it, and reports success.
+    #[test]
+    fn selection_longest_breaks_a_tie_towards_the_first_title() {
+        let mut d = disc(5, false, false);
+        // Three playlists at the same, longest runtime; index 1 is the real one.
+        d.titles[1].duration_secs = 7200.0;
+        d.titles[3].duration_secs = 7200.0;
+        d.titles[4].duration_secs = 7200.0;
+        assert_eq!(
+            resolve_selection(&d, &Selection::Longest),
+            vec![1],
+            "the first of the equal-longest playlists is the feature; the later \
+             ones are decoys"
+        );
+    }
+
+    /// A title with no duration at all must not win, and must not crash the
+    /// comparison — `partial_cmp` on a NaN is `None`.
+    /// A non-finite duration must never win, INCLUDING when it is the first
+    /// title. Rejecting NaN only inside the comparison looks correct and is
+    /// not: `t > NaN` is false for every `t`, so a NaN that reaches the
+    /// accumulator first is never displaced. A disc whose first playlist has
+    /// an unparseable runtime would rip that playlist every time.
+    #[test]
+    fn selection_longest_ignores_a_leading_title_with_no_measurable_duration() {
+        let mut d = disc(3, false, false); // 60, 120, 180
+        d.titles[0].duration_secs = f64::NAN;
+        assert_eq!(
+            resolve_selection(&d, &Selection::Longest),
+            vec![2],
+            "a leading NaN must not win the longest-title selection"
+        );
+
+        // Every duration unusable: no title is selectable, so select nothing
+        // rather than defaulting to index 0 and ripping an arbitrary playlist.
+        for t in d.titles.iter_mut() {
+            t.duration_secs = f64::NAN;
+        }
+        assert!(resolve_selection(&d, &Selection::Longest).is_empty());
+    }
+
+    #[test]
+    fn selection_longest_ignores_a_title_with_no_measurable_duration() {
+        let mut d = disc(3, false, false); // 60, 120, 180
+        d.titles[2].duration_secs = f64::NAN;
+        assert_eq!(
+            resolve_selection(&d, &Selection::Longest),
+            vec![1],
+            "an unmeasurable title is not the longest one"
+        );
+    }
+
+    #[test]
+    fn selection_longest_on_an_empty_disc_selects_nothing() {
+        let d = disc(0, false, false);
+        assert_eq!(
+            resolve_selection(&d, &Selection::Longest),
+            Vec::<usize>::new()
+        );
     }
 
     #[test]

@@ -457,24 +457,8 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         .map(|s| SenseFamily::from_sense_key(s.sense_key))
         .unwrap_or(SenseFamily::Other);
 
-    // Zone-entry tracking: this is the first error after a clean run
-    // (or the first error of the sweep). Capture the genuine
-    // clean->damaged transition here, BEFORE mutating in_damage_zone,
-    // so the 30s zone-entry cooldown below keys off the real
-    // transition rather than re-deriving it from a counter that the
-    // fast-jump path resets after every jump.
-    //
-    // A RECOVERED_ERROR (marginal read) is explicitly NOT damage-zone signal
-    // (see the SkipBlock branch below) — it returns early, so latching
-    // in_damage_zone here would spuriously consume the zone-entry transition and
-    // let a genuine hard error that follows skip the 30s wedge cooldown.
     let is_recovered =
         err.scsi_sense().map(|s| s.sense_key) == Some(scsi::SENSE_KEY_RECOVERED_ERROR);
-    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting && !is_recovered;
-    if is_zone_entry_transition {
-        ctx.in_damage_zone = true;
-        ctx.zones_entered += 1;
-    }
 
     ctx.total_errors += 1;
     ctx.last_error_at = Some(now);
@@ -564,6 +548,37 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     }
     if sense_key != scsi::SENSE_KEY_NOT_READY {
         ctx.not_ready_retries = 0;
+    }
+
+    // Zone-entry tracking: this is the first error after a clean run (or the
+    // first error of the sweep). Capture the genuine clean->damaged transition
+    // here, BEFORE mutating in_damage_zone, so the 30 s zone-entry cooldown
+    // below keys off the real transition rather than re-deriving it from a
+    // counter the fast-jump path resets after every jump.
+    //
+    // Latched AFTER every branch above that RETURNS EARLY, not before them.
+    // The three early exits — transport failure, bridge degradation, and the
+    // generic NOT_READY retry — never reach the cooldown selection at the
+    // bottom, so a transition latched before them is consumed by an error that
+    // could not use it. That was not hypothetical: a Pass 1 sweep whose first
+    // error is the documented BU40N bad-sector signature (NOT READY / 04 / 3E)
+    // latched the zone on call 1 and then returned `Retry{3s}` for the whole
+    // retry budget; by the time the budget was spent and the code reached the
+    // pause selection the transition was gone, and the drive got the ordinary
+    // 5 s pause instead of the 30 s cooldown — the constant defeated for exactly
+    // the sense family it was written for, at the moment the module doc says
+    // quiet is what prevents the firmware fast-fail wedge. The same hazard was
+    // already recognised for RECOVERED_ERROR and guarded with `!is_recovered`;
+    // moving the latch here covers all four with one rule instead of a growing
+    // list of exceptions, and stops `zones_entered` counting transient
+    // NOT_READYs as damage zones.
+    //
+    // A RECOVERED_ERROR (marginal read) is still explicitly NOT damage-zone
+    // signal — see the SkipBlock branch below, which also returns early.
+    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting && !is_recovered;
+    if is_zone_entry_transition {
+        ctx.in_damage_zone = true;
+        ctx.zones_entered += 1;
     }
 
     // 4. Hardware error / illegal request — the firmware-wedge family.
@@ -868,6 +883,60 @@ mod tests {
         handle_read_error(&hardware_err(), &mut ctx);
         assert!(ctx.in_damage_zone);
         assert_eq!(ctx.zones_entered, 1, "hard error registers the zone entry");
+    }
+
+    /// A NOT_READY retry must not consume the zone-entry transition either.
+    ///
+    /// The zone entry is what buys the drive the 30 s cooldown, and the whole
+    /// point of that constant is the firmware fast-fail wedge. The BU40N's
+    /// documented bad-sector signature IS a NOT_READY, so on the discs this
+    /// matters most for, the first error spent the transition on a 3 s retry
+    /// and the genuine hard error that followed got the ordinary 5 s pause.
+    #[test]
+    fn a_not_ready_retry_does_not_consume_the_zone_entry() {
+        let mut ctx = ReadCtx::for_sweep(32);
+        for _ in 0..NOT_READY_MAX_RETRIES {
+            let a = handle_read_error(&not_ready_err(), &mut ctx);
+            assert!(matches!(a, ReadAction::Retry { .. }), "got {a:?}");
+        }
+        assert!(
+            !ctx.in_damage_zone,
+            "a transient NOT_READY retry is not evidence of a damage zone"
+        );
+        assert_eq!(
+            ctx.zones_entered, 0,
+            "the zone counter must not tick for retries that never reach the cooldown"
+        );
+
+        // The error that DOES reach the pause selection is the real zone
+        // entry, and it must get the long cooldown.
+        let a = handle_read_error(&hardware_err(), &mut ctx);
+        assert!(ctx.in_damage_zone);
+        assert_eq!(ctx.zones_entered, 1);
+        let pause = match a {
+            ReadAction::JumpAhead { pause_secs, .. } => pause_secs,
+            ReadAction::SkipBlock { pause_secs } => pause_secs,
+            ReadAction::Retry { pause_secs } => pause_secs,
+            other => panic!("expected a paused action, got {other:?}"),
+        };
+        assert!(
+            pause >= ZONE_ENTRY_COOLDOWN_SECS,
+            "the real zone entry must get the {ZONE_ENTRY_COOLDOWN_SECS}s wedge \
+             cooldown, got {pause}s — the NOT_READY retries had eaten the transition"
+        );
+    }
+
+    /// A transport failure aborts the pass, so it must not spend the
+    /// transition on its way out either.
+    #[test]
+    fn a_transport_failure_does_not_consume_the_zone_entry() {
+        let mut ctx = ReadCtx::for_sweep(32);
+        assert!(matches!(
+            handle_read_error(&transport_failure_err(), &mut ctx),
+            ReadAction::AbortPass
+        ));
+        assert!(!ctx.in_damage_zone);
+        assert_eq!(ctx.zones_entered, 0);
     }
 
     #[test]
