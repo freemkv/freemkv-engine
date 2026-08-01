@@ -46,10 +46,6 @@ pub struct Job {
     pub selection: Selection,
     /// Recovery strategy.
     pub mode: RipMode,
-    /// In `Multi` mode, how many seconds of main-movie loss to tolerate before
-    /// aborting after retries are exhausted. `0` = require a perfect rip (abort
-    /// on ANY loss). Ignored in `Single` mode. (See autorip `abort_on_lost_secs`.)
-    pub abort_on_lost_secs: u32,
     /// Skip decryption and write ciphertext through (forensic / raw backup).
     pub raw: bool,
     /// Which audio + subtitle streams to keep in each ripped title (video is
@@ -104,7 +100,6 @@ impl Job {
             dest: dest.into(),
             selection: Selection::default(),
             mode: RipMode::default(),
-            abort_on_lost_secs: 0,
             raw: false,
             streams: StreamChoice::default(),
         }
@@ -151,7 +146,6 @@ mod tests {
         assert_eq!(j.mode, RipMode::Single);
         assert_eq!(j.selection, Selection::MainMovie);
         assert!(!j.raw);
-        assert_eq!(j.abort_on_lost_secs, 0);
     }
 
     #[test]
