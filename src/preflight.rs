@@ -270,6 +270,30 @@ mod tests {
         assert_eq!(preflight(&d, &j), Preflight::Ready);
     }
 
+    /// `is_ready` is the accessor a front-end greys out Start on.
+    ///
+    /// Every test in this module that touches it asserts the BLOCKED
+    /// direction, so a constant `false` was indistinguishable — and a
+    /// permanently greyed-out Start with no reason shown is a UI nobody can
+    /// use. Assert both directions against the same accessor, and against
+    /// `reasons()`, which has to agree with it.
+    #[test]
+    fn is_ready_agrees_with_the_variant_in_both_directions() {
+        let ready = preflight(
+            &disc_with(2, false, false),
+            &Job::new("iso://x.iso", "/out"),
+        );
+        assert!(ready.is_ready(), "a runnable job must report ready");
+        assert!(ready.reasons().is_empty(), "ready carries no reasons");
+
+        let blocked = preflight(
+            &disc_with(0, false, false),
+            &Job::new("iso://x.iso", "/out"),
+        );
+        assert!(!blocked.is_ready());
+        assert!(!blocked.reasons().is_empty());
+    }
+
     #[test]
     fn blocks_encrypted_placeholder_aacs_without_key_material() {
         // A VID-only scan leaves `aacs = Some(..)` with EMPTY unit_keys and no

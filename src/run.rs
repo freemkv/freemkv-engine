@@ -221,7 +221,7 @@ pub fn recover_to_iso(
 
     with_cancel_watcher(sink, |halt| {
         let opts = CopyOptions {
-            decrypt: !job.raw,
+            decrypt: crate::multipass::pass_should_decrypt(job.raw),
             multipass: matches!(job.mode, RipMode::Multi),
             progress: Some(&bridge),
             halt: Some(halt.clone()),
@@ -456,6 +456,55 @@ mod tests {
             &[0],
             "a disc with nothing wrong reported bad sectors purely because the \
              sweep had not finished yet"
+        );
+    }
+
+    /// ...and it must COUNT the damage once there is some.
+    ///
+    /// The companion test above uses an all-zero `PassProgress`, where
+    /// `/ 2048`, `% 2048` and `* 2048` all agree on `0` — so the conversion
+    /// itself was exercised with the one input that can never distinguish it.
+    /// The number this produces is the bad-sector count an operator reads off
+    /// the progress line while deciding whether to stop a failing rip.
+    #[test]
+    fn sectors_bad_converts_bad_bytes_into_a_sector_count() {
+        use libfreemkv::progress::Progress as _;
+
+        #[derive(Default)]
+        struct Captured(std::sync::Mutex<Vec<u64>>);
+        impl Sink for Captured {
+            fn progress(&self, p: &Progress) {
+                self.0.lock().unwrap().push(p.sectors_bad);
+            }
+        }
+
+        let sink = Captured::default();
+        let bridge = ProgressBridge::new(&sink);
+
+        // 4096 unreadable + 2952 retryable = 7048 bytes, deliberately NOT a
+        // multiple of 2048, so `/`, `%` and `*` all give different answers
+        // (3 vs 904 vs an overflow-saturated absurdity).
+        bridge.report(&libfreemkv::progress::PassProgress {
+            kind: libfreemkv::progress::PassKind::Sweep,
+            work_done: 1_000_000,
+            work_total: 25 * 1024 * 1024 * 1024,
+            bytes_good_total: 1_000_000,
+            bytes_unreadable_total: 4096,
+            bytes_pending_total: 8192,
+            bytes_retryable_total: 2952,
+            bytes_total_disc: 25 * 1024 * 1024 * 1024,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 0,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located: libfreemkv::progress::LocatedProgress::default(),
+        });
+
+        assert_eq!(
+            sink.0.lock().unwrap().as_slice(),
+            &[3],
+            "7048 bad bytes is 3 whole bad sectors — unreadable and retryable \
+             are summed, then converted once, rounding down"
         );
     }
 

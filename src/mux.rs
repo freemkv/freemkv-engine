@@ -445,6 +445,22 @@ fn mux_with_input(
 /// so a shell can log key attempts (the CLI) or stay quiet (the GUI) without
 /// this core knowing. `disc_to_iso`'s image copy uses a different lower-level
 /// `Drive` API and is intentionally not covered here.
+/// The `KeySpec` a drive bring-up opens with.
+///
+/// Lifted out of [`open_scan_resolve`]'s struct literal because that function
+/// opens a real drive and so cannot be unit-tested at all — which left the one
+/// field that matters in it unverified. `credentials` carries the host
+/// certificate(s) for the SCSI AACS handshake and is forwarded to
+/// `ScanOptions::credentials` at scan time; it is the ONLY input to that
+/// handshake. Dropped, every caller silently authenticates as no-one and a
+/// locked drive refuses the disc regardless of what the shell passed in.
+fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemkv::KeySpec {
+    libfreemkv::KeySpec {
+        credentials,
+        ..Default::default()
+    }
+}
+
 pub fn open_scan_resolve(
     target: libfreemkv::DeviceTarget,
     credentials: Option<libfreemkv::DriveCredentials>,
@@ -456,11 +472,7 @@ pub fn open_scan_resolve(
     ),
     libfreemkv::Error,
 > {
-    let keyspec = libfreemkv::KeySpec {
-        credentials,
-        ..Default::default()
-    };
-    let mut session = libfreemkv::DiscSession::open(target, keyspec)?;
+    let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
     // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
     session.lock_tray();
     session.scan(libfreemkv::ScanOptions::default())?;
@@ -551,6 +563,74 @@ mod tests {
         assert_eq!(
             resolve_selection(&d, &Selection::Titles(vec![0, 9])),
             vec![0]
+        );
+    }
+
+    /// The range filter is `i < n`, and `n` itself is out of range.
+    ///
+    /// Every other out-of-range case in this suite uses an index comfortably
+    /// past the end (9 against 2), so `<` and `<=` agree and the boundary was
+    /// never pinned. `<=` admits `disc.titles[n]`, which is the classic
+    /// off-by-one that either panics on the index or hands the muxer a title
+    /// the disc does not have.
+    #[test]
+    fn selection_explicit_index_equal_to_the_title_count_is_out_of_range() {
+        let d = disc(3, false, false); // valid indices are 0, 1, 2
+        assert_eq!(
+            resolve_selection(&d, &Selection::Titles(vec![3])),
+            Vec::<usize>::new(),
+            "index == title count is one past the end, not a fourth title"
+        );
+        assert_eq!(
+            resolve_selection(&d, &Selection::Titles(vec![2, 3])),
+            vec![2],
+            "the last valid index still survives the same filter"
+        );
+    }
+
+    /// A lone selected title is NOT a multi-title rip.
+    ///
+    /// `multi_title = indices.len() > 1` is the flag `decide_title` consults
+    /// to decide whether a non-feature stub may be silently skipped. Widened
+    /// to `>=`, a single selected non-feature title whose mux comes back as a
+    /// skippable stub is swallowed: the rip returns `Ok { titles_written: 0 }`
+    /// — a success that wrote no file — instead of reporting the failure. The
+    /// existing single-title stub test passes `explicit_selection: true`,
+    /// which is fatal by a different clause and so hides this one.
+    #[test]
+    fn a_single_non_explicit_title_stub_is_fatal_not_skipped() {
+        let d = disc(4, false, false); // durations 60..240 → longest is index 3
+        let indices = resolve_selection(&d, &Selection::Longest);
+        assert_eq!(indices, vec![3], "one title, and not the feature");
+
+        let outcome = run_titles(&indices, false, &NoopSink, |_| Err(stub_err()));
+        assert_eq!(
+            outcome,
+            RipOutcome::Failed {
+                title_index: 3,
+                code: libfreemkv::error_code(&stub_err()),
+                kind: stub_err().kind(),
+            },
+            "the only title the rip was going to write came back a stub — that \
+             is a failed rip, not a rip that skipped a bonus feature"
+        );
+    }
+
+    /// `open_scan_resolve` opens a real drive, so the only testable part of it
+    /// is the spec it opens with.
+    #[test]
+    fn build_keyspec_forwards_the_caller_credentials() {
+        assert!(
+            build_keyspec(None).credentials.is_none(),
+            "no credentials in, no credentials out"
+        );
+        let creds = libfreemkv::DriveCredentials {
+            host_certs: Vec::new(),
+        };
+        assert!(
+            build_keyspec(Some(creds)).credentials.is_some(),
+            "the host certs the shell supplied are the only input to the AACS \
+             handshake — dropping them authenticates as no-one"
         );
     }
 
