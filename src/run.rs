@@ -16,6 +16,20 @@ use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
+/// The error both recovery entry points return for a decrypting multipass job.
+///
+/// One constructor so the two call sites cannot describe the same refusal two
+/// different ways — the duplication-that-drifts shape this crate keeps finding.
+pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
+    libfreemkv::Error::IoError {
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "multipass implies raw: a multipass rip recovers a whole-disc \
+             image and cannot decrypt",
+        ),
+    }
+}
+
 /// Sets a watcher's `done` flag on EVERY exit path, including a panic unwind.
 ///
 /// A plain `done.store(true)` after the watched call is skipped by an unwind,
@@ -182,6 +196,16 @@ pub fn recover_to_iso(
     job: &Job,
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
+    // Multipass implies raw — refuse before touching the drive. `preflight`
+    // reports this as data for a UI, but it is explicitly callable without
+    // executing, so a front-end may skip it; this is the enforcement that
+    // cannot be bypassed. Refused rather than silently forced to raw: a caller
+    // that asked to decrypt and got a raw image would be handed an
+    // undecrypted ISO it believes is playable.
+    if matches!(job.mode, RipMode::Multi) && !job.raw {
+        return Err(multipass_requires_raw());
+    }
+
     let bridge = ProgressBridge::new(sink);
 
     sink.log(
@@ -481,8 +505,9 @@ mod tests {
         let mut reader = NotReadyReader { capacity: sectors };
         let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
         // Multipass, so the sweep skips on error and reaches the cooldown
-        // instead of aborting at the first failed read.
+        // instead of aborting at the first failed read. Multipass implies raw.
         job.mode = RipMode::Multi;
+        job.raw = true;
 
         let start = std::time::Instant::now();
         let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink)

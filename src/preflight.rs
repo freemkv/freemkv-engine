@@ -98,6 +98,23 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         Selection::MainMovie | Selection::All | Selection::Longest => {}
     }
 
+    // Multipass implies raw. A multipass rip is a whole-disc image recovery:
+    // it sweeps, patches and resumes against a mapfile that records progress
+    // in DISC geometry, and every pass re-reads sectors the previous pass
+    // could not get. Decryption has no place in that loop, and the two flags
+    // were independent all the way down — the CLI passes `raw` and
+    // `multipass` as separate booleans, and all three recovery call sites set
+    // `decrypt: !job.raw` regardless of mode, so nothing anywhere refused the
+    // combination.
+    //
+    // Refused rather than silently forced: a caller that asked for decryption
+    // and got a raw image would be handed an undecrypted ISO it believes is
+    // playable, which is the same wrong-artifact-at-exit-0 shape this crate
+    // has been bitten by before. Blocking says so before a sector is read.
+    if matches!(job.mode, crate::job::RipMode::Multi) && !job.raw {
+        reasons.push(Reason::new("multipass-requires-raw"));
+    }
+
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key.
     // `disc.encrypted` is the library's authoritative "needs decryption" flag.
     // Delegate the "do we actually have a key?" judgment to `resolve_keys` — the
@@ -119,6 +136,55 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::RipMode;
+
+    /// Multipass implies raw, and the engine must be the place that knows it.
+    ///
+    /// `decrypt` and `multipass` were independent fields with no relationship
+    /// encoded anywhere: not in the CLI, which passes them as separate
+    /// booleans, and not in the engine, whose three recovery call sites all
+    /// set `decrypt: !job.raw` whatever the mode. Every front-end — including
+    /// a GUI that does not exist yet — could therefore construct a rip the
+    /// product does not support, and nothing would say so.
+    #[test]
+    fn a_decrypting_multipass_job_is_blocked() {
+        let disc = disc_with(2, false, false);
+
+        let mut job = Job::new("disc:///dev/sg0", "iso:///tmp/out.iso");
+        job.mode = RipMode::Multi;
+        job.raw = false;
+        let pf = preflight(&disc, &job);
+        assert!(
+            pf.reasons()
+                .iter()
+                .any(|r| r.key == "multipass-requires-raw"),
+            "a decrypting multipass job must be refused before a sector is \
+             read; got {:?}",
+            pf
+        );
+
+        // The supported combination still passes this gate.
+        job.raw = true;
+        let pf = preflight(&disc, &job);
+        assert!(
+            !pf.reasons()
+                .iter()
+                .any(|r| r.key == "multipass-requires-raw"),
+            "a raw multipass job is the supported shape and must not be blocked"
+        );
+
+        // And single-pass decrypting rips are untouched.
+        job.mode = RipMode::Single;
+        job.raw = false;
+        let pf = preflight(&disc, &job);
+        assert!(
+            !pf.reasons()
+                .iter()
+                .any(|r| r.key == "multipass-requires-raw"),
+            "single-pass decrypt is the ordinary case and must not be blocked"
+        );
+    }
+
     use crate::job::Job;
 
     // A resolved AacsState carrying real key material (non-empty unit_keys) —
