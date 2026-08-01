@@ -244,6 +244,114 @@ impl Default for SpeedEstimator {
 
 #[cfg(test)]
 mod tests {
+
+    // ── Mutation-testing gaps ──────────────────────────────────────────────
+    //
+    // A mutation run over this crate found `sample` could be replaced wholesale
+    // with a constant — `(0, None)`, `(1, Some(1))`, and four other variants —
+    // without a single test failing. `sample` is the entry point
+    // `ProgressBridge` calls on every progress tick, so the one function every
+    // front-end's speed and ETA flows through was unverified. The boundary
+    // comparisons below were equally unpinned: `<` could become `<=` or `==` in
+    // `display_window_secs`, `observe`, `eta_speed_mbs` and `sample_at` with no
+    // effect on the suite.
+
+    /// `sample_at` must report real throughput, not a constant.
+    ///
+    /// Kills the six "replace sample -> (0, None)"-family mutants: each asserts
+    /// a value no constant return can satisfy at the same time.
+    #[test]
+    fn sample_reports_the_actual_rate_and_a_finite_eta() {
+        let t0 = Instant::now();
+        let mut est = SpeedEstimator::new();
+
+        // 100 MiB in the first second, then another 100 MiB in the next.
+        let mib = 1024 * 1024u64;
+        est.sample_at(t0, 0, 1000 * mib);
+        let (speed_bps, eta) = est.sample_at(t0 + Duration::from_secs(1), 100 * mib, 1000 * mib);
+
+        assert!(
+            speed_bps > 0,
+            "a moving rip must report a non-zero speed; got {speed_bps}"
+        );
+        // ~100 MiB/s. Generous bounds: the point is that it tracks the input,
+        // not that it hits an exact figure.
+        assert!(
+            (50 * mib..=200 * mib).contains(&speed_bps),
+            "speed should track the observed ~100 MiB/s, got {} MiB/s",
+            speed_bps / mib
+        );
+        // 900 MiB left at ~100 MiB/s: an ETA in minutes, and crucially SOME.
+        let eta = eta.expect("forward progress must produce an ETA");
+        assert!(
+            (1..=120).contains(&eta),
+            "ETA should be roughly 9s-ish for 900MiB at 100MiB/s, got {eta}s"
+        );
+    }
+
+    /// A stalled rip yields no ETA rather than an astronomical one.
+    #[test]
+    fn a_stalled_rip_reports_no_eta() {
+        let t0 = Instant::now();
+        let mut est = SpeedEstimator::new();
+        est.sample_at(t0, 0, 1_000_000_000);
+        // Time passes, nothing is read.
+        let (_speed, eta) = est.sample_at(t0 + Duration::from_secs(30), 0, 1_000_000_000);
+        assert_eq!(
+            eta, None,
+            "a dead stall must not divide toward a multi-year ETA"
+        );
+    }
+
+    /// A finished rip reports no ETA: there is nothing left to wait for.
+    #[test]
+    fn a_finished_rip_reports_no_eta() {
+        let t0 = Instant::now();
+        let mut est = SpeedEstimator::new();
+        est.sample_at(t0, 0, 1000);
+        let (_speed, eta) = est.sample_at(t0 + Duration::from_secs(1), 1000, 1000);
+        assert_eq!(
+            eta, None,
+            "bytes_total == bytes_done leaves nothing to estimate"
+        );
+    }
+
+    /// The display window's phase boundaries are exact.
+    ///
+    /// Kills the `<` -> `<=` mutants in `display_window_secs`: each assertion
+    /// below sits exactly ON a boundary, where the two operators disagree.
+    #[test]
+    fn the_display_window_boundaries_are_exact() {
+        // Static phase: [0, 60) is a flat 10s window.
+        assert_eq!(display_window_secs(0.0), STATIC_WINDOW_SECS);
+        assert_eq!(display_window_secs(59.9), STATIC_WINDOW_SECS);
+
+        // AT 60.0 the growth phase begins, and its term is zero there, so the
+        // value is the static window either way.
+        //
+        // The mutation run flagged `<` -> `<=` here as surviving. It is an
+        // EQUIVALENT MUTANT, not a coverage gap: with `<` the else-if computes
+        // t = 0 and yields STATIC_WINDOW_SECS + (MAX - STATIC) * 0, which is
+        // STATIC_WINDOW_SECS — exactly what `<=` returns directly. No input can
+        // tell them apart, so no test can kill it. Recorded here so the next
+        // person reading the survivor list does not spend the afternoon trying.
+        assert_eq!(
+            display_window_secs(STATIC_PHASE_SECS),
+            STATIC_WINDOW_SECS,
+            "the two phases agree at the boundary"
+        );
+        assert!(
+            display_window_secs(STATIC_PHASE_SECS + 0.1) > STATIC_WINDOW_SECS,
+            "just past the boundary the window must be growing"
+        );
+
+        // Growth is monotonic and lands exactly on MAX at the end.
+        let end = STATIC_PHASE_SECS + GROWTH_PHASE_SECS;
+        assert!(display_window_secs(end - 0.1) < MAX_WINDOW_SECS);
+        assert_eq!(display_window_secs(end), MAX_WINDOW_SECS);
+        assert_eq!(display_window_secs(end + 10_000.0), MAX_WINDOW_SECS);
+    }
+
     use super::*;
 
     // ─── Display speed (observe) ────────────────────────────────────────────
