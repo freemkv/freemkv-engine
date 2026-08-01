@@ -588,12 +588,37 @@ mod tests {
             }
         }
 
-        struct CancelSink;
-        impl Sink for CancelSink {
+        // NOT a sink that is already cancelled: `with_cancel_watcher`'s
+        // "check once before starting" fires on the very FIRST `should_cancel`
+        // call — before the sweep loop ever calls `read_sectors` once — so an
+        // always-true sink proves nothing about the cooldown at all: the read
+        // loop's own halt check (top of every iteration, before the read)
+        // breaks it before `NotReadyReader` is ever invoked. That was this
+        // test's original shape, and it stayed green when instrumented to
+        // confirm `read_sectors` is called zero times under it — the fixture
+        // made the cooldown branch this test is named for unreachable.
+        //
+        // A sink that flips to cancelled on the SECOND ask (as opposed to
+        // this one, elapsed-time-gated) is not enough either: the watcher
+        // thread's own first poll happens essentially immediately after
+        // `with_cancel_watcher`'s pre-start check consumes ask #1, so ask #2
+        // — the watcher's first loop iteration, no sleep yet — usually wins
+        // the race against the main thread even reaching the sweep loop,
+        // reproducing the exact same "halted before the first read" shape
+        // this test exists to rule out. Gating on wall-clock time instead
+        // gives the main thread a real window to issue the read and enter
+        // the cooldown before any observer is allowed to see a cancellation.
+        struct DelayedCancelSink {
+            start: std::time::Instant,
+        }
+        impl Sink for DelayedCancelSink {
             fn should_cancel(&self) -> bool {
-                true
+                self.start.elapsed() > std::time::Duration::from_millis(50)
             }
         }
+        let sink = DelayedCancelSink {
+            start: std::time::Instant::now(),
+        };
 
         let dir = std::env::temp_dir().join(format!("fmkv-engine-cooldown-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -608,11 +633,18 @@ mod tests {
         job.raw = true;
 
         let start = std::time::Instant::now();
-        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink)
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &sink)
             .expect("a cancelled rip halts, it does not error");
         let elapsed = start.elapsed();
 
         assert!(r.halted, "a cancelling sink must halt the rip");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "finished in {elapsed:?} — faster than the sink's own 50 ms \
+             cancel-delay, so this never actually entered the NOT_READY \
+             cooldown at all (the fixture made the interesting branch \
+             unreachable again)"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \

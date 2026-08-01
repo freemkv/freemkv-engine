@@ -2055,3 +2055,161 @@ pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> 
 
     Ok(())
 }
+
+#[cfg(test)]
+mod check_mapfile_identity_tests {
+    use super::*;
+
+    /// Every field `check_mapfile_identity` never reads gets a neutral value:
+    /// `Disc` and `AacsState` carry many fields this check doesn't consult
+    /// (region, css, format, ...), so a minimal fixture keeps each test's
+    /// intent legible — only `aacs` (and inside it, `unit_keys`/`volume_id`)
+    /// varies per case.
+    fn disc_with_aacs(aacs: Option<libfreemkv::disc::AacsState>) -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::Uhd,
+            capacity_sectors: 1,
+            capacity_bytes: 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs,
+            css: None,
+            // `encrypted` plays no role in `check_mapfile_identity` (it only
+            // reads `disc.aacs`), so a fixed value is fine here.
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    fn aacs_with(
+        unit_keys: Vec<(u32, [u8; 16])>,
+        volume_id: [u8; 16],
+    ) -> libfreemkv::disc::AacsState {
+        libfreemkv::disc::AacsState {
+            version: 2,
+            bus_encryption: true,
+            mkb_version: None,
+            disc_hash: String::new(),
+            key_source: libfreemkv::disc::KeyOrigin::ExternalUk,
+            vuk: None,
+            unit_keys,
+            read_data_key: None,
+            volume_id,
+            uk_ro: Vec::new(),
+            mkb: Vec::new(),
+        }
+    }
+
+    fn tmpfile2(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        let name = format!(
+            "libfreemkv-mapfile-identity-test-{}-{}-{}.mapfile",
+            std::process::id(),
+            tag,
+            n
+        );
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(name)
+    }
+
+    /// Neither the mapfile nor the disc carries an AACS identity: legacy
+    /// mapfiles, unencrypted discs, CSS DVDs. Deliberately permissive — see
+    /// the doc on `check_mapfile_identity` for why this residual gap is not
+    /// this check's job to close.
+    #[test]
+    fn neither_identity_present_is_ok() {
+        let p = tmpfile2("neither");
+        let mf = Mapfile::create(&p, 2048, "test").unwrap();
+        let disc = disc_with_aacs(None);
+        assert!(check_mapfile_identity(&mf, &disc).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The keyed case: identical unit keys (even reordered — order is not
+    /// significant) must match.
+    #[test]
+    fn matching_unit_keys_in_any_order_is_ok() {
+        let p = tmpfile2("uk_match");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_unit_keys(&[(0, [0x11; 16]), (1, [0x22; 16])]);
+        let disc = disc_with_aacs(Some(aacs_with(
+            // Reordered relative to the mapfile.
+            vec![(1, [0x22; 16]), (0, [0x11; 16])],
+            [0u8; 16],
+        )));
+        assert!(check_mapfile_identity(&mf, &disc).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The failure this function exists to catch: a mapfile from one disc
+    /// (box-set reprint / same title pressed twice) applied to a different
+    /// disc with different unit keys must be refused, not silently resumed.
+    #[test]
+    fn mismatched_unit_keys_is_refused() {
+        let p = tmpfile2("uk_mismatch");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_unit_keys(&[(0, [0x11; 16])]);
+        let disc = disc_with_aacs(Some(aacs_with(vec![(0, [0x99; 16])], [0u8; 16])));
+        let err = check_mapfile_identity(&mf, &disc).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The mapfile carries keys but the disc in the drive resolved none at
+    /// all — still a mismatch, not a pass-through.
+    #[test]
+    fn mapfile_keys_against_a_disc_with_no_aacs_state_is_refused() {
+        let p = tmpfile2("uk_no_disc_aacs");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_unit_keys(&[(0, [0x11; 16])]);
+        let disc = disc_with_aacs(None);
+        assert!(check_mapfile_identity(&mf, &disc).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The unresolved case: only a VID recorded (no unit keys yet). A
+    /// matching VID passes.
+    #[test]
+    fn matching_vid_is_ok() {
+        let p = tmpfile2("vid_match");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_vid([0x7A; 16]);
+        let disc = disc_with_aacs(Some(aacs_with(vec![], [0x7A; 16])));
+        assert!(check_mapfile_identity(&mf, &disc).is_ok());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The box-set-reprint scenario this whole function was written for: two
+    /// different physical discs, same size, different Volume ID.
+    #[test]
+    fn mismatched_vid_is_refused() {
+        let p = tmpfile2("vid_mismatch");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_vid([0x7A; 16]);
+        let disc = disc_with_aacs(Some(aacs_with(vec![], [0x7B; 16])));
+        let err = check_mapfile_identity(&mf, &disc).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A recorded VID against a disc that never resolved any AACS state at
+    /// all (no keydb this run, or a non-AACS disc) is refused, not assumed
+    /// clean.
+    #[test]
+    fn mapfile_vid_against_a_disc_with_no_aacs_state_is_refused() {
+        let p = tmpfile2("vid_no_disc_aacs");
+        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
+        mf.set_vid([0x7A; 16]);
+        let disc = disc_with_aacs(None);
+        assert!(check_mapfile_identity(&mf, &disc).is_err());
+        let _ = std::fs::remove_file(&p);
+    }
+}
