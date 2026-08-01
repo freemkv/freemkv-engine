@@ -86,6 +86,27 @@ const WEDGE_ABORT_STREAK: u32 = 16;
 /// a true fast-fail.
 const WEDGE_FASTFAIL_MS: u64 = 500;
 
+// DELIBERATE DIVERGENCE from `read_error.rs`'s `WEDGE_ABORT_THRESHOLD`, which
+// counts any 16 consecutive wedge-family failures with no latency gate at all.
+// Both are 16, and both mean "the drive is wedged", but they disagree on a real
+// input: 16 consecutive HARDWARE_ERRORs each returned after seconds of genuine
+// ECC recovery. Pass 1 (here) keeps going, because a slow failure is a drive
+// that is honestly trying; Pass N (there) declares it wedged.
+//
+// This is intended, not drift. The two passes want different things. Pass 1
+// sweeps the whole disc and its value is the honest mapfile it produces, so
+// bailing early on a merely-damaged region would discard exactly what the pass
+// exists to build. Pass N is already committed to slow, targeted recovery of
+// ranges Pass 1 marked bad, so it can afford a blunter give-up rule.
+//
+// They also reset differently on purpose: this streak clears on any non-wedge
+// failure, Pass N's only on a success.
+//
+// Confirmed as a deliberate product decision by the owner. Do NOT "unify" these
+// two constants to make them match — an audit flagged the difference as the
+// project's recurring one-policy-implemented-twice pattern, and it is the one
+// case where the two copies are supposed to differ.
+
 /// Max read speed sentinel for `SET CD SPEED` (0xFFFF = "as fast as the drive
 /// will go"). The default for every read; a handler that wants to slow the
 /// spindle passes [`SpeedPref::Min`] and [`read_span`] restores this on exit.
