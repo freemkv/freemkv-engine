@@ -214,3 +214,155 @@ impl Sink<WorkItem> for SweepSink {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    /// Build a `SweepSink` over a scratch ISO pre-filled with `0xAA`, plus a
+    /// fresh mapfile. No drive, no producer thread — the consumer is driven
+    /// by hand.
+    fn sink_over(dir: &std::path::Path, total: u64) -> (SweepSink, std::path::PathBuf) {
+        let iso = dir.join("out.iso");
+        std::fs::write(&iso, vec![0xAAu8; total as usize]).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&iso)
+            .unwrap();
+        let wf = libfreemkv::io::WritebackFile::new(f).unwrap();
+        let map = Mapfile::create(&dir.join("out.map"), total, "test").unwrap();
+        let (sink, _rx) = SweepSink::new(wf, map, true);
+        (sink, iso)
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "fmkv-sweepsink-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// The zero-fill loop must write EXACTLY the skipped range.
+    ///
+    /// `SkipFill`/`GapFill` is the consumer half of damage handling: the
+    /// producer could not read `[pos, pos+len)`, so the consumer punches zeros
+    /// there and the mapfile records the range `NonTrimmed`. Those two halves
+    /// have to agree, and nothing tested them — this module had no tests at
+    /// all. If the loop writes nothing, the mapfile still claims the gap was
+    /// filled while the image keeps whatever was there before (on a resume,
+    /// bytes from a different disc); if it writes past `len`, it clobbers good
+    /// data the sweep already wrote just beyond the gap.
+    ///
+    /// `len` here spans more than two 64 KB chunks with a ragged remainder, so
+    /// the chunking arithmetic is genuinely exercised rather than short-cut by
+    /// a single pass.
+    #[test]
+    fn a_skip_fill_writes_exactly_the_gap_and_records_exactly_the_gap() {
+        let dir = scratch("skipfill");
+        let gap_start = 4096u64;
+        // Two whole 64 KB chunks plus a short final one, so the chunking
+        // arithmetic runs three times with a partial tail. Sector-aligned,
+        // because `Mapfile::record` widens a ragged range to whole sectors and
+        // that would blur the "exactly len" assertion.
+        let len = ZERO_CHUNK as u64 * 2 + 3 * 2048;
+        // Trailing slack wider than one chunk, so an overshooting fill has
+        // somewhere visible to overshoot INTO.
+        let total = gap_start + len + 2 * ZERO_CHUNK as u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+
+        sink.apply(WorkItem::SkipFill {
+            pos: gap_start,
+            len,
+        })
+        .unwrap();
+        let summary = sink.close().unwrap();
+
+        let mut got = Vec::new();
+        std::fs::File::open(&iso)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(
+            got.len() as u64,
+            total,
+            "the file must not have been resized"
+        );
+        assert!(
+            got[..gap_start as usize].iter().all(|&b| b == 0xAA),
+            "bytes before the gap were rewritten"
+        );
+        assert!(
+            got[gap_start as usize..(gap_start + len) as usize]
+                .iter()
+                .all(|&b| b == 0),
+            "the gap the mapfile is about to call NonTrimmed was not actually zeroed"
+        );
+        assert!(
+            got[(gap_start + len) as usize..].iter().all(|&b| b == 0xAA),
+            "the fill ran past the end of the gap and clobbered good data"
+        );
+
+        assert_eq!(summary.stats.bytes_good, 0);
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert_eq!(
+            reloaded.ranges_with(&[SectorStatus::NonTrimmed]),
+            vec![(gap_start, len)],
+            "exactly the gap is recorded NonTrimmed — no more, no less"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A gap smaller than one chunk is still written in full.
+    #[test]
+    fn a_sub_chunk_gap_fill_writes_its_whole_length() {
+        let dir = scratch("gapfill");
+        let len = 3072u64;
+        let total = 8192u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+
+        sink.apply(WorkItem::GapFill { pos: 0, len }).unwrap();
+        let summary = sink.close().unwrap();
+
+        let got = std::fs::read(&iso).unwrap();
+        assert!(got[..len as usize].iter().all(|&b| b == 0));
+        assert!(
+            got[len as usize..].iter().all(|&b| b == 0xAA),
+            "a fill shorter than one chunk still stopped at len"
+        );
+        assert_eq!(summary.stats.bytes_good, 0);
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert_eq!(
+            reloaded.ranges_with(&[SectorStatus::NonTrimmed]),
+            vec![(0, len)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A good batch lands at its own offset and is recorded Finished there.
+    #[test]
+    fn a_good_batch_is_written_at_its_position_and_recorded_finished() {
+        let dir = scratch("good");
+        let total = 8192u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+
+        sink.apply(WorkItem::Good {
+            pos: 2048,
+            buf: vec![0x5Au8; 2048],
+        })
+        .unwrap();
+        let summary = sink.close().unwrap();
+
+        let got = std::fs::read(&iso).unwrap();
+        assert!(got[..2048].iter().all(|&b| b == 0xAA));
+        assert!(got[2048..4096].iter().all(|&b| b == 0x5A));
+        assert!(got[4096..].iter().all(|&b| b == 0xAA));
+        assert_eq!(summary.stats.bytes_good, 2048);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

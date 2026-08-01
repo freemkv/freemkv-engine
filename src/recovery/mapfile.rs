@@ -1614,6 +1614,53 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    /// A truncated data line is skipped, not indexed into.
+    ///
+    /// `if fields.len() < 3 { continue; }` is the only thing standing between
+    /// `fields[2]` and a short line. A mapfile is a file on disk that survives
+    /// crashes and power cuts and is advertised as ddrescue-interoperable, so
+    /// a half-written trailing line is an ordinary thing to find — and every
+    /// other malformed-line shape in this file has a test. Inverted to `>`,
+    /// this panics out of bounds on the damage record of a rip in progress.
+    #[test]
+    fn load_skips_a_data_line_with_too_few_fields() {
+        let p = tmpfile("load_shortline");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x0  ?  1  0\n\
+             0x0        0x2800  +\n\
+             0x2800     0x800\n",
+        )
+        .unwrap();
+        let map = Mapfile::load(&p)
+            .expect("a short trailing line is skipped, not a parse error and not a panic");
+        // Only the well-formed entry was taken; the truncated one contributed
+        // nothing at all rather than half of itself.
+        assert_eq!(map.stats().bytes_good, 0x2800);
+        assert_eq!(map.total_size(), 0x2800);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// A single-field line is the same case one field shorter.
+    #[test]
+    fn load_skips_a_data_line_with_one_field() {
+        let p = tmpfile("load_onefield");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x0  ?  1  0\n\
+             0x0        0x2800  +\n\
+             0x2800\n",
+        )
+        .unwrap();
+        let map = Mapfile::load(&p).expect("a one-field trailing line is skipped");
+        assert_eq!(map.stats().bytes_good, 0x2800);
+        let _ = std::fs::remove_file(&p);
+    }
+
     /// load() rejects an unknown status char (MapfileInvalid{kind:
     /// "status_char"}). A `~` is not in the ddrescue alphabet.
     #[test]

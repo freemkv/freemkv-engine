@@ -518,6 +518,33 @@ mod tests {
         );
     }
 
+    /// `StreamChoice::resolve` is the method every front-end calls; the free
+    /// function underneath it is what every test above calls. That left the
+    /// one-line delegation replaceable with `Ok(Default::default())` — an
+    /// empty selection, which for a `PidFilter::Only(vec![])` audio choice is
+    /// a plausible-looking answer that silently drops every track.
+    #[test]
+    fn resolve_delegates_to_resolve_stream_selection() {
+        let t = title();
+        let choice = StreamChoice {
+            audio: StreamFilter::Langs(vec!["fre".into()]),
+            subtitles: StreamFilter::None,
+        };
+        let via_method = choice.resolve(&t).unwrap();
+        let via_function = resolve_stream_selection(&t, &choice.audio, &choice.subtitles).unwrap();
+        assert_eq!(via_method.audio, via_function.audio);
+        assert_eq!(via_method.subtitle, via_function.subtitle);
+        // Spelled out too, so the assertion above cannot pass by both sides
+        // being the same wrong (default) value.
+        assert_eq!(via_method.audio, PidFilter::Only(vec![0x1102]));
+        assert_eq!(via_method.subtitle, PidFilter::Only(vec![]));
+        assert_ne!(
+            via_method.audio,
+            StreamSelection::default().audio,
+            "a real resolve must not coincide with the Default"
+        );
+    }
+
     #[test]
     fn unmatched_flags_both_classes_independently() {
         let u = choice(
