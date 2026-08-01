@@ -67,6 +67,27 @@ pub fn abort_lost_bytes(
     }
 }
 
+/// True when loss EXISTS but cannot be scoped to the deliverable, so no honest
+/// millisecond figure can be produced.
+///
+/// An mkv-scoped rip measures damage inside the main title's extents. A title
+/// with no extents — a scan that could not read the playlist metadata, or the
+/// `DiscTitle::empty()` fallback `multipass_rip_inner` uses when the disc
+/// reports no titles at all — makes that measurement return 0, which is
+/// indistinguishable from "clean". Whole-disc (ISO) scope sums the bad ranges
+/// directly and needs no extents, so it is never unscopable.
+///
+/// Shared so the two loss paths cannot drift: `abort_lost_ms` had this guard
+/// and the live gate in `multipass_rip_inner` did not, which is precisely how a
+/// damaged rip kept being delivered as clean after the guard was written.
+pub fn loss_is_unscopable(
+    is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+) -> bool {
+    !is_iso && title.extents.is_empty() && !bad_ranges.is_empty()
+}
+
 /// Milliseconds of playback lost, scoped by [`abort_lost_bytes`] and converted
 /// via the title's own bytes/sec bitrate. Ported verbatim from autorip's
 /// `abort_lost_ms`.
@@ -82,7 +103,7 @@ pub fn abort_lost_ms(
     // bitrate at 0, so the two arrive together. Returning 0.0 here would report
     // a damaged disc as clean. Checked BEFORE the zero-bytes early return,
     // because that is the branch it would otherwise take.
-    if !output_is_iso && title.extents.is_empty() && !bad_ranges.is_empty() {
+    if loss_is_unscopable(output_is_iso, title, bad_ranges) {
         return f64::NAN;
     }
     let lost_bytes = abort_lost_bytes(output_is_iso, title, bad_ranges);
@@ -284,6 +305,45 @@ fn main_title_lost_ms(disc: &libfreemkv::Disc, main_bad_bytes: u64) -> f64 {
         // gate treats as fail-safe abort.
         _ => f64::NAN,
     }
+}
+
+/// The end-of-recovery loss figure, plus the reason it is unquantifiable when
+/// it is. `None` means the number is trustworthy.
+///
+/// Pure and separate from [`multipass_rip_inner`] deliberately. This decision
+/// lived inline inside a function that needs a drive, a mapfile and a live
+/// sink, so nothing could reach it — which is exactly how it shipped answering
+/// `0.0` for damage it could not measure. A test of the PREDICATE alone does
+/// not guard the gate: the bug was that the gate did not consult the predicate.
+pub fn end_of_recovery_lost_ms(
+    promotion_intact: bool,
+    is_iso: bool,
+    title: &libfreemkv::DiscTitle,
+    bad_ranges: &[(u64, u64)],
+    disc: &libfreemkv::Disc,
+    lost_bytes: u64,
+) -> (f64, Option<&'static str>) {
+    if !promotion_intact {
+        // The damage record itself is incomplete, so nothing derived from it
+        // can be trusted.
+        return (
+            f64::NAN,
+            Some(
+                "multipass_rip: damage record is incomplete after a failed \
+                 promotion — treating loss as unquantifiable",
+            ),
+        );
+    }
+    if loss_is_unscopable(is_iso, title, bad_ranges) {
+        return (
+            f64::NAN,
+            Some(
+                "multipass_rip: the disc reports no title extents, so in-title \
+                 loss cannot be measured — treating loss as unquantifiable",
+            ),
+        );
+    }
+    (main_title_lost_ms(disc, lost_bytes), None)
 }
 
 /// The result of a multipass run.
@@ -587,16 +647,17 @@ fn multipass_rip_inner(
                 // the damage record is incomplete, the loss is unquantifiable,
                 // and NaN makes `loss_aborts` fire regardless of threshold
                 // rather than delivering a possibly-lossy rip as perfect.
-                let lost_ms = if promotion_intact {
-                    main_title_lost_ms(disc, lost_bytes)
-                } else {
-                    sink.log(
-                        Level::Error,
-                        "multipass_rip: damage record is incomplete after a failed \
-                         promotion — treating loss as unquantifiable",
-                    );
-                    f64::NAN
-                };
+                let (lost_ms, unquantifiable) = end_of_recovery_lost_ms(
+                    promotion_intact,
+                    opts.is_iso_output,
+                    main_title,
+                    &bad_ranges,
+                    disc,
+                    lost_bytes,
+                );
+                if let Some(why) = unquantifiable {
+                    sink.log(Level::Error, why);
+                }
                 (
                     lost_ms,
                     lost_bytes,
@@ -751,6 +812,126 @@ mod tests {
         // autorip test `mkv_resume_ignores_out_of_title_loss` pins this).
         let outside = [(500_000_000u64, 2048u64)];
         assert_eq!(abort_lost_ms(false, &t, &outside, 8_250_000.0), 0.0);
+    }
+
+    /// The LIVE abort gate must not answer "0 ms lost" for damage it cannot
+    /// measure.
+    ///
+    /// The previous round put this guard in `abort_lost_ms` — which has no
+    /// production callers. `multipass_rip_inner` hand-rolls
+    /// `abort_lost_bytes` + `main_title_lost_ms` instead, and that pair had the
+    /// hole: an extents-less title makes `bytes_bad_in_title` return 0, so
+    /// `main_title_lost_ms` returns 0.0 on its FIRST line and never reaches its
+    /// own NaN branch. Under a non-zero tolerance that ships a damaged rip as
+    /// clean. Reachable because `preflight` is advisory (see the note at the
+    /// top of `multipass_rip_inner`) and the gate falls back to
+    /// `DiscTitle::empty()` when the disc reports no titles.
+    #[test]
+    fn unmeasurable_in_title_loss_is_never_reported_as_zero() {
+        let empty = libfreemkv::DiscTitle::empty();
+        let damage = [(0u64, 8192u64)];
+
+        // The exact shape the live gate builds.
+        assert!(empty.extents.is_empty());
+        assert!(loss_is_unscopable(false, &empty, &damage));
+
+        // And the two functions the live gate actually calls still answer the
+        // misleading zero — which is why the gate needs the predicate, not a
+        // change to either of them.
+        assert_eq!(
+            abort_lost_bytes(false, &empty, &damage),
+            0,
+            "extents-less scoping still answers 0; the guard is what catches it"
+        );
+
+        // Now the GATE'S OWN decision function — not the predicate in
+        // isolation. An earlier version of this test asserted only
+        // `loss_is_unscopable(..)`, and it passed with the guard deleted from
+        // the gate, because the bug was never in the predicate: it was that
+        // the gate did not consult one. Call what the gate calls.
+        let disc = disc_with(vec![empty.clone()]);
+        let (lost_ms, why) = end_of_recovery_lost_ms(
+            /* promotion_intact */ true, /* is_iso */ false, &empty, &damage, &disc,
+            /* lost_bytes, as abort_lost_bytes computed it */ 0,
+        );
+        assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
+        assert!(why.is_some(), "an unquantifiable verdict must say why");
+        assert!(
+            loss_aborts(0, lost_ms, 30),
+            "unmeasurable loss must abort even under a 30s tolerance"
+        );
+        // What the gate used to answer, pinned so the regression is legible:
+        assert!(
+            !loss_aborts(0, 0.0, 30),
+            "0.0 passes a 30s tolerance — that was the bug"
+        );
+    }
+
+    /// A disc carrying exactly these titles.
+    fn disc_with(titles: Vec<libfreemkv::DiscTitle>) -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: "T".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 1,
+            capacity_bytes: 2048,
+            layers: 1,
+            titles,
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    /// The gate must still produce a real number when the loss IS measurable —
+    /// the guard must not swallow the normal path.
+    #[test]
+    fn the_gate_still_quantifies_a_measurable_loss() {
+        let mut t = test_title(0, 100);
+        t.size_bytes = 1_000_000;
+        t.duration_secs = 100.0;
+        let disc = disc_with(vec![t.clone()]);
+        let (ms, why) = end_of_recovery_lost_ms(true, false, &t, &[(0, 4096)], &disc, 100_000);
+        assert!(
+            why.is_none(),
+            "measurable loss must not be flagged: {why:?}"
+        );
+        assert!((ms - 10_000.0).abs() < 1e-6, "expected 10s, got {ms}");
+    }
+
+    /// A failed promotion still wins over everything else.
+    #[test]
+    fn the_gate_reports_an_incomplete_damage_record_first() {
+        let t = test_title(0, 100);
+        let disc = disc_with(vec![t.clone()]);
+        let (ms, why) = end_of_recovery_lost_ms(false, false, &t, &[], &disc, 0);
+        assert!(ms.is_nan());
+        assert!(why.unwrap().contains("damage record is incomplete"));
+    }
+
+    /// ISO scope sums the bad ranges whole-disc and needs no extents, so it is
+    /// never unscopable — the guard must not fire there.
+    #[test]
+    fn iso_scope_is_never_unscopable() {
+        let empty = libfreemkv::DiscTitle::empty();
+        let damage = [(0u64, 8192u64)];
+        assert!(!loss_is_unscopable(true, &empty, &damage));
+        assert_eq!(abort_lost_bytes(true, &empty, &damage), 8192);
+    }
+
+    /// And the direction that matters most: no damage means the guard cannot
+    /// fire, so a clean rip is never turned into an abort.
+    #[test]
+    fn a_clean_rip_is_never_made_unscopable() {
+        let empty = libfreemkv::DiscTitle::empty();
+        assert!(!loss_is_unscopable(false, &empty, &[]));
+        let t = test_title(0, 100);
+        assert!(!loss_is_unscopable(false, &t, &[]));
+        assert!(!loss_is_unscopable(false, &t, &[(0, 4096)]));
     }
 
     #[test]
