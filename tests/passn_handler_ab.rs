@@ -838,16 +838,7 @@ fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats 
     ];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
-    let opts = freemkv_engine::PatchOptions {
-        decrypt: false,
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: None,
-        halt: None,
-        key_fetch: None,
-    };
+    let opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("patch must not error on a per-sector failure sense");
 
@@ -953,16 +944,7 @@ fn patch_not_ready_then_recovers_fully() {
     ];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
-    let opts = freemkv_engine::PatchOptions {
-        decrypt: false,
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: None,
-        halt: None,
-        key_fetch: None,
-    };
+    let opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("patch must not error on a transient NOT_READY");
 
@@ -1026,16 +1008,7 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
     ];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
-    let opts = freemkv_engine::PatchOptions {
-        decrypt: false,
-        block_sectors: Some(32),
-        full_recovery: true,
-        reverse: true,
-        wedged_threshold: 50,
-        progress: None,
-        halt: None,
-        key_fetch: None,
-    };
+    let opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("handler-chain patch must not error");
 

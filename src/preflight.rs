@@ -93,9 +93,32 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
                 }
             }
         }
-        // MainMovie / All / Longest always resolve to at least one title on a
-        // disc with titles (checked above), so they never block here.
+        // MainMovie / All / Longest carry no per-index reason to report; the
+        // resolves-to-nothing gate below covers them. It is NOT true that they
+        // always resolve — see that gate.
         Selection::MainMovie | Selection::All | Selection::Longest => {}
+    }
+
+    // Does the selection actually resolve to a title? Ask the ONE function that
+    // decides it rather than restating the answer here.
+    //
+    // This block used to be an assumption in a comment — "MainMovie / All /
+    // Longest always resolve to at least one title on a disc with titles" — and
+    // that is a second copy of a policy `mux::resolve_selection` owns. The
+    // copies diverged the moment the owner was hardened: `Longest` drops
+    // non-finite durations before folding (a NaN reaching the accumulator first
+    // is never displaced by `t > NaN` and would otherwise win outright), so a
+    // disc whose every playlist has an unparseable runtime resolves to NOTHING.
+    // Preflight said `Ready`, the loop was handed an empty index list, and
+    // `run_titles` returned `Ok { titles_written: 0 }`: success, exit 0, no
+    // file. The gate is deliberately last and conditional on no earlier reason,
+    // so an explicit out-of-range selection still blocks with the reason that
+    // names the index instead of a vaguer duplicate.
+    //
+    // `resolve_selection` is pure — no drive, no file, no read — so calling it
+    // keeps preflight's no-side-effects contract.
+    if reasons.is_empty() && crate::mux::resolve_selection(disc, &job.selection).is_empty() {
+        reasons.push(Reason::new("empty-selection"));
     }
 
     // Multipass implies raw. A multipass rip is a whole-disc image recovery:
@@ -323,6 +346,81 @@ mod tests {
             .find(|r| r.key == "title-out-of-range")
             .expect("expected out-of-range reason");
         assert_eq!(r.detail.as_deref(), Some("5"));
+    }
+
+    /// `Ready` has to mean the rip will actually rip something.
+    ///
+    /// The selection→indices policy lives in `mux::resolve_selection`, and
+    /// preflight carried a SECOND copy of the "does it resolve to anything?"
+    /// question — an assumption, written as a comment, that MainMovie / All /
+    /// Longest always yield at least one title on a disc that has titles. That
+    /// stopped being true when `resolve_selection` was hardened: `Longest` now
+    /// drops non-finite durations BEFORE folding (a NaN reaching the
+    /// accumulator first was never displaced and won outright), so a disc whose
+    /// every playlist has an unparseable runtime resolves to NO title.
+    ///
+    /// The two copies then disagreed on exactly that input: preflight said
+    /// `Ready`, `resolve_selection` said `[]`, and `run_titles([])` returns
+    /// `Ok { titles_written: 0 }` — a rip that reports success, exits 0, and
+    /// writes nothing. Preflight now asks the owner instead of assuming.
+    #[test]
+    fn ready_implies_the_selection_resolves_to_at_least_one_title() {
+        let mut d = disc_with(3, false, false);
+        for t in d.titles.iter_mut() {
+            t.duration_secs = f64::NAN;
+        }
+        let j = Job {
+            selection: Selection::Longest,
+            ..Job::new("iso://x.iso", "/out")
+        };
+
+        // The property, stated against the owner of the policy: preflight may
+        // not report Ready for a selection that resolves to nothing.
+        let pf = preflight(&d, &j);
+        let resolved = crate::mux::resolve_selection(&d, &j.selection);
+        assert!(
+            resolved.is_empty(),
+            "fixture invalid: Longest must resolve to nothing when no duration \
+             is measurable, got {resolved:?}"
+        );
+        assert!(
+            !pf.is_ready(),
+            "preflight reported Ready for a selection that resolves to no \
+             title — the rip would write nothing and exit 0"
+        );
+        assert!(
+            pf.reasons().iter().any(|r| r.key == "empty-selection"),
+            "expected empty-selection, got {:?}",
+            pf.reasons()
+        );
+
+        // And a measurable disc is untouched: one title resolves, Ready holds.
+        d.titles[1].duration_secs = 120.0;
+        let pf = preflight(&d, &j);
+        assert!(
+            pf.is_ready(),
+            "a disc with one measurable runtime must still be rippable: {pf:?}"
+        );
+    }
+
+    /// An explicit selection that is entirely out of range must keep reporting
+    /// the reason that names the offending index — the new resolves-to-nothing
+    /// gate must not displace or duplicate it.
+    #[test]
+    fn an_all_out_of_range_explicit_selection_still_names_the_index() {
+        let d = disc_with(2, false, false);
+        let j = Job {
+            selection: Selection::Titles(vec![7]),
+            ..Job::new("iso://x.iso", "/out")
+        };
+        let pf = preflight(&d, &j);
+        assert!(!pf.is_ready());
+        let keys: Vec<&str> = pf.reasons().iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["title-out-of-range"],
+            "the specific reason must survive, unduplicated"
+        );
     }
 
     #[test]

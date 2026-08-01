@@ -12,12 +12,22 @@
 pub enum DamageSeverity {
     /// No bad sectors at all.
     Clean,
-    /// 1–50 bad sectors AND <1 sec lost. Likely unnoticeable.
+    /// 1–50 bad sectors AND under 1 s lost. Likely unnoticeable.
     Cosmetic,
-    /// 51–500 sectors OR 1–30 sec lost. Visible artifacts possible.
+    /// 51–499 sectors, OR 1 s up to (not including) 30 s lost. Visible
+    /// artifacts possible.
     Moderate,
-    /// 500+ sectors OR 30+ sec lost. Significant damage; consider rescan
-    /// or different drive.
+    /// 500 or more sectors, OR 30 s or more lost — or a loss that could not be
+    /// quantified at all (`lost_ms` NaN), which fails safe to this tier because
+    /// the abort-on-loss gate is refusing the same rip. Significant damage;
+    /// consider a rescan or a different drive.
+    ///
+    /// The boundaries are stated here as they are IMPLEMENTED
+    /// ([`crate::classify_damage`] is the owner): the ranges used to read
+    /// "51–500" and "500+", which claimed both tiers for exactly 500 sectors.
+    /// The code answers `Serious` there, and a front-end that rendered its
+    /// badge from this doc rather than from the function disagreed with the
+    /// engine on the boundary case.
     Serious,
 }
 

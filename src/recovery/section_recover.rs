@@ -903,11 +903,22 @@ impl SectionHandler for Oscillate {
                 let pos = rp + off;
                 // Forward-into: prime from the sector below, then read the target
                 // (the head approaches from a lower LBA).
-                if pos >= SECTOR
-                    && let ReadHit::Transport =
-                        read_span(ctx, &mut probe, pos - SECTOR, 1, self.params)
-                {
-                    return HandlerOutcome::TransportFault;
+                //
+                // A prime that SUCCEEDS is a recovery like any other and must be
+                // claimed: `read_span` has already handed those bytes to the
+                // sink (its contract leaves removing the span to the caller),
+                // and the prime target is not always outside the residual — the
+                // sector below `pos` is the one this loop just failed to read
+                // whenever `off > 0`. Left in `bad`, it is re-recorded
+                // NonTrimmed by the final tier, promoted to Unreadable after the
+                // last pass, and reported as permanent loss for bytes that are
+                // already correct in the image.
+                if pos >= SECTOR {
+                    match read_span(ctx, &mut probe, pos - SECTOR, 1, self.params) {
+                        ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Good => bad.remove(pos - SECTOR, SECTOR),
+                        ReadHit::Bad => {}
+                    }
                 }
                 let mut recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                     ReadHit::Good => {
@@ -933,10 +944,15 @@ impl SectionHandler for Oscillate {
                 // Skipping the prime just means this one sector gets the
                 // forward-into attempt only.
                 if !recovered && prime_above_is_in_range(pos, ctx.reader.capacity_sectors()) {
-                    if let ReadHit::Transport =
-                        read_span(ctx, &mut probe, pos + SECTOR, 1, self.params)
-                    {
-                        return HandlerOutcome::TransportFault;
+                    // Claim a successful prime — see the prime-below comment.
+                    // Above `pos` the exposure is worse: `pos + SECTOR` is the
+                    // NEXT still-bad sector whenever this sub-range is two or
+                    // more sectors long, so a landed prime here is routinely a
+                    // real recovery of a sector still marked bad.
+                    match read_span(ctx, &mut probe, pos + SECTOR, 1, self.params) {
+                        ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Good => bad.remove(pos + SECTOR, SECTOR),
+                        ReadHit::Bad => {}
                     }
                     recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                         ReadHit::Good => {
@@ -2129,6 +2145,74 @@ mod tests {
             "Oscillate must recover the direction-dependent sector"
         );
         assert_eq!(sink.got.get(&(13 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    /// A sector whose bytes the sink has ALREADY been handed must never be left
+    /// in the residual bad set.
+    ///
+    /// `read_span`'s contract is explicit: on a Good read it hands the bytes to
+    /// the sink and "does NOT touch the still-bad set — the caller removes
+    /// recovered spans". Oscillate discharged that for its two TARGET reads and
+    /// not for its two PRIME reads — and a prime is not always outside the
+    /// residual: priming above `pos` reads `pos + SECTOR`, which is the next
+    /// still-bad sector whenever the sub-range is 2+ sectors long (priming below
+    /// is symmetric on the sector just processed).
+    ///
+    /// So the prime lands the sector, `RecoverySink::recovered` writes its real
+    /// bytes and marks it Finished in the live wiring — and then, because it is
+    /// still in `bad`, `recover_section` emits `PatchItem::NonTrimmed` over it
+    /// on the final tier. `Mapfile::record` is last-writer-wins, so the sector
+    /// is downgraded to damaged, the next-pass promotion turns it into
+    /// `Unreadable`, and the rip reports permanent loss for bytes that are
+    /// sitting correct in the ISO — loss that can fire the abort-on-loss gate
+    /// and refuse a rip that is actually complete.
+    ///
+    /// Sector 1 is dead; sector 2 is fine. Oscillate primes above sector 1,
+    /// which reads sector 2, and the per-handler budget then expires before
+    /// sector 2's own turn comes round.
+    #[test]
+    fn oscillate_never_leaves_a_sector_it_recovered_in_the_bad_set() {
+        let (h, disc) = Harness::build(&[1u32], None, Duration::from_secs(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(h, disc, sink, now);
+        // The residual is sectors 1 and 2 — a two-sector sub-range, so sector 1's
+        // prime-above target IS sector 2.
+        let mut bad = SubRanges::from_section(SECTOR, 2 * SECTOR);
+        // Four reads happen while processing sector 1 (prime below, target,
+        // prime above, target again) at 1 s each; the budget ends exactly there,
+        // so the loop yields before sector 2 is read on its own account.
+        let deadline = (ctx.now)() + Duration::from_secs(4);
+
+        let out = Oscillate {
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+
+        // The fixture has to actually exercise the path, or the invariant below
+        // is vacuous: sector 2's bytes must have reached the sink via the prime.
+        assert_eq!(
+            sink.got.get(&(2 * SECTOR)).copied(),
+            Some(SECTOR as usize),
+            "fixture invalid: the prime-above read of sector 2 did not land"
+        );
+
+        // The invariant. Stated over every recovered span rather than over
+        // sector 2 alone, so the prime-below direction is covered too.
+        for &pos in sink.got.keys() {
+            let still_bad = bad
+                .ranges()
+                .iter()
+                .any(|&(p, l)| pos >= p && pos < p.saturating_add(l));
+            assert!(
+                !still_bad,
+                "sector at byte {pos} was recovered and handed to the sink, yet \
+                 is still in the residual bad set — the final tier will record \
+                 NonTrimmed over bytes we successfully read"
+            );
+        }
     }
 
     /// Oscillate must not prime from past the end of the disc.

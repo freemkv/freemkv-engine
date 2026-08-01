@@ -1888,3 +1888,43 @@ mod snapshot_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The shipped Pass-N patch preset, pinned.
+///
+/// `PatchOptions::for_patch_pass` exists so the two routes into a patch pass
+/// cannot drift, and five test sites nevertheless hand-wrote its four values as
+/// literals — which meant the SHIPPED preset was exercised by nothing: every
+/// value could be changed in production and the whole suite stayed green
+/// (verified: `block_sectors: Some(1), full_recovery: false, reverse: false,
+/// wedged_threshold: 8` passes 285 unit + 56 integration tests). The literals
+/// are gone; this is the assertion that makes the preset load-bearing.
+///
+/// Each value is a behaviour, not a magic number:
+/// - `block_sectors: Some(32)` — adaptive batching (32 when healthy, 1 on
+///   failure). `Some(1)` would walk clean stretches 32x slower; `None` would
+///   drop per-sector probing.
+/// - `full_recovery: true` — the drive is asked to try hard; false makes a
+///   patch pass no better than the sweep read it is retrying.
+/// - `reverse: true` — approach direction differs from the sweep's, which is
+///   the point of retrying at all.
+/// - `wedged_threshold: 50` — how many wedged reads end the pass.
+#[cfg(test)]
+mod patch_preset_tests {
+    use super::*;
+
+    #[test]
+    fn for_patch_pass_carries_the_shipped_tuning() {
+        let o = PatchOptions::for_patch_pass(false, None, None, None);
+        assert_eq!(o.block_sectors, Some(32), "adaptive batching starts at 32");
+        assert!(o.full_recovery, "a patch pass asks the drive to try hard");
+        assert!(
+            o.reverse,
+            "a patch pass approaches from the other direction"
+        );
+        assert_eq!(o.wedged_threshold, 50);
+        assert!(!o.decrypt, "decrypt is the caller's, forwarded verbatim");
+
+        // And `decrypt` really is forwarded, not hard-coded.
+        assert!(PatchOptions::for_patch_pass(true, None, None, None).decrypt);
+    }
+}

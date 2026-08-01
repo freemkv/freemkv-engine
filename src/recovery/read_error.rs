@@ -1281,23 +1281,65 @@ mod tests {
         }
     }
 
+    /// The WINDOW trigger, isolated from the fast-entry trigger.
+    ///
+    /// This test used to build its ctx with `for_sweep`, which sets
+    /// `fast_jump_threshold = 1` — so the very first error jumped via the
+    /// fast path and the loop broke on iteration 0. `damage_window_max` and
+    /// `damage_threshold_pct` were never consulted: replacing the whole
+    /// `window_trigger` expression with `false` left this test (and all 36
+    /// others in this module) green. The one test named for the damage window
+    /// was pinning the path that bypasses it.
+    ///
+    /// Disable the fast path the way Pass N does (`u64::MAX`) so only the
+    /// window can fire, then pin BOTH sides: no jump while the window is
+    /// short, a jump on the read that fills it.
     #[test]
     fn damage_window_fills_then_jumps() {
         let mut ctx = ReadCtx::for_sweep(1);
+        ctx.fast_jump_threshold = u64::MAX;
         ctx.damage_window_max = 4;
         ctx.damage_threshold_pct = 50;
-        let mut saw_jump = false;
-        for _ in 0..6 {
+
+        // Reads 1-3: the window is not full yet, so the window trigger must
+        // NOT fire — a partly-filled window is not evidence of a damage zone.
+        for i in 1..=3 {
             let a = handle_read_error(&medium_err(), &mut ctx);
-            if matches!(a, ReadAction::JumpAhead { .. }) {
-                saw_jump = true;
-                break;
-            }
+            assert!(
+                matches!(a, ReadAction::SkipBlock { .. }),
+                "read {i} filled only {}/4 of the window and must skip in \
+                 place, got {a:?}",
+                ctx.damage_window.len()
+            );
         }
+
+        // Read 4 fills the window at 100% bad, which clears the 50% threshold.
+        let a = handle_read_error(&medium_err(), &mut ctx);
         assert!(
-            saw_jump,
-            "expected at least one JumpAhead in 6 failures with 50% threshold"
+            matches!(a, ReadAction::JumpAhead { .. }),
+            "a full window at 100% bad against a 50% threshold must jump, \
+             got {a:?}"
         );
+    }
+
+    /// The window threshold is a real comparison, not a formality: a threshold
+    /// no density can reach must never jump, however long the failure run.
+    /// Without this, `bad_pct >= ctx.damage_threshold_pct` could be inverted
+    /// or dropped and only the test above would notice the direction.
+    #[test]
+    fn an_unreachable_damage_threshold_never_jumps() {
+        let mut ctx = ReadCtx::for_sweep(1);
+        ctx.fast_jump_threshold = u64::MAX;
+        ctx.damage_window_max = 4;
+        ctx.damage_threshold_pct = 101; // unsatisfiable: bad_pct maxes at 100
+        for i in 1..=12 {
+            let a = handle_read_error(&medium_err(), &mut ctx);
+            assert!(
+                matches!(a, ReadAction::SkipBlock { .. }),
+                "read {i}: no density can reach 101%, so the window trigger \
+                 must stay silent, got {a:?}"
+            );
+        }
     }
 
     #[test]
