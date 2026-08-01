@@ -1519,3 +1519,128 @@ fn mapfile_from_a_different_disc_is_refused() {
         "patch() must refuse disc A's mapfile against disc B, exactly as copy() does"
     );
 }
+
+// ── Survivors from the full-crate mutation run, killed here ────────────────
+
+/// A PLAIN copy (no `--multipass`) must ABORT on the first unreadable sector,
+/// not zero-fill and carry on.
+///
+/// `Err(err) if !opts.skip_on_error => { producer_err = ...; break 'outer }` is
+/// the whole behaviour of `disc:// -> iso://` without `--multipass`, because
+/// `sweep_internal` sets `skip_on_error: opts.multipass`. The mutation run
+/// forced that guard to `false` and the suite stayed green: the error then
+/// falls into the recovery arm, so the sweep zero-fills the bad region, marks
+/// it NonTrimmed, damage-jumps and returns Ok — a plain copy of a damaged disc
+/// exits 0 with a holed ISO.
+///
+/// It survived because every `CopyOptions` in this file sets `multipass: true`
+/// and every direct `SweepOptions` sets `skip_on_error: true`, so nothing ever
+/// ran a sweep with `skip_on_error: false` over a bad sector.
+#[test]
+fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
+    let sectors: u32 = 1000;
+    let bad: std::collections::HashSet<u32> = [320u32].into_iter().collect();
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: bad,
+    };
+    let disc = make_test_disc(sectors, "PLAIN");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("plain.iso");
+    let opts = SweepOptions {
+        decrypt: false,
+        resume: false,
+        batch_sectors: None,
+        skip_on_error: false, // plain copy: the first error is fatal
+        progress: None,
+        halt: None,
+        vid: None,
+        unit_keys: Vec::new(),
+        key_fetch: None,
+    };
+
+    let err = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
+        .expect_err("a plain copy must fail on an unreadable sector");
+    assert!(
+        matches!(err, libfreemkv::Error::DiscRead { .. }),
+        "expected a DiscRead error, got {err:?}"
+    );
+
+    // And it must not have recorded damage-jump state: the producer aborted
+    // before any NonTrimmed range was written.
+    let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).expect("load mapfile");
+    assert!(
+        mf.ranges_with(&[SectorStatus::NonTrimmed]).is_empty(),
+        "a plain copy must not damage-jump; it aborts"
+    );
+}
+
+/// A RESUME must not truncate the image it is resuming into.
+///
+/// `if resume && existing_len.is_some_and(|len| len > 0)` chooses open-existing
+/// over `File::create` + `set_len` — i.e. over truncation. The mutation run
+/// changed `>` to `<` and to `==`; both send every resume down the
+/// create-and-truncate branch, zeroing bytes the mapfile still records as
+/// Finished. The producer only builds work from NonTried ranges, so those
+/// bytes are never re-read: silent, total loss of the recovered image.
+///
+/// The existing resume tests could not catch it because they pre-fill the ISO
+/// with ZEROS and assert only which LBAs were read — truncating zeros to zeros
+/// is invisible. This one fills the recovered prefix with a recognisable
+/// pattern instead.
+#[test]
+fn a_resume_does_not_truncate_the_already_recovered_prefix() {
+    const SEC: u64 = libfreemkv::consts::SECTOR_BYTES_U64;
+    let sectors: u32 = 400;
+    let recovered_sectors: u32 = 100;
+
+    let disc = make_test_disc(sectors, "RESUME");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("resume.iso");
+
+    // A full-length ISO whose recovered prefix is 0xCC, not zeros.
+    let total = sectors as u64 * SEC;
+    let mut img = vec![0u8; total as usize];
+    for b in img
+        .iter_mut()
+        .take((recovered_sectors as u64 * SEC) as usize)
+    {
+        *b = 0xCC;
+    }
+    std::fs::write(&iso_path, &img).unwrap();
+
+    // A mapfile saying the prefix is Finished and the rest is NonTried.
+    let mf_path = disc.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, total, "test").expect("create mapfile");
+        mf.record(0, recovered_sectors as u64 * SEC, SectorStatus::Finished)
+            .expect("record");
+        mf.flush().expect("flush");
+    }
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = SweepOptions {
+        decrypt: false,
+        resume: true,
+        batch_sectors: None,
+        skip_on_error: true,
+        progress: None,
+        halt: None,
+        vid: None,
+        unit_keys: Vec::new(),
+        key_fetch: None,
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("resume sweep");
+
+    let after = std::fs::read(&iso_path).expect("read iso");
+    assert_eq!(after.len() as u64, total, "the ISO was resized");
+    assert!(
+        after[..(recovered_sectors as u64 * SEC) as usize]
+            .iter()
+            .all(|&b| b == 0xCC),
+        "the already-recovered prefix was overwritten — the resume truncated it"
+    );
+}
