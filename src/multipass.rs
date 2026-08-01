@@ -89,8 +89,17 @@ pub fn loss_is_unscopable(
 }
 
 /// Milliseconds of playback lost, scoped by [`abort_lost_bytes`] and converted
-/// via the title's own bytes/sec bitrate. Ported verbatim from autorip's
-/// `abort_lost_ms`.
+/// via the title's own bytes/sec bitrate.
+///
+/// Originally a verbatim port of autorip's `abort_lost_ms`; it no longer is.
+/// It now fails safe to NaN when the loss exists but cannot be measured —
+/// see [`loss_is_unscopable`].
+///
+/// NOTE for callers offering a loss override: NaN aborts under EVERY
+/// threshold, including `u64::MAX`. autorip's `.accept-loss` escape hatch
+/// therefore does NOT apply to a disc whose title has no extents. That is
+/// deliberate — an override should waive a loss you can measure, not one you
+/// cannot — but it is a behaviour change worth knowing about.
 pub fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -115,7 +124,10 @@ pub fn abort_lost_ms(
     // path in this crate answers NaN, which `loss_aborts` /
     // `should_abort_for_loss` treat as fail-safe abort; answering 0.0 let a
     // configured seconds tolerance silently accept loss it could not measure.
-    if title_bytes_per_sec <= 0.0 {
+    // `<= 0.0` alone let an INFINITE bitrate through: `lost_bytes / inf` is
+    // 0.0 ms, so a tolerance accepted loss that was never measured. Any
+    // non-finite or non-positive rate is unusable.
+    if !(title_bytes_per_sec.is_finite() && title_bytes_per_sec > 0.0) {
         return f64::NAN;
     }
     lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
@@ -298,7 +310,7 @@ fn main_title_lost_ms(disc: &libfreemkv::Disc, main_bad_bytes: u64) -> f64 {
         return 0.0;
     }
     match disc.titles.first() {
-        Some(t) if t.size_bytes > 0 && t.duration_secs > 0.0 => {
+        Some(t) if t.size_bytes > 0 && t.duration_secs > 0.0 && t.duration_secs.is_finite() => {
             main_bad_bytes as f64 / t.size_bytes as f64 * t.duration_secs * MILLIS_PER_SEC
         }
         // Loss exists but we can't quantify it (no bitrate) → NaN, which the
