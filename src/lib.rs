@@ -78,25 +78,25 @@ mod speed;
 mod streams;
 
 pub use extract::extract_tree;
-pub use job::{Job, Selection, StreamChoice, StreamFilter};
+pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
 pub use multipass::{
-    MultipassOpts, PatchDecision, abort_lost_bytes, abort_lost_ms, bad_sector_statuses,
-    classify_damage, effective_abort_secs, end_of_recovery_promotion, loss_aborts, multipass_rip,
-    patch_made_progress, patch_pass_decision, plan_passes, scope_bad_bytes, scope_converged,
-    should_abort_for_loss,
+    MultipassOpts, MultipassResult, PassPlan, PatchDecision, abort_lost_bytes, abort_lost_ms,
+    bad_sector_statuses, classify_damage, effective_abort_secs, end_of_recovery_promotion,
+    loss_aborts, multipass_rip, patch_made_progress, patch_pass_decision, plan_passes,
+    scope_bad_bytes, scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
     mux_title_session, open_scan_resolve, resolve_selection, run_titles,
 };
-pub use outcome::{DamageSeverity, Outcome};
-pub use preflight::{Preflight, preflight};
+pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
+pub use preflight::{Preflight, Reason, preflight};
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;
-pub use streams::StreamSelError;
+pub use streams::{StreamSelError, UnmatchedClass, resolve_stream_selection};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────
 //

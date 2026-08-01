@@ -225,6 +225,21 @@ pub(crate) fn aacs_aligned_batch(batch: u16, decrypt_is_aacs: bool) -> u16 {
     batch
 }
 
+/// Anchor a region's read cursor DOWN to the nearest AACS unit boundary.
+///
+/// A resume `NonTried` region can begin mid-unit. `decrypt_sectors` anchors
+/// units at buffer offset 0, so a read that STARTS mid-unit decrypts under the
+/// wrong alignment. Re-reading the few head sectors is idempotent, so aligning
+/// down is free. Sibling of [`aacs_aligned_batch`], which handles the other
+/// half of the same invariant (a whole number of units per read).
+pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) -> u64 {
+    if !decrypt_is_aacs {
+        return region_pos;
+    }
+    let unit = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64;
+    region_pos - (region_pos % unit)
+}
+
 #[cfg(test)]
 mod aacs_aligned_batch_tests {
     use super::{UNIT_SECTORS, aacs_aligned_batch};
@@ -643,6 +658,13 @@ pub fn sweep(
     let mut in_damage_zone = false;
     const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
     let mut cached_snapshot: Option<ProgressSnapshot> = None;
+    // Derived from `cached_snapshot.bad_ranges` + the main title ONLY, so they
+    // change exactly when a new snapshot lands — not once per batch. Computing
+    // them in the per-iteration reporter block re-ran `bytes_bad_in_title`
+    // (O(ranges x extents), twice: once directly and once inside
+    // `locate_ranges`) 400k-1.6M times per rip over a value that had not moved.
+    let mut cached_main_title_bad: u64 = 0;
+    let mut cached_located = libfreemkv::progress::LocatedProgress::default();
     let mut producer_err: Option<Error> = None;
 
     tracing::trace!(
@@ -683,8 +705,7 @@ pub fn sweep(
         // sweep's NonTried region starts at 0, already unit-aligned; this only
         // shifts resume regions that begin mid-unit.
         let mut pos = if decrypt_is_aacs {
-            let unit_bytes = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64;
-            region_pos - (region_pos % unit_bytes)
+            aacs_aligned_region_start(region_pos, true)
         } else {
             region_pos
         };
@@ -970,6 +991,10 @@ pub fn sweep(
 
             // Drain any consumer-side stats snapshot.
             if let Some(snap) = try_recv_progress(&prog_rx) {
+                if let Some(t) = disc.titles.first() {
+                    cached_main_title_bad = bytes_bad_in_title(t, &snap.bad_ranges);
+                    cached_located = locate_ranges(&snap.bad_ranges, t);
+                }
                 cached_snapshot = Some(snap);
             }
 
@@ -1028,14 +1053,7 @@ pub fn sweep(
                 // close enough for an early UI tick; the next
                 // real snapshot replaces it.
                 let main_title = disc.titles.first();
-                let main_title_bad = match &cached_snapshot {
-                    Some(snap) => disc
-                        .titles
-                        .first()
-                        .map(|t| bytes_bad_in_title(t, &snap.bad_ranges))
-                        .unwrap_or(0),
-                    None => 0,
-                };
+                let main_title_bad = cached_main_title_bad;
                 // The consumer's snapshot is the source of truth for
                 // bytes_unreadable / bytes_pending (the producer doesn't
                 // see them), but its bytes_good lags producer-side
@@ -1076,12 +1094,7 @@ pub fn sweep(
                     // Rendered drilldown from the consumer's in-memory
                     // snapshot (bad ranges) + title; empty until the first
                     // snapshot arrives.
-                    located: match &cached_snapshot {
-                        Some(snap) => main_title
-                            .map(|t| locate_ranges(&snap.bad_ranges, t))
-                            .unwrap_or_default(),
-                        None => libfreemkv::progress::LocatedProgress::default(),
-                    },
+                    located: cached_located.clone(),
                 };
                 if !reporter.report(&pp) {
                     halt_requested = true;
@@ -1249,6 +1262,10 @@ pub struct PatchOptions<'a> {
     pub decrypt: bool,
     pub block_sectors: Option<u16>,
     pub full_recovery: bool,
+    /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only.
+    /// It does NOT order the walk: `PatchCtx::run` sorts the bad ranges by
+    /// (size desc, pos asc), a total order over disjoint runs, so any
+    /// pre-ordering is unobservable.
     pub reverse: bool,
     pub wedged_threshold: u64,
     pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
@@ -1473,38 +1490,52 @@ mod snap_tests {
 mod tests {
     use super::*;
 
+    /// Region-start alignment, asserted against PRODUCTION.
+    ///
+    /// This test used to re-derive `region_pos - (region_pos % unit_bytes)`
+    /// inline and check properties of its own arithmetic, so breaking the real
+    /// sweep left it green. It now calls `aacs_aligned_region_start`.
+    ///
+    /// The batch half is deliberately NOT retested here — `aacs_aligned_batch`
+    /// has its own production-calling module above; duplicating it would be a
+    /// strictly weaker second copy.
     #[test]
-    fn aacs_sweep_batch_and_region_are_unit_aligned() {
-        const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16; // 3
-        let unit_bytes = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64; // 6144
+    fn aacs_region_start_anchors_down_to_a_unit_boundary() {
+        let unit = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64; // 6144
 
-        // (a) Batch rounding: ecc_sectors() for UHD/BD is 32, not a multiple of 3.
-        // The decrypting-AACS path rounds it up to the next multiple of 3 (33).
-        for format in [libfreemkv::DiscFormat::Uhd, libfreemkv::DiscFormat::BluRay] {
-            let mut batch = ecc_sectors(format);
-            assert_eq!(batch, 32);
-            if !batch.is_multiple_of(UNIT_SECTORS) {
-                batch = batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
-            }
-            assert_eq!(batch, 33, "batch must round 32 -> 33 (a multiple of 3)");
-            assert_eq!(batch % UNIT_SECTORS, 0);
-            // Every full batch read is then a whole number of 6144-byte units.
-            assert_eq!((batch as u64 * 2048) % unit_bytes, 0);
+        // EXACT expected values. Properties alone are not enough: an
+        // implementation that always returned 0 would satisfy "is unit
+        // aligned" and "moved down" while silently discarding every byte of
+        // resume progress.
+        for (pos, want) in [
+            (0u64, 0u64),
+            (2048, 0),
+            (4096, 0),
+            (6144, 6144),
+            (8192, 6144),
+            (65_536, 61_440),
+            (67_584, 67_584),
+        ] {
+            assert_eq!(
+                aacs_aligned_region_start(pos, true),
+                want,
+                "region {pos} must anchor to {want}"
+            );
         }
 
-        // (b) Region-start down-alignment. A resume NonTried region can begin
-        // mid-unit; aligning the read cursor DOWN to the nearest unit boundary
-        // makes block_lba % 3 == 0 for the first (and thus every) batch read.
-        // Re-reading the few head sectors is idempotent.
-        for region_pos in [0u64, 2048, 4096, 6144, 8192, 65536, 67_584] {
-            let pos = region_pos - (region_pos % unit_bytes);
-            assert_eq!(pos % unit_bytes, 0, "aligned cursor must be unit-aligned");
-            assert!(pos <= region_pos, "alignment only moves the cursor down");
-            // block_lba derived as pos/2048 must be a multiple of 3 sectors.
-            assert_eq!((pos / 2048) % UNIT_SECTORS as u64, 0);
+        // And the tightness bound the exact values encode, over a wider sweep:
+        // the cursor lands on the NEAREST boundary at or below `pos`, never a
+        // whole unit further back.
+        for pos in (0u64..40_000).step_by(512) {
+            let got = aacs_aligned_region_start(pos, true);
+            assert_eq!(got % unit, 0, "{pos} -> {got} is not unit-aligned");
+            assert!(got <= pos, "{pos} -> {got} moved the cursor UP");
+            assert!(pos - got < unit, "{pos} -> {got} skipped a whole unit back");
         }
-        // An already-aligned region (fresh sweep starts at 0) is unchanged.
-        assert_eq!(0u64 - (0u64 % unit_bytes), 0);
-        assert_eq!(6144u64 - (6144u64 % unit_bytes), 6144);
+
+        // A non-AACS sweep has no unit geometry; the cursor is untouched.
+        for pos in [0u64, 2048, 8192, 67_583] {
+            assert_eq!(aacs_aligned_region_start(pos, false), pos);
+        }
     }
 }

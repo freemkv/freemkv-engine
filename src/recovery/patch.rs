@@ -371,7 +371,6 @@ pub(super) fn send_or_abort(
 #[allow(clippy::type_complexity)]
 pub(super) fn compute_initial_state(
     path: &std::path::Path,
-    opts: &PatchOptions,
     mapfile_path: &std::path::Path,
 ) -> Result<(
     Mapfile,
@@ -393,10 +392,12 @@ pub(super) fn compute_initial_state(
     // pass 5 jumps over the same zone as pass 2, fine. NonTried ranges
     // are intentionally excluded — they are covered by a preceding
     // sweep pass, not by patch.
-    let mut bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
-    if opts.reverse {
-        bad_ranges.reverse();
-    }
+    // NOT reversed for `opts.reverse`: `PatchCtx::run` sorts this list by
+    // (size desc, pos asc) before walking it, and because `ranges_with` yields
+    // disjoint runs every `pos` is unique — a total order. Any pre-ordering
+    // here is therefore unobservable. A `bad_ranges.reverse()` lived here and
+    // did nothing; `opts.reverse` now only labels the reported `PassKind`.
+    let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
     let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
     // Fail SAFE when metadata is indeterminate: assume a regular file so a
     // real `sync_all` failure is surfaced, not swallowed. `/dev/null` and pipes
@@ -1342,10 +1343,11 @@ pub fn bytes_bad_in_title_from_mapfile(
 
 /// Pass 2..N of a multipass rip: re-read the bad ranges
 /// recorded in the sidecar mapfile and try to recover them.
-/// With `reverse: true` (the default for the recovery walker),
-/// the bad-range walk runs end-to-start so escalating skips
-/// converge on the actual bad sub-zones inside any
-/// `NonTrimmed` block. Returns a [`PatchOutcome`] with
+/// The walk is LARGEST-RANGE-FIRST (ties: lowest LBA first), not
+/// positional: the big `NonTrimmed` regions are usually sweep
+/// skip-ahead overshoot that reads straight back, so taking them
+/// before the many tiny dead fragments recovers the bulk of the
+/// disc in the first minutes. Returns a [`PatchOutcome`] with
 /// recovered byte counts and wedge-detection signals.
 ///
 /// Paired with [`Disc::sweep`] as the library's other flat
@@ -1370,7 +1372,7 @@ pub fn patch(
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
     let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
-        compute_initial_state(path, opts, &mapfile_path)?;
+        compute_initial_state(path, &mapfile_path)?;
     // Same reasoning as the decrypt gate above: `copy` and `sweep` both verify
     // the mapfile actually describes THIS disc before acting on it, and a
     // direct `patch` caller — the exposed sweep/patch resume pair — must not
@@ -1507,16 +1509,38 @@ pub fn patch(
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
     };
-    ctx.run(&bad_ranges)?;
+    // Hold the pass result rather than `?`-ing it: `pipe.finish()` below is what
+    // runs `PatchSink::close` (sync_all + mapfile.flush), and returning early
+    // here skipped it on every error path — so a pass that died mid-write left
+    // the on-disk damage record unflushed and disagreeing with what happened.
+    let run_result = ctx.run(&bad_ranges);
     ctx.scoreboard.log();
     let PatchCtx { state, .. } = ctx;
 
-    // Drain the consumer thread: drop tx, wait for `close` to run
-    // sync_all + mapfile.flush, then take the final stats from the
-    // sink's summary. `close` failing on a regular-file sync_all is
-    // surfaced here as `Error::IoError`, matching pre-split
-    // behaviour.
-    let summary = pipe.finish()?;
+    // Drain the consumer thread unconditionally: drop tx, wait for `close` to
+    // run sync_all + mapfile.flush, then take the final stats from the sink's
+    // summary. `close` failing on a regular-file sync_all is surfaced as
+    // `Error::IoError`, matching pre-split behaviour.
+    let finish_result = pipe.finish();
+
+    // Producer-side error wins over consumer-side — the pass failure is what
+    // motivated quitting; the flush error, if any, is downstream. Mirrors the
+    // sweep path's documented precedence. But do not let a close() failure
+    // vanish silently on the both-failed path: it is the only signal that the
+    // mapfile on disk is now untrustworthy.
+    if let Err(ref e) = run_result
+        && let Err(close_err) = &finish_result
+    {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "patch.finish.dropped",
+            pass_error = %e,
+            close_error = %close_err,
+            "patch: consumer close failed while the pass was already failing —              the mapfile on disk may be incomplete"
+        );
+    }
+    run_result?;
+    let summary = finish_result?;
 
     let outcome = build_outcome(
         &state,

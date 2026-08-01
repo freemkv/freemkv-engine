@@ -76,10 +76,28 @@ pub fn abort_lost_ms(
     bad_ranges: &[(u64, u64)],
     title_bytes_per_sec: f64,
 ) -> f64 {
-    if title_bytes_per_sec <= 0.0 {
+    // An UNSCOPABLE mkv-output title: `bytes_bad_in_title` returns 0 when the
+    // title has no extents, which is indistinguishable from "no damage" — and
+    // an extent-less title comes from the same failed scan that leaves the
+    // bitrate at 0, so the two arrive together. Returning 0.0 here would report
+    // a damaged disc as clean. Checked BEFORE the zero-bytes early return,
+    // because that is the branch it would otherwise take.
+    if !output_is_iso && title.extents.is_empty() && !bad_ranges.is_empty() {
+        return f64::NAN;
+    }
+    let lost_bytes = abort_lost_bytes(output_is_iso, title, bad_ranges);
+    // Genuinely no loss is genuinely zero — NaN here would abort clean rips.
+    if lost_bytes == 0 {
         return 0.0;
     }
-    abort_lost_bytes(output_is_iso, title, bad_ranges) as f64 / title_bytes_per_sec * MILLIS_PER_SEC
+    // Loss exists but cannot be converted to time. Every other unquantifiable
+    // path in this crate answers NaN, which `loss_aborts` /
+    // `should_abort_for_loss` treat as fail-safe abort; answering 0.0 let a
+    // configured seconds tolerance silently accept loss it could not measure.
+    if title_bytes_per_sec <= 0.0 {
+        return f64::NAN;
+    }
+    lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -671,6 +689,68 @@ mod tests {
             "muxed keeps configured"
         );
         assert_eq!(effective_abort_secs(false, 0), 0);
+    }
+
+    /// `abort_lost_ms` must never answer "0 ms lost" when loss exists but
+    /// cannot be measured — 0.0 reads to `should_abort_for_loss` as "within
+    /// tolerance", and a configured seconds tolerance then delivers a damaged
+    /// rip as good. Every sibling here (`main_title_lost_ms`,
+    /// `classify_damage`, `bytes_bad_in_title_from_mapfile`) fails safe; this
+    /// one did not.
+    ///
+    /// Not reachable from today's callers (autorip guards one site and feeds a
+    /// fallback bitrate at the other), so this pins an exported API against a
+    /// future front-end — and against the mutation run, which replaced this
+    /// whole body with a constant and kept the suite green.
+    #[test]
+    fn abort_lost_ms_fails_safe_when_loss_cannot_be_quantified() {
+        let mut t = test_title(0, 100);
+        t.size_bytes = 0;
+        t.duration_secs = 0.0;
+        let damage = [(0u64, 4096u64)];
+
+        // Zero bitrate + real in-title loss -> unquantifiable, not zero.
+        let ms = abort_lost_ms(false, &t, &damage, 0.0);
+        assert!(ms.is_nan(), "zero-bitrate loss must be NaN, got {ms}");
+        assert!(
+            loss_aborts(abort_lost_bytes(false, &t, &damage), ms, 30),
+            "an unquantifiable loss must abort even under a 30s tolerance"
+        );
+
+        // The scope hole: a title with NO EXTENTS cannot be scoped, so
+        // `bytes_bad_in_title` answers 0 — indistinguishable from "clean".
+        // With a perfectly good bitrate, this is the case a naive
+        // `lost_bytes == 0 -> 0.0` guard would wave through.
+        let mut no_extents = libfreemkv::DiscTitle::empty();
+        no_extents.size_bytes = 1_000_000;
+        no_extents.duration_secs = 100.0;
+        assert!(no_extents.extents.is_empty());
+        let ms = abort_lost_ms(false, &no_extents, &damage, 8_250_000.0);
+        assert!(
+            ms.is_nan(),
+            "an unscopable title with damage must be NaN, got {ms}"
+        );
+
+        // ISO scope is whole-disc, so it never needs extents: still quantified.
+        let ms_iso = abort_lost_ms(true, &no_extents, &damage, 8_250_000.0);
+        assert!(ms_iso > 0.0 && ms_iso.is_finite(), "iso scope: {ms_iso}");
+    }
+
+    /// The other direction: genuinely no loss must stay 0.0, or every clean rip
+    /// aborts. This is the guard that makes the NaN above safe to add.
+    #[test]
+    fn abort_lost_ms_reports_zero_for_a_genuinely_clean_rip() {
+        let t = test_title(0, 100);
+        assert_eq!(
+            abort_lost_ms(false, &t, &[], 0.0),
+            0.0,
+            "no damage, no bitrate"
+        );
+        assert_eq!(abort_lost_ms(true, &t, &[], 0.0), 0.0, "iso, no damage");
+        // Damage entirely OUTSIDE the title is not this title's loss (the
+        // autorip test `mkv_resume_ignores_out_of_title_loss` pins this).
+        let outside = [(500_000_000u64, 2048u64)];
+        assert_eq!(abort_lost_ms(false, &t, &outside, 8_250_000.0), 0.0);
     }
 
     #[test]
