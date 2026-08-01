@@ -164,4 +164,45 @@ mod tests {
         let j = Job::new("d", "o").with_selection(Selection::Titles(vec![0, 2, 5]));
         assert_eq!(j.selection, Selection::Titles(vec![0, 2, 5]));
     }
+
+    /// `is_all` is the "skip the stream filter entirely" shortcut, so it has
+    /// to mean BOTH classes keep everything. A version that answers true for a
+    /// half-filtered choice makes callers skip a filter the user asked for and
+    /// ship every track; one that answers false costs only a redundant
+    /// resolve. Untested until now, in either direction.
+    #[test]
+    fn is_all_requires_both_classes_to_keep_everything() {
+        let all = StreamChoice {
+            audio: StreamFilter::All,
+            subtitles: StreamFilter::All,
+        };
+        assert!(all.is_all());
+        assert!(
+            StreamChoice::default().is_all(),
+            "the default choice keeps everything"
+        );
+        assert!(
+            !StreamChoice {
+                audio: StreamFilter::None,
+                subtitles: StreamFilter::All,
+            }
+            .is_all(),
+            "audio is filtered — this is not a no-op"
+        );
+        assert!(
+            !StreamChoice {
+                audio: StreamFilter::All,
+                subtitles: StreamFilter::None,
+            }
+            .is_all(),
+            "subtitles are filtered — this is not a no-op"
+        );
+        assert!(
+            !StreamChoice {
+                audio: StreamFilter::Langs(vec!["eng".into()]),
+                subtitles: StreamFilter::Langs(vec!["eng".into()]),
+            }
+            .is_all()
+        );
+    }
 }

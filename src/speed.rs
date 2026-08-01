@@ -569,4 +569,120 @@ mod tests {
         let (speed, _) = s.sample_at(t, 200, 1000);
         assert_eq!(speed, 0, "same instant → no rate");
     }
+
+    // ─── The real production entry point (sample) ───────────────────────────
+
+    /// `sample` — not `sample_at` — is what `run.rs` and `mux.rs` actually
+    /// call on every progress tick, so it is the function whose whole body a
+    /// mutation run could replace with a constant tuple. Every test above
+    /// drives the injectable `sample_at`, which left the real-clock wrapper
+    /// completely unconstrained.
+    #[test]
+    fn sample_derives_from_the_real_clock_not_a_constant() {
+        let mut s = SpeedEstimator::new();
+        let total = 100 * 1024 * 1024u64;
+
+        // (0, None) is genuinely correct for the first call — one sample can't
+        // make a rate, and nothing is done yet.
+        assert_eq!(
+            s.sample(0, total),
+            (0, None),
+            "the first sample has no prior point to measure against"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        let (bps, eta) = s.sample(total / 2, total);
+        assert!(
+            bps > 0,
+            "half the disc over real elapsed time is a non-zero speed, got {bps}"
+        );
+        assert!(
+            eta.is_some(),
+            "half done with real throughput must produce an ETA"
+        );
+
+        // And it is finished-aware, which no single constant tuple can be at
+        // the same time as the assertions above.
+        std::thread::sleep(Duration::from_millis(20));
+        let (_, done_eta) = s.sample(total, total);
+        assert_eq!(done_eta, None, "nothing left to estimate once complete");
+    }
+
+    // ─── Boundary comparisons the round-6 mutation run left unpinned ────────
+
+    /// A byte count that has not moved is NOT a new pass.
+    ///
+    /// `observe`'s re-anchor guard is `bytes_done < start_bytes`. Widened to
+    /// `<=`, a stall at exactly the pass-start byte count — two ticks before
+    /// the first byte moves, which is ordinary on a slow spin-up — re-anchors
+    /// the running-average clock on every such tick. That is invisible in the
+    /// display speed (a stall reads 0 either way) but silently shortens the
+    /// ETA denominator once progress resumes.
+    #[test]
+    fn a_flat_byte_count_does_not_re_anchor_the_pass_clock() {
+        let mut s = SpeedEstimator::new();
+        let t0 = Instant::now();
+        s.observe(t0, 1000);
+        s.observe(t0 + Duration::from_secs(5), 1000);
+        s.observe(t0 + Duration::from_secs(15), 5000);
+
+        let eta = s.eta_speed_mbs(t0 + Duration::from_secs(15), 0.0);
+        // 4000 bytes over the FULL 15 s since the true pass start. The `<=`
+        // mutant re-anchors at t0+5s and divides by 10 s instead.
+        let expected = (4000.0 / BYTES_PER_MIB) / 15.0;
+        assert!(
+            (eta - expected).abs() < 1e-9,
+            "expected the rate over the true 15s pass, got {eta} (expected {expected})"
+        );
+    }
+
+    /// A sample sitting exactly ON the window cutoff stays in the window.
+    ///
+    /// Every other pruning test advances in whole seconds against a whole-second
+    /// window, so a sample lands on the cutoff constantly and `<`/`<=`/`==` are
+    /// indistinguishable by accident. This one is built so the answer differs:
+    /// the sample at the cutoff instant carries the byte count that makes the
+    /// rate come out at exactly 10 MB/s.
+    #[test]
+    fn the_window_cutoff_is_inclusive_of_a_sample_on_the_boundary() {
+        let mut s = SpeedEstimator::new();
+        let t0 = Instant::now();
+        let mib = 1024 * 1024u64;
+        s.observe(t0, 0);
+        s.observe(t0 + Duration::from_secs(1), 0);
+        s.observe(t0 + Duration::from_secs(2), 100 * mib);
+        // Window is the static 10 s, so cutoff == t0 + 1s exactly.
+        let speed = s.observe(t0 + Duration::from_secs(11), 100 * mib);
+
+        // Kept the t0+1s sample: 100 MiB over 10 s.
+        //   `<=` would drop it   → 0 MiB over 9 s  → 0.0
+        //   `==` would drop none → 100 MiB over 11 s → ~9.09
+        assert!(
+            (speed - 10.0).abs() < 1e-6,
+            "the sample exactly on the cutoff must be retained, got {speed} MB/s"
+        );
+    }
+
+    /// At exactly `ETA_WARMUP_SECS` the running average is already in use.
+    #[test]
+    fn eta_leaves_warmup_exactly_at_the_boundary() {
+        let mut s = SpeedEstimator::new();
+        let t0 = Instant::now();
+        s.observe(t0, 0);
+        s.observe(
+            t0 + Duration::from_secs_f64(ETA_WARMUP_SECS),
+            700 * 1024 * 1024,
+        );
+        // A sentinel no real rate can equal, so "fell back to display" is
+        // unambiguous.
+        let eta = s.eta_speed_mbs(t0 + Duration::from_secs_f64(ETA_WARMUP_SECS), 999.0);
+        assert_ne!(
+            eta, 999.0,
+            "at exactly the warmup boundary the running average must be used, not the display fallback"
+        );
+        assert!(
+            (eta - 70.0).abs() < 0.5,
+            "700 MiB over 10 s is ~70 MB/s, got {eta}"
+        );
+    }
 }

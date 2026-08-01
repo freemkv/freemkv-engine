@@ -22,6 +22,9 @@ use crate::sink::{Level, Sink};
 /// Milliseconds per second — the byte-loss→time conversion base.
 const MILLIS_PER_SEC: f64 = 1000.0;
 
+/// Bytes in one optical sector — the unit damage is scored in.
+const SECTOR_BYTES: u64 = 2048;
+
 /// Does the residual loss exceed the tolerance and therefore abort the rip?
 ///
 /// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
@@ -298,6 +301,45 @@ pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity 
     Cosmetic
 }
 
+/// Whether a recovery pass decrypts in place, given the job's `raw` flag.
+///
+/// FOUR pass-option sites spelled this `!job.raw` inline — the single-pass
+/// copy, the Pass 1 sweep and every patch pass here, plus `recover_to_iso`'s
+/// own `CopyOptions` in `run.rs`. Four copies of one policy is the shape that
+/// drifts, and a lone `!` is the easiest character in the file to lose. It
+/// matters in both directions: `raw` exists to preserve the ciphertext for
+/// out-of-band decryption later, so a raw pass that decrypts defeats the mode
+/// — and a non-raw pass that does NOT decrypt writes an ISO of ciphertext and
+/// returns success, which is the silent-garbage-success class the pre-flight
+/// gate in `copy` exists to stop. Named so it reads as a decision.
+pub(crate) fn pass_should_decrypt(raw: bool) -> bool {
+    !raw
+}
+
+/// Bad bytes expressed in whole sectors, the unit [`classify_damage`] scores.
+///
+/// Shared by all three `MultipassResult` exit paths (single-pass, halted,
+/// end-of-recovery) so the byte→sector conversion cannot drift between them.
+/// Rounds down: a partial sector of damage is still less than one sector.
+fn bad_sector_count(unreadable_bytes: u64, pending_bytes: u64) -> u64 {
+    unreadable_bytes.saturating_add(pending_bytes) / SECTOR_BYTES
+}
+
+/// A recovery is complete only when the abort-on-loss gate did NOT fire and
+/// the mapfile shows zero unreadable and zero pending bytes.
+///
+/// `aborted_for_loss` is load-bearing on its own: the unreadable-mapfile
+/// fail-safe sets `main_lost_ms = NaN` (so the gate fires) while the carried
+/// in-flight counters can both legitimately be zero — a disc that looked clean
+/// all the way through the loop but whose damage record could not be re-read
+/// at the final verification step. Without that term such a rip reports
+/// `complete: true` on the exact run the abort gate just refused. Extracted
+/// because reaching that branch from outside needs the mapfile corrupted
+/// mid-function, which no black-box fixture can do.
+fn recovery_is_complete(aborted_for_loss: bool, unreadable_bytes: u64, pending_bytes: u64) -> bool {
+    !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0
+}
+
 /// Milliseconds of main-title playback lost, given the bad bytes in the main
 /// title and the title's own size + duration. Scales the main title's bad
 /// bytes by its OWN size and runtime (the dimensionally-correct figure the CLI
@@ -485,7 +527,7 @@ fn multipass_rip_inner(
         // mirrors `RipMode::Single`.
         let bridge = ProgressBridge::new(sink);
         let copy_opts = CopyOptions {
-            decrypt: !job.raw,
+            decrypt: pass_should_decrypt(job.raw),
             multipass: false,
             progress: Some(&bridge),
             halt: Some(halt.clone()),
@@ -497,7 +539,7 @@ fn multipass_rip_inner(
         // Same reasoning as the halted branch: a single-pass run that came
         // back with unreadable bytes is not Clean just because there was only
         // one pass. Clean is a claim about the DISC, not about the plan.
-        let bad_sectors = cr.bytes_unreadable.saturating_add(cr.bytes_pending) / 2048;
+        let bad_sectors = bad_sector_count(cr.bytes_unreadable, cr.bytes_pending);
         return Ok(MultipassResult {
             unreadable_bytes: cr.bytes_unreadable,
             pending_bytes: cr.bytes_pending,
@@ -517,7 +559,7 @@ fn multipass_rip_inner(
     {
         let bridge = ProgressBridge::new(sink);
         let sweep_opts = SweepOptions {
-            decrypt: !job.raw,
+            decrypt: pass_should_decrypt(job.raw),
             resume: false,
             batch_sectors: None,
             skip_on_error: true,
@@ -565,8 +607,12 @@ fn multipass_rip_inner(
             }
 
             let bridge = ProgressBridge::new(sink);
-            let patch_opts =
-                PatchOptions::for_patch_pass(!job.raw, Some(&bridge), Some(halt.clone()), None);
+            let patch_opts = PatchOptions::for_patch_pass(
+                pass_should_decrypt(job.raw),
+                Some(&bridge),
+                Some(halt.clone()),
+                None,
+            );
             let pr = crate::recovery::patch(disc, reader, iso_path, &patch_opts)?;
             passes += 1;
             last_good = pr.bytes_good;
@@ -610,7 +656,7 @@ fn multipass_rip_inner(
         // only computable from the mapfile at end-of-recovery, which an
         // interrupted run never reaches. `halted: true` is the flag that says
         // this result is partial.
-        let bad_sectors = last_unreadable.saturating_add(last_pending) / 2048;
+        let bad_sectors = bad_sector_count(last_unreadable, last_pending);
         return Ok(MultipassResult {
             unreadable_bytes: last_unreadable,
             pending_bytes: last_pending,
@@ -694,9 +740,9 @@ fn multipass_rip_inner(
 
     let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
     let aborted_for_loss = loss_aborts(main_lost_bytes, main_lost_ms, effective_abort);
-    let bad_sectors = unreadable_bytes.saturating_add(pending_bytes) / 2048;
+    let bad_sectors = bad_sector_count(unreadable_bytes, pending_bytes);
     let severity = classify_damage(bad_sectors, main_lost_ms);
-    let complete = !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0;
+    let complete = recovery_is_complete(aborted_for_loss, unreadable_bytes, pending_bytes);
 
     Ok(MultipassResult {
         unreadable_bytes,
@@ -1547,6 +1593,18 @@ mod tests {
             "expected the retry loop to exhaust progress before the pass cap, got {} passes",
             result.passes
         );
+        // And the exact count, because the loose range above is what let the
+        // loop-bottom `== PatchDecision::NoProgress` be mutated to `!=` with
+        // the suite still green: `!=` breaks out after the FIRST patch pass
+        // (which does make ECC-neighbour progress, so the decision is
+        // `Continue`), giving 2 passes — still inside the range. Pass 1 heals
+        // the neighbours, pass 2 recovers nothing and is the one that must
+        // stop the loop.
+        assert_eq!(
+            result.passes, 3,
+            "1 sweep + 2 patch passes: the loop must stop on the pass that \
+             recovered nothing, not on the pass that made progress"
+        );
         assert!(
             result.unreadable_bytes > 0,
             "the sector was never recovered"
@@ -1710,5 +1768,56 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    // ── The three decisions lifted out of `multipass_rip_inner`. ──
+
+    #[test]
+    fn pass_should_decrypt_is_the_negation_of_raw() {
+        assert!(
+            !pass_should_decrypt(true),
+            "a raw pass must never decrypt — raw exists to keep the ciphertext"
+        );
+        assert!(
+            pass_should_decrypt(false),
+            "a non-raw pass must decrypt, or the ISO is unplayable ciphertext"
+        );
+    }
+
+    #[test]
+    fn bad_sector_count_divides_bytes_into_whole_sectors() {
+        assert_eq!(bad_sector_count(0, 0), 0);
+        assert_eq!(bad_sector_count(2048, 0), 1);
+        assert_eq!(bad_sector_count(0, 2048), 1);
+        assert_eq!(
+            bad_sector_count(4096, 2048),
+            3,
+            "both counters are summed, then converted once"
+        );
+        assert_eq!(
+            bad_sector_count(2047, 0),
+            0,
+            "a partial sector rounds down, it does not become a whole bad sector"
+        );
+        assert_eq!(
+            bad_sector_count(u64::MAX, u64::MAX),
+            u64::MAX / 2048,
+            "the sum saturates instead of wrapping to a tiny damage count"
+        );
+    }
+
+    #[test]
+    fn recovery_is_complete_requires_all_three() {
+        assert!(recovery_is_complete(false, 0, 0));
+        assert!(
+            !recovery_is_complete(true, 0, 0),
+            "a rip the abort gate refused is never complete, however clean the counters look"
+        );
+        assert!(
+            !recovery_is_complete(false, 1, 0),
+            "unreadable bytes remain"
+        );
+        assert!(!recovery_is_complete(false, 0, 1), "pending bytes remain");
+        assert!(!recovery_is_complete(true, 1, 1));
     }
 }

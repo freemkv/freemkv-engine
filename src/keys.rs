@@ -217,4 +217,63 @@ mod tests {
         };
         assert_eq!(won_source(&trace), None);
     }
+
+    /// An unencrypted disc resolves nothing and READS nothing.
+    ///
+    /// `resolve_disc_keys` is a three-line wire — factory, `resolve_keys_for`,
+    /// `won_source` — and every piece of it is well covered on its own, so the
+    /// whole function could be replaced with `Some("xyzzy")` or
+    /// `Some(String::new())` with the suite green. A fabricated winning source
+    /// label is what a front-end prints as "unlocked by keydb" and what
+    /// autorip records against the rip; inventing one for a disc that never
+    /// resolved a key is a lie about provenance.
+    ///
+    /// The panicking reader also pins the short-circuit: an unencrypted disc
+    /// has no AACS inputs, so nothing may sample ciphertext off it.
+    #[test]
+    fn resolve_disc_keys_is_none_and_reads_nothing_for_an_unencrypted_disc() {
+        struct NeverRead;
+        impl libfreemkv::SectorSource for NeverRead {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> libfreemkv::Result<usize> {
+                panic!("an unencrypted disc must not be sampled for key material");
+            }
+            fn capacity_sectors(&self) -> u32 {
+                1
+            }
+        }
+
+        let mut disc = libfreemkv::Disc {
+            volume_id: "PLAIN".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 1,
+            capacity_bytes: 2048,
+            layers: 1,
+            titles: vec![],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        };
+        let p = KeyParams {
+            keydb_path: Some("keydb.cfg".into()),
+            key_url: None,
+            key_auth: None,
+            online_only: false,
+        };
+        assert_eq!(
+            resolve_disc_keys(&mut disc, &mut NeverRead, &p),
+            None,
+            "no AACS inputs means no resolution, and therefore no winning source"
+        );
+    }
 }
