@@ -1644,3 +1644,777 @@ fn a_resume_does_not_truncate_the_already_recovered_prefix() {
         "the already-recovered prefix was overwritten — the resume truncated it"
     );
 }
+
+// ─── Instrumented readers for the sweep's drive-facing decisions ────────────
+
+/// One thing the sweep did to the DRIVE, in order.
+///
+/// Neither the read/retry lever nor the speed lever shows up in the ISO or the
+/// mapfile, and the ORDER matters: "full speed was restored" is not the same
+/// claim as "full speed was restored only after sixteen clean batches".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DriveEvent {
+    /// A read, and the `recovery` (in-drive retry) flag it carried.
+    Read { ok: bool, recovery: bool },
+    /// A `SET CD SPEED`.
+    Speed(u16),
+}
+
+/// A `MockReader` that records the drive-facing side of the sweep.
+struct InstrumentedReader {
+    total_sectors: u32,
+    bad_sectors: std::collections::HashSet<u32>,
+    events: std::sync::Arc<std::sync::Mutex<Vec<DriveEvent>>>,
+}
+
+impl libfreemkv::sector::SectorSource for InstrumentedReader {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> libfreemkv::error::Result<usize> {
+        for i in 0..count {
+            if self.bad_sectors.contains(&(lba + i as u32)) {
+                self.events.lock().unwrap().push(DriveEvent::Read {
+                    ok: false,
+                    recovery,
+                });
+                return Err(libfreemkv::error::Error::DiscRead {
+                    sector: (lba + i as u32) as u64,
+                    status: Some(0x02),
+                    sense: Some(libfreemkv::ScsiSense {
+                        sense_key: 0x02,
+                        asc: 0x04,
+                        ascq: 0x3E,
+                    }),
+                });
+            }
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .push(DriveEvent::Read { ok: true, recovery });
+        let n = count as usize * 2048;
+        buf[..n].fill(0xAA);
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.total_sectors
+    }
+    fn set_speed(&mut self, kbs: u16) {
+        self.events.lock().unwrap().push(DriveEvent::Speed(kbs));
+    }
+}
+
+/// A clean reader that raises a halt flag once it has served `after` reads, so
+/// a test can stop a sweep partway through deterministically.
+struct HaltingReader {
+    total_sectors: u32,
+    reads: u32,
+    after: u32,
+    halt: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl libfreemkv::sector::SectorSource for HaltingReader {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> libfreemkv::error::Result<usize> {
+        let n = count as usize * 2048;
+        buf[..n].fill(0xAA);
+        self.reads += 1;
+        if self.reads >= self.after {
+            self.halt.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.total_sectors
+    }
+}
+
+/// A reader that must never be asked for a sector.
+struct NoReadsReader {
+    total_sectors: u32,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl libfreemkv::sector::SectorSource for NoReadsReader {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> libfreemkv::error::Result<usize> {
+        self.reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let n = count as usize * 2048;
+        buf[..n].fill(0xAA);
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.total_sectors
+    }
+}
+
+const SEC: u64 = libfreemkv::consts::SECTOR_BYTES_U64;
+
+fn plain_sweep_opts(resume: bool, skip_on_error: bool) -> SweepOptions<'static> {
+    SweepOptions {
+        decrypt: false,
+        resume,
+        batch_sectors: None,
+        skip_on_error,
+        progress: None,
+        halt: None,
+        vid: None,
+        unit_keys: Vec::new(),
+        key_fetch: None,
+    }
+}
+
+fn multipass_copy_opts() -> CopyOptions<'static> {
+    CopyOptions {
+        decrypt: false,
+        multipass: true,
+        progress: None,
+        halt: None,
+        vid: None,
+        unit_keys: Vec::new(),
+        key_fetch: None,
+    }
+}
+
+/// A FRESH sweep must truncate an image left over from a previous run.
+///
+/// The counterpart to the resume test above, and the other half of the same
+/// condition: `resume && existing_len > 0`. Mutated to `||`, a fresh sweep
+/// over a pre-existing image OPENS it instead of creating it — so wherever the
+/// new sweep does not reach, the previous disc's bytes survive underneath and
+/// are handed to the muxer as this disc's data.
+///
+/// The sweep is halted partway so there IS a region the new sweep never
+/// reaches; a fresh create + `set_len` leaves that region zeroed.
+#[test]
+fn a_fresh_sweep_truncates_the_image_left_by_a_previous_run() {
+    let sectors: u32 = 400;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "FRESH");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("fresh.iso");
+
+    // The previous disc's image, every byte recognisable.
+    std::fs::write(&iso_path, vec![0xFFu8; total as usize]).unwrap();
+
+    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reader = HaltingReader {
+        total_sectors: sectors,
+        reads: 0,
+        after: 2,
+        halt: halt.clone(),
+    };
+    let opts = SweepOptions {
+        resume: false,
+        halt: Some(halt.clone()),
+        ..plain_sweep_opts(false, true)
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("fresh sweep");
+
+    let after = std::fs::read(&iso_path).expect("read iso");
+    assert_eq!(
+        after.len() as u64,
+        total,
+        "a fresh sweep pre-sizes the image to the disc"
+    );
+    assert!(
+        !after.contains(&0xFF),
+        "the previous run's bytes survived a FRESH sweep — they would be muxed \
+         as this disc's data"
+    );
+}
+
+/// A resume into a zero-length image must still pre-size it.
+///
+/// A mapfile that is entirely NonTried claims no progress, so the
+/// inconsistent-resume guard leaves `resume = true` even with a zero-length
+/// ISO on disk. `existing_len > 0` is then what routes it to the create +
+/// `set_len` branch; widened to `>=`, `Some(0)` takes the open-existing branch
+/// and the pre-size never happens. A halt then leaves the image shorter than
+/// the disc — and on the NEXT run the inconsistent-resume guard sees a short
+/// ISO against a mapfile that now does claim progress, throws the whole
+/// mapfile away, and re-rips from LBA 0.
+#[test]
+fn a_resume_into_an_empty_image_pre_sizes_it_to_the_disc() {
+    let sectors: u32 = 400;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "PRESIZE");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("presize.iso");
+
+    // Zero-length image + an all-NonTried mapfile (claims no progress).
+    std::fs::write(&iso_path, b"").unwrap();
+    {
+        let mf = Mapfile::create(&disc.mapfile_for(&iso_path), total, "test").unwrap();
+        drop(mf);
+    }
+
+    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut reader = HaltingReader {
+        total_sectors: sectors,
+        reads: 0,
+        after: 2,
+        halt: halt.clone(),
+    };
+    let opts = SweepOptions {
+        halt: Some(halt.clone()),
+        ..plain_sweep_opts(true, true)
+    };
+    let r = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("resume sweep");
+    assert!(r.halted, "the reader was supposed to halt this sweep");
+
+    assert_eq!(
+        std::fs::metadata(&iso_path).unwrap().len(),
+        total,
+        "a halted resume must still leave a full-length image — otherwise the \
+         next run discards the mapfile and re-rips the whole disc"
+    );
+}
+
+/// A resume whose image was DELETED must self-heal into a fresh sweep.
+///
+/// The inconsistent-resume guard reads the image length, and `NotFound` is the
+/// one error that means "no file yet" — anything else aborts. Classify a
+/// missing file as an unknown error and a resume whose ISO was cleaned up
+/// returns an error instead of simply starting over.
+///
+/// The existing downgrade test writes a zero-LENGTH file, which exists; this
+/// one removes it.
+#[test]
+fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
+    let sectors: u32 = 400;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "GONE");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("gone.iso");
+
+    // A mapfile claiming real progress, and NO image at all.
+    {
+        let mut mf = Mapfile::create(&disc.mapfile_for(&iso_path), total, "test").unwrap();
+        mf.record(0, 100 * SEC, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+    }
+    assert!(!iso_path.exists());
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &plain_sweep_opts(true, true))
+        .expect("a resume with no image self-heals into a fresh sweep");
+
+    let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
+    assert_eq!(
+        mf.stats().bytes_good,
+        total,
+        "the whole disc was re-read, not just the NonTried tail"
+    );
+    assert_eq!(std::fs::metadata(&iso_path).unwrap().len(), total);
+}
+
+/// KEYS XOR VID: the mapfile header carries one or the other, never both.
+///
+/// A keyed disc writes its unit keys — the final answer, so deferred mux
+/// decrypts directly with no key-service round trip. An unresolved disc writes
+/// only the VID, the retry marker. Deleting the `!` swaps them: a keyed disc
+/// records the VID and calls `set_unit_keys(&[])`, and deferred mux loses the
+/// keys it was promised. `mapfile.rs` tests the setters; nothing tested the
+/// wiring in `sweep`.
+#[test]
+fn the_mapfile_header_carries_the_unit_keys_when_there_are_keys() {
+    let sectors: u32 = 64;
+    let disc = make_test_disc(sectors, "KEYED");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("keyed.iso");
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = SweepOptions {
+        vid: Some([0x11; 16]),
+        unit_keys: vec![(0, [0xAB; 16])],
+        ..plain_sweep_opts(false, true)
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
+
+    let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
+    assert_eq!(
+        mf.unit_keys(),
+        &[(0u32, [0xABu8; 16])][..],
+        "a keyed disc must carry its unit keys to deferred mux"
+    );
+    assert_eq!(
+        mf.vid(),
+        None,
+        "keys are the final answer; the VID retry marker must not be written too"
+    );
+}
+
+/// ...and the VID when there are none.
+#[test]
+fn the_mapfile_header_carries_the_vid_when_there_are_no_keys() {
+    let sectors: u32 = 64;
+    let disc = make_test_disc(sectors, "UNKEYED");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("unkeyed.iso");
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let opts = SweepOptions {
+        vid: Some([0x11; 16]),
+        unit_keys: Vec::new(),
+        ..plain_sweep_opts(false, true)
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
+
+    let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
+    assert_eq!(mf.vid(), Some([0x11u8; 16]));
+    assert!(mf.unit_keys().is_empty());
+}
+
+/// The drive's in-drive retry lever is the INVERSE of skip-on-error.
+///
+/// Pass 1 of a multipass rip is "fast and accurate — get the most data in the
+/// shortest time", so it asks the drive for fast-fail reads and handles damage
+/// itself; a plain copy, which aborts on the first error, asks the drive to
+/// retry hard before giving up. Invert `let recovery = !opts.skip_on_error`
+/// and both modes get the wrong lever — a multipass Pass 1 crawls through
+/// in-drive retries on every batch of a damaged disc. Invisible in the ISO and
+/// the mapfile: it is a flag on a SCSI read.
+#[test]
+fn the_drive_retry_lever_is_the_inverse_of_skip_on_error() {
+    let sectors: u32 = 128;
+    let disc = make_test_disc(sectors, "LEVER");
+    let tmp = tempfile::tempdir().unwrap();
+
+    for (skip_on_error, want) in [(true, false), (false, true)] {
+        let events: std::sync::Arc<std::sync::Mutex<Vec<DriveEvent>>> = Default::default();
+        let mut reader = InstrumentedReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+            events: events.clone(),
+        };
+        let iso_path = tmp.path().join(format!("lever-{skip_on_error}.iso"));
+        freemkv_engine::sweep(
+            &disc,
+            &mut reader,
+            &iso_path,
+            &plain_sweep_opts(false, skip_on_error),
+        )
+        .expect("sweep");
+
+        let seen: Vec<bool> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                DriveEvent::Read { recovery, .. } => Some(*recovery),
+                DriveEvent::Speed(_) => None,
+            })
+            .collect();
+        assert!(!seen.is_empty(), "the sweep read nothing");
+        assert!(
+            seen.iter().all(|&f| f == want),
+            "skip_on_error={skip_on_error} must ask the drive for recovery={want}, \
+             saw {seen:?}"
+        );
+    }
+}
+
+/// Damage slows the drive down, and a clean run brings it back up.
+///
+/// Entering a damage zone drops the drive to its minimum read speed, and
+/// sixteen consecutive good batches restore maximum. Delete the `!` on the
+/// entry check and the zone is never entered at all (the flag starts false),
+/// so the drive is never slowed on damaged media and the whole recovery
+/// behaviour quietly disappears — no test noticed, because a mock reader
+/// ignores `set_speed`.
+#[test]
+fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
+    // Damage early, then a long clean tail so the exit threshold (16
+    // consecutive good batches) is reached before EOF. The jump-ahead lands
+    // well inside the disc rather than overshooting EOF.
+    let sectors: u32 = 200_000;
+    let bad: std::collections::HashSet<u32> = [320u32].into_iter().collect();
+    let events: std::sync::Arc<std::sync::Mutex<Vec<DriveEvent>>> = Default::default();
+    let mut reader = InstrumentedReader {
+        total_sectors: sectors,
+        bad_sectors: bad,
+        events: events.clone(),
+    };
+    let disc = make_test_disc(sectors, "SLOW");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("slow.iso");
+    freemkv_engine::sweep(
+        &disc,
+        &mut reader,
+        &iso_path,
+        &plain_sweep_opts(false, true),
+    )
+    .expect("sweep");
+
+    let seen = events.lock().unwrap().clone();
+    // The sweep asks for max speed once up front (riplock removal).
+    assert_eq!(
+        seen.first(),
+        Some(&DriveEvent::Speed(0xFFFF)),
+        "the sweep starts at full speed"
+    );
+    let slow_at = seen
+        .iter()
+        .position(|e| *e == DriveEvent::Speed(0x0000))
+        .expect("damage must drop the drive to its minimum read speed");
+    let restored_at = slow_at
+        + 1
+        + seen[slow_at + 1..]
+            .iter()
+            .position(|e| *e == DriveEvent::Speed(0xFFFF))
+            .expect("full speed must be restored once the disc reads cleanly again");
+
+    // The hysteresis is the point: the drive climbs back to full speed only
+    // after DAMAGE_ZONE_EXIT_THRESHOLD (16) consecutive GOOD batches. Restore
+    // it on the first clean read and the drive oscillates between minimum and
+    // maximum across a damaged region, which is the behaviour the zone exists
+    // to avoid.
+    let good_between = seen[slow_at + 1..restored_at]
+        .iter()
+        .filter(|e| matches!(e, DriveEvent::Read { ok: true, .. }))
+        .count();
+    assert!(
+        good_between >= 16,
+        "full speed came back after only {good_between} clean batches — the \
+         exit threshold is 16 consecutive good reads"
+    );
+}
+
+/// A finished rip with an intact image is a no-op — no reads, no re-write.
+///
+/// The dispatch shortcut is `covers_disc && bad_bytes == 0 && nontried == 0 &&
+/// !iso_is_intact` for the repair path, and the same conjunction with
+/// `iso_is_intact` for "already done". Loosen either and a COMPLETE rip with a
+/// perfectly good ISO takes `sweep_internal(resume = false)` — which removes
+/// the mapfile, `File::create`s the image and re-rips the whole disc, undoing
+/// a finished job.
+#[test]
+fn re_issuing_a_finished_copy_reads_nothing_and_rewrites_nothing() {
+    let sectors: u32 = 200;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "DONE");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("done.iso");
+
+    // A complete mapfile and a full-length image with recognisable content.
+    std::fs::write(&iso_path, vec![0x5Au8; total as usize]).unwrap();
+    {
+        let mut mf = Mapfile::create(&disc.mapfile_for(&iso_path), total, "test").unwrap();
+        mf.record(0, total, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+    }
+
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reader = NoReadsReader {
+        total_sectors: sectors,
+        reads: reads.clone(),
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &multipass_copy_opts())
+        .expect("a finished copy is a no-op, not an error");
+
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a finished rip must not touch the disc again"
+    );
+    assert_eq!(r.bytes_good, total);
+    assert!(r.complete);
+    assert!(
+        std::fs::read(&iso_path).unwrap().iter().all(|&b| b == 0x5A),
+        "the finished image was re-created and re-swept"
+    );
+}
+
+/// An all-Unreadable disc is terminal — it must not be patched again.
+///
+/// Once every bad sector has been promoted to Unreadable there is nothing
+/// retryable left, and the documented fallthrough returns the terminal result
+/// immediately. `bytes_retryable > 0` mutated to `>= 0` is always true for a
+/// u64, so that fallthrough never runs and every finished-but-lossy disc gets
+/// one more patch pass — and `patch` selects `damage_sector_statuses()`, which
+/// INCLUDES Unreadable, so it re-reads ranges the design considers permanently
+/// lost.
+#[test]
+fn a_disc_whose_damage_is_all_permanent_is_not_patched_again() {
+    let sectors: u32 = 200;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "TERMINAL");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("terminal.iso");
+
+    std::fs::write(&iso_path, vec![0u8; total as usize]).unwrap();
+    {
+        let mut mf = Mapfile::create(&disc.mapfile_for(&iso_path), total, "test").unwrap();
+        mf.record(0, 150 * SEC, SectorStatus::Finished).unwrap();
+        mf.record(150 * SEC, 50 * SEC, SectorStatus::Unreadable)
+            .unwrap();
+        mf.flush().unwrap();
+    }
+
+    let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut reader = NoReadsReader {
+        total_sectors: sectors,
+        reads: reads.clone(),
+    };
+    let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &multipass_copy_opts())
+        .expect("a terminal result, not an error");
+
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "permanently lost sectors must not be re-read"
+    );
+    assert_eq!(r.bytes_unreadable, 50 * SEC);
+    assert_eq!(r.bytes_good, 150 * SEC);
+    assert!(!r.complete, "a lossy rip is never complete");
+}
+
+/// Retryable bytes are not "no bad bytes", even when they exactly cancel.
+///
+/// `bad_bytes = bytes_pending + bytes_unreadable`, and the two are DISJOINT
+/// counters — Unreadable feeds only `bytes_unreadable`, while NonTried /
+/// NonTrimmed / NonScraped feed `bytes_pending`. Turn the `+` into a `-` and
+/// the two cancel whenever they happen to be equal, so `bad_bytes == 0` and
+/// the dispatch takes the "already complete" shortcut instead of routing to
+/// `patch`: retryable bytes silently abandoned and the rip reported terminal.
+#[test]
+fn equal_pending_and_unreadable_counts_still_route_to_a_patch_pass() {
+    let sectors: u32 = 200;
+    let total = sectors as u64 * SEC;
+    let disc = make_test_disc(sectors, "CANCEL");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("cancel.iso");
+
+    std::fs::write(&iso_path, vec![0u8; total as usize]).unwrap();
+    {
+        // 50 sectors Unreadable and 50 NonTrimmed: pending == unreadable, so a
+        // subtraction gives zero.
+        let mut mf = Mapfile::create(&disc.mapfile_for(&iso_path), total, "test").unwrap();
+        mf.record(0, 100 * SEC, SectorStatus::Finished).unwrap();
+        mf.record(100 * SEC, 50 * SEC, SectorStatus::Unreadable)
+            .unwrap();
+        mf.record(150 * SEC, 50 * SEC, SectorStatus::NonTrimmed)
+            .unwrap();
+        mf.flush().unwrap();
+    }
+    {
+        let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
+        let st = mf.stats();
+        assert_eq!(
+            st.bytes_pending, st.bytes_unreadable,
+            "fixture precondition: the two counters must be equal, or the \
+             subtraction would not cancel"
+        );
+        assert!(st.bytes_nontried == 0);
+    }
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let r =
+        freemkv_engine::copy(&disc, &mut reader, &iso_path, &multipass_copy_opts()).expect("copy");
+
+    assert!(
+        r.recovered_this_pass > 0,
+        "the NonTrimmed range must be handed to a patch pass, not written off"
+    );
+    assert!(
+        r.bytes_good >= 150 * SEC,
+        "the recovered range must be counted good, got {}",
+        r.bytes_good
+    );
+}
+
+/// A fresh sweep over another disc's mapfile drops it and sweeps.
+///
+/// `if resume && mapfile_path.exists()` guards the identity check. Widened to
+/// `||`, a FRESH sweep runs the identity check against the leftover mapfile
+/// and errors out — a new disc in the drive after a previous rip refuses to
+/// start, instead of doing the obvious thing and starting over. The existing
+/// identity test only covers the resume path, which is the direction that must
+/// error.
+#[test]
+fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
+    let sectors: u32 = 128;
+    let total = sectors as u64 * SEC;
+    let disc_a = make_test_disc(sectors, "DISC-A");
+    let disc_b = make_test_disc(sectors, "DISC-B");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("swap.iso");
+
+    // Disc A finished here; the mapfile path is the same for both discs.
+    assert_eq!(disc_a.mapfile_for(&iso_path), disc_b.mapfile_for(&iso_path));
+    {
+        let mut reader = MockReader {
+            total_sectors: sectors,
+            bad_sectors: std::collections::HashSet::new(),
+        };
+        // A's volume id goes into the mapfile header — that is what makes the
+        // leftover mapfile identifiably A's rather than anonymous.
+        let a_opts = SweepOptions {
+            vid: Some([0xAA; 16]),
+            ..plain_sweep_opts(false, true)
+        };
+        freemkv_engine::sweep(&disc_a, &mut reader, &iso_path, &a_opts).expect("disc A sweep");
+        let a_map = Mapfile::load(&disc_a.mapfile_for(&iso_path)).unwrap();
+        assert_eq!(
+            a_map.vid(),
+            Some([0xAAu8; 16]),
+            "fixture precondition: the leftover mapfile must carry A's identity"
+        );
+    }
+
+    // Now disc B, fresh. It must drop A's mapfile rather than compare against
+    // it.
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    freemkv_engine::sweep(
+        &disc_b,
+        &mut reader,
+        &iso_path,
+        &plain_sweep_opts(false, true),
+    )
+    .expect("a FRESH sweep must drop the previous disc's mapfile, not refuse");
+
+    let mf = Mapfile::load(&disc_b.mapfile_for(&iso_path)).unwrap();
+    assert_eq!(
+        mf.vid(),
+        None,
+        "A's mapfile must have been dropped, not inherited"
+    );
+    assert_eq!(mf.stats().bytes_good, total);
+}
+
+/// A DECRYPTING sweep must actually decrypt — and the crate never once ran one.
+///
+/// Every `CopyOptions`/`SweepOptions` in this suite sets `decrypt: false`, and
+/// the two AACS fixtures are refused pre-flight, so the whole decrypt-wiring
+/// triangle at the top of `sweep` — resolve a whole-disc AACS key map, or fall
+/// back to the CSS self-descramble path — was unexercised. Widening
+/// `opts.decrypt && decrypt_is_aacs` to `||` installs an AACS key map on a CSS
+/// disc, and a `Some(key_map)` takes the mapped early-return in
+/// `DecryptingSectorSource` and never reaches the CSS descramble at all: a
+/// `--decrypt` CSS rip writes scrambled bytes to the ISO and exits 0. That is
+/// exactly the silent-garbage-success this file's pre-flight gate exists to
+/// stop, arriving one layer below the gate.
+///
+/// A CSS sector carries its own scramble flag in bits 4-5 of byte 0x14, so the
+/// fixture can mark some sectors scrambled and leave others clear and the
+/// assertion is simply: the scrambled ones changed, the clear ones did not.
+#[test]
+fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
+    /// Deterministic per-sector content, before any descrambling.
+    fn plain_sector(lba: u32, scrambled: bool) -> [u8; 2048] {
+        let mut s = [0u8; 2048];
+        for (i, b) in s.iter_mut().enumerate() {
+            *b = (lba as u8)
+                .wrapping_mul(7)
+                .wrapping_add((i as u8).wrapping_mul(31));
+        }
+        // Bits 4-5 of the sub-header byte are the CSS scramble flag.
+        s[0x14] &= !0x30;
+        if scrambled {
+            s[0x14] |= 0x30;
+        }
+        s
+    }
+
+    struct CssReader {
+        total_sectors: u32,
+    }
+    fn is_scrambled_lba(lba: u32) -> bool {
+        (32..64).contains(&lba)
+    }
+    impl libfreemkv::sector::SectorSource for CssReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::error::Result<usize> {
+            for i in 0..count as u32 {
+                let s = plain_sector(lba + i, is_scrambled_lba(lba + i));
+                let off = i as usize * 2048;
+                buf[off..off + 2048].copy_from_slice(&s);
+            }
+            Ok(count as usize * 2048)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.total_sectors
+        }
+    }
+
+    let sectors: u32 = 96;
+    let mut disc = make_test_disc(sectors, "CSSDISC");
+    disc.format = DiscFormat::Dvd;
+    disc.content_format = ContentFormat::MpegPs;
+    disc.encrypted = true;
+    disc.css = Some(libfreemkv::css::CssState {
+        title_key: [0x11, 0x22, 0x33, 0x44, 0x55],
+        crack_span: None,
+    });
+
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("css.iso");
+    let mut reader = CssReader {
+        total_sectors: sectors,
+    };
+    let opts = SweepOptions {
+        decrypt: true, // NOT --raw: this rip must produce plaintext
+        ..plain_sweep_opts(false, true)
+    };
+    freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
+        .expect("a CSS disc with a title key is decryptable");
+
+    let img = std::fs::read(&iso_path).expect("read iso");
+    assert_eq!(img.len() as u64, sectors as u64 * SEC);
+
+    let mut changed = 0usize;
+    for lba in 0..sectors {
+        let got = &img[(lba as u64 * SEC) as usize..((lba as u64 + 1) * SEC) as usize];
+        let raw = plain_sector(lba, is_scrambled_lba(lba));
+        if is_scrambled_lba(lba) {
+            if got != raw.as_slice() {
+                changed += 1;
+            }
+        } else {
+            assert_eq!(
+                got,
+                raw.as_slice(),
+                "clear sector {lba} was altered — a decrypting sweep must pass \
+                 unscrambled filesystem/nav sectors through untouched"
+            );
+        }
+    }
+    assert_eq!(
+        changed, 32,
+        "every scrambled sector must have been descrambled on the way to the ISO"
+    );
+}
