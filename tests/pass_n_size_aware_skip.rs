@@ -259,8 +259,21 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     // trips and the bytes_good assertion below fails loudly.
     let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let halt_for_watchdog = halt.clone();
+    // Poll to a deadline rather than sleeping straight through it. The bound
+    // is what this watchdog is for — a busy-spin regression must still be cut
+    // off at 20s — but on the happy path the work finishes in well under a
+    // second, and an unconditional sleep made every green run of this file pay
+    // the full 20s anyway, on every push, in every repo of the cascade.
+    let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog_done_t = watchdog_done.clone();
     let watchdog = std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(20));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::time::Instant::now() < deadline {
+            if watchdog_done_t.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         halt_for_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
@@ -277,6 +290,7 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
 
     let outcome = freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts);
     // Stop the watchdog regardless of outcome.
+    watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
     halt.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = watchdog.join();
 
