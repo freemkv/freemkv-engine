@@ -1081,6 +1081,9 @@ mod tests {
         assert_eq!(classify_damage(50, 999.0), Cosmetic);
         assert_eq!(classify_damage(51, 0.0), Moderate);
         assert_eq!(classify_damage(10, 1_000.0), Moderate);
+        // Both sides of the sector boundary, because the tier doc used to
+        // claim 500 for Moderate ("51–500") AND for Serious ("500+").
+        assert_eq!(classify_damage(499, 0.0), Moderate);
         assert_eq!(classify_damage(500, 0.0), Serious);
         assert_eq!(classify_damage(10, 30_000.0), Serious);
     }
