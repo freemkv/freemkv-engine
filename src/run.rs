@@ -135,13 +135,14 @@ impl<'a> ProgressBridge<'a> {
 
 impl libfreemkv::progress::Progress for ProgressBridge<'_> {
     fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-        let pass = match p.kind {
-            libfreemkv::progress::PassKind::Sweep => "sweep".to_string(),
-            libfreemkv::progress::PassKind::Scrape { .. } => "patch-scrape".to_string(),
-            libfreemkv::progress::PassKind::Trim { .. } => "patch-trim".to_string(),
-            libfreemkv::progress::PassKind::Mux => "mux".to_string(),
-            libfreemkv::progress::PassKind::Verify => "verify".to_string(),
-        };
+        // Borrowed, not allocated: this runs once per batch.
+        let pass: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(match p.kind {
+            libfreemkv::progress::PassKind::Sweep => "sweep",
+            libfreemkv::progress::PassKind::Scrape { .. } => "patch-scrape",
+            libfreemkv::progress::PassKind::Trim { .. } => "patch-trim",
+            libfreemkv::progress::PassKind::Mux => "mux",
+            libfreemkv::progress::PassKind::Verify => "verify",
+        });
         // Derive speed/ETA ONCE, here — the front-end just formats it. Sweep's
         // work_done/work_total are the authoritative progress denominator.
         let (speed_bps, eta_secs) = self

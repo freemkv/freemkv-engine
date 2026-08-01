@@ -104,7 +104,7 @@ let job = Job::new("iso:///path/to/disc.iso", "/output/dir")
     .with_mode(RipMode::Multi)              // Single = one pass; Multi = sweep+patch+abort-gate
     .with_selection(Selection::MainMovie);  // MainMovie | All | Longest | Titles(vec![0,2])
 // fields you can also set: job.raw (ciphertext passthrough),
-// job.abort_on_lost_secs (Multi only; 0 = require perfect rip).
+// opts.abort_on_lost_secs (Multi only; 0 = require perfect rip).
 ```
 
 ### 2. `preflight(&Disc, &Job) -> Preflight` — keep Start honest

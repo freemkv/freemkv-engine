@@ -397,7 +397,7 @@ fn mux_with_input(
                 if let Some((done_b, total_b)) = latest {
                     let (speed_bps, eta_secs) = speed.sample(done_b, total_b);
                     let p = crate::sink::Progress {
-                        pass: "mux".to_string(),
+                        pass: std::borrow::Cow::Borrowed("mux"),
                         bytes_done: done_b,
                         bytes_total: total_b,
                         sectors_bad: 0,

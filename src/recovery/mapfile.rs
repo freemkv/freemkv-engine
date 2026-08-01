@@ -635,55 +635,72 @@ impl Mapfile {
             s.push(".tmp");
             PathBuf::from(s)
         };
-        {
-            let file = std::fs::File::create(&tmp)?;
-            let mut w = std::io::BufWriter::new(file);
-            writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
-            // VID comment lives in the header block. ddrescue treats any
-            // `#`-prefixed line as a comment, so this round-trips through
-            // our `load()` without affecting the `pos size status` data
-            // parser. 16 bytes → 32 lowercase hex chars.
-            // KEYS XOR VID: a keyed disc persists its unit keys (the final
-            // answer — deferred-mux decrypts directly); an unresolved disc
-            // persists only the VID (the retry marker, so a future mux can
-            // re-ask the key service). Never both.
-            use std::fmt::Write as _;
-            if !self.unit_keys.is_empty() {
-                for (cps, key) in &self.unit_keys {
+        // Any `?` between creating the tmp and the final rename used to leave a
+        // partially-written `<path>.tmp` behind forever — one per failure, in
+        // the output directory, for the lifetime of a long-running service.
+        // Written as a closure so a single cleanup covers every early return.
+        let write_tmp = |tmp: &std::path::Path| -> io::Result<()> {
+            {
+                let file = std::fs::File::create(tmp)?;
+                let mut w = std::io::BufWriter::new(file);
+                writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
+                // VID comment lives in the header block. ddrescue treats any
+                // `#`-prefixed line as a comment, so this round-trips through
+                // our `load()` without affecting the `pos size status` data
+                // parser. 16 bytes → 32 lowercase hex chars.
+                // KEYS XOR VID: a keyed disc persists its unit keys (the final
+                // answer — deferred-mux decrypts directly); an unresolved disc
+                // persists only the VID (the retry marker, so a future mux can
+                // re-ask the key service). Never both.
+                use std::fmt::Write as _;
+                if !self.unit_keys.is_empty() {
+                    for (cps, key) in &self.unit_keys {
+                        let mut hex = String::with_capacity(32);
+                        for b in key {
+                            let _ = write!(hex, "{b:02x}");
+                        }
+                        writeln!(w, "# freemkv-uk: {cps}:{hex}")?;
+                    }
+                } else if let Some(vid) = self.vid {
                     let mut hex = String::with_capacity(32);
-                    for b in key {
+                    for b in vid {
                         let _ = write!(hex, "{b:02x}");
                     }
-                    writeln!(w, "# freemkv-uk: {cps}:{hex}")?;
+                    writeln!(w, "# freemkv-vid: {hex}")?;
                 }
-            } else if let Some(vid) = self.vid {
-                let mut hex = String::with_capacity(32);
-                for b in vid {
-                    let _ = write!(hex, "{b:02x}");
+                writeln!(w, "# Current pos / status / pass / pass_time")?;
+                writeln!(w, "0x000000000  ?  1  0")?;
+                writeln!(w, "#      pos        size  status")?;
+                for e in &self.entries {
+                    writeln!(
+                        w,
+                        "0x{:09x}  0x{:09x}    {}",
+                        e.pos,
+                        e.size,
+                        e.status.to_char()
+                    )?;
                 }
-                writeln!(w, "# freemkv-vid: {hex}")?;
+                w.flush()?;
+                // fsync the tmp file before the rename so the bytes are durable on
+                // disk (notably on NFS, where a rename can otherwise reach the
+                // server before the data does and leave a truncated mapfile after
+                // a crash). Recover the File from the BufWriter to call sync_all.
+                let file = w.into_inner().map_err(|e| e.into_error())?;
+                file.sync_all()?;
             }
-            writeln!(w, "# Current pos / status / pass / pass_time")?;
-            writeln!(w, "0x000000000  ?  1  0")?;
-            writeln!(w, "#      pos        size  status")?;
-            for e in &self.entries {
-                writeln!(
-                    w,
-                    "0x{:09x}  0x{:09x}    {}",
-                    e.pos,
-                    e.size,
-                    e.status.to_char()
-                )?;
-            }
-            w.flush()?;
-            // fsync the tmp file before the rename so the bytes are durable on
-            // disk (notably on NFS, where a rename can otherwise reach the
-            // server before the data does and leave a truncated mapfile after
-            // a crash). Recover the File from the BufWriter to call sync_all.
-            let file = w.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+            Ok(())
+        };
+        if let Err(e) = write_tmp(&tmp) {
+            // Do not leave the half-written tmp behind. Best-effort: if the
+            // failure was itself "cannot touch this directory", the remove will
+            // fail too, and the write error is the one worth reporting.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
-        std::fs::rename(&tmp, &self.path)?;
+        if let Err(e) = std::fs::rename(&tmp, &self.path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
         // fsync the parent directory so the rename itself is durable. Syncing
         // the tmp file's bytes (above) is not enough: after the rename the new
         // dirent for the final mapfile name lives only in the directory's
@@ -1846,6 +1863,46 @@ pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfi
             );
             Err(e)
         }
+    }
+}
+
+#[cfg(test)]
+mod write_to_disk_cleanup_tests {
+    use super::*;
+
+    /// A failed write must not leave `<path>.tmp` behind.
+    ///
+    /// Every `?` between `File::create(&tmp)` and the final `rename` used to
+    /// return with the partially-written tmp still on disk — one orphan per
+    /// failure, in the output directory, for the lifetime of a long-running
+    /// service. Reachable case: the tmp writes fine and the rename fails,
+    /// which is what a directory sitting on the destination name produces.
+    #[test]
+    fn a_failed_write_does_not_orphan_the_tmp_file() {
+        let dir = std::env::temp_dir().join(format!("fmkv-tmpclean-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Occupy the mapfile's own name with a non-empty DIRECTORY, so the
+        // rename at the end of `write_to_disk` cannot succeed.
+        let path = dir.join("m.mapfile");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("occupied"), b"x").unwrap();
+
+        // `create` writes eagerly, so this exercises the failing path.
+        let res = Mapfile::create(&path, 4096, "test");
+        assert!(res.is_err(), "expected the rename onto a directory to fail");
+
+        let tmp = {
+            let mut s = path.clone().into_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        assert!(
+            !tmp.exists(),
+            "a partially-written tmp was left behind at {tmp:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -41,7 +41,12 @@ pub enum Level {
 pub struct Progress {
     /// Human-facing name of the current pass, e.g. `"sweep"`, `"patch #2"`,
     /// `"mux"`. Front-ends may localize; the engine supplies a stable key.
-    pub pass: String,
+    /// `Cow` so the common case — one of a small set of fixed pass names —
+    /// costs no allocation. `ProgressBridge::report` runs once per batch
+    /// (400k-1.6M times per rip) and allocated a fresh `String` every call to
+    /// carry one of five literals. A dynamic name (`"patch #2"`) still works
+    /// via `Cow::Owned`.
+    pub pass: std::borrow::Cow<'static, str>,
     /// Bytes completed in the current operation.
     pub bytes_done: u64,
     /// Total bytes the current operation expects (0 if not yet known).
@@ -110,7 +115,7 @@ mod tests {
         let s = NoopSink;
         s.log(Level::Info, "hello");
         let p = Progress {
-            pass: "sweep".into(),
+            pass: std::borrow::Cow::Borrowed("sweep"),
             bytes_done: 10,
             bytes_total: 100,
             ..Default::default()

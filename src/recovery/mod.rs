@@ -236,7 +236,10 @@ pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) 
     if !decrypt_is_aacs {
         return region_pos;
     }
-    let unit = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64;
+    // Same source of truth as `aacs_aligned_batch`'s `UNIT_SECTORS`, expressed
+    // in bytes rather than sectors — deriving it twice from the raw constant is
+    // how the two halves of one invariant drift apart.
+    let unit = UNIT_SECTORS as u64 * 2048;
     region_pos - (region_pos % unit)
 }
 
@@ -592,7 +595,10 @@ pub fn sweep(
     let file =
         libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
     let mut batch: u16 = match opts.batch_sectors {
-        Some(b) => b,
+        // A zero batch makes `block_bytes` 0 every iteration, so `pos` never
+        // advances and the producer spins forever emitting zero-length reads.
+        // Clamp rather than error: the caller asked for "as small as possible".
+        Some(b) => b.max(1),
         None if opts.skip_on_error => ecc_sectors(disc.format),
         None => DEFAULT_BATCH_SECTORS_OPTICAL,
     };
