@@ -21,7 +21,10 @@ use crate::outcome::KeyStatus;
 ///   no key material (a VID-only placeholder scan) is treated as unresolved.
 /// - CSS with a recovered key → resolved, summary `"resolved-css"`.
 /// - Encrypted but no key → unresolved, summary `"no-key"` (or the more
-///   specific `"no-keydb"` when the library flagged a missing keydb).
+///   specific `"no-keydb"` when the library flagged a missing keydb, or
+///   `"key-service-unavailable"` / `"key-service-unauthorized"` /
+///   `"key-service-rate-limited"` when a key SOURCE failed to answer at all —
+///   which is not the same claim as "no key exists").
 pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     if !disc.encrypted {
         return KeyStatus {
@@ -81,6 +84,12 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     // can point the user at the keydb fix.
     let summary = match &disc.aacs_error {
         Some(libfreemkv::Error::KeydbLoad { .. }) => "no-keydb",
+        // A key SOURCE could not answer. NOT "no-key": nothing was learned about
+        // whether this disc has a key, and the operator action is to retry / fix
+        // the token / back off, not to go looking for a VUK.
+        Some(libfreemkv::Error::KeyServiceUnavailable) => "key-service-unavailable",
+        Some(libfreemkv::Error::KeyServiceUnauthorized) => "key-service-unauthorized",
+        Some(libfreemkv::Error::KeyServiceRateLimited) => "key-service-rate-limited",
         _ => "no-key",
     };
     KeyStatus::unresolved(summary)
@@ -103,6 +112,23 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
 pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
     disc.ensure_decryptable(raw)?;
     if disc.encrypted && !raw && !resolve_keys(disc).resolved {
+        // A disc whose key SOURCE failed keeps that verdict here too. The library
+        // gate already raises it when the disc carries AACS state; this arm covers
+        // the `aacs: None, aacs_error: Some(..)` disc the library gate passes, so
+        // the two predicates cannot disagree about WHY the disc is undecryptable
+        // any more than they disagree about WHETHER it is.
+        match disc.aacs_error {
+            Some(libfreemkv::Error::KeyServiceUnavailable) => {
+                return Err(libfreemkv::Error::KeyServiceUnavailable);
+            }
+            Some(libfreemkv::Error::KeyServiceUnauthorized) => {
+                return Err(libfreemkv::Error::KeyServiceUnauthorized);
+            }
+            Some(libfreemkv::Error::KeyServiceRateLimited) => {
+                return Err(libfreemkv::Error::KeyServiceRateLimited);
+            }
+            _ => {}
+        }
         return Err(libfreemkv::error::Error::NoDiscKey {
             disc_hash: disc
                 .aacs
