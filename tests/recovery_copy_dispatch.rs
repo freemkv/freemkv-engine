@@ -240,6 +240,12 @@ fn copy_raw_aacs_no_key_proceeds() {
     assert_eq!(result.bytes_good, sectors as u64 * 2048);
 }
 
+// `/dev/null` is a POSIX character device and these three tests exist to
+// exercise exactly that: writing to a character device where `set_len` returns
+// ENODEV. Windows has no equivalent — NUL is not a character device with these
+// semantics — so the tests do not merely fail there, they have nothing to
+// assert. Gate them rather than pretend the coverage is cross-platform.
+#[cfg(unix)]
 #[test]
 fn sweep_to_dev_null_real() {
     let sectors: u32 = 1000;
@@ -677,6 +683,12 @@ impl Drop for CleanupGuard {
     }
 }
 
+// `/dev/null` is a POSIX character device and these three tests exist to
+// exercise exactly that: writing to a character device where `set_len` returns
+// ENODEV. Windows has no equivalent — NUL is not a character device with these
+// semantics — so the tests do not merely fail there, they have nothing to
+// assert. Gate them rather than pretend the coverage is cross-platform.
+#[cfg(unix)]
 #[test]
 fn sweep_dev_null_full_good() {
     let sectors: u32 = 2000;
@@ -995,6 +1007,12 @@ fn patch_dev_null_after_sweep() {
 ///
 /// Both calls now target `/dev/null`, so they share one mapfile and the second
 /// really is a patch pass over the first's damage.
+// `/dev/null` is a POSIX character device and these three tests exist to
+// exercise exactly that: writing to a character device where `set_len` returns
+// ENODEV. Windows has no equivalent — NUL is not a character device with these
+// semantics — so the tests do not merely fail there, they have nothing to
+// assert. Gate them rather than pretend the coverage is cross-platform.
+#[cfg(unix)]
 #[test]
 fn patch_dev_null_direct() {
     let dev_null = std::path::Path::new("/dev/null");
