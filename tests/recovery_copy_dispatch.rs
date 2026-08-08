@@ -95,6 +95,38 @@ fn make_test_disc(sectors: u32, name: &str) -> Disc {
     }
 }
 
+/// A disc title that is unique to THIS process and this call.
+///
+/// `Disc::mapfile_for(Path::new("/dev/null"))` has nowhere to put a sibling
+/// mapfile, so it derives `$TMPDIR/<sanitized-title>.mapfile` — a fixed path
+/// with no pid and no counter. `CleanupGuard` removes it on a normal exit or an
+/// unwind, but not after a SIGKILL, a test-binary timeout, or a hard abort, so
+/// a killed run leaves a mapfile behind that the NEXT run resumes from instead
+/// of sweeping. That makes `sweep_dev_null_full_good`'s
+/// `bytes_good == sectors * 2048` fail for reasons that have nothing to do with
+/// the code under test (the three `/dev/null` tests already use distinct titles
+/// — T2/T3/T5 — so intra-run collision was never the problem; cross-run residue
+/// is).
+///
+/// pid + nanosecond timestamp + a per-process counter makes the derived path
+/// unique per run, so a stale file can never be mistaken for this run's. Only
+/// `[A-Za-z0-9-_]` survives `mapfile_for`'s sanitizer, so the suffix uses
+/// digits and `-` only and reaches the filename intact.
+#[cfg(unix)]
+fn unique_title(prefix: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{prefix}-{}-{nanos}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
 fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
     AacsState {
         version: 2,
@@ -254,7 +286,7 @@ fn sweep_to_dev_null_real() {
         total_sectors: sectors,
         bad_sectors: bad,
     };
-    let disc = make_test_disc(sectors, "T2");
+    let disc = make_test_disc(sectors, &unique_title("T2"));
     let _cleanup = CleanupGuard(disc.mapfile_for(std::path::Path::new("/dev/null")));
     let opts = CopyOptions {
         decrypt: false,
@@ -696,7 +728,7 @@ fn sweep_dev_null_full_good() {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let disc = make_test_disc(sectors, "T3");
+    let disc = make_test_disc(sectors, &unique_title("T3"));
     let _cleanup = CleanupGuard(disc.mapfile_for(std::path::Path::new("/dev/null")));
     let opts = CopyOptions {
         decrypt: false,
@@ -1018,7 +1050,7 @@ fn patch_dev_null_direct() {
     let dev_null = std::path::Path::new("/dev/null");
     let sectors: u32 = 500;
     let bad: std::collections::HashSet<u32> = [100u32, 200, 300].into_iter().collect();
-    let disc = make_test_disc(sectors, "T5");
+    let disc = make_test_disc(sectors, &unique_title("T5"));
     // Own the shared temp mapfile path for the whole test: removed up front so
     // a leftover from an earlier run cannot be resumed, and on the way out so
     // this run leaves nothing behind.

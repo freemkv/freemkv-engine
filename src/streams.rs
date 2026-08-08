@@ -7,6 +7,51 @@ use crate::job::{StreamChoice, StreamFilter};
 use isolang::Language;
 use libfreemkv::{PidFilter, StreamSelection};
 
+/// A subtitle policy whose FORCED-subtitle language set is independent of its
+/// normal-subtitle language set.
+///
+/// Forced subtitles are a different editorial object from full subtitles: they
+/// translate on-screen signs and foreign dialogue for a viewer who is listening
+/// in the dub, so the language you want them in is the language you are
+/// *watching* in — not the language you want full subtitles in. "German
+/// subtitles, and forced only if in English" is a single coherent request that a
+/// single language list cannot express, which is why this splits in two.
+///
+/// The `forced` side is matched against subtitle streams whose `forced` flag is
+/// set (libfreemkv decides forcedness — including its PGS forced probe — and
+/// this only reads the flag); the `normal` side against the rest. The resolved
+/// selection is the UNION of the two: neither side can remove what the other
+/// kept, and either may be [`StreamFilter::None`].
+///
+/// A plain [`StreamFilter`] converts into the both-sides-the-same case, which is
+/// exactly the pre-forced behavior — see [`From`] below.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubtitleFilter {
+    /// Applied to subtitle streams that are NOT flagged forced.
+    pub normal: StreamFilter,
+    /// Applied to subtitle streams that ARE flagged forced.
+    pub forced: StreamFilter,
+}
+
+impl SubtitleFilter {
+    /// Two independent sides: `normal` subtitles from one policy, forced
+    /// subtitles from another. The user's "only German subtitles, and forced
+    /// only if in English" is `split(Langs(["de"]), Langs(["en"]))`.
+    pub fn split(normal: StreamFilter, forced: StreamFilter) -> Self {
+        SubtitleFilter { normal, forced }
+    }
+}
+
+/// One filter applied to BOTH sides — i.e. forcedness is ignored, which is what
+/// a caller that has only ever had a single subtitle list means. `All` still
+/// keeps every subtitle, `None` still keeps none, and `Langs(["de"])` still
+/// keeps every German subtitle whether or not it is forced.
+impl From<StreamFilter> for SubtitleFilter {
+    fn from(f: StreamFilter) -> Self {
+        SubtitleFilter::split(f.clone(), f)
+    }
+}
+
 impl StreamChoice {
     /// Translate this choice into the library's PID [`StreamSelection`] for one
     /// scanned title. See [`resolve_stream_selection`].
@@ -130,9 +175,24 @@ pub fn resolve_stream_selection(
     audio: &StreamFilter,
     subtitles: &StreamFilter,
 ) -> Result<StreamSelection, StreamSelError> {
+    resolve_stream_selection_forced(title, audio, &subtitles.clone().into())
+}
+
+/// As [`resolve_stream_selection`], but the subtitle policy carries an
+/// independent forced-subtitle language set ([`SubtitleFilter`]). The subtitle
+/// PIDs are the UNION of (non-forced streams matching `subtitles.normal`) and
+/// (forced streams matching `subtitles.forced`), in stream order.
+///
+/// `resolve_stream_selection` is this function with the same filter on both
+/// sides, so there is one matcher, not two.
+pub fn resolve_stream_selection_forced(
+    title: &libfreemkv::DiscTitle,
+    audio: &StreamFilter,
+    subtitles: &SubtitleFilter,
+) -> Result<StreamSelection, StreamSelError> {
     Ok(StreamSelection {
-        audio: resolve_class(title, audio, StreamClass::Audio)?,
-        subtitle: resolve_class(title, subtitles, StreamClass::Subtitle)?,
+        audio: resolve_audio(title, audio)?,
+        subtitle: resolve_subtitles(title, subtitles)?,
     })
 }
 
@@ -152,44 +212,96 @@ impl StreamClass {
     }
 }
 
-fn resolve_class(
-    title: &libfreemkv::DiscTitle,
-    sel: &StreamFilter,
-    class: StreamClass,
-) -> Result<PidFilter, StreamSelError> {
-    match sel {
-        StreamFilter::All => Ok(PidFilter::All),
-        StreamFilter::None => Ok(PidFilter::Only(vec![])),
-        StreamFilter::Langs(tags) => {
-            // Resolve every tag first (surfacing typos before touching streams).
-            let wanted: Vec<Language> = tags
-                .iter()
-                .map(|t| {
-                    normalize_lang(t)
-                        .ok_or_else(|| StreamSelError::UnknownLanguage { tag: t.clone() })
-                })
-                .collect::<Result<_, _>>()?;
+/// A [`StreamFilter`] with its language tags already resolved to identities —
+/// every tag is validated ONCE, before any stream is looked at, so a typo is
+/// reported as [`StreamSelError::UnknownLanguage`] whether or not the disc
+/// happens to carry a stream that would have matched.
+enum Wanted {
+    All,
+    None,
+    Langs(Vec<Language>),
+}
 
-            // Iterate the class's streams via the lib accessors (cleaner than a
-            // Stream-enum match); keep those whose language matches any tag.
-            let matches = |lang: &str, pid: u16| -> Option<u16> {
-                normalize_lang(lang)
-                    .filter(|l| wanted.contains(l))
-                    .map(|_| pid)
-            };
-            let pids: Vec<u16> = match class {
-                StreamClass::Audio => title
-                    .audio_streams()
-                    .filter_map(|a| matches(&a.language, a.pid))
-                    .collect(),
-                StreamClass::Subtitle => title
-                    .subtitle_streams()
-                    .filter_map(|s| matches(&s.language, s.pid))
-                    .collect(),
-            };
-            Ok(PidFilter::Only(pids))
+impl Wanted {
+    fn compile(sel: &StreamFilter) -> Result<Wanted, StreamSelError> {
+        Ok(match sel {
+            StreamFilter::All => Wanted::All,
+            StreamFilter::None => Wanted::None,
+            StreamFilter::Langs(tags) => Wanted::Langs(
+                tags.iter()
+                    .map(|t| {
+                        normalize_lang(t)
+                            .ok_or_else(|| StreamSelError::UnknownLanguage { tag: t.clone() })
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+
+    /// Does this side keep a stream tagged `lang`? An untagged (or unresolvable)
+    /// language can only be kept by `All` — a language filter has nothing to
+    /// match it against.
+    fn keeps(&self, lang: &str) -> bool {
+        match self {
+            Wanted::All => true,
+            Wanted::None => false,
+            Wanted::Langs(langs) => normalize_lang(lang).is_some_and(|l| langs.contains(&l)),
         }
     }
+}
+
+fn resolve_audio(
+    title: &libfreemkv::DiscTitle,
+    sel: &StreamFilter,
+) -> Result<PidFilter, StreamSelError> {
+    // `All` stays the library's `All` rather than an enumerated PID list, so an
+    // unfiltered rip is byte-identical to no selection at all.
+    if matches!(sel, StreamFilter::All) {
+        return Ok(PidFilter::All);
+    }
+    let wanted = Wanted::compile(sel)?;
+    // A SET, not a fallback chain: every audio stream matching ANY listed
+    // language is kept, so "German & Spanish audio" keeps both.
+    Ok(PidFilter::Only(
+        title
+            .audio_streams()
+            .filter(|a| wanted.keeps(&a.language))
+            .map(|a| a.pid)
+            .collect(),
+    ))
+}
+
+/// Subtitle PIDs = (non-forced streams matching `sel.normal`) ∪ (forced streams
+/// matching `sel.forced`), in stream order. Each stream is classified by the
+/// `forced` flag libfreemkv already put on it (its PGS forced probe feeds that
+/// flag; forcedness is never re-derived here) and is therefore offered to
+/// exactly one side — the two sides never contend for the same stream, and the
+/// union is duplicate-free by construction.
+fn resolve_subtitles(
+    title: &libfreemkv::DiscTitle,
+    sel: &SubtitleFilter,
+) -> Result<PidFilter, StreamSelError> {
+    // Both sides unfiltered is the archival default: keep the library's `All`.
+    if matches!(sel.normal, StreamFilter::All) && matches!(sel.forced, StreamFilter::All) {
+        return Ok(PidFilter::All);
+    }
+    // Compile both sides up front: a typo on the forced side is an error even
+    // when the disc carries no forced subtitle at all.
+    let normal = Wanted::compile(&sel.normal)?;
+    let forced = Wanted::compile(&sel.forced)?;
+    Ok(PidFilter::Only(
+        title
+            .subtitle_streams()
+            .filter(|s| {
+                if s.forced {
+                    forced.keeps(&s.language)
+                } else {
+                    normal.keeps(&s.language)
+                }
+            })
+            .map(|s| s.pid)
+            .collect(),
+    ))
 }
 
 /// Normalize a language tag (a name, 639-1, 639-2/T, 639-2/B, or 639-3 code) to
@@ -312,11 +424,17 @@ mod tests {
         })
     }
     fn sub(pid: u16, lang: &str) -> Stream {
+        sub_flagged(pid, lang, false)
+    }
+    fn forced_sub(pid: u16, lang: &str) -> Stream {
+        sub_flagged(pid, lang, true)
+    }
+    fn sub_flagged(pid: u16, lang: &str, forced: bool) -> Stream {
         Stream::Subtitle(SubtitleStream {
             pid,
             codec: Codec::Pgs,
             language: lang.into(),
-            forced: false,
+            forced,
             qualifier: LabelQualifier::None,
             codec_data: None,
         })
@@ -542,6 +660,211 @@ mod tests {
             via_method.audio,
             StreamSelection::default().audio,
             "a real resolve must not coincide with the Default"
+        );
+    }
+
+    /// A disc with the same language on BOTH sides of the forced flag, plus one
+    /// language that exists only non-forced (fra) and one only forced (jpn) —
+    /// the four cases the split has to tell apart.
+    fn forced_title() -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.streams = vec![
+            audio(0x1100, "eng"),
+            audio(0x1101, "deu"),
+            audio(0x1102, "spa"),
+            sub(0x1200, "eng"),
+            sub(0x1201, "deu"),
+            sub(0x1202, "fra"), // fra exists ONLY as a full subtitle
+            forced_sub(0x1210, "eng"),
+            forced_sub(0x1211, "deu"),
+            forced_sub(0x1212, "jpn"), // jpn exists ONLY as a forced subtitle
+        ];
+        t
+    }
+
+    /// The request this split exists for, verbatim: "German & Spanish audio,
+    /// only German subtitles, and forced only if in English."
+    ///
+    /// Audio is a SET — both German and Spanish are kept, not the first match.
+    /// Subtitles are a UNION of two INDEPENDENT sets: the German full subtitle
+    /// AND the English forced one, together. Anything that folds the two sides
+    /// into one language list can satisfy at most one half of this.
+    #[test]
+    fn german_spanish_audio_german_subs_forced_english() {
+        let sel = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::Langs(vec!["German".into(), "Spanish".into()]),
+            &SubtitleFilter::split(
+                StreamFilter::Langs(vec!["de".into()]),
+                StreamFilter::Langs(vec!["en".into()]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            sel.audio,
+            PidFilter::Only(vec![0x1101, 0x1102]),
+            "both listed audio languages must be kept"
+        );
+        assert_eq!(
+            sel.subtitle,
+            PidFilter::Only(vec![0x1201, 0x1210]),
+            "German full subtitle UNION English forced subtitle"
+        );
+    }
+
+    /// jpn is on the disc only as a forced subtitle. The normal side must not
+    /// reach it (that side selects full subtitles, and there is no full Japanese
+    /// one), while the forced side must.
+    #[test]
+    fn language_present_only_as_forced() {
+        let normal_side = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::None,
+            &SubtitleFilter::split(StreamFilter::Langs(vec!["jpn".into()]), StreamFilter::None),
+        )
+        .unwrap();
+        assert_eq!(
+            normal_side.subtitle,
+            PidFilter::Only(vec![]),
+            "a forced-only language must not be reachable from the normal side"
+        );
+
+        let forced_side = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::None,
+            &SubtitleFilter::split(StreamFilter::None, StreamFilter::Langs(vec!["jpn".into()])),
+        )
+        .unwrap();
+        assert_eq!(forced_side.subtitle, PidFilter::Only(vec![0x1212]));
+    }
+
+    /// The mirror image: fra is on the disc only as a full subtitle, so the
+    /// forced side must not reach it. Without this, a `forced` side that
+    /// silently ignored the flag would look correct in the test above.
+    #[test]
+    fn language_present_only_as_non_forced() {
+        let forced_side = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::None,
+            &SubtitleFilter::split(StreamFilter::None, StreamFilter::Langs(vec!["fra".into()])),
+        )
+        .unwrap();
+        assert_eq!(
+            forced_side.subtitle,
+            PidFilter::Only(vec![]),
+            "a non-forced-only language must not be reachable from the forced side"
+        );
+
+        let normal_side = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::None,
+            &SubtitleFilter::split(StreamFilter::Langs(vec!["fra".into()]), StreamFilter::None),
+        )
+        .unwrap();
+        assert_eq!(normal_side.subtitle, PidFilter::Only(vec![0x1202]));
+    }
+
+    /// Either side may be empty, and an empty side removes nothing from the
+    /// other — "German subtitles, no forced ones" and "no subtitles except
+    /// forced German" are both expressible, and both-empty keeps nothing.
+    #[test]
+    fn an_empty_side_selects_nothing_and_takes_nothing_from_the_other() {
+        let subs = |f: SubtitleFilter| {
+            resolve_stream_selection_forced(&forced_title(), &StreamFilter::None, &f)
+                .unwrap()
+                .subtitle
+        };
+        assert_eq!(
+            subs(SubtitleFilter::split(
+                StreamFilter::Langs(vec!["deu".into()]),
+                StreamFilter::None
+            )),
+            PidFilter::Only(vec![0x1201]),
+            "empty forced side must drop the forced German subtitle only"
+        );
+        assert_eq!(
+            subs(SubtitleFilter::split(
+                StreamFilter::None,
+                StreamFilter::Langs(vec!["deu".into()])
+            )),
+            PidFilter::Only(vec![0x1211]),
+            "empty normal side must drop the full German subtitle only"
+        );
+        assert_eq!(
+            subs(SubtitleFilter::split(
+                StreamFilter::None,
+                StreamFilter::None
+            )),
+            PidFilter::Only(vec![]),
+            "both sides empty keeps nothing"
+        );
+    }
+
+    /// A caller that has only one subtitle list keeps today's behavior exactly:
+    /// the `From` conversion applies it to both sides, so forcedness is ignored
+    /// — `All` is still the library's `All`, `None` still empty, and a language
+    /// still matches forced and full subtitles alike.
+    #[test]
+    fn a_plain_filter_converts_to_a_forced_agnostic_split() {
+        let t = forced_title();
+        for f in [
+            StreamFilter::All,
+            StreamFilter::None,
+            StreamFilter::Langs(vec!["deu".into()]),
+        ] {
+            let legacy = resolve_stream_selection(&t, &StreamFilter::All, &f).unwrap();
+            let split =
+                resolve_stream_selection_forced(&t, &StreamFilter::All, &f.clone().into()).unwrap();
+            assert_eq!(legacy.subtitle, split.subtitle, "{f:?} must not change");
+        }
+        let all = resolve_stream_selection(&t, &StreamFilter::All, &StreamFilter::All).unwrap();
+        assert_eq!(all.subtitle, PidFilter::All);
+        let none = resolve_stream_selection(&t, &StreamFilter::All, &StreamFilter::None).unwrap();
+        assert_eq!(none.subtitle, PidFilter::Only(vec![]));
+        let deu = resolve_stream_selection(
+            &t,
+            &StreamFilter::All,
+            &StreamFilter::Langs(vec!["deu".into()]),
+        )
+        .unwrap();
+        assert_eq!(
+            deu.subtitle,
+            PidFilter::Only(vec![0x1201, 0x1211]),
+            "one list means forcedness is ignored: both German subtitles"
+        );
+    }
+
+    /// `All` on one side only is still an honest selection: every non-forced
+    /// subtitle, no forced ones (the "I never want forced subs" case).
+    #[test]
+    fn all_on_one_side_enumerates_that_side_only() {
+        let sel = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::None,
+            &SubtitleFilter::split(StreamFilter::All, StreamFilter::None),
+        )
+        .unwrap();
+        assert_eq!(sel.subtitle, PidFilter::Only(vec![0x1200, 0x1201, 0x1202]));
+    }
+
+    /// A typo on the forced side is an error even when the disc has no forced
+    /// subtitle in that language — tags are validated before streams are read.
+    #[test]
+    fn unknown_language_on_the_forced_side_errors() {
+        let err = resolve_stream_selection_forced(
+            &forced_title(),
+            &StreamFilter::All,
+            &SubtitleFilter::split(
+                StreamFilter::None,
+                StreamFilter::Langs(vec!["Klingonish".into()]),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            StreamSelError::UnknownLanguage {
+                tag: "Klingonish".into()
+            }
         );
     }
 

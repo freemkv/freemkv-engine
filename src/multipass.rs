@@ -544,7 +544,25 @@ fn multipass_rip_inner(
             unreadable_bytes: cr.bytes_unreadable,
             pending_bytes: cr.bytes_pending,
             good_bytes: cr.bytes_good,
-            main_lost_ms: 0.0,
+            // Single-pass never runs the end-of-recovery gate that measures
+            // main-title loss. A flat 0.0 therefore asserted a measurement
+            // that never happened — indistinguishable, to any consumer, from
+            // "this damaged disc lost no playback", against a non-zero
+            // unreadable count. NaN is this crate's existing and only marker
+            // for "could not be quantified" (see the Err-branch fail-safe
+            // below, and this field's own doc).
+            //
+            // A disc with NO bad sectors is the one case that needs no
+            // measurement: nothing was lost because nothing was unreadable.
+            // Reporting NaN there would mark a perfect rip as unquantified.
+            main_lost_ms: if bad_sectors == 0 { 0.0 } else { f64::NAN },
+            // Severity still comes from the SECTOR count, which single-pass
+            // does know. Passing the NaN here instead would escalate every
+            // damaged single-pass rip to Serious, because `classify_damage`
+            // treats an unquantifiable loss as fail-safe — right for the
+            // abort gate, wrong here, since single-pass has no abort gate
+            // (`aborted_for_loss: false`). The 0.0 below is "no time-based
+            // escalation", not a claim that nothing was lost.
             severity: classify_damage(bad_sectors, 0.0),
             passes: 1,
             aborted_for_loss: false,
@@ -1418,6 +1436,93 @@ mod tests {
         (dir, iso)
     }
 
+    /// The only single-pass test ran a CLEAN disc, where `main_lost_ms: 0.0`
+    /// is correct and therefore indistinguishable from a hard-coded constant.
+    /// On a DAMAGED disc the constant was a claim nothing had measured: a rip
+    /// returning `complete: false` and a non-zero unreadable count also
+    /// reported, in the same breath, that no playback was lost.
+    ///
+    /// Single-pass never runs the gate that measures loss, so it must say so.
+    #[test]
+    fn single_pass_reports_loss_as_unquantified_on_a_damaged_disc() {
+        let (dir, iso) = scratch_iso("single-damaged");
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![test_title(0, sectors)]);
+        let total = sectors as u64 * 2048;
+
+        // The reachable damaged-single-pass state is the RESUME one: a plain
+        // copy aborts at the first read error, so damage only comes back as a
+        // RESULT when a prior run already attempted the whole disc. That is
+        // exactly what a user hits re-running after a failed rip. Build that
+        // mapfile: fully attempted, some sectors permanently Unreadable.
+        let mapfile_path = disc.mapfile_for(&iso);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf =
+            crate::recovery::mapfile::Mapfile::create(&mapfile_path, total, "vTEST").unwrap();
+        mf.record(0, total, crate::recovery::mapfile::SectorStatus::Finished)
+            .unwrap();
+        mf.record(
+            1000 * 2048,
+            2048 * 8,
+            crate::recovery::mapfile::SectorStatus::Unreadable,
+        )
+        .unwrap();
+        mf.flush().unwrap();
+        std::fs::write(&iso, vec![0u8; total as usize]).unwrap();
+
+        // This path must not read the disc at all — it is terminal.
+        let mut reader = ZeroReader { capacity: sectors };
+        let mut job = raw_job(&iso);
+        job.mode = crate::RipMode::Single;
+        let opts = MultipassOpts {
+            max_passes: 0,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let r = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("a fully-attempted mapfile with bad bytes is terminal, not an error");
+
+        assert_eq!(r.passes, 1, "single-pass is one dispatch");
+        assert!(
+            r.unreadable_bytes + r.pending_bytes > 0,
+            "fixture check: this run must come back damaged, else every \
+             assertion below is vacuous"
+        );
+        assert!(
+            !r.main_lost_ms.is_finite(),
+            "single-pass measured nothing, so it must not report a NUMBER of \
+             milliseconds lost beside {} unreadable + {} pending bytes",
+            r.unreadable_bytes,
+            r.pending_bytes,
+        );
+        // Severity still comes from the sector count, which single-pass DOES
+        // know. It must not have been escalated to Serious merely because the
+        // loss is unquantified — that rule belongs to the abort gate, which
+        // single-pass never runs.
+        assert_ne!(
+            r.severity,
+            crate::DamageSeverity::Clean,
+            "a rip holding unreadable bytes is not Clean"
+        );
+        assert_eq!(
+            r.severity,
+            classify_damage(bad_sector_count(r.unreadable_bytes, r.pending_bytes), 0.0),
+            "severity must come from the sector count, not from the NaN"
+        );
+        assert!(!r.aborted_for_loss, "single-pass has no abort gate");
+
+        let _ = std::fs::remove_file(&mapfile_path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn multipass_rip_single_pass_mode_is_one_dispatch_no_retry_loop() {
         // max_passes == 0 -> plan_passes(0).multipass == false: one
@@ -1807,6 +1912,406 @@ mod tests {
             u64::MAX / 2048,
             "the sum saturates instead of wrapping to a tiny damage count"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // The three fail-safes inside `multipass_rip_inner` that no black-box
+    // fixture reached: the failed end-of-recovery promotion, the unreadable
+    // mapfile at the abort-decision point, and the mid-loop cancel.
+    //
+    // All three need the world to change WHILE the loop is running, which is
+    // what `HookSink` is for: the loop's own log lines are the only
+    // deterministic clock a caller has inside a `multipass_rip` call.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// A `Sink` that records every line the loop logs and, the first time a
+    /// line contains `trigger`, runs `action` (and optionally starts
+    /// cancelling). The trigger points used below are chosen so the action
+    /// lands in a gap where the loop is doing no I/O of its own:
+    ///
+    /// * `"exhausted"` / `"skipping remaining"` — logged immediately before
+    ///   the `break` that leaves the patch loop, so a sabotage takes effect
+    ///   for the end-of-recovery `Mapfile::load` and nothing else.
+    /// * `"multipass_rip: pass "` — logged right after a patch pass returns
+    ///   and before the next iteration's cancel check, which is the only way
+    ///   to arm a cancel that the *loop-top* check (and not a recovery
+    ///   primitive's own halt token) is guaranteed to observe first.
+    struct HookSink {
+        trigger: &'static str,
+        action: Box<dyn Fn() + Send + Sync>,
+        cancel_after_trigger: bool,
+        fired: std::sync::atomic::AtomicBool,
+        logs: std::sync::Mutex<Vec<(Level, String)>>,
+    }
+
+    impl HookSink {
+        fn new(
+            trigger: &'static str,
+            cancel_after_trigger: bool,
+            action: Box<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            Self {
+                trigger,
+                action,
+                cancel_after_trigger,
+                fired: std::sync::atomic::AtomicBool::new(false),
+                logs: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn cancelling(trigger: &'static str) -> Self {
+            Self::new(trigger, true, Box::new(|| {}))
+        }
+
+        fn did_fire(&self) -> bool {
+            self.fired.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Did the loop log a line containing `needle` at `level`?
+        fn logged(&self, level: Level, needle: &str) -> bool {
+            self.logs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(l, m)| *l == level && m.contains(needle))
+        }
+    }
+
+    impl Sink for HookSink {
+        fn log(&self, level: Level, msg: &str) {
+            self.logs.lock().unwrap().push((level, msg.to_string()));
+            if msg.contains(self.trigger)
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                (self.action)();
+            }
+        }
+        fn should_cancel(&self) -> bool {
+            self.cancel_after_trigger && self.did_fire()
+        }
+    }
+
+    /// A 4096-sector disc whose ONE title's extents span the whole image, so
+    /// an MKV-scoped (`is_iso_output: false`) gate sees the damage at LBA
+    /// 1000 and the loop actually runs patch passes. Returns the scratch dir,
+    /// the ISO path, the mapfile path the loop will use, and the disc.
+    fn in_title_damage_fixture(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        libfreemkv::Disc,
+    ) {
+        let (dir, iso) = scratch_iso(tag);
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![test_title(0, sectors)]);
+        let mapfile = disc.mapfile_for(&iso);
+        (dir, iso, mapfile, disc)
+    }
+
+    /// The reader half of [`in_title_damage_fixture`]: LBA 1000 never heals.
+    fn never_healing_reader() -> MultiSpotReader {
+        MultiSpotReader {
+            capacity: 4096,
+            spots: vec![Spot {
+                lba: 1000,
+                heal_after: u32::MAX,
+                attempts: 0,
+            }],
+        }
+    }
+
+    /// A raw (multipass-legal) job writing to `iso`.
+    fn raw_job(iso: &std::path::Path) -> Job {
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
+        job
+    }
+
+    /// A generous tolerance: the real residual loss on the fixture above is
+    /// ~35 s of a 7200 s title, so an HOUR of tolerance accepts it. Every
+    /// abort asserted below therefore comes from the fail-safe under test and
+    /// from nothing else.
+    const GENEROUS_TOLERANCE_SECS: u64 = 3600;
+
+    /// CONTROL for the two sabotage tests below: the same disc, the same
+    /// damage, the same tolerance, with the mapfile left alone. The gate
+    /// quantifies the loss, accepts it, and does NOT abort. Without this the
+    /// sabotage tests could pass for the wrong reason (any run of this fixture
+    /// aborting).
+    #[test]
+    fn multipass_rip_accepts_a_measurable_loss_under_a_generous_tolerance() {
+        let (dir, iso, _mapfile, disc) = in_title_damage_fixture("gate-control");
+        let mut reader = never_healing_reader();
+        let job = raw_job(&iso);
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
+            is_iso_output: false,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("a permanently-bad sector is a reported result, not an Err");
+
+        assert!(!result.halted);
+        assert!(
+            result.unreadable_bytes > 0,
+            "the fixture must actually end with confirmed loss"
+        );
+        assert!(
+            result.main_lost_ms.is_finite() && result.main_lost_ms > 0.0,
+            "the loss must be quantifiable when the mapfile is intact, got {}",
+            result.main_lost_ms
+        );
+        assert!(
+            !result.aborted_for_loss,
+            "{} ms of loss is well inside a {GENEROUS_TOLERANCE_SECS}s tolerance",
+            result.main_lost_ms
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The LIVE end-of-recovery gate must abort when the mapfile — the rip's
+    /// only damage record — cannot be read at the abort-decision point.
+    ///
+    /// `end_of_recovery_lost_ms` is tested as a pure predicate, but the
+    /// shipped bug (see its doc) was that the GATE did not consult a
+    /// predicate. This drives `multipass_rip` end to end and replaces the
+    /// mapfile with a directory at the instant the patch loop breaks, so
+    /// `Mapfile::load` at the gate returns `Err`. The fail-safe answers NaN,
+    /// which `loss_aborts` treats as abort under EVERY threshold — including
+    /// the hour-long one that the control test above proves accepts this
+    /// disc's real loss.
+    #[test]
+    fn multipass_rip_aborts_when_the_mapfile_cannot_be_read_at_the_gate() {
+        let (dir, iso, mapfile, disc) = in_title_damage_fixture("gate-unreadable-mapfile");
+        let mut reader = never_healing_reader();
+        let job = raw_job(&iso);
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
+            is_iso_output: false,
+        };
+
+        // Sabotage: the mapfile becomes a DIRECTORY, so `read_to_string`
+        // fails with EISDIR no matter which user runs the suite.
+        let victim = mapfile.clone();
+        let sink = HookSink::new(
+            "exhausted",
+            false,
+            Box::new(move || {
+                let _ = std::fs::remove_file(&victim);
+                std::fs::create_dir_all(&victim).expect("sabotage: mapfile -> directory");
+            }),
+        );
+
+        let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &sink)
+            .expect("an unreadable mapfile is a fail-safe verdict, not an Err");
+
+        assert!(
+            sink.did_fire(),
+            "the sabotage never ran — test proves nothing"
+        );
+        assert!(mapfile.is_dir(), "the mapfile must still be unreadable");
+        assert!(
+            sink.logged(
+                Level::Error,
+                "mapfile could not be loaded to verify loss — forcing abort"
+            ),
+            "the gate must say it is failing safe: {:?}",
+            sink.logs.lock().unwrap()
+        );
+        assert!(
+            result.main_lost_ms.is_nan(),
+            "an unreadable damage record is unquantifiable loss, got {}",
+            result.main_lost_ms
+        );
+        assert!(
+            result.aborted_for_loss,
+            "the abort must fire even under a {GENEROUS_TOLERANCE_SECS}s tolerance"
+        );
+        assert!(!result.complete, "a rip the gate refused is never complete");
+        assert_eq!(
+            result.severity,
+            crate::DamageSeverity::Serious,
+            "an unquantifiable loss is Serious, not a lower tier"
+        );
+        assert!(!result.halted, "this is the gate firing, not a cancel");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed end-of-recovery PROMOTION must abort the rip.
+    ///
+    /// Promotion is what makes the loss visible: the gate reads `Unreadable`
+    /// ranges only, so a range that fails to promote out of `NonTrimmed`
+    /// silently drops out of the decision it should be driving — and the rip
+    /// ships as good. Here `Mapfile::load` SUCCEEDS (so this is not the
+    /// unreadable-mapfile branch above — asserted) but the promoted map
+    /// cannot be persisted, because `write_to_disk` writes `<mapfile>.tmp`
+    /// first and that path has been replaced by a directory. `flush()` fails,
+    /// `promotion_intact` goes false, and the loss becomes unquantifiable.
+    #[test]
+    fn multipass_rip_aborts_when_the_end_of_recovery_promotion_cannot_be_persisted() {
+        let (dir, iso, mapfile, disc) = in_title_damage_fixture("gate-promotion-failure");
+        let mut reader = never_healing_reader();
+        let job = raw_job(&iso);
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
+            is_iso_output: false,
+        };
+
+        let tmp_path = {
+            let mut s = mapfile.clone().into_os_string();
+            s.push(".tmp");
+            std::path::PathBuf::from(s)
+        };
+        let victim = tmp_path.clone();
+        let sink = HookSink::new(
+            "exhausted",
+            false,
+            Box::new(move || {
+                let _ = std::fs::remove_file(&victim);
+                std::fs::create_dir_all(&victim).expect("sabotage: mapfile.tmp -> directory");
+            }),
+        );
+
+        let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &sink)
+            .expect("a failed promotion is a fail-safe verdict, not an Err");
+
+        assert!(
+            sink.did_fire(),
+            "the sabotage never ran — test proves nothing"
+        );
+        assert!(tmp_path.is_dir(), "the mapfile must still be unwritable");
+        assert!(
+            !sink.logged(Level::Error, "mapfile could not be loaded"),
+            "the mapfile must LOAD fine — this is the promotion branch, not \
+             the unreadable-mapfile branch: {:?}",
+            sink.logs.lock().unwrap()
+        );
+        assert!(
+            sink.logged(Level::Warn, "failed to flush promoted mapfile")
+                || sink.logged(Level::Warn, "end-of-recovery promotion failed"),
+            "a failed promotion must be reported: {:?}",
+            sink.logs.lock().unwrap()
+        );
+        assert!(
+            sink.logged(Level::Error, "damage record is incomplete"),
+            "the gate must say WHY the loss is unquantifiable: {:?}",
+            sink.logs.lock().unwrap()
+        );
+        assert!(
+            result.main_lost_ms.is_nan(),
+            "an incomplete damage record is unquantifiable loss, got {}",
+            result.main_lost_ms
+        );
+        assert!(
+            result.aborted_for_loss,
+            "the abort must fire even under a {GENEROUS_TOLERANCE_SECS}s tolerance"
+        );
+        assert!(!result.complete);
+        assert_eq!(result.severity, crate::DamageSeverity::Serious);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rip cancelled mid-loop, AFTER damage has been found, is halted and is
+    /// never reported as Clean.
+    ///
+    /// Two untested things at once, because they are one user-visible event:
+    /// the loop-top cancel check (which breaks out between patch passes) and
+    /// the halted result branch. Severity there was once hard-coded `Clean`,
+    /// so a cancelled rip that had already found unreadable sectors rendered a
+    /// "Clean" badge next to a non-zero unreadable count.
+    ///
+    /// The cancel is armed from the "pass N recovered" log line, i.e. after
+    /// the first patch pass has returned and before the second iteration's
+    /// cancel check — the only window in which the LOOP's own check, rather
+    /// than a recovery primitive's halt token, is guaranteed to be the thing
+    /// that stops the run. Hence the exact `passes == 2`.
+    #[test]
+    fn multipass_rip_cancelled_mid_loop_is_halted_and_never_reported_clean() {
+        let (dir, iso) = scratch_iso("mid-loop-cancel");
+        let sectors = 200_000u32;
+        let disc = test_disc(sectors, vec![]);
+        // One spot that heals on the next touch (so patch pass 1 makes real
+        // progress and the loop-bottom NoProgress gate does NOT break for us)
+        // and one that never heals (so the scope never converges either).
+        let mut reader = MultiSpotReader {
+            capacity: sectors,
+            spots: vec![
+                Spot {
+                    lba: 1_000,
+                    heal_after: 1,
+                    attempts: 0,
+                },
+                Spot {
+                    lba: 100_000,
+                    heal_after: u32::MAX,
+                    attempts: 0,
+                },
+            ],
+        };
+        let job = raw_job(&iso);
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let sink = HookSink::cancelling("multipass_rip: pass ");
+        let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &sink)
+            .expect("a cancelled rip is a partial result, not an Err");
+
+        assert!(
+            sink.did_fire(),
+            "the cancel was never armed — test proves nothing"
+        );
+        assert!(result.halted, "a cancelled rip must report halted");
+        assert_eq!(
+            result.passes, 2,
+            "sweep + the one patch pass that ran before the cancel: the loop \
+             must stop at its own top-of-loop cancel check"
+        );
+        assert!(
+            result.unreadable_bytes + result.pending_bytes > 0,
+            "the fixture must have found damage BEFORE the cancel, or the \
+             severity assertion below is vacuous"
+        );
+        assert_ne!(
+            result.severity,
+            crate::DamageSeverity::Clean,
+            "a cancelled rip holding {} unreadable + {} pending bytes is not \
+             Clean — that badge contradicted the counters next to it",
+            result.unreadable_bytes,
+            result.pending_bytes
+        );
+        assert_eq!(
+            result.severity,
+            classify_damage(
+                bad_sector_count(result.unreadable_bytes, result.pending_bytes),
+                0.0
+            ),
+            "severity must be derived from the damage actually recorded"
+        );
+        assert!(!result.complete, "an interrupted rip is never complete");
+        assert!(
+            !result.aborted_for_loss,
+            "the abort gate is not reached on the halted path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
