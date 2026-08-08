@@ -59,7 +59,7 @@ impl StreamChoice {
         &self,
         title: &libfreemkv::DiscTitle,
     ) -> Result<StreamSelection, StreamSelError> {
-        resolve_stream_selection(title, &self.audio, &self.subtitles)
+        resolve_stream_selection_forced(title, &self.audio, &self.subtitles)
     }
 
     /// Report the language-filtered classes that matched NO stream on `title`
@@ -73,7 +73,18 @@ impl StreamChoice {
     pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
         let mut out = Vec::new();
         check_class(title, &self.audio, StreamClass::Audio, &mut out);
-        check_class(title, &self.subtitles, StreamClass::Subtitle, &mut out);
+        // KNOWN GAP: only the NORMAL subtitle side is checked. A language asked
+        // for on the forced side alone is not reported, and `available` mixes
+        // forced and non-forced languages. Reporting it needs a second class key
+        // (`"subtitle-forced"`) that every front-end must localize, so it is a
+        // cross-repo change, not a local one. For a caller with a single subtitle
+        // list both sides are equal and this is exactly the previous behavior.
+        check_class(
+            title,
+            &self.subtitles.normal,
+            StreamClass::Subtitle,
+            &mut out,
+        );
         out
     }
 }
@@ -553,7 +564,10 @@ mod tests {
     }
 
     fn choice(audio: StreamFilter, subtitles: StreamFilter) -> StreamChoice {
-        StreamChoice { audio, subtitles }
+        StreamChoice {
+            audio,
+            subtitles: subtitles.into(),
+        }
     }
 
     #[test]
@@ -646,10 +660,11 @@ mod tests {
         let t = title();
         let choice = StreamChoice {
             audio: StreamFilter::Langs(vec!["fre".into()]),
-            subtitles: StreamFilter::None,
+            subtitles: StreamFilter::None.into(),
         };
         let via_method = choice.resolve(&t).unwrap();
-        let via_function = resolve_stream_selection(&t, &choice.audio, &choice.subtitles).unwrap();
+        let via_function =
+            resolve_stream_selection_forced(&t, &choice.audio, &choice.subtitles).unwrap();
         assert_eq!(via_method.audio, via_function.audio);
         assert_eq!(via_method.subtitle, via_function.subtitle);
         // Spelled out too, so the assertion above cannot pass by both sides
