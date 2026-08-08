@@ -910,6 +910,28 @@ fn build_flat_pool() -> Vec<Box<dyn SectionHandler>> {
     pool
 }
 
+/// The batch label carried through the pass. `block_sectors` no longer sizes
+/// any read (the handler chain owns read sizing); it survives ONLY as this
+/// label, and the clamp keeps `Some(0)` from reading as "scrape".
+pub(super) fn initial_batch_of(opts: &PatchOptions) -> u16 {
+    opts.block_sectors.unwrap_or(1).max(1)
+}
+
+/// The pass label the front end renders for a patch pass.
+///
+/// This is the one observable consequence `block_sectors` and `reverse` still
+/// have: a single-sector batch is reported as a SCRAPE pass, anything larger as
+/// a TRIM pass, and `reverse` decorates whichever one it is. Shared by
+/// `report_patch_progress` (every progress tick) so the label cannot be
+/// asserted against a re-implementation of the rule.
+pub(super) fn pass_kind(initial_batch: u16, reverse: bool) -> libfreemkv::progress::PassKind {
+    if initial_batch == 1 {
+        libfreemkv::progress::PassKind::Scrape { reverse }
+    } else {
+        libfreemkv::progress::PassKind::Trim { reverse }
+    }
+}
+
 /// True when the flat-pool bandit scheduler is requested (`FREEMKV_PATCH_FLAT`
 /// set to anything but empty / `0`). Default (unset) keeps the tier ladder.
 fn patch_flat_mode() -> bool {
@@ -1245,15 +1267,7 @@ pub(super) fn report_patch_progress(
             .expect("PatchSink shared state mutex poisoned");
         (g.stats, g.bad_ranges.clone())
     };
-    let kind = if state.initial_batch == 1 {
-        libfreemkv::progress::PassKind::Scrape {
-            reverse: opts.reverse,
-        }
-    } else {
-        libfreemkv::progress::PassKind::Trim {
-            reverse: opts.reverse,
-        }
-    };
+    let kind = pass_kind(state.initial_batch, opts.reverse);
     let main_title_bad = disc
         .titles
         .first()
@@ -1379,6 +1393,40 @@ pub fn patch(
     // and records them Finished, which is silent corruption presented as a
     // successful recovery.
     mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
+    // Same argument as the identity gate above, and the gap it left open. A
+    // patch pass walks only the mapfile's BAD ranges and takes `bytes_good`
+    // from its stats, so it never looks at — and never re-reads — anything the
+    // mapfile already calls Finished. If the image has since been truncated
+    // (a full disk, an interrupted transfer, a remount), every Finished range
+    // past the cut is a sparse hole that this pass will not touch, and the
+    // outcome still reports the whole disc as good: a successful recovery over
+    // data that was never written.
+    //
+    // `copy` and `sweep` both answer this by forcing a fresh sweep. `patch` has
+    // no sweep to fall back to, so it refuses instead and leaves the choice to
+    // the caller.
+    //
+    // REGULAR FILES ONLY. A length is only evidence of content for a regular
+    // file: a character device (`/dev/null`, the discard destination used by
+    // read-only verification passes) always stat's as 0 bytes no matter how
+    // much has been written to it, so an unconditional gate refuses every such
+    // pass. `sweep.rs::close` exempts non-regular outputs from its `sync_all`
+    // check for the same reason; `is_regular` here is the same flag, read from
+    // the open handle by `compute_initial_state`.
+    let image = crate::recovery::image_state(path, total_bytes)?;
+    if is_regular && image.is_short() {
+        tracing::info!(
+            target: "freemkv::scan",
+            phase = "patch",
+            have = image.len,
+            want = image.want,
+            "refusing: the image is shorter than the mapfile describes"
+        );
+        return Err(Error::ImageTruncated {
+            have: image.len,
+            want: image.want,
+        });
+    }
     tracing::info!(
         target: "freemkv::scan",
         phase = "patch",
@@ -1467,7 +1515,7 @@ pub fn patch(
     // below (informational-only; a caller can't change read sizing or the
     // recovery timeout through them). Clamp to ≥1 so the label math never
     // underflows on a `Some(0)`.
-    let initial_batch = opts.block_sectors.unwrap_or(1).max(1);
+    let initial_batch = initial_batch_of(opts);
     let recovery = opts.full_recovery;
     log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
 
@@ -1564,6 +1612,166 @@ pub fn patch(
 mod tests {
     use super::*;
 
+    /// A minimal disc for the image-length gate. Only capacity matters here.
+    fn guard_disc(sectors: u32) -> libfreemkv::Disc {
+        libfreemkv::Disc {
+            volume_id: "TESTDISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: sectors,
+            capacity_bytes: sectors as u64 * 2048,
+            layers: 1,
+            titles: vec![],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    struct NoReader;
+    impl libfreemkv::sector::SectorSource for NoReader {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _decrypt: bool,
+        ) -> std::result::Result<usize, libfreemkv::Error> {
+            panic!("the image-length gate must refuse BEFORE any sector is read");
+        }
+    }
+
+    /// A patch pass walks only the mapfile's BAD ranges and takes `bytes_good`
+    /// from its stats, so it never re-reads anything already marked Finished.
+    /// If the image has been truncated since, every Finished range past the cut
+    /// is a sparse hole — and the outcome still reported the whole disc as
+    /// good: a successful recovery over data that was never written.
+    ///
+    /// `copy` and `sweep` both guarded this and `patch` did not. It must refuse,
+    /// and it must refuse before reading a single sector (NoReader panics).
+    #[test]
+    fn patch_refuses_an_image_shorter_than_the_mapfile_describes() {
+        let dir = std::env::temp_dir().join(format!("fmkv-patch-trunc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("short.iso");
+
+        let sectors = 64u32;
+        let disc = guard_disc(sectors);
+        let full = disc.capacity_bytes;
+
+        // The mapfile describes the WHOLE disc, with one bad range to patch.
+        let mapfile_path = disc.mapfile_for(&iso);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        mf.record(2048, 2048, mapfile::SectorStatus::NonTrimmed)
+            .unwrap();
+        mf.flush().unwrap();
+
+        // …but the image on disk is half that long.
+        std::fs::write(&iso, vec![0u8; (full / 2) as usize]).unwrap();
+
+        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let err = match patch(&disc, &mut NoReader, &iso, &opts) {
+            Err(e) => e,
+            Ok(_) => panic!("a truncated image must not be patched and called good"),
+        };
+        match err {
+            Error::ImageTruncated { have, want } => {
+                assert_eq!(have, full / 2, "reports the length actually found");
+                assert_eq!(want, full, "reports the length the mapfile describes");
+            }
+            other => panic!("expected ImageTruncated, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&mapfile_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The gate must not fire on a healthy image — otherwise every normal
+    /// resume would be refused.
+    #[test]
+    fn patch_accepts_an_image_of_the_length_the_mapfile_describes() {
+        let dir = std::env::temp_dir().join(format!("fmkv-patch-intact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("full.iso");
+
+        let sectors = 64u32;
+        let disc = guard_disc(sectors);
+        let full = disc.capacity_bytes;
+
+        let mapfile_path = disc.mapfile_for(&iso);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
+
+        // Nothing bad to patch, so this returns without reading a sector — the
+        // point is only that it did NOT return ImageTruncated.
+        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let r = patch(&disc, &mut NoReader, &iso, &opts);
+        assert!(
+            !matches!(r, Err(Error::ImageTruncated { .. })),
+            "an image of exactly the right length must not be refused"
+        );
+
+        let _ = std::fs::remove_file(&mapfile_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A NON-REGULAR destination is exempt from the truncation gate.
+    ///
+    /// `/dev/null` is a real destination here (the discard sink used for
+    /// read-only verification / benchmark passes), and a character device
+    /// always stat's as 0 bytes no matter how much has been written to it. An
+    /// unconditional length gate therefore reads "0 of N bytes" and refuses
+    /// EVERY such pass with `ImageTruncated` — which is exactly the regression
+    /// that shipped and that only an integration test caught. The length is
+    /// only evidence for a regular file, so the gate must be `is_regular`-gated.
+    #[test]
+    #[cfg(unix)]
+    fn patch_does_not_apply_the_truncation_gate_to_a_non_regular_destination() {
+        let dev_null = std::path::Path::new("/dev/null");
+
+        // Unique volume id → a unique temp mapfile name (`mapfile_for` derives
+        // the /dev/null mapfile name from the disc), so this cannot collide
+        // with a concurrently-running test's mapfile.
+        let mut disc = guard_disc(64);
+        disc.volume_id = format!("fmkv-devnull-gate-{}", std::process::id());
+        let full = disc.capacity_bytes;
+
+        let mapfile_path = disc.mapfile_for(dev_null);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+
+        // /dev/null reports len 0 while the mapfile describes `full` bytes:
+        // the short-image condition is satisfied, and must NOT fire. Nothing is
+        // bad, so the pass reads no sector (NoReader would panic).
+        assert_eq!(
+            std::fs::metadata(dev_null).unwrap().len(),
+            0,
+            "precondition: the character device measures as zero-length"
+        );
+        let opts = PatchOptions::for_patch_pass(false, None, None, None);
+        let r = patch(&disc, &mut NoReader, dev_null, &opts);
+        let _ = std::fs::remove_file(&mapfile_path);
+        match r {
+            Err(Error::ImageTruncated { have, want }) => panic!(
+                "a /dev/null patch pass must not be refused as truncated \
+                 (have={have}, want={want}) — a character device has no meaningful length"
+            ),
+            Err(other) => panic!("unexpected patch failure: {other:?}"),
+            Ok(_) => {}
+        }
+    }
+
     /// The flat bandit pool must contain every handler from every tier, with a
     /// UNIQUE name per config — the scoreboard keys on the name, so any two
     /// handlers sharing a name would blur each other's decayed-yield ranking.
@@ -1587,16 +1795,254 @@ mod tests {
         );
     }
 
-    /// The flat-mode toggle: unset / empty / "0" → tier ladder; anything else →
-    /// flat bandit. (Env is process-global; this asserts the parse logic via the
-    /// same rules `patch_flat_mode` applies.)
+    // ----------------------------------------------------------------
+    // Env-var scheduler knobs (`FREEMKV_PATCH_FLAT`,
+    // `FREEMKV_PATCH_FLAT_BUDGET`).
+    //
+    // Process env is GLOBAL and cargo runs tests on many threads, so every
+    // test that writes one of these keys must hold `ENV_LOCK` for as long as
+    // it needs its value to stand, and must put the previous value back.
+    // `EnvGuard` does both. `FREEMKV_PATCH_FLAT*` is read ONLY by this module
+    // (`patch_flat_mode` / `flat_handler_budget_secs`) and the only tests in
+    // the whole lib binary that reach that code are in this file, so this lock
+    // is sufficient today — ANY future test that sets these keys, wherever it
+    // lives, must take it too or it will race.
+    // ----------------------------------------------------------------
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds `ENV_LOCK` and restores the captured keys on drop (including on
+    /// panic, so one failing assertion cannot leak `FREEMKV_PATCH_FLAT` into
+    /// the rest of the run).
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn capture(keys: &[&'static str]) -> Self {
+            // A poisoned lock only means some earlier test panicked while
+            // holding it; the guard's Drop still restored the env, so the
+            // mutex's data (`()`) is not actually corrupt.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, val: Option<&str>) {
+            // SAFETY: single-threaded with respect to these keys — `ENV_LOCK`
+            // is held for the guard's lifetime and nothing else in the binary
+            // touches them.
+            unsafe {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                // SAFETY: as in `set` — the lock is still held here.
+                unsafe {
+                    match v {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The flat-mode toggle, exercised through the real function: unset / empty
+    /// / "0" → tier ladder; anything else → flat bandit.
+    ///
+    /// This used to assert against a locally-defined copy of the predicate, so
+    /// the function under test was never called and any rewrite of it (e.g. to
+    /// `!= "1"`, which flips `"true"` and every other value) left the test
+    /// green. It now sets the real env var and calls `patch_flat_mode`.
     #[test]
-    fn flat_mode_toggle_parsing() {
-        let on = |v: &str| !v.is_empty() && v != "0";
-        assert!(!on(""));
-        assert!(!on("0"));
-        assert!(on("1"));
-        assert!(on("true"));
+    fn flat_mode_toggle_reads_the_env_var() {
+        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT"]);
+
+        g.set("FREEMKV_PATCH_FLAT", None);
+        assert!(!patch_flat_mode(), "unset must keep the proven tier ladder");
+        g.set("FREEMKV_PATCH_FLAT", Some(""));
+        assert!(!patch_flat_mode(), "empty is not an opt-in");
+        g.set("FREEMKV_PATCH_FLAT", Some("0"));
+        assert!(!patch_flat_mode(), "0 is the explicit off switch");
+
+        g.set("FREEMKV_PATCH_FLAT", Some("1"));
+        assert!(patch_flat_mode(), "1 selects the flat bandit");
+        g.set("FREEMKV_PATCH_FLAT", Some("true"));
+        assert!(
+            patch_flat_mode(),
+            "any non-empty, non-zero value opts in — not just \"1\""
+        );
+    }
+
+    /// The flat per-handler EXPLORE budget, exercised through the real
+    /// function. It had no test at all, and it is the whole reason the flat
+    /// scheduler gives all 16 handlers a fast turn: a wrong default (or a
+    /// missing floor) either starves the pool or spins forever on a handler
+    /// with a zero-second deadline.
+    #[test]
+    fn flat_handler_budget_defaults_parses_and_floors() {
+        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT_BUDGET"]);
+
+        g.set("FREEMKV_PATCH_FLAT_BUDGET", None);
+        assert_eq!(flat_handler_budget_secs(), 12, "shipped default is 12 s");
+
+        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("30"));
+        assert_eq!(flat_handler_budget_secs(), 30, "an override is honoured");
+
+        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("  7 "));
+        assert_eq!(
+            flat_handler_budget_secs(),
+            7,
+            "surrounding space is trimmed"
+        );
+
+        // A zero/negative budget would make every deadline already-expired, so
+        // handlers would be entered and abandoned without a single read.
+        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("0"));
+        assert_eq!(flat_handler_budget_secs(), 1, "floored at 1 s");
+
+        // Garbage must fall back to the default, not to 0 and not to a panic.
+        for junk in ["", "abc", "-5", "12s"] {
+            g.set("FREEMKV_PATCH_FLAT_BUDGET", Some(junk));
+            assert_eq!(
+                flat_handler_budget_secs(),
+                12,
+                "unparseable {junk:?} must fall back to the default"
+            );
+        }
+    }
+
+    /// A reader that fails every read and remembers the LBA order it was asked
+    /// for. Every handler therefore yields on its own dead-read limit, and the
+    /// recorded sequence is a direct trace of the SCHEDULER's walk.
+    struct TraceReader {
+        lbas: Vec<u32>,
+    }
+    impl libfreemkv::sector::SectorSource for TraceReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _decrypt: bool,
+        ) -> std::result::Result<usize, libfreemkv::Error> {
+            self.lbas.push(lba);
+            // An ORDINARY bad sector (CHECK CONDITION / medium error): must not
+            // be mistaken for a transport fault, which would end the pass early
+            // and destroy the trace.
+            Err(Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION),
+                sense: Some(libfreemkv::scsi::ScsiSense {
+                    sense_key: 0x03,
+                    asc: 0x11,
+                    ascq: 0x00,
+                }),
+            })
+        }
+    }
+
+    /// Run one real patch pass over two bad ranges and return the LBA trace.
+    /// The caller owns `FREEMKV_PATCH_FLAT` (via `EnvGuard`) around this.
+    fn trace_two_range_pass(tag: &str, a: (u32, u32), b: (u32, u32)) -> Vec<u32> {
+        let dir = std::env::temp_dir().join(format!("fmkv-flat-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("trace.iso");
+
+        let disc = guard_disc(2000);
+        let full = disc.capacity_bytes;
+        let mapfile_path = disc.mapfile_for(&iso);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        for &(lba, count) in &[a, b] {
+            mf.record(
+                lba as u64 * 2048,
+                count as u64 * 2048,
+                mapfile::SectorStatus::NonTrimmed,
+            )
+            .unwrap();
+        }
+        mf.flush().unwrap();
+        std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
+
+        let mut reader = TraceReader { lbas: Vec::new() };
+        let opts = PatchOptions::for_patch_pass(false, None, None, None);
+        patch(&disc, &mut reader, &iso, &opts).expect("the pass itself must complete");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        reader.lbas
+    }
+
+    /// END-TO-END through the FLAT scheduler: with `FREEMKV_PATCH_FLAT` set,
+    /// `PatchCtx::run` does ONE walk over the ranges and gives each range the
+    /// whole handler pool before moving on. The tier ladder does the opposite:
+    /// it sweeps EVERY range at tier 0, then every range again at tier 1, so a
+    /// range is revisited after later ranges have been touched.
+    ///
+    /// That difference is the entire behavioural content of the env flag, and
+    /// nothing exercised it — `build_flat_pool` was only checked structurally,
+    /// so the flat branch of `run` (and the per-handler budget it selects)
+    /// could be deleted or inverted with the suite still green. The read trace
+    /// makes the walk order observable: flat = range A finished before range B
+    /// is ever touched; tiered = A is revisited after B.
+    #[test]
+    fn the_flat_scheduler_finishes_a_range_before_starting_the_next() {
+        // Range A is the LARGER one, so the (size desc, pos asc) sort puts it
+        // first in BOTH schedulers — the only variable left is the walk shape.
+        let a = (100u32, 16u32);
+        let b = (1000u32, 4u32);
+        let in_a = |l: &u32| *l >= a.0 && *l < a.0 + a.1;
+        let in_b = |l: &u32| *l >= b.0 && *l < b.0 + b.1;
+
+        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT", "FREEMKV_PATCH_FLAT_BUDGET"]);
+        // A 1 s per-handler budget keeps the pass quick; the handlers all yield
+        // on dead reads long before it, so it does not change the walk.
+        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("1"));
+
+        g.set("FREEMKV_PATCH_FLAT", Some("1"));
+        let flat = trace_two_range_pass("flat", a, b);
+        g.set("FREEMKV_PATCH_FLAT", None);
+        let tiered = trace_two_range_pass("tier", a, b);
+        drop(g);
+
+        // Both schedulers must actually visit both ranges, or the ordering
+        // assertions below would hold vacuously.
+        for (name, trace) in [("flat", &flat), ("tiered", &tiered)] {
+            assert!(
+                trace.iter().any(in_a) && trace.iter().any(in_b),
+                "{name}: both bad ranges must be attempted (trace: {trace:?})"
+            );
+        }
+
+        let last_a = flat.iter().rposition(in_a).unwrap();
+        let first_b = flat.iter().position(in_b).unwrap();
+        assert!(
+            last_a < first_b,
+            "FLAT: the whole handler pool must finish range A before range B is \
+             touched — range A was read again at trace index {last_a}, after \
+             range B started at {first_b} (trace: {flat:?})"
+        );
+
+        // The contrast that proves the trace really observes the scheduler:
+        // the default ladder DOES come back to range A after range B.
+        let last_a_t = tiered.iter().rposition(in_a).unwrap();
+        let first_b_t = tiered.iter().position(in_b).unwrap();
+        assert!(
+            last_a_t > first_b_t,
+            "TIERED: the breadth-first ladder must revisit range A on a later \
+             tier, after range B's tier-0 pass (trace: {tiered:?})"
+        );
     }
 
     /// Transport failure (status=0xFF, USB-bridge crash) must be recognised and

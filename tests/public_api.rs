@@ -48,3 +48,34 @@ fn documented_free_functions_are_callable() {
     ) -> Result<libfreemkv::StreamSelection, freemkv_engine::StreamSelError> =
         freemkv_engine::resolve_stream_selection;
 }
+
+/// Forced subtitles are selectable INDEPENDENTLY of normal ones — a user can
+/// ask for German subtitles plus forced English. The split type and the
+/// resolver that takes it must both be nameable, or a front-end can never
+/// construct the request. `SubtitleFilter` lives in a private module, so
+/// without its re-export it is bindable by inference and unwritable in a
+/// signature — the exact failure this file exists to catch.
+#[test]
+fn forced_subtitle_selection_is_nameable_and_constructible() {
+    use freemkv_engine::SubtitleFilter;
+
+    // Both sides named explicitly: the user's own example.
+    let split: SubtitleFilter = SubtitleFilter::split(
+        freemkv_engine::StreamFilter::Langs(vec!["de".into()]),
+        freemkv_engine::StreamFilter::Langs(vec!["en".into()]),
+    );
+    fn _takes_split(_: &SubtitleFilter) {}
+    _takes_split(&split);
+
+    // And a plain filter must still convert, so existing callers are unbroken.
+    let from_plain: SubtitleFilter = freemkv_engine::StreamFilter::All.into();
+    _takes_split(&from_plain);
+
+    // The forced-aware resolver is reachable by name.
+    let _f: fn(
+        &libfreemkv::DiscTitle,
+        &freemkv_engine::StreamFilter,
+        &SubtitleFilter,
+    ) -> Result<freemkv_engine::StreamSelection, freemkv_engine::StreamSelError> =
+        freemkv_engine::resolve_stream_selection_forced;
+}
