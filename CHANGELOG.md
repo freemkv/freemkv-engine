@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.6.2] — 2026-08-08
+
+Version sync with the workspace. No functional change in this crate.
+
 All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
