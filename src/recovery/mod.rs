@@ -83,11 +83,9 @@ pub fn copy(
         // `iso_is_intact`, and routed to a fresh `sweep_internal`, which
         // removes the mapfile and `File::create`s the image. A stat blip
         // destroyed a completed recovery and re-ripped the disc from LBA 0.
-        let iso_len = match iso_len_from_metadata(std::fs::metadata(path))? {
-            IsoLen::Missing => 0,
-            IsoLen::Len(n) => n,
-        };
-        let iso_is_intact = iso_len == disc_size;
+        let image = image_state(path, disc_size)?;
+        let iso_len = image.len;
+        let iso_is_intact = image.is_intact();
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && !iso_is_intact {
             // Complete mapfile, but the image it describes is gone or short.
             // A resume cannot repair this: the producer builds work only from
@@ -414,6 +412,51 @@ pub(crate) fn iso_len_from_metadata(m: std::io::Result<std::fs::Metadata>) -> Re
     }
 }
 
+/// The image a mapfile describes, measured against the length it should be.
+///
+/// ONE definition, used by `copy`, `sweep` AND `patch`. It used to be written
+/// out at each call site — `copy` compared for equality, `sweep` for "shorter
+/// than", and `patch` did not check at all. That third gap was the dangerous
+/// one: a truncated staging image could be patched and reported as a whole
+/// good disc, because the pass only walks the mapfile's bad ranges and takes
+/// `bytes_good` from its stats, so every Finished range beyond the truncation
+/// is a hole nothing ever re-reads.
+pub(crate) struct ImageState {
+    /// Length on disk. A missing file reports 0 — absent is as inconsistent
+    /// with a mapfile claiming progress as empty is, and both self-heal the
+    /// same way.
+    pub(crate) len: u64,
+    /// Length the mapfile says the image should be.
+    pub(crate) want: u64,
+}
+
+impl ImageState {
+    /// Exactly the length it should be. A LONGER file is not intact either:
+    /// it is not the image this mapfile describes.
+    pub(crate) fn is_intact(&self) -> bool {
+        self.len == self.want
+    }
+
+    /// Short of what the mapfile describes — the case where trusting the
+    /// mapfile invents recovered data that was never read.
+    pub(crate) fn is_short(&self) -> bool {
+        self.len < self.want
+    }
+}
+
+/// Measure `path` against the length a mapfile expects of it.
+///
+/// A stat failure other than "not found" is an error, never silently 0: a
+/// transient stat failure once threw away a good resume and re-ripped hours
+/// of work.
+pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageState> {
+    let len = match iso_len_from_metadata(std::fs::metadata(path))? {
+        IsoLen::Missing => 0,
+        IsoLen::Len(n) => n,
+    };
+    Ok(ImageState { len, want })
+}
+
 /// Whether a fresh sweep may proceed after trying to delete a stale mapfile.
 ///
 /// A fresh sweep MUST start from an empty mapfile: if the stale file survives,
@@ -650,12 +693,10 @@ pub fn sweep(
                     // Missing counts as zero here: an absent image is as
                     // inconsistent with a mapfile claiming progress as an
                     // empty one, and both self-heal the same way.
-                    let iso_len = match iso_len_from_metadata(std::fs::metadata(path))? {
-                        IsoLen::Missing => 0,
-                        IsoLen::Len(n) => n,
-                    };
+                    let image = image_state(path, existing.total_size())?;
+                    let iso_len = image.len;
                     let claims_progress = existing.stats().bytes_pending != existing.total_size();
-                    if iso_len < existing.total_size() && claims_progress {
+                    if image.is_short() && claims_progress {
                         tracing::info!(
                             "sweep: mapfile claims prior progress (pending {} of {}) but the ISO is {} of {} bytes; forcing fresh sweep",
                             existing.stats().bytes_pending,
@@ -1420,13 +1461,21 @@ pub struct SweepOptions<'a> {
 /// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
 pub struct PatchOptions<'a> {
     pub decrypt: bool,
+    /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only
+    /// (1 → Scrape, >1 → Trim). It does NOT size any read: the handler chain
+    /// owns read sizing and bisection.
     pub block_sectors: Option<u16>,
+    /// Diagnostics only — logged as `recovery=` at pass start and read by
+    /// nothing. Per-read effort is the handler chain's `ReadParams`.
     pub full_recovery: bool,
     /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only.
     /// It does NOT order the walk: `PatchCtx::run` sorts the bad ranges by
     /// (size desc, pos asc), a total order over disjoint runs, so any
     /// pre-ordering is unobservable.
     pub reverse: bool,
+    /// Echoed verbatim into [`PatchOutcome::wedged_threshold`] for the caller
+    /// to render. Nothing counts wedged reads against it — `wedged_exit` is set
+    /// from a handler's transport fault.
     pub wedged_threshold: u64,
     pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -1443,12 +1492,13 @@ impl<'a> PatchOptions<'a> {
     /// apart on a future tuning change with nothing to catch it. Only one of
     /// the two copies even carried the rationale for `block_sectors`.
     ///
-    /// Adaptive batching: patch reads at 32 sectors when the drive is healthy,
-    /// drops to 1 on failure to probe each sector individually, then climbs
-    /// back after 16 consecutive clean singles. Walks NonTrimmed regions ~32x
-    /// faster in clean stretches without sacrificing per-sector recovery
-    /// quality — the drop-to-1 retry from the same position guarantees every
-    /// sector in a failed batch is individually probed.
+    /// NOTE on `block_sectors: Some(32)`: it no longer sizes any read. The
+    /// adaptive 32→1→32 batching this comment used to describe was replaced by
+    /// the handler chain (`section_recover.rs`), which owns read sizing and
+    /// bisection. What survives is the pass LABEL — >1 reports a Trim pass, 1
+    /// reports a Scrape pass. Likewise `full_recovery` is now diagnostics-only
+    /// and `wedged_threshold` is reported in the outcome, not enforced. See
+    /// `patch_preset_tests` for what each value actually does.
     pub fn for_patch_pass(
         decrypt: bool,
         progress: Option<&'a dyn libfreemkv::progress::Progress>,
@@ -1649,6 +1699,68 @@ mod snap_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The image guard is ONE definition used by copy, sweep and patch. These
+    /// pin the two questions each of them asks, because they used to ask them
+    /// with hand-written comparisons that disagreed: copy tested equality,
+    /// sweep tested "shorter than", and patch tested nothing at all.
+    #[test]
+    fn image_state_answers_intact_and_short_separately() {
+        let exact = ImageState {
+            len: 4096,
+            want: 4096,
+        };
+        assert!(exact.is_intact());
+        assert!(!exact.is_short(), "the right length is not short");
+
+        let short = ImageState {
+            len: 2048,
+            want: 4096,
+        };
+        assert!(!short.is_intact());
+        assert!(short.is_short(), "this is the case that invents good data");
+
+        // A LONGER file is not the image this mapfile describes either, so it
+        // is not intact — but it is not the dangerous case, so not short.
+        let long = ImageState {
+            len: 8192,
+            want: 4096,
+        };
+        assert!(
+            !long.is_intact(),
+            "a longer file is not this mapfile's image"
+        );
+        assert!(!long.is_short());
+    }
+
+    /// A missing file reports length 0 rather than erroring: absent is exactly
+    /// as inconsistent with a mapfile claiming progress as empty is, and both
+    /// self-heal the same way.
+    #[test]
+    fn image_state_treats_a_missing_file_as_zero_length() {
+        let dir = std::env::temp_dir().join(format!("fmkv-imgstate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let absent = dir.join("not-here.iso");
+        let _ = std::fs::remove_file(&absent);
+
+        let st = image_state(&absent, 4096).expect("a missing image is not an error");
+        assert_eq!(st.len, 0);
+        assert!(st.is_short(), "absent must read as short, not as intact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Measured against the real file, not a guess.
+    #[test]
+    fn image_state_measures_the_file_on_disk() {
+        let dir = std::env::temp_dir().join(format!("fmkv-imgstate-len-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("short.iso");
+        std::fs::write(&f, vec![0u8; 2048]).unwrap();
+
+        assert!(image_state(&f, 4096).unwrap().is_short());
+        assert!(image_state(&f, 2048).unwrap().is_intact());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Region-start alignment, asserted against PRODUCTION.
     ///
@@ -1899,32 +2011,115 @@ mod snapshot_tests {
 /// wedged_threshold: 8` passes 285 unit + 56 integration tests). The literals
 /// are gone; this is the assertion that makes the preset load-bearing.
 ///
-/// Each value is a behaviour, not a magic number:
-/// - `block_sectors: Some(32)` — adaptive batching (32 when healthy, 1 on
-///   failure). `Some(1)` would walk clean stretches 32x slower; `None` would
-///   drop per-sector probing.
-/// - `full_recovery: true` — the drive is asked to try hard; false makes a
-///   patch pass no better than the sweep read it is retrying.
-/// - `reverse: true` — approach direction differs from the sweep's, which is
-///   the point of retrying at all.
-/// - `wedged_threshold: 50` — how many wedged reads end the pass.
+/// WHAT THESE FOUR VALUES ACTUALLY DO — read this before "fixing" a value here
+/// because a doc comment somewhere says it tunes recovery. Three of the four no
+/// longer steer the pass at all; the handler chain in `section_recover.rs` owns
+/// read sizing, per-read timeouts and the wedge exit:
+/// - `block_sectors: Some(32)` — LABEL ONLY. It does not size any read. Its one
+///   observable effect is the pass label the front end renders: `Some(1)` reads
+///   as a SCRAPE pass, anything larger as a TRIM pass
+///   (`patch::pass_kind`). Asserted below through that production function.
+/// - `reverse: true` — LABEL ONLY. It decorates the same `PassKind`. It does
+///   NOT order the walk: `PatchCtx::run` sorts bad ranges (size desc, pos asc).
+///   Asserted below through the label.
+/// - `full_recovery: true` — DIAGNOSTIC ONLY. `patch()` logs it as `recovery=`
+///   and nothing reads it. Pinned below as a value, not as a behaviour, and
+///   deliberately not dressed up as one.
+/// - `wedged_threshold: 50` — REPORTED, NOT ENFORCED. Nothing counts wedged
+///   reads against it; `PatchOutcome::wedged_exit` comes from a handler's
+///   `TransportFault`. The threshold is echoed verbatim into the outcome for
+///   the caller to render, which is what the test asserts (through
+///   `build_outcome`, not by re-reading the field).
+///
+/// So this is honestly "the preset, and the labels/echoes it produces" — not
+/// recovery tuning. The reason it still earns its place: the preset exists so
+/// the two routes into a patch pass cannot drift, and five test sites used to
+/// hand-write its four values as literals, which meant the SHIPPED preset was
+/// exercised by nothing (verified: `block_sectors: Some(1), full_recovery:
+/// false, reverse: false, wedged_threshold: 8` passed the whole suite).
 #[cfg(test)]
 mod patch_preset_tests {
     use super::*;
 
+    /// The preset's values, pinned — including the two that are inert, so a
+    /// future change to them is at least deliberate.
     #[test]
     fn for_patch_pass_carries_the_shipped_tuning() {
         let o = PatchOptions::for_patch_pass(false, None, None, None);
-        assert_eq!(o.block_sectors, Some(32), "adaptive batching starts at 32");
-        assert!(o.full_recovery, "a patch pass asks the drive to try hard");
-        assert!(
-            o.reverse,
-            "a patch pass approaches from the other direction"
-        );
+        assert_eq!(o.block_sectors, Some(32));
+        assert!(o.full_recovery, "diagnostics-only, but pinned");
+        assert!(o.reverse);
         assert_eq!(o.wedged_threshold, 50);
         assert!(!o.decrypt, "decrypt is the caller's, forwarded verbatim");
 
         // And `decrypt` really is forwarded, not hard-coded.
         assert!(PatchOptions::for_patch_pass(true, None, None, None).decrypt);
+    }
+
+    /// The behaviour `block_sectors` + `reverse` still have: the pass label the
+    /// operator sees on every progress tick. With the shipped preset that is a
+    /// REVERSE TRIM pass; `Some(1)` would relabel the same pass as a scrape.
+    #[test]
+    fn the_preset_reports_a_reverse_trim_pass() {
+        use libfreemkv::progress::PassKind;
+        let o = PatchOptions::for_patch_pass(false, None, None, None);
+
+        let kind = patch::pass_kind(patch::initial_batch_of(&o), o.reverse);
+        assert!(
+            matches!(kind, PassKind::Trim { reverse: true }),
+            "the shipped preset must render as a reverse TRIM pass, got {kind:?}"
+        );
+
+        // The contrast, so the assertion above is not just "whatever it does":
+        // a single-sector batch is a SCRAPE pass, and `reverse` really is the
+        // flag that decorates it.
+        let mut scrape = PatchOptions::for_patch_pass(false, None, None, None);
+        scrape.block_sectors = Some(1);
+        scrape.reverse = false;
+        assert!(matches!(
+            patch::pass_kind(patch::initial_batch_of(&scrape), scrape.reverse),
+            PassKind::Scrape { reverse: false }
+        ));
+
+        // `Some(0)` must not underflow into the scrape label by accident.
+        let mut zero = PatchOptions::for_patch_pass(false, None, None, None);
+        zero.block_sectors = Some(0);
+        assert_eq!(
+            patch::initial_batch_of(&zero),
+            1,
+            "clamped to a valid batch"
+        );
+    }
+
+    /// The behaviour `wedged_threshold` has: it is REPORTED, verbatim, in the
+    /// outcome the caller renders — and it does not, by itself, make the pass
+    /// look wedged. Both halves matter: a caller that printed a wedge warning
+    /// off this field alone would be wrong, and a caller that never saw the
+    /// number could not explain the wedge exit when it does happen.
+    #[test]
+    fn the_wedged_threshold_is_reported_not_enforced() {
+        let o = PatchOptions::for_patch_pass(false, None, None, None);
+
+        let state = patch::PatchLoopState::new(0, 4096, patch::initial_batch_of(&o), 4096);
+        let summary = patch::PatchSummary {
+            stats: mapfile::MapStats::default(),
+        };
+        let outcome = patch::build_outcome(
+            &state,
+            &summary,
+            std::path::Path::new("/nonexistent/for-outcome-only"),
+            4096,
+            0,
+            o.wedged_threshold,
+        );
+        assert_eq!(
+            outcome.wedged_threshold, 50,
+            "the preset's threshold must reach the caller's outcome verbatim"
+        );
+        assert!(
+            !outcome.wedged_exit,
+            "the threshold alone must not mark a pass wedged — `wedged_exit` \
+             comes from a handler's TransportFault, nothing counts against 50"
+        );
     }
 }

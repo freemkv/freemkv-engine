@@ -237,6 +237,23 @@ mod tests {
         (sink, iso)
     }
 
+    /// A `SweepSink` whose output is `/dev/null` — a character device whose
+    /// `fsync` genuinely fails at the OS level (macOS `F_FULLFSYNC` → ENODEV,
+    /// Linux `fsync` → EINVAL). `is_regular` is supplied by the caller so both
+    /// arms of `close`'s policy can be driven over the SAME real failure.
+    #[cfg(unix)]
+    fn sink_over_dev_null(dir: &std::path::Path, is_regular: bool) -> SweepSink {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let wf = libfreemkv::io::WritebackFile::new(f).unwrap();
+        let map = Mapfile::create(&dir.join("out.map"), 8192, "test").unwrap();
+        let (sink, _rx) = SweepSink::new(wf, map, is_regular);
+        sink
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
             "fmkv-sweepsink-{name}-{}-{:?}",
@@ -363,6 +380,168 @@ mod tests {
         assert!(got[2048..4096].iter().all(|&b| b == 0x5A));
         assert!(got[4096..].iter().all(|&b| b == 0xAA));
         assert_eq!(summary.stats.bytes_good, 2048);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bisect-bad sector is zeroed AND recorded `NonTrimmed` — never
+    /// `Finished`.
+    ///
+    /// This is the one item in the enum whose payload is invented by the
+    /// consumer rather than read off the disc: the producer could not read the
+    /// sector, so `apply` writes 2048 zeros of its own. The status it records
+    /// is therefore the ONLY thing standing between those zeros and the user.
+    /// If this arm ever recorded `Finished`, the mapfile would call fabricated
+    /// zeros recovered data, `bytes_good` would include them, a later patch
+    /// pass would never retry the sector, and the rip would be handed over as
+    /// complete with a hole in it. Nothing else in the tree checks it: the
+    /// producer-side bisect only decides which item to send.
+    #[test]
+    fn a_bisect_bad_sector_is_zeroed_and_recorded_nontrimmed_not_finished() {
+        let dir = scratch("bisectbad");
+        let total = 8192u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+
+        sink.apply(WorkItem::BisectBad { pos: 4096 }).unwrap();
+        let summary = sink.close().unwrap();
+
+        let got = std::fs::read(&iso).unwrap();
+        assert_eq!(got.len() as u64, total);
+        assert!(
+            got[..4096].iter().all(|&b| b == 0xAA),
+            "the zero-fill ran backwards past the failed sector"
+        );
+        assert!(
+            got[4096..6144].iter().all(|&b| b == 0),
+            "the failed sector must be zero-filled, not left as whatever was there"
+        );
+        assert!(
+            got[6144..].iter().all(|&b| b == 0xAA),
+            "the zero-fill wrote past the single 2048-byte sector"
+        );
+
+        assert_eq!(
+            summary.stats.bytes_good, 0,
+            "a sector the drive could not read must not count as recovered data"
+        );
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert_eq!(
+            reloaded.ranges_with(&[SectorStatus::NonTrimmed]),
+            vec![(4096, 2048)],
+            "exactly the failed sector is NonTrimmed, so a patch pass retries it"
+        );
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "fabricated zeros must never be recorded Finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A bisect-good sector lands at its own offset and is recorded `Finished`.
+    ///
+    /// The mirror of the arm above, and the pair is the point: the two carry
+    /// the same 2048-byte length and differ only in payload and status. This
+    /// one asserts the sector really is written where it says (`pos`, not the
+    /// file's current position) and really is marked `Finished` — a bisect that
+    /// recovered a sector but recorded it `NonTrimmed` would make every later
+    /// pass re-read a sector already in hand, and one that wrote to the wrong
+    /// offset would corrupt a neighbour while claiming success.
+    #[test]
+    fn a_bisect_good_sector_is_written_at_its_position_and_recorded_finished() {
+        let dir = scratch("bisectgood");
+        let total = 8192u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+
+        sink.apply(WorkItem::BisectGood {
+            pos: 4096,
+            buf: Box::new([0x5Au8; 2048]),
+        })
+        .unwrap();
+        let summary = sink.close().unwrap();
+
+        let got = std::fs::read(&iso).unwrap();
+        assert!(got[..4096].iter().all(|&b| b == 0xAA));
+        assert!(
+            got[4096..6144].iter().all(|&b| b == 0x5A),
+            "the recovered sector must land at pos, not at the file's cursor"
+        );
+        assert!(got[6144..].iter().all(|&b| b == 0xAA));
+
+        assert_eq!(summary.stats.bytes_good, 2048);
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert_eq!(
+            reloaded.ranges_with(&[SectorStatus::Finished]),
+            vec![(4096, 2048)],
+            "a sector recovered by bisect must be Finished, or later passes re-read it forever"
+        );
+        assert!(reloaded.ranges_with(&[SectorStatus::NonTrimmed]).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `close` must surface a failed `sync_all` when the output is a regular
+    /// file.
+    ///
+    /// `output_is_regular` is unit-tested where it is computed; what was
+    /// untested is its CONSUMPTION here, which is the half that decides whether
+    /// a real durability failure on the just-written image reaches the user or
+    /// is thrown away. `sync_all` is the last barrier before `copy` reports a
+    /// finished rip — if the swallow ever widened to cover regular files, an
+    /// ENOSPC/EIO fsync on the ISO would be reported as a successful rip.
+    ///
+    /// The failure is genuine, not injected: `/dev/null`'s fsync fails at the
+    /// OS level (macOS `F_FULLFSYNC` → ENODEV, Linux `fsync` → EINVAL). Only
+    /// the `is_regular` flag — the input to the policy under test — is varied
+    /// between this test and its pair below, so the two differ in exactly the
+    /// bit being asserted.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_all_is_an_error_when_the_output_is_regular() {
+        let dir = scratch("syncfail-regular");
+        let mut sink = sink_over_dev_null(&dir, true);
+        sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        })
+        .unwrap();
+
+        let err = sink
+            .close()
+            .err()
+            .expect("a failed fsync on a regular output must be reported, not swallowed");
+        assert!(
+            matches!(err, Error::IoError { .. }),
+            "the underlying io error must be surfaced as-is, got {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ...and must NOT surface it when the output is not a regular file.
+    ///
+    /// `/dev/null` and pipes always fail `sync_all`; treating that as an error
+    /// would make every benchmark/sink rip fail at the finish line. The
+    /// exemption also has to keep doing the rest of `close`'s job, so this
+    /// asserts the mapfile was still flushed and the summary is real — not just
+    /// that no error came back.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_all_is_exempt_when_the_output_is_not_regular() {
+        let dir = scratch("syncfail-devnull");
+        let mut sink = sink_over_dev_null(&dir, false);
+        sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        })
+        .unwrap();
+
+        let summary = sink
+            .close()
+            .expect("a /dev/null output always fails fsync; that is not a rip failure");
+        assert_eq!(summary.stats.bytes_good, 2048);
+        let reloaded = Mapfile::load(&dir.join("out.map"))
+            .expect("the exempt path must still flush the mapfile");
+        assert_eq!(
+            reloaded.ranges_with(&[SectorStatus::Finished]),
+            vec![(0, 2048)]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

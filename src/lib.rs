@@ -96,7 +96,10 @@ pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;
-pub use streams::{StreamSelError, UnmatchedClass, resolve_stream_selection};
+pub use streams::{
+    StreamSelError, SubtitleFilter, UnmatchedClass, resolve_stream_selection,
+    resolve_stream_selection_forced,
+};
 
 // ─── Re-exports so a front-end can depend on the engine alone ────────────────
 //
@@ -105,8 +108,8 @@ pub use streams::{StreamSelError, UnmatchedClass, resolve_stream_selection};
 // so front-ends never have to add a *direct* libfreemkv dependency just for
 // these — the engine is their substrate.
 pub use libfreemkv::{
-    AudioStream, Codec, Disc, DiscFormat, DiscTitle, Halt, Resolution, Stream, SubtitleStream,
-    VideoStream,
+    AudioStream, Codec, Disc, DiscFormat, DiscTitle, Halt, PidFilter, Resolution, Stream,
+    StreamSelection, SubtitleStream, VideoStream,
 };
 
 /// The engine's result type. Errors are [`libfreemkv::Error`] — a typed enum
