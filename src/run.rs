@@ -616,10 +616,6 @@ mod tests {
                 self.start.elapsed() > std::time::Duration::from_millis(50)
             }
         }
-        let sink = DelayedCancelSink {
-            start: std::time::Instant::now(),
-        };
-
         let dir = std::env::temp_dir().join(format!("fmkv-engine-cooldown-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let iso = dir.join("cd.iso");
@@ -632,7 +628,15 @@ mod tests {
         job.mode = RipMode::Multi;
         job.raw = true;
 
+        // ONE origin for the sink's cancel-delay and the measurement below.
+        // These used to be separate instants with `create_dir_all`, `Job::new`
+        // and path formatting in between, so filesystem latency came out of the
+        // sink's 50 ms window: on a slow runner the sink already reported
+        // cancelled before the first read, the run halted immediately, and this
+        // test failed on its OWN lower bound. It gates every release (CI runs
+        // this suite in both profiles), so the flake was a release blocker.
         let start = std::time::Instant::now();
+        let sink = DelayedCancelSink { start };
         let r = recover_to_iso(&disc, &mut reader, &iso, &job, &sink)
             .expect("a cancelled rip halts, it does not error");
         let elapsed = start.elapsed();
