@@ -362,7 +362,12 @@ mod tests {
         };
         let observed = with_cancel_watcher(&sink, |halt| {
             // Give the watcher time to poll at least once (it sleeps 100 ms).
-            for _ in 0..40 {
+            // The loop returns the instant the flag goes up, so the deadline
+            // costs nothing on the happy path — it is a liveness backstop, not
+            // a measurement, and is deliberately far past the one poll this
+            // needs so a runner that doesn't schedule the watcher promptly
+            // cannot turn a working watcher into a red build.
+            for _ in 0..400 {
                 if halt.load(std::sync::atomic::Ordering::Relaxed) {
                     return true;
                 }

@@ -29,6 +29,13 @@ struct PatternedSectorReader {
     bad_lbas: HashSet<u32>,
     /// Trace every read so tests can assert what was actually attempted.
     trace: Arc<Mutex<Vec<(u32, u16)>>>,
+    /// Optional WORK-budget watchdog: raise this halt flag once the pass has
+    /// issued `budget` reads. A deterministic stand-in for a wall-clock
+    /// watchdog thread — a loop that fails to advance burns reads at whatever
+    /// speed the machine runs at, so counting reads bounds it identically on a
+    /// fast laptop and a contended CI runner, and a healthy run (which needs a
+    /// handful) can never trip it by being slow.
+    halt_after_reads: Option<(u64, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
 type ReadTrace = Arc<Mutex<Vec<(u32, u16)>>>;
@@ -41,9 +48,15 @@ impl PatternedSectorReader {
                 capacity,
                 bad_lbas,
                 trace: trace.clone(),
+                halt_after_reads: None,
             },
             trace,
         )
+    }
+
+    fn halt_after_reads(mut self, budget: u64, halt: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.halt_after_reads = Some((budget, halt));
+        self
     }
 }
 
@@ -55,7 +68,16 @@ impl SectorSource for PatternedSectorReader {
         buf: &mut [u8],
         _recovery: bool,
     ) -> Result<usize> {
-        self.trace.lock().unwrap().push((lba, count));
+        let reads = {
+            let mut t = self.trace.lock().unwrap();
+            t.push((lba, count));
+            t.len() as u64
+        };
+        if let Some((budget, halt)) = &self.halt_after_reads
+            && reads >= *budget
+        {
+            halt.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // Whole-batch fails if ANY sector in the batch is bad. (Models a
         // real drive: a multi-sector READ aborts on the first ECC failure.)
         for offset in 0..count as u32 {
@@ -235,10 +257,24 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     let capacity_sectors: u32 = 256;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
+    // The bound on this test used to be a watchdog THREAD that set `halt`
+    // after 20 s of wall clock. That made a slow runner indistinguishable from
+    // the regression: trip the watchdog and the run comes back `halted`, which
+    // is exactly the assertion below, so a busy CI box failed the test for
+    // reasons having nothing to do with busy-spinning. The bound belongs in
+    // WORK, not seconds — a loop that never advances issues reads without
+    // limit, so a read budget catches it just as surely and cannot be tripped
+    // by slowness. 512 reads against the 3 a healthy run of this 10-sector
+    // range needs — verified to arm: drop the budget to 1 and the run comes
+    // back halted and the assertion below fires.
+    const READ_BUDGET: u64 = 512;
+
     // Small NonTrimmed range that is entirely readable (no bad LBAs), so
     // single-sector patch reads recover it immediately. Without the
     // clamp the loop would never progress regardless of readability.
-    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, HashSet::new());
+    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (reader, trace) = PatternedSectorReader::new(capacity_sectors, HashSet::new());
+    let mut reader = reader.halt_after_reads(READ_BUDGET, halt.clone());
     let disc = synthetic_disc(capacity_sectors);
 
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -252,30 +288,22 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     let nontrimmed = [(100 * 2048, 10 * 2048)];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
-    // A halt watchdog bounds the run: the inner loop polls `halt` every
-    // iteration, so even a busy-spin regression breaks out within the
-    // window instead of hanging the test binary. With the clamp the run
-    // finishes long before the watchdog fires; without it the watchdog
-    // trips and the bytes_good assertion below fails loudly.
-    let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let halt_for_watchdog = halt.clone();
-    // Poll to a deadline rather than sleeping straight through it. The bound
-    // is what this watchdog is for — a busy-spin regression must still be cut
-    // off at 20s — but on the happy path the work finishes in well under a
-    // second, and an unconditional sleep made every green run of this file pay
-    // the full 20s anyway, on every push, in every repo of the cascade.
-    let watchdog_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let watchdog_done_t = watchdog_done.clone();
-    let watchdog = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if watchdog_done_t.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+    // Capture the pass label the operator would see. It is the one observable
+    // the clamp still drives end-to-end (`initial_batch_of().max(1)` → a
+    // 1-sector batch → SCRAPE); an unclamped `Some(0)` renders the same pass as
+    // a TRIM. Without this the test could not tell a clamped build from an
+    // unclamped one at all.
+    #[derive(Default)]
+    struct KindReporter {
+        kinds: Mutex<Vec<libfreemkv::progress::PassKind>>,
+    }
+    impl libfreemkv::progress::Progress for KindReporter {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            self.kinds.lock().unwrap().push(p.kind);
+            true
         }
-        halt_for_watchdog.store(true, std::sync::atomic::Ordering::Relaxed);
-    });
+    }
+    let reporter = KindReporter::default();
 
     let opts = PatchOptions {
         decrypt: false,
@@ -283,26 +311,42 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
         full_recovery: false,
         reverse: false,
         wedged_threshold: 0,
-        progress: None,
+        progress: Some(&reporter),
         halt: Some(halt.clone()),
         key_fetch: None,
     };
 
     let outcome = freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts);
-    // Stop the watchdog regardless of outcome.
-    watchdog_done.store(true, std::sync::atomic::Ordering::Relaxed);
-    halt.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = watchdog.join();
 
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(&map_path);
 
     let outcome = outcome.expect("patch returns Ok");
+    let reads = trace.lock().unwrap().clone();
     assert!(
         !outcome.halted,
         "patch with block_sectors=Some(0) must complete on its own \
-         (clamped to a 1-sector batch), not be cut off by the watchdog"
+         (clamped to a 1-sector batch), not burn through the {READ_BUDGET}-read \
+         budget; it issued {} reads",
+        reads.len()
+    );
+    // The direct signature of the regression: a zero-length read reads no
+    // sectors, so a loop sized off an unclamped `Some(0)` never advances its
+    // cursor. One of these in the trace is the busy-spin, caught by inspection
+    // rather than by how long the test happened to take.
+    assert!(
+        reads.iter().all(|&(_, count)| count >= 1),
+        "every read must cover at least one sector; trace = {reads:?}"
+    );
+    let kinds = reporter.kinds.lock().unwrap().clone();
+    assert!(
+        !kinds.is_empty()
+            && kinds
+                .iter()
+                .all(|k| matches!(k, libfreemkv::progress::PassKind::Scrape { reverse: false })),
+        "Some(0) must be clamped to a 1-sector batch, which the pass reports as \
+         a forward SCRAPE; got {kinds:?}"
     );
     let bytes_good = outcome.bytes_good;
     // The 10-sector NonTrimmed range was fully readable; clamped to a
