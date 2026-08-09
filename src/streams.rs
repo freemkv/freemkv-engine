@@ -73,16 +73,23 @@ impl StreamChoice {
     pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
         let mut out = Vec::new();
         check_class(title, &self.audio, StreamClass::Audio, &mut out);
-        // KNOWN GAP: only the NORMAL subtitle side is checked. A language asked
-        // for on the forced side alone is not reported, and `available` mixes
-        // forced and non-forced languages. Reporting it needs a second class key
-        // (`"subtitle-forced"`) that every front-end must localize, so it is a
-        // cross-repo change, not a local one. For a caller with a single subtitle
-        // list both sides are equal and this is exactly the previous behavior.
+        // BOTH sides, each against only its own streams. A caller asking for a
+        // forced language the disc does not carry used to be told nothing at
+        // all: the rip finished at exit 0 as though the request had been
+        // honoured, with that half of it silently dropped. The two sides are
+        // chosen independently, so a miss on one is not answered by a hit on
+        // the other, and `available` must not mix them or the correction it
+        // offers names tracks the user cannot have.
         check_class(
             title,
             &self.subtitles.normal,
             StreamClass::Subtitle,
+            &mut out,
+        );
+        check_class(
+            title,
+            &self.subtitles.forced,
+            StreamClass::SubtitleForced,
             &mut out,
         );
         out
@@ -162,6 +169,12 @@ fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<Str
         StreamClass::Audio => title.audio_streams().map(|a| a.language.clone()).collect(),
         StreamClass::Subtitle => title
             .subtitle_streams()
+            .filter(|s| !s.forced)
+            .map(|s| s.language.clone())
+            .collect(),
+        StreamClass::SubtitleForced => title
+            .subtitle_streams()
+            .filter(|s| s.forced)
             .map(|s| s.language.clone())
             .collect(),
     }
@@ -211,6 +224,10 @@ pub fn resolve_stream_selection_forced(
 enum StreamClass {
     Audio,
     Subtitle,
+    /// Forced subtitles, checked SEPARATELY from full ones. The two are chosen
+    /// independently ("German subtitles, forced only if English"), so a request
+    /// that matches nothing on one side says nothing about the other.
+    SubtitleForced,
 }
 
 impl StreamClass {
@@ -219,6 +236,7 @@ impl StreamClass {
         match self {
             StreamClass::Audio => "audio",
             StreamClass::Subtitle => "subtitle",
+            StreamClass::SubtitleForced => "subtitle_forced",
         }
     }
 }
@@ -383,6 +401,55 @@ mod tests {
     /// `isolang` is the oracle rather than a restated mapping — the property is
     /// that a bibliographic tag and the /T form the table sends it to name the
     /// SAME language.
+    /// A forced language the disc does not carry must be REPORTED.
+    ///
+    /// The two subtitle sides are chosen independently, so a hit on the full
+    /// side says nothing about the forced one. Before this, asking for forced
+    /// Japanese on a disc with none finished at exit 0 as though the request
+    /// had been honoured — that half of it silently dropped, which is the
+    /// whole failure this check exists to prevent.
+    #[test]
+    fn a_forced_language_the_disc_lacks_is_reported_on_its_own_side() {
+        let t = forced_title(); // deu/eng full, eng/deu forced
+        let choice = StreamChoice {
+            audio: StreamFilter::All,
+            subtitles: SubtitleFilter::split(
+                StreamFilter::Langs(vec!["deu".into()]), // present on the full side
+                // `fra` exists ONLY as a full subtitle, never as a forced one.
+                // If the two sides leaked into each other this would look like
+                // a match and report nothing.
+                StreamFilter::Langs(vec!["fra".into()]),
+            ),
+        };
+        let miss = choice.unmatched(&t);
+        assert_eq!(miss.len(), 1, "exactly the forced side missed: {miss:?}");
+        assert_eq!(
+            miss[0].class, "subtitle_forced",
+            "it must name the FORCED side, or the message tells the user to fix \
+             a request that was already satisfied"
+        );
+        assert_eq!(miss[0].requested, vec!["fra".to_string()]);
+        assert!(
+            !miss[0].available.iter().any(|l| l == "fra"),
+            "the languages offered as alternatives must be the FORCED ones the \
+             disc actually has, not the full-subtitle list: {:?}",
+            miss[0].available
+        );
+
+        // And the full side alone still reports independently.
+        let other = StreamChoice {
+            audio: StreamFilter::All,
+            subtitles: SubtitleFilter::split(
+                // `jpn` exists only as FORCED, so the full side must miss it.
+                StreamFilter::Langs(vec!["jpn".into()]),
+                StreamFilter::Langs(vec!["eng".into()]),
+            ),
+        };
+        let miss2 = other.unmatched(&t);
+        assert_eq!(miss2.len(), 1);
+        assert_eq!(miss2[0].class, "subtitle");
+    }
+
     #[test]
     fn every_bibliographic_code_resolves_to_its_terminologic_language() {
         for bib in BIB_CODES {
