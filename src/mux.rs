@@ -369,6 +369,39 @@ fn mux_with_input(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
+    with_mux_watcher(sink, |halt, events| {
+        sink.log(
+            Level::Info,
+            &format!(
+                "mux: {source_label} -> {dest} (~{})",
+                human_bytes(total_bytes_hint)
+            ),
+        );
+        libfreemkv::mux_stream(input, dest, mux_opts, halt, events)
+    })
+}
+
+/// The Sink↔libfreemkv bridge every mux runs inside, lifted out of
+/// [`mux_with_input`] so it can be tested without a disc.
+///
+/// [`mux_with_input`] itself cannot be: everything it adds on top of this is a
+/// call into `libfreemkv::mux_stream`, which needs real media. But the two
+/// things that go WRONG here are not about media at all — a cancel that never
+/// reaches the muxer (the user presses Stop and watches the rip run to
+/// completion anyway), and a watcher that is never told to exit (the scope
+/// joins a thread that loops forever, so the mux hangs instead of returning).
+/// Both are exercisable against a closure standing in for the mux, so they are.
+///
+/// Runs `f` with:
+/// - a [`libfreemkv::Halt`] mirroring `sink.should_cancel()` — asked ONCE
+///   before `f` starts and then polled every 100 ms by a scoped watcher;
+/// - a `'static` [`libfreemkv::MuxEvents`] handle (`mux_stream` takes it as an
+///   `Arc`, so it cannot borrow the `&dyn Sink`) whose write-progress is
+///   forwarded to [`Sink::progress`] by that same watcher.
+fn with_mux_watcher<T>(
+    sink: &dyn Sink,
+    f: impl FnOnce(&libfreemkv::Halt, Arc<dyn libfreemkv::MuxEvents>) -> T,
+) -> T {
     use std::sync::mpsc;
 
     let halt = libfreemkv::Halt::new();
@@ -441,20 +474,13 @@ fn mux_with_input(
             }
         });
 
-        sink.log(
-            Level::Info,
-            &format!(
-                "mux: {source_label} -> {dest} (~{})",
-                human_bytes(total_bytes_hint)
-            ),
-        );
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
         // Same guard the recovery paths use: `mux_stream` runs on damaged and
         // malformed media, a panic there is in scope, and storing `done` after
         // the call means an unwind skips it — leaving thread::scope joining a
         // watcher that loops forever. The mux would hang instead of failing.
         let _signal_done = crate::run::SignalDone(&done);
-        libfreemkv::mux_stream(input, dest, mux_opts, &halt, events)
+        f(&halt, events)
     })
 }
 
@@ -725,6 +751,152 @@ mod tests {
             "the host certs the shell supplied are the only input to the AACS \
              handshake — dropping them authenticates as no-one"
         );
+    }
+
+    /// Wait for `cond` to hold, up to `secs`. Returns whether it held — a
+    /// bounded wait, so a bridge that never fires fails the test instead of
+    /// hanging the suite forever.
+    fn wait_for(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        cond()
+    }
+
+    /// A sink that records every progress tick it is handed and never cancels.
+    #[derive(Default)]
+    struct RecordingSink {
+        ticks: std::sync::Mutex<Vec<crate::sink::Progress>>,
+    }
+    impl Sink for RecordingSink {
+        fn progress(&self, p: &crate::sink::Progress) {
+            self.ticks.lock().unwrap().push(p.clone());
+        }
+    }
+
+    /// The mux must not start work it has ALREADY been told to stop.
+    ///
+    /// A watcher alone makes cancellation a race the work can win: on a short
+    /// title the mux can finish before the watcher thread is first scheduled.
+    /// Only asking before the work begins closes that window. The sink here
+    /// answers `true` exactly ONCE — that one answer is the pre-check — and
+    /// `false` to every later poll, so nothing but the pre-check can be what
+    /// cancelled the token.
+    #[test]
+    fn an_already_cancelled_sink_halts_the_mux_before_it_starts() {
+        struct CancelledOnce {
+            asked: AtomicUsize,
+        }
+        impl Sink for CancelledOnce {
+            fn should_cancel(&self) -> bool {
+                self.asked.fetch_add(1, Ordering::SeqCst) == 0
+            }
+        }
+        let sink = CancelledOnce {
+            asked: AtomicUsize::new(0),
+        };
+        let halted_on_entry = with_mux_watcher(&sink, |halt, _events| halt.is_cancelled());
+        assert!(
+            halted_on_entry,
+            "a rip that was cancelled before it began must reach the muxer \
+             already halted, not run to completion"
+        );
+    }
+
+    /// A Stop pressed once the mux is under way must reach the muxer.
+    ///
+    /// The sink only starts cancelling AFTER the mux has begun, so the
+    /// pre-check cannot be what sets the token — the watcher's poll is the
+    /// only path left. Without it a user's Stop is swallowed and the mux runs
+    /// to completion.
+    #[test]
+    fn a_cancel_during_the_mux_reaches_the_halt_token() {
+        struct CancelOnceStarted {
+            started: AtomicBool,
+        }
+        impl Sink for CancelOnceStarted {
+            fn should_cancel(&self) -> bool {
+                self.started.load(Ordering::SeqCst)
+            }
+        }
+        let sink = CancelOnceStarted {
+            started: AtomicBool::new(false),
+        };
+        let saw_halt = with_mux_watcher(&sink, |halt, _events| {
+            sink.started.store(true, Ordering::SeqCst);
+            wait_for(5, || halt.is_cancelled())
+        });
+        assert!(
+            saw_halt,
+            "the watcher must mirror should_cancel onto the halt token the mux \
+             polls; otherwise Stop does nothing until the mux finishes on its own"
+        );
+    }
+
+    /// Write-progress from the muxer must arrive at the sink as a `mux` tick.
+    ///
+    /// `mux_stream` reports through an `Arc<dyn MuxEvents>` that cannot borrow
+    /// the `&dyn Sink`, so the bridge is a channel plus the watcher drain. If
+    /// that drain is broken the rip shows no movement at all for its whole
+    /// duration.
+    #[test]
+    fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
+        let sink = RecordingSink::default();
+        with_mux_watcher(&sink, |_halt, events| {
+            events.on_write_progress(4096, 8192);
+            assert!(
+                wait_for(5, || !sink.ticks.lock().unwrap().is_empty()),
+                "no progress tick reached the sink"
+            );
+        });
+        let ticks = sink.ticks.lock().unwrap();
+        let p = ticks.first().expect("a tick was recorded");
+        assert_eq!(p.pass, "mux", "the mux stage must name itself");
+        assert_eq!(p.bytes_done, 4096);
+        assert_eq!(p.bytes_total, 8192);
+    }
+
+    /// A panic inside the mux must still release the watcher.
+    ///
+    /// `mux_stream` runs on damaged and malformed media, so a panic there is in
+    /// scope. `thread::scope` joins the watcher before it resumes the unwind —
+    /// if `done` is only stored after the call returns, an unwind skips it and
+    /// the watcher loops forever: the rip HANGS instead of failing, and no
+    /// error ever reaches the front-end. Bounded here, because the failure
+    /// mode is a hang.
+    #[test]
+    fn a_panicking_mux_still_releases_the_watcher() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let sink = NoopSink;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                with_mux_watcher(&sink, |_halt, _events| panic!("mux blew up"))
+            }));
+            assert!(r.is_err(), "the panic must still propagate to the caller");
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "the scope never joined: a panicking mux left the watcher looping, \
+             so the rip hangs instead of reporting the failure"
+        );
+    }
+
+    /// The size hint in the mux log line is a byte count rendered for humans;
+    /// each threshold is pinned so a unit never shifts by 1024×.
+    #[test]
+    fn human_bytes_picks_the_unit_at_each_threshold() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1 KB");
+        assert_eq!(human_bytes(1024 * 1024), "1 MB");
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
+        // The user's ~51.6 GB rip: GB, one decimal, not 55460235264 B.
+        assert_eq!(human_bytes(55_460_235_264), "51.7 GB");
     }
 
     fn disc_no_key_err() -> std::io::Error {

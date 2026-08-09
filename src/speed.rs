@@ -577,8 +577,26 @@ mod tests {
     /// mutation run could replace with a constant tuple. Every test above
     /// drives the injectable `sample_at`, which left the real-clock wrapper
     /// completely unconstrained.
+    ///
+    /// It needs the real clock to have MOVED between two `sample` calls, which
+    /// used to be arranged with `thread::sleep(60ms)`. Sleeping is the wrong
+    /// primitive for "the clock ticked": it over-delivers (the assertions need
+    /// one tick, not 60 ms), it costs 80 ms on every run of the suite in both
+    /// profiles, and it states the requirement in a unit the test does not
+    /// care about. `wait_for_the_clock_to_tick` below expresses exactly the
+    /// precondition — `Instant::now()` returns a later value than it did — and
+    /// returns as soon as that is true.
     #[test]
     fn sample_derives_from_the_real_clock_not_a_constant() {
+        /// Spin until the monotonic clock reports a later instant than `from`.
+        /// Terminates on the first tick of whatever resolution the platform
+        /// has; no duration is assumed or asserted.
+        fn wait_for_the_clock_to_tick(from: Instant) {
+            while Instant::now() <= from {
+                std::hint::spin_loop();
+            }
+        }
+
         let mut s = SpeedEstimator::new();
         let total = 100 * 1024 * 1024u64;
 
@@ -590,7 +608,10 @@ mod tests {
             "the first sample has no prior point to measure against"
         );
 
-        std::thread::sleep(Duration::from_millis(60));
+        // Taken AFTER the call, so it is at or past the instant `sample` read
+        // internally: once `now()` passes this, the next sample is strictly
+        // later than the first and the interval is real.
+        wait_for_the_clock_to_tick(Instant::now());
         let (bps, eta) = s.sample(total / 2, total);
         assert!(
             bps > 0,
@@ -603,7 +624,7 @@ mod tests {
 
         // And it is finished-aware, which no single constant tuple can be at
         // the same time as the assertions above.
-        std::thread::sleep(Duration::from_millis(20));
+        wait_for_the_clock_to_tick(Instant::now());
         let (_, done_eta) = s.sample(total, total);
         assert_eq!(done_eta, None, "nothing left to estimate once complete");
     }
