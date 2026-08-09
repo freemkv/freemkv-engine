@@ -43,20 +43,20 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/libfreemkv
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-keysources
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-keysources
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -86,20 +86,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/libfreemkv
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-keysources
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-keysources
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -131,20 +131,20 @@ jobs:
   test-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/libfreemkv
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-keysources
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-keysources
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -172,20 +172,20 @@ jobs:
   check-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/libfreemkv
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-keysources
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-keysources
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -210,20 +210,20 @@ jobs:
   check-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/libfreemkv
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: libfreemkv
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-keysources
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
           path: freemkv-keysources
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           repository: freemkv/freemkv-unlock
           ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
@@ -266,20 +266,20 @@ jobs:
   consumers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/libfreemkv, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: libfreemkv }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-keysources, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-keysources }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-unlock, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-unlock }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv-i18n, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv-i18n }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/freemkv, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: freemkv }
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with: { repository: freemkv/autorip, ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}", path: autorip }
       - name: Point both consumers at THIS engine commit
         shell: bash
