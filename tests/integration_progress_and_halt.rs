@@ -52,23 +52,23 @@ impl SectorSource for ZeroSectorReader {
     }
 }
 
-/// Like ZeroSectorReader but sleeps a configurable duration per call.
-/// Used by the halt test so the copy takes >1 s.
-struct SlowZeroSectorReader {
+/// Zero-filling reader that raises the halt flag ITSELF on its Nth read and
+/// counts every read the sweep issues, so a halt test can assert on a count
+/// instead of a stopwatch.
+///
+/// The interesting number is `reads_total - halt_after_reads`: how many more
+/// batches the sweep read after the flag went up. The sweep polls `halt` at the
+/// top of every batch iteration, immediately before the read, so a correct
+/// build issues exactly ZERO further reads — no wall-clock budget involved, and
+/// no dependence on how fast the machine happens to be.
+struct HaltingZeroSectorReader {
     capacity: u32,
-    sleep_per_call: Duration,
+    halt: Arc<AtomicBool>,
+    reads: Arc<AtomicU64>,
+    halt_after_reads: u64,
 }
 
-impl SlowZeroSectorReader {
-    fn new(capacity: u32, sleep_per_call: Duration) -> Self {
-        Self {
-            capacity,
-            sleep_per_call,
-        }
-    }
-}
-
-impl SectorSource for SlowZeroSectorReader {
+impl SectorSource for HaltingZeroSectorReader {
     fn read_sectors(
         &mut self,
         _lba: u32,
@@ -76,7 +76,10 @@ impl SectorSource for SlowZeroSectorReader {
         buf: &mut [u8],
         _recovery: bool,
     ) -> Result<usize> {
-        std::thread::sleep(self.sleep_per_call);
+        let n = self.reads.fetch_add(1, Ordering::Relaxed) + 1;
+        if n == self.halt_after_reads {
+            self.halt.store(true, Ordering::Relaxed);
+        }
         let bytes = count as usize * SECTOR_SIZE;
         buf[..bytes].fill(0);
         Ok(bytes)
@@ -229,52 +232,47 @@ fn test_disc_copy_progress_callback_fires() {
 
 #[test]
 fn test_halt_aborts_disc_copy_promptly() {
-    // 60,000 sectors, 60-sector batches → 1000 read_sectors() calls at 10 ms
-    // each, so ~10 s if the halt is never observed. The disc has to be this
-    // large for the assertion to mean anything: at the original 6000 sectors
-    // the UN-halted run took ~1 s and the 2 s bound below could not tell a
-    // prompt halt from no halt polling at all — make the poll fire once per N
-    // batches instead of every batch and the copy ran to completion, still
-    // reported halted, and still landed inside the bound.
-    let capacity_sectors: u32 = 60_000;
-    let mut reader = SlowZeroSectorReader::new(capacity_sectors, Duration::from_millis(10));
+    // "Promptly" measured in READS, not seconds.
+    //
+    // This test used to run the copy on a worker thread, sleep 200 ms, set the
+    // halt flag, and give the thread 2 s to exit — with a reader sleeping 10 ms
+    // per call so the un-halted run took ~10 s and the deadline meant
+    // something. That made a release gate out of thread scheduling: nothing
+    // bounds "the spawned thread gets to run and finish within 2 s" on a loaded
+    // CI box running the suite in parallel, twice (debug + release).
+    //
+    // The invariant it was actually reaching for is exact and countable: the
+    // sweep polls `halt` at the top of every batch iteration, immediately
+    // before issuing the read, so the number of reads that happen AFTER the
+    // flag goes up is exactly zero. The reader below raises the flag itself
+    // mid-read, which removes the race the sleep was papering over — and the
+    // assertion is now strictly stronger than the old deadline. Make the poll
+    // fire once per N batches instead of every batch and the count goes to
+    // N-1, whatever the machine's speed; drop the poll entirely and the sweep
+    // runs all ~1000 batches of this fixture.
+    let capacity_sectors: u32 = 60_000; // ~1000 batches at 60 sectors/batch
+    let halt_after_reads: u64 = 5;
+
+    let halt = Arc::new(AtomicBool::new(false));
+    let reads = Arc::new(AtomicU64::new(0));
+    let mut reader = HaltingZeroSectorReader {
+        capacity: capacity_sectors,
+        halt: halt.clone(),
+        reads: reads.clone(),
+        halt_after_reads,
+    };
     let disc = synthetic_disc(capacity_sectors);
 
     let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
     let iso_path = tmp.path().to_path_buf();
     drop(tmp);
 
-    let halt = Arc::new(AtomicBool::new(false));
-    let halt_for_thread = halt.clone();
-    let iso_path_for_thread = iso_path.clone();
-
-    let join = std::thread::spawn(move || {
-        let opts = CopyOptions {
-            decrypt: false,
-            halt: Some(halt_for_thread),
-            ..Default::default()
-        };
-        let t0 = Instant::now();
-        let res = freemkv_engine::copy(&disc, &mut reader, &iso_path_for_thread, &opts);
-        (res, t0.elapsed())
-    });
-
-    // Let copy run, then halt.
-    std::thread::sleep(Duration::from_millis(200));
-    halt.store(true, Ordering::Relaxed);
-
-    // Bound the join: 2 s against a ~10 s un-halted runtime, so only a halt
-    // that is actually polled per batch can satisfy it.
-    let started = Instant::now();
-    let mut joined = None;
-    while started.elapsed() < Duration::from_millis(2000) {
-        if join.is_finished() {
-            joined = Some(join.join().expect("thread join"));
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let (result, elapsed) = joined.expect("copy thread did not exit within 2s of halt");
+    let opts = CopyOptions {
+        decrypt: false,
+        halt: Some(halt.clone()),
+        ..Default::default()
+    };
+    let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
 
     // Cleanup
     let _ = std::fs::remove_file(&iso_path);
@@ -289,10 +287,23 @@ fn test_halt_aborts_disc_copy_promptly() {
         !copy_result.complete,
         "copy_result.complete should be false when halted"
     );
+
+    let reads_total = reads.load(Ordering::Relaxed);
+    assert_eq!(
+        reads_total,
+        halt_after_reads,
+        "the sweep issued {} read(s) after the halt flag was raised — halt must \
+         be polled before EVERY batch read (this fixture is ~1000 batches, so an \
+         unpolled halt reads all of them)",
+        reads_total.saturating_sub(halt_after_reads)
+    );
+
+    // And it really did abandon the disc rather than finish it quietly.
     assert!(
-        elapsed < Duration::from_millis(2000),
-        "copy thread exit elapsed {elapsed:?} exceeded 2s — the un-halted run of \
-         this fixture is ~10s, so this is the halt not being polled"
+        copy_result.bytes_good < copy_result.bytes_total,
+        "a halted sweep cannot have read the whole disc: bytes_good={} bytes_total={}",
+        copy_result.bytes_good,
+        copy_result.bytes_total
     );
 }
 
@@ -314,20 +325,40 @@ fn test_drop_impls_do_not_panic_or_block() {
     )
     .unwrap();
 
-    // Drop on a worker thread; main thread enforces the timeout.
+    // Two separate things are being proved here, and they used to share one
+    // 100 ms budget on the main thread — which meant the worker thread's
+    // scheduling latency was charged against the drop's time. Under a parallel
+    // test binary nothing bounds that at 100 ms, so the test could fail on a
+    // busy runner with a perfectly well-behaved Drop.
+    //
+    // Split them:
+    //   1. Drop must not panic and must RETURN — proved by the worker thread
+    //      reaching the send and by `join()` returning Ok. The recv timeout
+    //      here is a deadlock backstop only, so it is deliberately generous
+    //      (60 s); it is not the thing being measured, and no plausible amount
+    //      of scheduler noise reaches it.
+    //   2. Drop must not BLOCK — proved by timing the `drop` call itself,
+    //      inside the worker, with nothing else between the two clock reads.
+    //      A Drop that waits on a thread/lock/IO shows up here regardless of
+    //      how long the worker took to get scheduled.
+    let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
+        let t0 = Instant::now();
         drop(stream);
+        let took = t0.elapsed();
+        let _ = tx.send(took);
     });
 
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(100) {
-        if handle.is_finished() {
-            handle.join().expect("drop thread join");
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    panic!("DiscStream drop did not complete within 100ms");
+    let took = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("DiscStream drop never returned — Drop is blocking or panicked");
+    handle.join().expect("drop thread panicked");
+
+    assert!(
+        took < Duration::from_secs(1),
+        "DiscStream::drop itself took {took:?} — Drop must not block on IO, a \
+         lock, or a thread join"
+    );
 }
 
 // ── 5. FileSectorSource round trip ────────────────────────────────────────
@@ -403,6 +434,9 @@ struct FailingSectorReader {
     /// If set, signals halt on the first `read_sectors` call. Cleared after
     /// the first signal so subsequent reads are plain Err.
     halt_on_first_read: Option<Arc<AtomicBool>>,
+    /// Every `read_sectors` call. The halt test asserts on this instead of on
+    /// a stopwatch. `&mut` borrow, so the test reads it back after `copy`.
+    reads: u64,
 }
 
 impl FailingSectorReader {
@@ -410,6 +444,7 @@ impl FailingSectorReader {
         Self {
             capacity,
             halt_on_first_read: None,
+            reads: 0,
         }
     }
 
@@ -417,6 +452,7 @@ impl FailingSectorReader {
         Self {
             capacity,
             halt_on_first_read: Some(halt),
+            reads: 0,
         }
     }
 }
@@ -429,6 +465,7 @@ impl SectorSource for FailingSectorReader {
         _buf: &mut [u8],
         _recovery: bool,
     ) -> Result<usize> {
+        self.reads += 1;
         if let Some(h) = self.halt_on_first_read.take() {
             h.store(true, Ordering::Relaxed);
         }
@@ -565,14 +602,35 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .expect("copy returns Ok on halt");
     let elapsed = t0.elapsed();
+    let reads = reader.reads;
 
     // Cleanup
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
+    // The primary, clock-free assertion: the halt raised during read #1 means
+    // read #2 never happens. The sweep polls `halt` at the top of every batch
+    // iteration, so this is exact — it does not get less true on a slow runner.
+    assert_eq!(
+        reads,
+        1,
+        "the sweep issued {} read(s) after the reader raised halt on read #1",
+        reads.saturating_sub(1)
+    );
+    // The wall clock is kept for the one thing the read count cannot see: the
+    // post-failure cooldown that runs BETWEEN the failing read and the next
+    // halt poll (zone-entry cooldown, 30 s) has to be halt-aware, or the copy
+    // sits in `sleep_secs_or_halt` long after the user pressed stop. There is
+    // no countable proxy for that from outside the crate — a build that
+    // ignores halt mid-sleep produces exactly the same read count. So the
+    // bound is deliberately generous relative to the ~10 ms this actually
+    // takes, and still an order of magnitude below the 30 s regression it
+    // exists to catch. (`sleep_secs_or_halt`'s own unit tests in
+    // src/recovery/mod.rs pin the behaviour directly.)
     assert!(
-        elapsed < Duration::from_secs(2),
-        "halt must return within 2 s; took {elapsed:?}"
+        elapsed < Duration::from_secs(10),
+        "halt returned in {elapsed:?}; the post-failure cooldown is not being \
+         cut short by the halt flag"
     );
     assert!(result.halted, "result.halted must be true");
     assert!(
