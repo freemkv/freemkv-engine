@@ -103,7 +103,13 @@ impl StreamChoice {
 /// track-less file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnmatchedClass {
-    /// Stable class key the front-end localizes: `"audio"` or `"subtitle"`.
+    /// Stable class key the front-end localizes: `"audio"`, `"subtitle"` or
+    /// `"subtitle_forced"`.
+    ///
+    /// These are the full set — they are [`StreamClass::key`]'s output, and a
+    /// front-end's lookup table must cover all three. `"subtitle_forced"` is
+    /// the newest: a forced-subtitle request is filtered independently of the
+    /// ordinary subtitle request, so it can go unmatched on its own.
     pub class: &'static str,
     /// The language tags the user requested, verbatim.
     pub requested: Vec<String>,
