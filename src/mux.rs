@@ -410,8 +410,6 @@ fn with_mux_watcher<T>(
     // can win: on a short title the mux can finish before the watcher thread is
     // first scheduled, and an already-cancelled request then runs to completion.
     // Polling cannot close that window — only asking before the work begins can.
-    // This doc block already claimed to be the same bridge as
-    // `with_cancel_watcher`; now it is.
     if sink.should_cancel() {
         halt.cancel();
     }

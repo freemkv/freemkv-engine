@@ -4,6 +4,13 @@
 //! GUI selections, hands it to [`crate::preflight`] to check it, then to
 //! [`crate::run`] to execute it. It carries no I/O handles and no callbacks —
 //! those arrive separately as the [`crate::Sink`].
+//!
+//! "Pure data" is about I/O, not about module position: the request shape
+//! reaches into [`crate::streams`] for [`SubtitleFilter`], which is itself
+//! plain data. It lives there because that is where the filter is APPLIED and
+//! where its language-matching rules are documented, and duplicating it here
+//! to keep the import graph one-directional would give the two copies a way to
+//! disagree about what a filter means.
 
 use crate::streams::SubtitleFilter;
 
