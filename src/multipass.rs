@@ -318,11 +318,91 @@ pub(crate) fn pass_should_decrypt(raw: bool) -> bool {
 
 /// Bad bytes expressed in whole sectors, the unit [`classify_damage`] scores.
 ///
-/// Shared by all three `MultipassResult` exit paths (single-pass, halted,
-/// end-of-recovery) so the byte→sector conversion cannot drift between them.
-/// Rounds down: a partial sector of damage is still less than one sector.
-fn bad_sector_count(unreadable_bytes: u64, pending_bytes: u64) -> u64 {
-    unreadable_bytes.saturating_add(pending_bytes) / SECTOR_BYTES
+/// Shared by every `MultipassResult` exit path so the byte→sector conversion
+/// cannot drift between them. Rounds down: a partial sector of damage is still
+/// less than one sector.
+///
+/// The second term is RETRYABLE bytes, not `bytes_pending`. They are not the
+/// same thing: `bytes_pending` also counts `NonTried` — the un-attempted
+/// remainder of the disc ahead of the sweep head — so on any interrupted run
+/// it is dominated by sectors nobody has looked at yet. Feeding that in scored
+/// a rip cancelled ten seconds into a 66 GB disc as ~32 million bad sectors
+/// and stamped it Serious, when what was actually known was zero damage.
+/// `run.rs`'s live progress tick already refuses that aggregate for the same
+/// reason and says so; this is the same rule, applied to the same number, at
+/// the other end of the run.
+fn bad_sector_count(unreadable_bytes: u64, retryable_bytes: u64) -> u64 {
+    unreadable_bytes.saturating_add(retryable_bytes) / SECTOR_BYTES
+}
+
+/// The retryable-bytes argument for an exit that did NOT finish the sweep.
+///
+/// A `CopyResult` carries one `bytes_pending` total and cannot say how much of
+/// it is retryable damage versus never-attempted disc, so an interrupted path
+/// has nothing honest to pass. Zero, and the name says why: the unreadable
+/// count is what is actually KNOWN, and it still scores — a cancel that had
+/// already found 300 MB unreadable does not come back Clean.
+const UNMEASURED_ON_AN_INTERRUPTED_PASS: u64 = 0;
+
+/// How a finished patch pass ends the loop, if it does.
+///
+/// A pure function over the two flags a `PatchOutcome` carries, because the
+/// branch that consumes them needs a live USB-bridge crash to reach and so
+/// could not be tested where it sits. `wedged_exit` was simply not read at
+/// all: a pass killed by a transport fault fell through to the exhaustion
+/// gate, ended the recovery, and its never-attempted ranges were promoted to
+/// permanently `Unreadable` — after which a re-run took `recovery::copy`'s
+/// terminal shortcut and never retried them. Recoverable sectors, written off
+/// on the strength of a flag nobody looked at.
+///
+/// `halted` wins when both are set: the user asked to stop, and that is the
+/// more specific thing to tell them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassExit {
+    /// Keep going — evaluate the exhaustion gate.
+    Continue,
+    /// The operator pressed Stop.
+    Cancelled,
+    /// The transport died mid-pass. The remaining damage is still RETRYABLE.
+    Wedged,
+}
+
+/// See [`PassExit`].
+pub fn pass_exit(halted: bool, wedged_exit: bool) -> PassExit {
+    if halted {
+        PassExit::Cancelled
+    } else if wedged_exit {
+        PassExit::Wedged
+    } else {
+        PassExit::Continue
+    }
+}
+
+/// Severity for a run that stopped early, given what it actually measured.
+///
+/// Two rules meet here and both are load-bearing:
+///
+/// - The score must not fold in `NonTried`, or a cancel ten seconds into a
+///   66 GB disc reports ~32 million bad sectors and stamps Serious on a disc
+///   nobody has looked at.
+/// - The badge must not read **Clean** beside a non-zero pending count. The
+///   front-end draws them together, and Clean is the reading that gets
+///   believed — that contradiction is what the halted branch was written to
+///   stop, and it stays stopped.
+///
+/// So: damage is scored from the unreadable bytes alone, and outstanding work
+/// merely denies the Clean badge rather than inventing a tier for it.
+/// `Cosmetic` is the floor because it is the mildest thing that is not Clean;
+/// an interrupted run makes no claim about how bad the rest of the disc is.
+fn interrupted_severity(unreadable_bytes: u64, pending_bytes: u64) -> crate::DamageSeverity {
+    let measured = classify_damage(
+        bad_sector_count(unreadable_bytes, UNMEASURED_ON_AN_INTERRUPTED_PASS),
+        0.0,
+    );
+    if measured == crate::DamageSeverity::Clean && pending_bytes > 0 {
+        return crate::DamageSeverity::Cosmetic;
+    }
+    measured
 }
 
 /// A recovery is complete only when the abort-on-loss gate did NOT fire and
@@ -421,6 +501,20 @@ pub struct MultipassResult {
     pub aborted_for_loss: bool,
     /// Whether the rip was cancelled (halt) mid-pass.
     pub halted: bool,
+    /// Whether a pass ended early on a TRANSPORT FAULT — the USB-bridge crash
+    /// that `patch` reports as `wedged_exit`.
+    ///
+    /// Distinct from [`Self::halted`], which is the user pressing Stop, and it
+    /// has to be: the ranges a wedged pass never reached are still RETRYABLE,
+    /// so the end-of-recovery promotion that writes surviving ranges off as
+    /// permanently `Unreadable` must not run. Dropping this signal meant a
+    /// bridge crash was recorded as permanent loss, and a later re-run then
+    /// took `recovery::copy`'s terminal shortcut (nothing retryable, nothing
+    /// un-attempted) and never touched those sectors again.
+    ///
+    /// The front-end's cue to spin-cycle the drive and resume from the
+    /// mapfile, which is exactly what `patch` documents the fault for.
+    pub wedged: bool,
     /// True when the disc (or the scoped muxable portion of it, per
     /// [`MultipassOpts::is_iso_output`]) ended with zero unreadable and zero
     /// pending bytes, and the run was neither halted nor aborted for loss.
@@ -563,10 +657,18 @@ fn multipass_rip_inner(
             // abort gate, wrong here, since single-pass has no abort gate
             // (`aborted_for_loss: false`). The 0.0 below is "no time-based
             // escalation", not a claim that nothing was lost.
-            severity: classify_damage(bad_sectors, 0.0),
+            severity: if cr.halted {
+                interrupted_severity(cr.bytes_unreadable, cr.bytes_pending)
+            } else {
+                classify_damage(bad_sectors, 0.0)
+            },
             passes: 1,
             aborted_for_loss: false,
             halted: cr.halted,
+            // Single-pass has no patch stage, so no transport-fault exit to
+            // report: `recovery::copy` aborts the pass on a bridge crash
+            // rather than continuing past it.
+            wedged: false,
             complete: cr.complete,
         });
     }
@@ -638,9 +740,36 @@ fn multipass_rip_inner(
             last_pending = pr.bytes_pending;
             let recovered = pr.bytes_recovered_this_pass;
 
-            if pr.halted {
+            let exit = pass_exit(pr.halted, pr.wedged_exit);
+            if exit == PassExit::Cancelled {
                 halted = true;
                 break;
+            }
+            // A transport fault is NOT an exhausted pass. The bridge died
+            // mid-range, so everything it had not reached is still retryable —
+            // and falling through to the loop's exhaustion gate would end the
+            // recovery, promote those ranges to permanently Unreadable, and
+            // make a later re-run skip them entirely. Return partial, like a
+            // cancel, and say which of the two it was.
+            if exit == PassExit::Wedged {
+                sink.log(
+                    Level::Warn,
+                    "multipass_rip: patch pass ended on a transport fault — \
+                     the remaining damage is still retryable; power-cycle the \
+                     drive and resume from the mapfile",
+                );
+                return Ok(MultipassResult {
+                    unreadable_bytes: last_unreadable,
+                    pending_bytes: last_pending,
+                    good_bytes: last_good,
+                    main_lost_ms: 0.0,
+                    severity: interrupted_severity(last_unreadable, last_pending),
+                    passes,
+                    aborted_for_loss: false,
+                    halted: false,
+                    wedged: true,
+                    complete: false,
+                });
             }
             sink.log(
                 Level::Info,
@@ -674,16 +803,16 @@ fn multipass_rip_inner(
         // only computable from the mapfile at end-of-recovery, which an
         // interrupted run never reaches. `halted: true` is the flag that says
         // this result is partial.
-        let bad_sectors = bad_sector_count(last_unreadable, last_pending);
         return Ok(MultipassResult {
             unreadable_bytes: last_unreadable,
             pending_bytes: last_pending,
             good_bytes: last_good,
             main_lost_ms: 0.0,
-            severity: classify_damage(bad_sectors, 0.0),
+            severity: interrupted_severity(last_unreadable, last_pending),
             passes,
             aborted_for_loss: false,
             halted: true,
+            wedged: false,
             complete: false,
         });
     }
@@ -771,6 +900,7 @@ fn multipass_rip_inner(
         passes,
         aborted_for_loss,
         halted: false,
+        wedged: false,
         complete,
     })
 }
@@ -1265,6 +1395,103 @@ mod tests {
         assert!(plan.total_passes >= plan.patch_passes);
         // The ordinary case is unchanged.
         assert_eq!(plan_passes(5).total_passes, 7);
+    }
+
+    // ── A cancelled or wedged pass has not MEASURED the disc ──────────────
+    //
+    // `bytes_pending` counts NonTried — the un-attempted remainder ahead of
+    // the sweep head — so folding it into the damage score made an early
+    // interruption look like catastrophic damage.
+
+    /// A rip cancelled seconds into a 66 GB disc has found nothing bad. It
+    /// must not be scored as though the whole disc were unreadable.
+    #[test]
+    fn an_early_cancel_is_not_scored_as_a_destroyed_disc() {
+        const DISC: u64 = 66_000_000_000;
+        // Nothing unreadable; essentially the whole disc still un-attempted.
+        assert_eq!(
+            interrupted_severity(0, DISC),
+            crate::DamageSeverity::Cosmetic,
+            "an immediate cancel must not claim damage nobody measured — but \
+             it must not read Clean beside a pending count either"
+        );
+        // The number the old aggregate handed to classify_damage, for contrast.
+        assert!(
+            bad_sector_count(0, DISC) > 30_000_000,
+            "this is what used to be scored: the entire un-read disc"
+        );
+        assert_eq!(
+            classify_damage(bad_sector_count(0, DISC), 0.0),
+            crate::DamageSeverity::Serious,
+            "and it stamped Serious on a disc nobody had looked at"
+        );
+    }
+
+    /// Damage that WAS found still scores. A cancel is not an amnesty:
+    /// 300 MB of unreadable sectors on the record must reach a real tier, not
+    /// merely the not-Clean floor.
+    #[test]
+    fn a_cancel_does_not_erase_damage_already_found() {
+        assert_eq!(
+            interrupted_severity(300 * 1024 * 1024, 0),
+            crate::DamageSeverity::Serious,
+            "unreadable bytes are KNOWN damage and must still score in full"
+        );
+    }
+
+    /// Nothing outstanding and nothing bad really is Clean — the floor must
+    /// not deny a badge that was earned.
+    #[test]
+    fn an_interrupted_run_with_nothing_outstanding_is_still_clean() {
+        assert_eq!(interrupted_severity(0, 0), crate::DamageSeverity::Clean);
+    }
+
+    /// The wedge branch itself. It needs a live USB-bridge crash to reach in
+    /// place, which is why the decision was extracted: `wedged_exit` was not
+    /// read at all, and nothing in the suite could have said so.
+    #[test]
+    fn a_transport_fault_ends_the_pass_instead_of_exhausting_the_recovery() {
+        assert_eq!(pass_exit(false, false), PassExit::Continue);
+        assert_eq!(
+            pass_exit(false, true),
+            PassExit::Wedged,
+            "a wedged pass must end the loop — falling through to the \
+             exhaustion gate promotes its never-attempted ranges to \
+             permanently Unreadable, and a re-run then skips them forever"
+        );
+        assert_eq!(
+            pass_exit(true, false),
+            PassExit::Cancelled,
+            "a cancel is the operator's, and is reported as such"
+        );
+        assert_eq!(
+            pass_exit(true, true),
+            PassExit::Cancelled,
+            "both at once is the user's Stop: the more specific thing to say"
+        );
+    }
+
+    /// A transport fault is not an exhausted pass, and must not be reported
+    /// as a cancel either — the two need different responses from the caller.
+    #[test]
+    fn a_wedged_result_is_distinguishable_from_a_cancelled_one() {
+        let wedged = MultipassResult {
+            unreadable_bytes: 0,
+            pending_bytes: 4096,
+            good_bytes: 1 << 30,
+            main_lost_ms: 0.0,
+            severity: crate::DamageSeverity::Clean,
+            passes: 2,
+            aborted_for_loss: false,
+            halted: false,
+            wedged: true,
+            complete: false,
+        };
+        assert!(wedged.wedged && !wedged.halted);
+        assert!(
+            !wedged.complete,
+            "a wedged pass left retryable damage behind, so the run is not done"
+        );
     }
 
     #[test]
