@@ -38,5 +38,5 @@ codegen-units = 1
 # the CI resolution path; the release script rewrites the tags on bump. Local
 # dev overrides it with a path patch via the gitignored .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.3" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.3" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.4" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.4" }
