@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.6.4] — UNRELEASED
+
+### Fixed
+
+- **A power-cycle-recoverable drive wedge was written off as permanent data
+  loss.** A patch pass killed by a USB-bridge transport fault was treated as a
+  completed pass, and the end-of-recovery step then marked every surviving range
+  — including ones the wedged pass never reached — permanently unreadable, so a
+  re-run skipped them for good. A wedged pass now returns partial and reports
+  itself as wedged (distinct from a user pressing Stop), so the recovery can be
+  resumed after a power cycle.
+
+- **A rip cancelled seconds in no longer reports a healthy disc as seriously
+  damaged.** The damage score folded in the un-attempted remainder ahead of the
+  read head, scoring tens of millions of "bad" sectors on a disc nobody had read
+  yet. The score now counts only genuinely unreadable bytes; outstanding work
+  merely withholds the "Clean" badge rather than inventing damage.
+
 ## [1.6.3] — 2026-08-10
 
 ### Changed
