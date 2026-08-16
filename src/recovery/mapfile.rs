@@ -6,7 +6,7 @@
 //!
 //! Format:
 //! ```text
-//! # Rescue Logfile. Created by libfreemkv vX.Y.Z
+//! # Rescue Logfile. Created by freemkv-engine vX.Y.Z
 //! # Current pos / status / pass / pass_time (ddrescue state machine — we only populate pos)
 //! 0x000000000  ?  1  0
 //! #      pos        size  status
@@ -24,6 +24,8 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Minimum interval between mapfile persists. `record()` updates in-memory
@@ -149,7 +151,7 @@ pub(crate) struct MapEntry {
 /// NonScraped) split that aggregate so UIs can distinguish *unread*
 /// territory (still ahead of Pass 1's read head) from *needs-retry*
 /// territory (Pass 1 already encountered, queued for Pass 2-N).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct MapStats {
     pub bytes_total: u64,
     pub bytes_good: u64,
@@ -174,6 +176,34 @@ pub struct MapStats {
     pub main_lost_ms: f64,
 }
 
+/// Revokes a [`Mapfile`]'s right to write its path — the owner's way of
+/// saying "whatever you still hold is no longer the record of that file".
+///
+/// Obtainable ONLY from a live `Mapfile` ([`Mapfile::disown_handle`]), so it
+/// cannot be conjured for a pipeline that owns no mapfile.
+///
+/// Why it exists: a consumer thread that is wedged inside a write on a hung
+/// mount is ABANDONED (detached, not killed) by
+/// [`super::finish_bounded`] and the pass returns. The caller is then free to
+/// resume the rip against the same mapfile path. When the abandoned thread's
+/// write finally returns it still owns a `Mapfile` — a snapshot from before
+/// the abandonment — and both `record()`'s interval flush and `Mapfile`'s
+/// `Drop` flush would then rewrite the WHOLE file from that stale snapshot,
+/// silently reverting progress the resumed pass has already persisted (and
+/// racing the live writer over the shared `<path>.tmp` staging name).
+/// Disowning is what makes the abandoned writer harmless.
+#[derive(Clone)]
+pub(crate) struct MapfileDisown(Arc<AtomicBool>);
+
+impl MapfileDisown {
+    /// Revoke the mapfile's right to write. Idempotent, and safe to call
+    /// from a thread other than the one that owns the `Mapfile` — that is
+    /// the entire point.
+    pub(crate) fn disown(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 /// Time-batched mapfile. `record()` keeps in-memory state up-to-date on
 /// every call; persists to disk at most once per `FLUSH_INTERVAL`.
 /// Explicit `flush()` and `Drop` guarantee state is on disk after a sweep
@@ -181,6 +211,25 @@ pub struct MapStats {
 /// interval of records — the file's payload bytes are unaffected.
 pub struct Mapfile {
     path: PathBuf,
+    /// The CANONICAL maximal-run partition of `[0, total_size)`: contiguous,
+    /// gapless, and (after any `record()`) with no two adjacent entries sharing
+    /// a status. There is deliberately no cap, and none is needed — that
+    /// invariant IS the bound. The length is exactly the number of status runs
+    /// the disc's damage actually has, so:
+    ///
+    /// * it does not grow with the number of passes, or with the number of
+    ///   `record()` calls. A record that repeats or extends an existing run
+    ///   leaves the partition untouched.
+    /// * it is not a ratchet. Recovering the damage between two same-status
+    ///   runs merges all three, so fragmentation FALLS as a rip succeeds — in
+    ///   the pathological interleave (`fragmentation_peaks_then_collapses…`)
+    ///   the count goes 7 → 193 → 1.
+    /// * the only thing that grows it is genuinely finer interleaving of
+    ///   statuses, bounded by `2 * (interleaved damaged sectors) + 1`.
+    ///
+    /// Measured ceiling on real media: archived mapfiles for a genuinely
+    /// damaged UHD disc hold 19 entries, unchanged between passes. `record()`
+    /// is O(entries), so that is a handful of comparisons per sector.
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
@@ -208,6 +257,10 @@ pub struct Mapfile {
     /// comment headers when the disc was successfully keyed. Mutually exclusive
     /// with `vid` (see above). Empty when unresolved.
     unit_keys: Vec<(u32, [u8; 16])>,
+    /// Raised through a [`MapfileDisown`] handle when this mapfile's owner
+    /// has been abandoned; once set, no further write reaches the path. See
+    /// [`MapfileDisown`].
+    disowned: Arc<AtomicBool>,
 }
 
 impl Mapfile {
@@ -234,6 +287,7 @@ impl Mapfile {
             last_flushed: Instant::now(),
             vid: None,
             unit_keys: Vec::new(),
+            disowned: Arc::new(AtomicBool::new(false)),
         };
         // Eager initial persist so a resume can pick this up even if
         // `record()` is never called.
@@ -260,16 +314,36 @@ impl Mapfile {
                 if let Some(v) = rest.strip_prefix("Rescue Logfile. Created by ") {
                     version = v.to_string();
                 }
+                // The two identity headers are NOT best-effort. Dropping a
+                // malformed one loads a mapfile that CARRIES a disc identity as
+                // one carrying NONE, and `check_mapfile_identity` returns
+                // `Ok(())` for none (legacy files, unencrypted discs) — so a
+                // corrupted `# freemkv-uk:` / `# freemkv-vid:` line downgrades
+                // the resume guard to the exact pre-guard behaviour it was
+                // written to stop: disc A's Finished ranges trusted for disc B,
+                // and an ISO spliced from two physical discs that passes every
+                // completeness check.
+                //
+                // ABSENT is fine and stays fine (that is the ddrescue-import and
+                // legacy case). PRESENT-BUT-UNPARSEABLE is corruption, and the
+                // only safe reading of corruption in the file that decides
+                // whether this is even the right disc is to refuse the file.
                 if let Some(hex) = rest.strip_prefix("freemkv-vid:") {
-                    // Best-effort: a malformed or short VID comment is
-                    // ignored rather than failing the whole load.
-                    vid = parse_vid_hex(hex.trim());
+                    let Some(parsed) = parse_vid_hex(hex.trim()) else {
+                        let e: io::Error =
+                            libfreemkv::error::Error::MapfileInvalid { kind: "vid" }.into();
+                        return Err(e);
+                    };
+                    vid = Some(parsed);
                 }
                 if let Some(uk) = rest.strip_prefix("freemkv-uk:") {
-                    // `<cps>:<32hex>`. Best-effort: a malformed line is skipped.
-                    if let Some(entry) = parse_uk_line(uk.trim()) {
-                        unit_keys.push(entry);
-                    }
+                    // `<cps>:<32hex>`.
+                    let Some(entry) = parse_uk_line(uk.trim()) else {
+                        let e: io::Error =
+                            libfreemkv::error::Error::MapfileInvalid { kind: "unit_key" }.into();
+                        return Err(e);
+                    };
+                    unit_keys.push(entry);
                 }
                 continue;
             }
@@ -305,7 +379,22 @@ impl Mapfile {
             // Entry: `pos size statuschar`
             let fields: Vec<&str> = t.split_whitespace().collect();
             if fields.len() < 3 {
-                continue;
+                // A short data line is DROPPED COVERAGE, not noise. Every other
+                // consumer reads this file as a gapless partition of
+                // `[0, total_size)`; skipping a line silently deletes its range
+                // from the partition, and skipping the LAST one also shortens
+                // `total_size` — which is derived from the final entry's end.
+                // The rip then reports the smaller extent as its whole disc.
+                //
+                // Rejecting is also the SAFE downgrade at every in-crate caller:
+                // `sweep`'s corrupt-mapfile branch and `copy`'s coverage check
+                // both fall back to a fresh full sweep, and `patch` refuses by
+                // design. Consistent with every other malformed shape here
+                // (`hex`, `status_char`, `zero_size`, `overlap`), which all
+                // reject rather than skip.
+                let e: io::Error =
+                    libfreemkv::error::Error::MapfileInvalid { kind: "short_line" }.into();
+                return Err(e);
             }
             let pos = parse_hex(fields[0])?;
             let size = parse_hex(fields[1])?;
@@ -408,6 +497,7 @@ impl Mapfile {
             last_flushed: Instant::now(),
             vid,
             unit_keys,
+            disowned: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -512,6 +602,13 @@ impl Mapfile {
         Ok(())
     }
 
+    /// A handle that revokes this mapfile's right to write its path. Take
+    /// one BEFORE the mapfile moves into a consumer thread; see
+    /// [`MapfileDisown`] and [`super::finish_bounded_disowning`].
+    pub(crate) fn disown_handle(&self) -> MapfileDisown {
+        MapfileDisown(Arc::clone(&self.disowned))
+    }
+
     /// Persist any pending in-memory changes to disk. No-op if clean.
     /// Callers (sweep/patch finalisation) invoke this after their last
     /// `record()` to guarantee state is durable before returning.
@@ -565,7 +662,19 @@ impl Mapfile {
         &self.entries
     }
 
-    /// Total image size in bytes, i.e. the end byte of the last entry.
+    /// Total image size in bytes, FIXED at construction: the size handed to
+    /// [`Mapfile::create`], or the end byte of the last entry [`Mapfile::load`]
+    /// parsed.
+    ///
+    /// It is NOT recomputed. [`Mapfile::record`] never touches it and never
+    /// bounds a range against it, so this is "the coverage this mapfile was
+    /// opened for", not "the end of the last entry as it stands now" — the two
+    /// coincide only because every in-crate producer stays inside the coverage
+    /// (`recovery::copy` forces a fresh, correctly-sized mapfile on ANY
+    /// mapfile/disc size mismatch rather than recording past the old one). The
+    /// distinction matters because `stats().bytes_total` is this value: were a
+    /// caller to record past it, the ratio a front-end renders would exceed
+    /// 100% rather than the total growing to meet it.
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -627,6 +736,15 @@ impl Mapfile {
     }
 
     fn write_to_disk(&self) -> io::Result<()> {
+        // DISOWNED: this mapfile's owner was abandoned and someone else is
+        // the record of this path now. Checked here rather than in each of
+        // `flush` / `record` / `Drop` because this is the single place the
+        // file is committed, so one check covers all three. Reported as
+        // success: not writing IS the correct outcome, and there is no
+        // caller left to handle an error anyway.
+        if self.disowned.load(Ordering::Acquire) {
+            return Ok(());
+        }
         // Write to a tempfile then rename for atomicity. Appending ".tmp"
         // rather than `with_extension` so we don't clobber the original
         // extension (which may already be ".mapfile").
@@ -697,6 +815,18 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
+        // Re-check at the COMMIT POINT. The entry check above can be minutes
+        // stale by now: writing and fsyncing the tmp is exactly the step that
+        // hangs on the mount this whole mechanism exists for, and the owner
+        // may have been abandoned during it. Checking again immediately
+        // before the rename narrows the window in which a disowned writer can
+        // still commit to the gap between this load and the rename syscall.
+        // (It narrows it; it cannot close it — there is no atomic
+        // check-and-rename. Two processes would need a real lock.)
+        if self.disowned.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&tmp);
+            return Ok(());
+        }
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -727,17 +857,20 @@ impl Drop for Mapfile {
 }
 
 /// Parse a 32-char lowercase/uppercase hex string into a 16-byte VID.
-/// Returns `None` on any malformation (wrong length, non-hex) — the
-/// caller treats a bad VID comment as simply absent rather than an
-/// error, so a corrupt header never fails a mapfile load.
+/// Returns `None` on any malformation (wrong length, non-hex). `load()`
+/// turns that `None` into a hard `MapfileInvalid{kind:"vid"}`: a header
+/// that is PRESENT but unparseable is corruption in the disc-identity
+/// record, and loading it as "no identity" is what re-opens the
+/// cross-disc resume splice (see `check_mapfile_identity`).
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
     // byte-based so a multi-byte `# freemkv-vid:` comment rejects, never panics).
     libfreemkv::hex::parse_hex_fixed::<16>(s)
 }
 
-/// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`. Returns
-/// `None` on any malformation so a corrupt line is ignored, never fatal.
+/// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`.
+/// Returns `None` on any malformation; `load()` treats that as fatal, for the
+/// same reason as [`parse_vid_hex`].
 fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let (cps, hex) = s.split_once(':')?;
     let cps: u32 = cps.trim().parse().ok()?;
@@ -823,6 +956,186 @@ mod tests {
         dir.join(name)
     }
 
+    /// Runs a three-pass patch-shaped workload over `mf` and returns the entry
+    /// count after each pass. Pass 2 is the worst case for `record()`'s
+    /// coalescing: alternate sectors inside each damaged region come back, so
+    /// every recovered sector is its own run bracketed by two unrecovered ones.
+    fn fragmenting_multipass(mf: &mut Mapfile) -> Vec<usize> {
+        const SEC: u64 = 2048;
+        let mut counts = Vec::new();
+        // Pass 1 (sweep): the readable bulk lands Finished, three regions of
+        // 64 sectors each fail as NonTrimmed.
+        mf.record(0, 1000 * SEC, SectorStatus::Finished).unwrap();
+        for base in [100u64, 400, 700] {
+            mf.record(base * SEC, 64 * SEC, SectorStatus::NonTrimmed)
+                .unwrap();
+        }
+        counts.push(mf.entries().len());
+        // Pass 2 (scrape): every other sector inside each bad region comes
+        // back; the rest stay NonTrimmed. Worst-case interleave.
+        for base in [100u64, 400, 700] {
+            for i in 0..64u64 {
+                if i % 2 == 0 {
+                    mf.record((base + i) * SEC, SEC, SectorStatus::Finished)
+                        .unwrap();
+                }
+            }
+        }
+        counts.push(mf.entries().len());
+        // Pass 3: the remaining sectors come back too.
+        for base in [100u64, 400, 700] {
+            for i in 0..64u64 {
+                if i % 2 == 1 {
+                    mf.record((base + i) * SEC, SEC, SectorStatus::Finished)
+                        .unwrap();
+                }
+            }
+        }
+        counts.push(mf.entries().len());
+        counts
+    }
+
+    /// `record()` leaves `entries` as the CANONICAL maximal-run partition of
+    /// `[0, total_size)`: contiguous, gapless, and with no two adjacent entries
+    /// sharing a status. That invariant — not any cap — is what bounds the list:
+    /// its length is exactly the number of status runs the disc's damage
+    /// actually has, so it can only grow when the damage itself interleaves
+    /// more finely, and it SHRINKS again as recovery merges runs back together.
+    fn assert_canonical(mf: &Mapfile) {
+        let es = mf.entries();
+        assert!(!es.is_empty());
+        assert_eq!(es[0].pos, 0, "partition must start at 0");
+        let mut expect_pos = 0u64;
+        for (i, e) in es.iter().enumerate() {
+            assert_eq!(e.pos, expect_pos, "gap or overlap before entry {i}");
+            assert!(e.size > 0, "zero-size entry {i}");
+            if i > 0 {
+                assert_ne!(
+                    es[i - 1].status,
+                    e.status,
+                    "entries {} and {i} share a status and were not coalesced",
+                    i - 1
+                );
+            }
+            expect_pos += e.size;
+        }
+        assert_eq!(
+            expect_pos,
+            mf.total_size(),
+            "partition must cover the whole image"
+        );
+    }
+
+    /// The `Mapfile.entries` bound, measured rather than asserted from a doc.
+    ///
+    /// A patch pass that recovers alternate sectors inside a damaged region is
+    /// the worst case coalescing can face — it is the ONLY thing that defeats
+    /// the merge, since a record that repeats or extends an existing run never
+    /// adds an entry. Even so the list is not a ratchet: pass 3 recovers the
+    /// interleaved remainder and 193 entries collapse back to 1.
+    ///
+    /// So fragmentation tracks the damage topology, not the pass count, and it
+    /// is bounded by `2 * (interleaved damaged sectors) + 1`. Archived mapfiles
+    /// from real damaged UHD media hold 19 entries and do not grow between
+    /// passes (see `real_shaped_mapfile_round_trips`).
+    #[test]
+    fn fragmentation_peaks_then_collapses_as_damage_is_recovered() {
+        let p = tmpfile("fragmentation_peaks_then_collapses");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000 * 2048, "test").unwrap();
+        let counts = fragmenting_multipass(&mut mf);
+        assert_canonical(&mf);
+        let _ = std::fs::remove_file(&p);
+        // Literals, not recomputed from the code under test:
+        //  pass 1 — [+ | * | + | * | + | * | +]                        = 7
+        //  pass 2 — 3 regions x 64 sectors alternating +/*, 64 runs each,
+        //           the leading + of each region merging into the bulk:
+        //           1 + 3*64 = 193
+        //  pass 3 — everything Finished, one run                       = 1
+        assert_eq!(counts, vec![7, 193, 1]);
+        assert!(
+            counts[2] < counts[1],
+            "fragmentation must be reversible, not a ratchet: {counts:?}"
+        );
+    }
+
+    /// A record that lands inside an existing run of the same status is free:
+    /// the partition is unchanged, so repeated passes over already-known
+    /// territory cannot fragment the list at all.
+    #[test]
+    fn repeat_records_inside_a_run_do_not_fragment() {
+        let p = tmpfile("repeat_records_inside_a_run");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 1000 * 2048, "test").unwrap();
+        mf.record(0, 1000 * 2048, SectorStatus::Finished).unwrap();
+        mf.record(100 * 2048, 8 * 2048, SectorStatus::Unreadable)
+            .unwrap();
+        let before: Vec<MapEntry> = mf.entries().to_vec();
+        assert_eq!(before.len(), 3);
+        for _ in 0..500 {
+            mf.record(100 * 2048, 8 * 2048, SectorStatus::Unreadable)
+                .unwrap();
+            mf.record(0, 100 * 2048, SectorStatus::Finished).unwrap();
+        }
+        assert_eq!(mf.entries(), before.as_slice());
+        assert_canonical(&mf);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The mapfile is a persisted, ddrescue-compatible artifact that outlives
+    /// the build that wrote it. This pins the on-disk format against a literal
+    /// copy of a mapfile written by an older release (v0.14.0) for genuinely
+    /// damaged UHD media: it must load, its 19 entries must be understood
+    /// exactly, and re-writing it must reproduce the same bytes.
+    #[test]
+    fn real_shaped_mapfile_round_trips() {
+        const ARCHIVED: &str = "\
+# Rescue Logfile. Created by libfreemkv v0.14.0
+# Current pos / status / pass / pass_time
+0x000000000  ?  1  0
+#      pos        size  status
+0x000000000  0x34b630000    +
+0x34b630000  0x000010000    *
+0x34b640000  0x2b0d50000    +
+0x5fc390000  0x007010000    *
+0x6033a0000  0x000070000    +
+0x603410000  0x008000000    *
+0x60b410000  0x371030000    +
+0x97c440000  0x000010000    *
+0x97c450000  0x0001f0000    +
+0x97c640000  0x000010000    *
+0x97c650000  0x0000c0000    +
+0x97c710000  0x001000000    *
+0x97d710000  0x000090000    +
+0x97d7a0000  0x002000000    *
+0x97f7a0000  0x005480000    +
+0x984c20000  0x003010000    *
+0x987c30000  0x000080000    +
+0x987cb0000  0x004000000    *
+0x98bcb0000  0xa24550000    +
+";
+        let p = tmpfile("real_shaped_mapfile_round_trips");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(&p, ARCHIVED).unwrap();
+        let mut mf = Mapfile::load(&p).unwrap();
+        // Nineteen entries — the real fragmentation ceiling this format has
+        // been observed to reach, and unchanged between that disc's two passes.
+        assert_eq!(mf.entries().len(), 19);
+        assert_eq!(mf.total_size(), 0x1_3B0_200_000);
+        assert_eq!(mf.entries()[1].pos, 0x34b630000);
+        assert_eq!(mf.entries()[1].size, 0x10000);
+        assert_eq!(mf.entries()[1].status, SectorStatus::NonTrimmed);
+        // Re-write it: same build, same bytes.
+        mf.record(0, 0x34b630000, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        let rewritten = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(rewritten, ARCHIVED);
+        // And it still loads to the same entries.
+        let reloaded = Mapfile::load(&p).unwrap();
+        assert_eq!(reloaded.entries(), mf.entries());
+        let _ = std::fs::remove_file(&p);
+    }
+
     #[test]
     fn create_has_one_nontried_region() {
         let p = tmpfile("create_has_one_nontried_region");
@@ -900,6 +1213,25 @@ mod tests {
         mf.flush().unwrap();
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
+        // The entry list was the ONLY thing compared here, and it is the one
+        // part of the state that is written verbatim. `total_size` and the
+        // stats are SUPPLIED on create and RE-DERIVED on load, so a writer
+        // that dropped the trailing NonTried extent — or a reader that
+        // mis-derived the total — round-tripped "correctly" against entries
+        // alone while every consumer of `stats()` silently lost that coverage.
+        // Literals, so neither side is asked to confirm itself.
+        assert_eq!(
+            loaded.total_size(),
+            1000,
+            "the extent must survive a reload"
+        );
+        assert_eq!(loaded.total_size(), mf.total_size());
+        assert_eq!(loaded.stats(), mf.stats(), "in-memory and reloaded stats");
+        let st = loaded.stats();
+        assert_eq!(st.bytes_total, 1000);
+        assert_eq!(st.bytes_good, 200, "record(100, 200, Finished)");
+        assert_eq!(st.bytes_unreadable, 100, "record(500, 100, Unreadable)");
+        assert_eq!(st.bytes_pending, 700, "1000 - 200 - 100 still outstanding");
         let _ = std::fs::remove_file(&p);
     }
 
@@ -924,6 +1256,12 @@ mod tests {
 
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
+        // Same reason as `round_trip_load`: the derived state has to survive
+        // too, or a durable write of a truncated extent still passes.
+        assert_eq!(loaded.total_size(), 1000);
+        assert_eq!(loaded.stats(), mf.stats());
+        assert_eq!(loaded.stats().bytes_good, 200);
+        assert_eq!(loaded.stats().bytes_pending, 800);
         let _ = std::fs::remove_file(&p);
     }
 
@@ -950,6 +1288,11 @@ mod tests {
 
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
+        assert_eq!(loaded.total_size(), 1000);
+        assert_eq!(loaded.stats(), mf.stats());
+        assert_eq!(loaded.stats().bytes_good, 400);
+        assert_eq!(loaded.stats().bytes_unreadable, 100);
+        assert_eq!(loaded.stats().bytes_pending, 500);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1165,14 +1508,18 @@ mod tests {
         assert_eq!(loaded_novid.vid(), None);
         assert_eq!(loaded_novid.entries(), loaded.entries());
 
-        // Malformed VID comments must not error the load (treated absent).
+        // A malformed VID comment FAILS the load. Treating it as absent
+        // silently downgrades "this mapfile names a disc" to "this mapfile
+        // names no disc", which `check_mapfile_identity` accepts — see
+        // `load_rejects_a_malformed_vid_header`.
         let mut bad = text.replace("00112233445566778899aabbccddeeff", "zzzz");
         let pbad = tmpfile("vid_round_trips_bad");
         let _ = std::fs::remove_file(&pbad);
         std::fs::write(&pbad, &bad).unwrap();
-        let loaded_bad = Mapfile::load(&pbad).unwrap();
-        assert_eq!(loaded_bad.vid(), None);
-        assert_eq!(loaded_bad.entries(), loaded.entries());
+        assert!(
+            Mapfile::load(&pbad).is_err(),
+            "a corrupt VID header must not load as 'no identity'"
+        );
 
         // A load->save cycle preserves the VID (the patch-pass path).
         bad.clear();
@@ -1282,9 +1629,15 @@ mod tests {
         );
         // total_size unchanged (last entry end), but the hole is now pending.
         assert_eq!(mf.total_size(), 0x300);
-        assert!(
-            mf.stats().bytes_pending >= 0x100,
-            "the hole must count as pending so copy() doesn't report complete"
+        // EXACTLY the hole, not "at least" it. The fixture's only non-Finished
+        // bytes are the filled gap [0x100,0x200), so `>=` was satisfied by any
+        // over-count too: doubling the NonTried contribution in `compute_stats`
+        // left this assertion green while six other mapfile tests went red.
+        assert_eq!(
+            mf.stats().bytes_pending,
+            0x100,
+            "the hole must count as pending — exactly once — so copy() doesn't \
+             report complete"
         );
         let _ = std::fs::remove_file(&p);
     }
@@ -1343,11 +1696,13 @@ mod tests {
             assert_eq!(st.to_char(), ch, "{st:?} must map to '{ch}'");
             assert_eq!(SectorStatus::from_char(ch), Some(st));
         }
-        // Any char outside the alphabet is rejected.
-        for bad in ['x', ' ', '0', '#', '?'.to_ascii_uppercase()] {
-            if "?*/-+".contains(bad) {
-                continue;
-            }
+        // Any char outside the alphabet is rejected. Every entry here must be
+        // genuinely OUTSIDE it: this list used to end in
+        // `'?'.to_ascii_uppercase()`, which is just `'?'` — a VALID status char
+        // — and the loop skipped it through a `if "?*/-+".contains(bad)` guard,
+        // so that element asserted nothing the `pairs` loop above had not
+        // already covered. The guard went with it.
+        for bad in ['x', ' ', '0', '#', '!'] {
             assert_eq!(
                 SectorStatus::from_char(bad),
                 None,
@@ -1370,7 +1725,8 @@ mod tests {
     }
 
     /// A `# freemkv-uk:` line missing the `cps:hex` shape, with a bad cps,
-    /// or a wrong-length key, must parse to None (best-effort, never fatal).
+    /// or a wrong-length key, must parse to None. (`load()` turns that None
+    /// into a hard error — see `load_rejects_a_malformed_unit_key_header`.)
     #[test]
     fn parse_uk_line_rejects_malformed() {
         assert_eq!(parse_uk_line("no-colon"), None);
@@ -1614,16 +1970,20 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// A truncated data line is skipped, not indexed into.
+    /// A truncated data line is REFUSED, not skipped.
     ///
-    /// `if fields.len() < 3 { continue; }` is the only thing standing between
-    /// `fields[2]` and a short line. A mapfile is a file on disk that survives
-    /// crashes and power cuts and is advertised as ddrescue-interoperable, so
-    /// a half-written trailing line is an ordinary thing to find — and every
-    /// other malformed-line shape in this file has a test. Inverted to `>`,
-    /// this panics out of bounds on the damage record of a rip in progress.
+    /// `fields.len() < 3` used to `continue`, which deletes that line's range
+    /// from a partition every consumer reads as gapless — and when the short
+    /// line is the LAST one it also shrinks `total_size`, since that is derived
+    /// from the final entry's end. Here the truncated line is the tail of the
+    /// disc: skipping it reports a 0x2800-byte disc that is 100% good, erasing
+    /// 0x800 bytes of coverage from every consumer.
+    ///
+    /// The expectation is a literal, not a value re-derived from the parser:
+    /// the skip answer is `total_size == 0x2800`, and that is what must not
+    /// happen.
     #[test]
-    fn load_skips_a_data_line_with_too_few_fields() {
+    fn load_rejects_a_data_line_with_too_few_fields() {
         let p = tmpfile("load_shortline");
         let _ = std::fs::remove_file(&p);
         std::fs::write(
@@ -1634,18 +1994,21 @@ mod tests {
              0x2800     0x800\n",
         )
         .unwrap();
-        let map = Mapfile::load(&p)
-            .expect("a short trailing line is skipped, not a parse error and not a panic");
-        // Only the well-formed entry was taken; the truncated one contributed
-        // nothing at all rather than half of itself.
-        assert_eq!(map.stats().bytes_good, 0x2800);
-        assert_eq!(map.total_size(), 0x2800);
+        let err = match Mapfile::load(&p) {
+            Ok(map) => panic!(
+                "a short line must not be skipped; loaded total_size={:#x} good={:#x}",
+                map.total_size(),
+                map.stats().bytes_good
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&p);
     }
 
     /// A single-field line is the same case one field shorter.
     #[test]
-    fn load_skips_a_data_line_with_one_field() {
+    fn load_rejects_a_data_line_with_one_field() {
         let p = tmpfile("load_onefield");
         let _ = std::fs::remove_file(&p);
         std::fs::write(
@@ -1656,9 +2019,109 @@ mod tests {
              0x2800\n",
         )
         .unwrap();
-        let map = Mapfile::load(&p).expect("a one-field trailing line is skipped");
-        assert_eq!(map.stats().bytes_good, 0x2800);
+        let err = match Mapfile::load(&p) {
+            Ok(_) => panic!("a one-field line must be refused, not skipped"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// A malformed `# freemkv-vid:` header must FAIL the load.
+    ///
+    /// Dropping it silently turns a mapfile that CARRIES a disc identity into
+    /// one that carries NONE — and `check_mapfile_identity` answers `Ok(())`
+    /// for none (legacy files, unencrypted discs). That is the cross-disc
+    /// resume splice the identity guard exists to stop, reachable by
+    /// corrupting one hex digit into a `z`.
+    #[test]
+    fn load_rejects_a_malformed_vid_header() {
+        let p = tmpfile("load_bad_vid");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             # freemkv-vid: 00112233445566778899aabbccddeezz\n\
+             0x0  ?  1  0\n\
+             0x0  0x800    +\n",
+        )
+        .unwrap();
+        let err = match Mapfile::load(&p) {
+            Ok(mf) => panic!(
+                "a corrupt VID header must not load as 'no identity' (vid={:?})",
+                mf.vid()
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Same rule for a malformed `# freemkv-uk:` header — the KEYED half of
+    /// the keys-XOR-vid identity, and the half a normally-ripped AACS disc
+    /// actually writes (30 hex chars below, not 32).
+    #[test]
+    fn load_rejects_a_malformed_unit_key_header() {
+        let p = tmpfile("load_bad_uk");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             # freemkv-uk: 0:000102030405060708090a0b0c0d0e\n\
+             0x0  ?  1  0\n\
+             0x0  0x800    +\n",
+        )
+        .unwrap();
+        let err = match Mapfile::load(&p) {
+            Ok(mf) => panic!(
+                "a corrupt unit-key header must not load as 'no identity' (keys={})",
+                mf.unit_keys().len()
+            ),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The other side of the same rule: NO identity header at all still loads
+    /// (ddrescue imports, legacy files, unencrypted discs), and a WELL-FORMED
+    /// one still parses to the same 16 bytes it names.
+    #[test]
+    fn absent_identity_loads_and_a_wellformed_one_parses() {
+        let p = tmpfile("load_no_vid");
+        let _ = std::fs::remove_file(&p);
+        std::fs::write(
+            &p,
+            "# Rescue Logfile. Created by test\n\
+             0x0  ?  1  0\n\
+             0x0  0x800    +\n",
+        )
+        .unwrap();
+        let mf = Mapfile::load(&p).expect("no identity header at all is legal");
+        assert_eq!(mf.vid(), None);
+        assert!(mf.unit_keys().is_empty());
+        let _ = std::fs::remove_file(&p);
+
+        let p2 = tmpfile("load_ok_vid");
+        let _ = std::fs::remove_file(&p2);
+        std::fs::write(
+            &p2,
+            "# Rescue Logfile. Created by test\n\
+             # freemkv-vid: 00112233445566778899aabbccddeeff\n\
+             0x0  ?  1  0\n\
+             0x0  0x800    +\n",
+        )
+        .unwrap();
+        let mf2 = Mapfile::load(&p2).expect("a well-formed VID header must still load");
+        assert_eq!(
+            mf2.vid(),
+            Some([
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff
+            ])
+        );
+        assert_eq!(mf2.total_size(), 0x800);
+        let _ = std::fs::remove_file(&p2);
     }
 
     /// load() rejects an unknown status char (MapfileInvalid{kind:

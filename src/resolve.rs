@@ -144,6 +144,79 @@ pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> c
 mod tests {
     use super::*;
 
+    /// Every `KeyStatus::summary` value this module can emit must be documented
+    /// where a front-end will look for it.
+    ///
+    /// `summary` is a contract with a UI that renders nothing but the key:
+    /// an undocumented value is an unlocalised string in front of the user, on
+    /// the strip whose whole job is to explain why a disc will not decrypt. The
+    /// set was presented as seven for as long as there have been ten — the
+    /// three `key-service-*` values (a key SOURCE could not answer, which is
+    /// NOT the claim "this disc has no key") were emitted and listed nowhere.
+    ///
+    /// Derived from the SOURCE — the body of `resolve_keys` itself — not from a
+    /// hand-kept list here, so adding an eleventh summary without documenting
+    /// it fails this test rather than quietly repeating the same omission.
+    /// Mirrors `preflight.rs`'s `every_emitted_reason_key_is_documented` and
+    /// `multipass.rs`'s `every_multipass_result_field_is_documented`.
+    #[test]
+    fn every_emitted_key_summary_is_documented() {
+        let src = include_str!("resolve.rs");
+        let guide = include_str!("../USING_THE_ENGINE.md");
+        // Scope the scan to `resolve_keys`' own body — anchored structurally,
+        // like both sibling tests, so an unrelated string literal elsewhere in
+        // the file (a `tracing` field, a test fixture) can neither add a
+        // phantom key nor mask a missing one.
+        let body = src
+            .split_once("pub fn resolve_keys(")
+            .expect("the file declares resolve_keys")
+            .1
+            .split_once("\n}")
+            .expect("the function body is closed")
+            .0;
+
+        let mut keys: Vec<&str> = Vec::new();
+        for line in body.lines() {
+            if line.trim_start().starts_with("//") {
+                continue; // prose about a key is not an emission of it
+            }
+            for (i, part) in line.split('"').enumerate() {
+                // Odd indices are the insides of string literals.
+                if i % 2 == 1
+                    && !part.is_empty()
+                    && part.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+                {
+                    keys.push(part);
+                }
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+
+        // Fixture checks: a parser that silently extracts nothing (or loses the
+        // values this test was written for) must fail LOUDLY, not pass
+        // vacuously.
+        assert!(
+            keys.len() >= 10,
+            "fixture check: expected at least the ten known summaries, found {keys:?}"
+        );
+        for expected in ["unencrypted", "no-key", "key-service-unavailable"] {
+            assert!(
+                keys.contains(&expected),
+                "fixture check: a summary this test was written for is gone: {keys:?}"
+            );
+        }
+
+        for key in keys {
+            assert!(
+                guide.contains(key),
+                "KeyStatus summary {key:?} is emitted but not listed in \
+                 USING_THE_ENGINE.md — a front-end localising only the \
+                 documented values renders this one raw"
+            );
+        }
+    }
+
     fn disc(encrypted: bool) -> libfreemkv::Disc {
         libfreemkv::Disc {
             volume_id: "T".into(),
