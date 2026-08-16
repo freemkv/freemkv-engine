@@ -40,8 +40,18 @@ impl Preflight {
 /// (an index, a count) the message may interpolate, never prose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reason {
-    /// Stable reason key, e.g. `"no-titles"`, `"title-out-of-range"`,
-    /// `"encrypted-no-key"`, `"empty-selection"`.
+    /// Stable reason key. The complete set this crate emits — a front-end that
+    /// maps only part of it renders a blocked Start with no explanation:
+    ///
+    /// * `"no-titles"` — the scan found no titles at all.
+    /// * `"empty-selection"` — the selection resolves to no title.
+    /// * `"title-out-of-range"` — an explicit index past the last title;
+    ///   `detail` carries the offending index.
+    /// * `"multipass-requires-raw"` — `RipMode::Multi` without `job.raw`.
+    /// * `"language-unmatched"` — a language-filtered stream class the job asks
+    ///   for is carried by no selected title; `detail` carries the class key
+    ///   (`audio`, `subtitle`, `subtitle_forced`).
+    /// * `"encrypted-no-key"` — an encrypted disc, not raw, with no usable key.
     pub key: String,
     /// Optional machine detail for the message (e.g. the offending index).
     pub detail: Option<String>,
@@ -68,7 +78,10 @@ impl Reason {
 /// Checks, cheapest first:
 /// 1. The disc has at least one title.
 /// 2. The selection resolves to a non-empty set of in-range title indices.
-/// 3. If the disc is encrypted and the job is NOT `raw`, a usable key exists
+/// 3. Every language-filtered stream class the job asks for is carried by at
+///    least one selected title (so a rip cannot silently ship a file without
+///    the audio or subtitle track the user asked for).
+/// 4. If the disc is encrypted and the job is NOT `raw`, a usable key exists
 ///    (so a decrypting rip cannot silently write ciphertext — the same class
 ///    of guard `Disc::ensure_decryptable` enforces at execution time, surfaced
 ///    here earlier as data).
@@ -117,8 +130,35 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     //
     // `resolve_selection` is pure — no drive, no file, no read — so calling it
     // keeps preflight's no-side-effects contract.
-    if reasons.is_empty() && crate::mux::resolve_selection(disc, &job.selection).is_empty() {
+    let resolved = crate::mux::resolve_selection(disc, &job.selection);
+    if reasons.is_empty() && resolved.is_empty() {
         reasons.push(Reason::new("empty-selection"));
+    }
+
+    // A language request no selected title can honour. `StreamChoice::
+    // unmatched` has computed this all along and nothing called it: the
+    // resolved `StreamSelection` simply came back with no PIDs for the class,
+    // the mux wrote the file without it, and the run exited 0 — `-a jpn` on a
+    // disc with no Japanese audio delivered a video-only MKV and reported
+    // success. Detected, and not reported, is the same as not detected.
+    //
+    // Judged across the whole selection, not per title: a batch where the
+    // language is present on SOME selected title can honour the request, and
+    // blocking it would refuse ordinary multi-title rips. Only a request that
+    // no selected title can satisfy is a rip that will certainly ship without
+    // the track. A class no selected title carries at all is not a miss —
+    // there was never a track to keep.
+    //
+    // Conditional on no earlier reason for the same purpose as the gate above:
+    // a job blocked for an out-of-range index gets the reason that names the
+    // index, not a second, vaguer one derived from titles it never selected.
+    if reasons.is_empty() {
+        for class in job
+            .streams
+            .unmatched_everywhere(resolved.iter().filter_map(|&i| disc.titles.get(i)))
+        {
+            reasons.push(Reason::with_detail("language-unmatched", class));
+        }
     }
 
     // Multipass implies raw. A multipass rip is a whole-disc image recovery:
@@ -206,6 +246,65 @@ mod tests {
                 .any(|r| r.key == "multipass-requires-raw"),
             "single-pass decrypt is the ordinary case and must not be blocked"
         );
+    }
+
+    /// Every reason key this module can emit must be documented where a
+    /// front-end will look for it.
+    ///
+    /// `Reason.key` is a contract with a UI that renders nothing but the key:
+    /// a key the guide does not list is a blocked Start button with no
+    /// message. The set was presented as four for as long as there have been
+    /// five — `multipass-requires-raw` was emitted but listed nowhere, and it
+    /// is the key `USING_THE_ENGINE.md`'s own §1 example triggers.
+    ///
+    /// Derived from the SOURCE, not from a hand-kept list here, so adding a
+    /// sixth key without documenting it fails this test rather than quietly
+    /// repeating the same omission.
+    #[test]
+    fn every_emitted_reason_key_is_documented() {
+        let src = include_str!("preflight.rs");
+        let guide = include_str!("../USING_THE_ENGINE.md");
+        // The `Reason.key` rustdoc: inside the struct, i.e. between its
+        // declaration and the `impl` that follows.
+        let doc_block = src
+            .split_once("pub struct Reason")
+            .expect("the file has a Reason struct")
+            .1
+            .split_once("impl Reason")
+            .expect("the struct is followed by its impl")
+            .0;
+
+        let mut keys: Vec<&str> = Vec::new();
+        for marker in ["Reason::new(\"", "Reason::with_detail(\""] {
+            for (i, part) in src.split(marker).enumerate() {
+                // The first split part is what precedes the first marker.
+                if i == 0 {
+                    continue;
+                }
+                keys.push(part.split('"').next().expect("a closed string literal"));
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        assert!(
+            keys.len() >= 5,
+            "fixture check: expected at least the five known keys, found {keys:?}"
+        );
+        assert!(
+            keys.contains(&"multipass-requires-raw"),
+            "fixture check: the key this test was written for is gone: {keys:?}"
+        );
+
+        for key in keys {
+            assert!(
+                doc_block.contains(key),
+                "reason key {key:?} is emitted but not listed on `Reason.key`"
+            );
+            assert!(
+                guide.contains(key),
+                "reason key {key:?} is emitted but not listed in USING_THE_ENGINE.md"
+            );
+        }
     }
 
     use crate::job::Job;
@@ -420,6 +519,119 @@ mod tests {
             keys,
             vec!["title-out-of-range"],
             "the specific reason must survive, unduplicated"
+        );
+    }
+
+    // A title carrying exactly the audio languages named, and one English
+    // full subtitle so the subtitle class is never the thing being tested.
+    fn title_with_audio(langs: &[&str]) -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.duration_secs = 3600.0;
+        for (i, l) in langs.iter().enumerate() {
+            t.streams
+                .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
+                    pid: 0x1100 + i as u16,
+                    codec: libfreemkv::Codec::TrueHd,
+                    channels: libfreemkv::AudioChannels::Stereo,
+                    language: (*l).into(),
+                    sample_rate: libfreemkv::SampleRate::S48,
+                    secondary: false,
+                    purpose: libfreemkv::LabelPurpose::Normal,
+                    label: String::new(),
+                }));
+        }
+        t
+    }
+
+    fn disc_with_titles(titles: Vec<libfreemkv::DiscTitle>) -> libfreemkv::Disc {
+        let mut d = disc_with(0, false, false);
+        d.titles = titles;
+        d
+    }
+
+    fn audio_job(langs: &[&str]) -> Job {
+        Job::new("iso://x.iso", "/out").with_audio(crate::job::StreamFilter::Langs(
+            langs.iter().map(|s| s.to_string()).collect(),
+        ))
+    }
+
+    /// `-a jpn` on a disc with no Japanese audio must be REFUSED, not run.
+    ///
+    /// `StreamChoice::unmatched` computes exactly this and had no caller
+    /// anywhere in the crate: the resolved selection simply kept no audio PIDs,
+    /// the mux wrote a video-only file, and the run exited 0. The user asked for
+    /// a track, got a file without one, and nothing said so.
+    #[test]
+    fn a_language_no_selected_title_carries_is_refused() {
+        let d = disc_with_titles(vec![title_with_audio(&["eng", "deu"])]);
+        let pf = preflight(&d, &audio_job(&["jpn"]));
+        assert!(
+            !pf.is_ready(),
+            "a rip that cannot honour its own audio request must not report \
+             Ready: {pf:?}"
+        );
+        let r = pf
+            .reasons()
+            .iter()
+            .find(|r| r.key == "language-unmatched")
+            .unwrap_or_else(|| panic!("expected language-unmatched, got {:?}", pf.reasons()));
+        assert_eq!(
+            r.detail.as_deref(),
+            Some("audio"),
+            "the reason must name the class the front-end has to explain"
+        );
+
+        // A language the disc DOES carry is untouched — including via its
+        // bibliographic code, which is how discs label tracks.
+        for ok in [vec!["eng"], vec!["ger"], vec!["jpn", "eng"]] {
+            let pf = preflight(&d, &audio_job(&ok));
+            assert!(
+                pf.is_ready(),
+                "{ok:?} is satisfiable on this disc and must not block: {pf:?}"
+            );
+        }
+    }
+
+    /// The gate is about the RIP, not about one title: a batch where some
+    /// selected title carries the language still runs. Only a request no
+    /// selected title can satisfy is refused.
+    #[test]
+    fn a_language_present_on_one_selected_title_does_not_block_the_batch() {
+        let d = disc_with_titles(vec![
+            title_with_audio(&["eng"]),
+            title_with_audio(&["jpn", "eng"]),
+        ]);
+        let j = Job {
+            selection: Selection::All,
+            ..audio_job(&["jpn"])
+        };
+        assert!(
+            preflight(&d, &j).is_ready(),
+            "one title carries the language; the rip can honour the request"
+        );
+
+        // Selecting only the title that lacks it is refused, though.
+        let j = Job {
+            selection: Selection::Titles(vec![0]),
+            ..audio_job(&["jpn"])
+        };
+        assert!(
+            preflight(&d, &j)
+                .reasons()
+                .iter()
+                .any(|r| r.key == "language-unmatched"),
+            "the only selected title has no Japanese audio"
+        );
+    }
+
+    /// A title with NO audio at all is not a language miss: there was never a
+    /// track to keep, and blocking would refuse every silent-title rip.
+    #[test]
+    fn a_class_the_disc_lacks_entirely_is_not_a_language_miss() {
+        let d = disc_with_titles(vec![title_with_audio(&[])]);
+        assert!(
+            preflight(&d, &audio_job(&["jpn"])).is_ready(),
+            "a title with no audio streams cannot 'miss' an audio language"
         );
     }
 

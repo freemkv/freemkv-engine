@@ -1,41 +1,29 @@
 //! Pass-N (`freemkv_engine::patch`) read-error handler — A/B golden fixture.
 //!
-//! Background (2026-05-13, v0.20.8):
+//! WHAT THIS PINS, in today's code: the end-to-end behaviour of
+//! `freemkv_engine::patch` over eight canonical damage profiles against a
+//! synthetic `ScriptedSectorReader`. Each profile asserts the exact observable
+//! outcome — final mapfile byte counts, plus an upper bound on the number of
+//! reads — so any change to the Pass-N failure path either preserves the
+//! goldens or fails loudly. They are the evidence that a refactor did not move
+//! shipped recovery behaviour.
 //!
-//! `recovery::read_error::handle_read_error` is supposed to be
-//! the single source of truth for sector-read error → recovery action
-//! decisions. Pass 1 sweep routes through it. Pass N patch's
-//! `handle_read_failure` (in `recovery/patch.rs`) does NOT — historically
-//! MEDIUM_ERROR / NOT_READY get inline handling with their own thresholds
-//! (`PASSN_DAMAGE_THRESHOLD_PCT=6` vs the sweep's `12`), their own
-//! damage_window (state.damage_window, separate from ReadCtx.damage_window),
-//! and their own skip logic (`compute_damage_skip`, which runs AFTER
-//! the failure handler and has a size-aware `range_remaining/4` cap
-//! that `handle_read_error::JumpAhead` does not know about).
+//! WHERE THAT BEHAVIOUR LIVES: `recovery::read_error::handle_read_error` is the
+//! Pass-1 (sweep) error policy and is the sweep loop's only production caller.
+//! Pass N does not route through it: its recovery is the chain of
+//! time-bounded handlers in `recovery/section_recover.rs`, driven per bad
+//! section by `recovery/patch.rs`. The Pass-N damage threshold is
+//! `read_error::PATCH_DAMAGE_THRESHOLD_PCT` (6, against the sweep's 12).
 //!
-//! This file is the A/B fixture for that unification. It pins the
-//! CURRENT (pre-unification) end-to-end behavior of `patch` for
-//! eight canonical damage profiles against a synthetic
-//! `ScriptedSectorReader`. Each profile asserts the exact observable
-//! outcome — final mapfile byte counts and outer-loop counters — so any
-//! attempt to refactor the failure path either preserves the goldens or
-//! the test fails loudly.
-//!
-//! An "exact sequence of `ReadAction` enums per LBA" framing doesn't
-//! fit the current architecture because
-//! `handle_read_failure` produces `FailureAction`, not `ReadAction`,
-//! and interleaves with `compute_damage_skip` + cursor management in
-//! the outer loop. The observable contract — what `patch` does
-//! to the mapfile and how many reads it performs — is the equivalent
-//! invariant, captured end-to-end.
-//!
-//! Why we expect divergence under naïve unification: the patch loop's
-//! skip semantics
-//! live in `compute_damage_skip` POST-failure-handler, with a size-aware
-//! cap that `handle_read_error` knows nothing about; routing through
-//! `handle_read_error` would invert that cursor flow. The fixture stays
-//! checked in regardless — it documents the contract for the next
-//! refactor attempt.
+//! HISTORY (2026-05-13, v0.20.8), because the golden VALUES below date from
+//! it: this file began as the A/B fixture for unifying Pass N onto
+//! `handle_read_error`, when Pass N had its own inline `handle_read_failure`
+//! in `recovery/patch.rs` producing a `FailureAction`, its own damage window,
+//! and its own `compute_damage_skip` with a size-aware `range_remaining/4` cap
+//! and a `MAX_SKIPS_PER_RANGE` bound. NONE of those five names exists in `src/`
+//! any more — the per-section handler chain replaced that loop wholesale — so
+//! do not go looking for them. What survived the replacement, unchanged, is the
+//! observable contract this file asserts.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::{Mapfile, SectorStatus};
@@ -108,7 +96,6 @@ impl ScriptedSectorReader {
 
     /// Set a multi-step script for `lba`: first attempt yields
     /// `steps[0]`, second `steps[1]`, … on retry the last step repeats.
-    #[allow(dead_code)]
     fn sequence(&mut self, lba: u32, steps: Vec<ScriptStep>) {
         self.script.insert(lba, steps);
     }
@@ -232,10 +219,11 @@ struct Golden {
     bytes_unreadable: u64,
     /// `bytes_pending` (NonTrimmed) at end.
     bytes_pending: u64,
-    /// Sanity bound on trace length — patch makes a finite number of
-    /// reads bounded by `MAX_SKIPS_PER_RANGE * range_sectors` plus
-    /// retries. Asserted as an UPPER bound only (so any reduction in
-    /// retries via future tuning doesn't fail the test spuriously).
+    /// Sanity bound on trace length — patch makes a finite number of reads,
+    /// bounded today by the per-handler wall-clock deadlines and the fixed
+    /// handler chain rather than by any skip count. Asserted as an UPPER bound
+    /// only (so any reduction in retries via future tuning doesn't fail the
+    /// test spuriously).
     max_reads: usize,
 }
 
@@ -334,11 +322,10 @@ fn profile_01_clean_all_recoverable() {
 // ─────────────────────────── Profile 2: ALL MEDIUM ───────────────────────
 //
 // Every LBA in the NonTrimmed range returns MEDIUM_ERROR every attempt.
-// Adaptive-batch drops to count=1 on first batch failure, then each
-// single-sector read fails → consecutive_failures climbs, damage_window
-// fills, compute_damage_skip fires, MAX_SKIPS_PER_RANGE caps the work,
-// remaining bytes stay NonTrimmed (NEVER marked Unreadable inside a
-// single pass — 2026-05-11 design call).
+// The handler chain works the section down to single-sector reads, every
+// handler in turn fails to recover anything, each one returns `Remaining`
+// when its deadline passes, and the remaining bytes stay NonTrimmed (NEVER
+// marked Unreadable inside a single pass — 2026-05-11 design call).
 
 #[test]
 fn profile_02_all_medium_error() {
@@ -588,9 +575,9 @@ fn profile_05_single_bad_sector() {
 // ───────────────────── Profile 6: DEEP PIT ───────────────────────────────
 //
 // A contiguous 8-sector bad pit in the middle of a wider 24-sector
-// NonTrimmed range. Tests the damage-window threshold + size-aware-skip
-// converging on the actual pit boundaries instead of bailing on
-// MAX_SKIPS_PER_RANGE.
+// NonTrimmed range. Tests the handler chain converging on the actual pit
+// boundaries — recovering everything either side of it — instead of
+// abandoning the whole range once it hits the pit.
 
 #[test]
 fn profile_06_deep_pit() {

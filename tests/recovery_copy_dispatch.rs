@@ -1481,6 +1481,65 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
          took {n} reads (the whole chain grinds on when the tick's halt answer \
          is discarded)"
     );
+
+    // Promptness was the ONLY thing checked here, so a cancel that corrupted
+    // the byte accounting — or that wrote the bad range off as unreadable on
+    // its way out — passed unchanged. What a halted pass reports is what the
+    // orchestrator scores the rip on and what a resume starts from, so it has
+    // to be exactly as honest as an uninterrupted one.
+    const TOTAL: u64 = 500 * 2048;
+    const BAD: u64 = 60 * 2048; // sectors 100..160
+    assert_eq!(
+        out.bytes_good + out.bytes_unreadable + out.bytes_pending,
+        TOTAL,
+        "every byte of the image must be accounted for: good {} + unreadable \
+         {} + pending {}",
+        out.bytes_good,
+        out.bytes_unreadable,
+        out.bytes_pending
+    );
+    assert_eq!(
+        out.bytes_unreadable, 0,
+        "a patch pass never CONFIRMS loss — the end-of-recovery promotion does, \
+         and a cancel must not reach it, or a resume skips those sectors forever"
+    );
+    assert!(
+        out.bytes_pending >= BAD,
+        "the {BAD} bad bytes must still be queued for retry after a cancel; \
+         got {} pending",
+        out.bytes_pending
+    );
+    assert!(
+        out.bytes_recovered_this_pass <= n as u64 * 2048,
+        "the pass claims {} recovered bytes from {n} reads — a halted pass \
+         cannot report more progress than it could physically have made",
+        out.bytes_recovered_this_pass
+    );
+
+    // And the persisted record has to say the same thing: the mapfile is what
+    // a resume reads, and it outlives the `PatchOutcome`.
+    let map = freemkv_engine::Mapfile::load(&freemkv_engine::mapfile_path_for(&iso_path))
+        .expect("the mapfile must survive a cancel");
+    let stats = map.stats();
+    assert_eq!(
+        (
+            stats.bytes_good,
+            stats.bytes_unreadable,
+            stats.bytes_pending
+        ),
+        (out.bytes_good, out.bytes_unreadable, out.bytes_pending),
+        "the outcome and the mapfile must not disagree about the same pass"
+    );
+    let retryable: u64 = map
+        .ranges_with(&[freemkv_engine::SectorStatus::NonTrimmed])
+        .iter()
+        .map(|(_, size)| *size)
+        .sum();
+    assert!(
+        retryable >= BAD,
+        "the bad range must still be NonTrimmed (retryable) in the mapfile; \
+         only {retryable} bytes are"
+    );
 }
 
 /// A mapfile carrying unaligned ranges — e.g. imported from ddrescue run with

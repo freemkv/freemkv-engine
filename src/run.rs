@@ -260,11 +260,27 @@ mod tests {
         ) -> libfreemkv::Result<usize> {
             let n = ((count as usize) * 2048).min(buf.len());
             buf[..n].fill(0);
-            Ok(count as usize)
+            // BYTES, per `SectorSource::read_sectors`' contract — not `count`.
+            Ok(n)
         }
         fn capacity_sectors(&self) -> u32 {
             self.capacity
         }
+    }
+
+    /// The double must honour the contract it stands in for:
+    /// `SectorSource::read_sectors` returns the number of BYTES written into
+    /// `buf`. This one filled `count * 2048` bytes and returned `count`.
+    #[test]
+    fn the_zero_reader_returns_a_byte_count_like_the_trait_says() {
+        use libfreemkv::SectorSource as _;
+        let mut buf = vec![0u8; 4 * 2048];
+        let mut zero = ZeroReader { capacity: 64 };
+        assert_eq!(
+            zero.read_sectors(0, 4, &mut buf, false).unwrap(),
+            8192,
+            "4 sectors is 8192 BYTES"
+        );
     }
 
     // Counts progress ticks and log lines so a test can assert the bridge fired.

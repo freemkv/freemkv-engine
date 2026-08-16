@@ -117,9 +117,19 @@ match preflight(&disc, &job) {
     Preflight::Ready => { /* enable Start */ }
     Preflight::Blocked(reasons) => {
         for r in &reasons {
-            // r.key is a STABLE identifier you localize (never English):
+            // r.key is a STABLE identifier you localize (never English).
+            // The COMPLETE set the engine emits — map all six, or a
+            // blocked Start renders with no explanation:
             //   "no-titles" | "empty-selection" | "title-out-of-range"
+            //   | "multipass-requires-raw" | "language-unmatched"
             //   | "encrypted-no-key"
+            // "language-unmatched" means a language-filtered stream class the
+            // job asked for is carried by no selected title; r.detail is the
+            // class key ("audio", "subtitle", "subtitle_forced").
+            // "multipass-requires-raw" is the one §1's own example above
+            // triggers: RipMode::Multi without job.raw is refused, because a
+            // multipass rip is a whole-disc image recovery and decryption has
+            // no place in that loop. Set job.raw for Multi.
             // r.detail is an optional machine value (e.g. the bad index).
         }
     }
@@ -132,13 +142,20 @@ match preflight(&disc, &job) {
 let ks = resolve_keys(&disc);
 // ks.resolved: bool
 // ks.origin:   Option<KeyOrigin>   (where the key came from)
-// ks.summary:  stable key you localize:
+// ks.summary:  stable key you localize. The COMPLETE set the engine emits —
+//              map all ten, or the strip renders a raw key at the user:
 //   "unencrypted" | "resolved-keydb" | "resolved-external" | "resolved-derived"
 //   | "resolved-css" | "no-key" | "no-keydb"   ← render the red "no KEYDB.cfg"
 //                                                 strip on "no-keydb"
+//   | "key-service-unavailable" | "key-service-unauthorized"
+//   | "key-service-rate-limited"
 // "resolved-external" is source-agnostic (an externally supplied unit key —
 // not necessarily online); "resolved-derived" means the key was derived from
 // device/processing keys. There is no "resolved-online".
+// The three "key-service-*" values are NOT "no-key": a key SOURCE failed to
+// answer, so nothing was learned about whether this disc has a key. The user
+// action is retry / fix the token / back off — not "go find a VUK" — so give
+// them their own message rather than folding them into the no-key case.
 ```
 
 No scraping logs for key state — it's here as data.
@@ -163,8 +180,24 @@ let mp: MultipassResult = multipass_rip(
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
 // mp.main_lost_ms (NaN = unquantifiable), mp.severity (DamageSeverity),
-// mp.passes, mp.aborted_for_loss, mp.halted
+// mp.passes, mp.aborted_for_loss, mp.halted,
+// mp.wedged, mp.complete
 ```
+
+Three of those decide which result page you show, and they are not
+interchangeable:
+
+* `mp.complete` — the rip actually finished (nothing unreadable, nothing
+  pending, not halted, not aborted). This is the ONLY "done" test; a run that
+  merely used up `max_passes` is not complete.
+* `mp.halted` — the user pressed Stop. Resume from the mapfile whenever they
+  ask.
+* `mp.wedged` — a pass ended on a TRANSPORT FAULT (the USB-bridge / firmware
+  crash). NOT a user Stop and NOT permanent damage: the ranges that pass never
+  reached are still retryable. Tell the operator to power-cycle the drive, then
+  resume from the mapfile. Without this field a bridge crash is
+  indistinguishable from an ordinary partial rip — `halted` and
+  `aborted_for_loss` are both false and the byte counts look unremarkable.
 
 `reader` is a `&mut dyn libfreemkv::SectorSource`. `scan_iso` hands back a
 `Box<dyn SectorSource>`, so reborrow it through the box: `&mut *reader`. For a

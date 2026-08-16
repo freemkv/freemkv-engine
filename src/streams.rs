@@ -72,7 +72,7 @@ impl StreamChoice {
     /// no streams of that class (nothing could match).
     pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
         let mut out = Vec::new();
-        check_class(title, &self.audio, StreamClass::Audio, &mut out);
+        let _ = check_class(title, &self.audio, StreamClass::Audio, &mut out);
         // BOTH sides, each against only its own streams. A caller asking for a
         // forced language the disc does not carry used to be told nothing at
         // all: the rip finished at exit 0 as though the request had been
@@ -80,13 +80,13 @@ impl StreamChoice {
         // chosen independently, so a miss on one is not answered by a hit on
         // the other, and `available` must not mix them or the correction it
         // offers names tracks the user cannot have.
-        check_class(
+        let _ = check_class(
             title,
             &self.subtitles.normal,
             StreamClass::Subtitle,
             &mut out,
         );
-        check_class(
+        let _ = check_class(
             title,
             &self.subtitles.forced,
             StreamClass::SubtitleForced,
@@ -94,6 +94,65 @@ impl StreamChoice {
         );
         out
     }
+
+    /// The class keys whose language request NOT ONE of `titles` can satisfy —
+    /// i.e. the whole rip will ship without that track class, however many
+    /// titles it writes.
+    ///
+    /// [`unmatched`](StreamChoice::unmatched) answers for ONE title, which is
+    /// the wrong question for a multi-title job: a language present on the
+    /// second title is not a miss just because the first lacks it. This is the
+    /// question preflight has to ask, and until it did, a `-a jpn` rip of a
+    /// disc with no Japanese audio resolved to zero audio PIDs, muxed a
+    /// video-only file and exited 0.
+    ///
+    /// A class NO selected title carries at all is not reported: there was
+    /// never a track to keep, so nothing was lost. Keys are returned in the
+    /// fixed order audio, subtitle, subtitle_forced.
+    pub fn unmatched_everywhere<'a>(
+        &self,
+        titles: impl IntoIterator<Item = &'a libfreemkv::DiscTitle>,
+    ) -> Vec<&'static str> {
+        let classes = [
+            (StreamClass::Audio, &self.audio),
+            (StreamClass::Subtitle, &self.subtitles.normal),
+            (StreamClass::SubtitleForced, &self.subtitles.forced),
+        ];
+        let mut missed = [false; 3];
+        let mut matched = [false; 3];
+        let mut scratch = Vec::new();
+        for title in titles {
+            for (i, (class, sel)) in classes.iter().enumerate() {
+                scratch.clear();
+                match check_class(title, sel, *class, &mut scratch) {
+                    ClassVerdict::Missed => missed[i] = true,
+                    ClassVerdict::Matched => matched[i] = true,
+                    // Not language-filtered, or the title has no such stream:
+                    // neither evidence of a miss nor of a hit.
+                    ClassVerdict::Unfiltered | ClassVerdict::Absent => {}
+                }
+            }
+        }
+        classes
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| missed[*i] && !matched[*i])
+            .map(|(_, (class, _))| class.key())
+            .collect()
+    }
+}
+
+/// What one language filter did against one class of one title.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClassVerdict {
+    /// `all` / `none` — nothing to miss.
+    Unfiltered,
+    /// The title carries no stream of this class at all.
+    Absent,
+    /// At least one stream of the class matched the request.
+    Matched,
+    /// The class is present and NOTHING matched — the loss this reports.
+    Missed,
 }
 
 /// A language-filtered class (audio or subtitle) where the requested languages
@@ -123,10 +182,10 @@ fn check_class(
     sel: &StreamFilter,
     class: StreamClass,
     out: &mut Vec<UnmatchedClass>,
-) {
+) -> ClassVerdict {
     // Only an explicit language filter can "miss"; all/none are always honored.
     let StreamFilter::Langs(tags) = sel else {
-        return;
+        return ClassVerdict::Unfiltered;
     };
     // Keep EVERY stream of the class, including ones with an empty language tag.
     // The distinction matters: "this title has no audio at all" is not a miss,
@@ -141,7 +200,7 @@ fn check_class(
     if present.is_empty() {
         // The title has no streams of this class at all — nothing to match, and
         // not a "wrong file": there was never a track to keep.
-        return;
+        return ClassVerdict::Absent;
     }
     let wanted: Vec<Language> = tags.iter().filter_map(|t| normalize_lang(t)).collect();
     let any_match = present
@@ -163,7 +222,9 @@ fn check_class(
             requested: tags.clone(),
             available,
         });
+        return ClassVerdict::Missed;
     }
+    ClassVerdict::Matched
 }
 
 /// The raw language tags of every stream of `class` on `title` (order preserved,
@@ -391,6 +452,44 @@ mod tests {
         AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, Stream, SubtitleStream,
     };
 
+    /// ISO 639-2's complete set of languages whose bibliographic (/B) code
+    /// differs from its terminologic (/T) code, transcribed from the standard's
+    /// own code table: `(639-2/B, 639-2/T, 639-1)`.
+    ///
+    /// This is an INDEPENDENT statement of the standard, not a restatement of
+    /// `bib_to_terminologic`. That distinction is the whole point: the previous
+    /// test asserted `normalize_lang(bib) == from_639_3(bib_to_terminologic(bib))`,
+    /// which routes both sides through the very table under test, so a row could
+    /// be wrong and still agree with itself — `"ger" => "fra"` (i.e. `-a ger`
+    /// silently selecting the French track) passed the whole suite. The 639-1
+    /// column is the oracle: it reaches `isolang` by a path that does not touch
+    /// this crate's table at all.
+    ///
+    /// All 20 pairs are listed, so a row DELETED from the production table is
+    /// caught as well as a row rewritten.
+    const BIB_TERM_ISO1: [(&str, &str, &str); 20] = [
+        ("alb", "sqi", "sq"), // Albanian
+        ("arm", "hye", "hy"), // Armenian
+        ("baq", "eus", "eu"), // Basque
+        ("bur", "mya", "my"), // Burmese
+        ("chi", "zho", "zh"), // Chinese
+        ("cze", "ces", "cs"), // Czech
+        ("dut", "nld", "nl"), // Dutch
+        ("fre", "fra", "fr"), // French
+        ("geo", "kat", "ka"), // Georgian
+        ("ger", "deu", "de"), // German
+        ("gre", "ell", "el"), // Greek, Modern
+        ("ice", "isl", "is"), // Icelandic
+        ("mac", "mkd", "mk"), // Macedonian
+        ("mao", "mri", "mi"), // Maori
+        ("may", "msa", "ms"), // Malay
+        ("per", "fas", "fa"), // Persian
+        ("rum", "ron", "ro"), // Romanian
+        ("slo", "slk", "sk"), // Slovak
+        ("tib", "bod", "bo"), // Tibetan
+        ("wel", "cym", "cy"), // Welsh
+    ];
+
     /// The 639-2/B codes the table claims to cover. Inputs only — the mapping
     /// itself is never restated here, or this would be a second copy of the
     /// table that agrees with any edit to it.
@@ -456,18 +555,56 @@ mod tests {
         assert_eq!(miss2[0].class, "subtitle");
     }
 
+    /// Every 639-2/B code a disc may carry must reach the language the ISO
+    /// standard says it names — checked against the standard's own /B ↔ 639-1
+    /// pairing, never against `bib_to_terminologic`.
     #[test]
     fn every_bibliographic_code_resolves_to_its_terminologic_language() {
-        for bib in BIB_CODES {
+        for (bib, term, iso1) in BIB_TERM_ISO1 {
             let via_bib =
                 normalize_lang(bib).unwrap_or_else(|| panic!("{bib}: no language resolved"));
-            let term = bib_to_terminologic(bib)
-                .unwrap_or_else(|| panic!("{bib}: not in the /B → /T table"));
-            let via_term = Language::from_639_3(term)
-                .unwrap_or_else(|| panic!("{bib} → {term}: not a 639-3 code"));
+
+            // The oracle: the 639-1 code the STANDARD pairs with this /B code,
+            // resolved by isolang without consulting anything in this crate.
+            let oracle = Language::from_639_1(iso1)
+                .unwrap_or_else(|| panic!("{iso1}: not a 639-1 code isolang knows"));
             assert_eq!(
-                via_bib, via_term,
-                "{bib} resolved to {via_bib:?} but its /T form {term} is {via_term:?}"
+                via_bib, oracle,
+                "-a {bib} must select {iso1} ({oracle:?}); it selected {via_bib:?}"
+            );
+
+            // And the /T form the standard pairs with it, stated independently
+            // of the production table, is the same language and is what the
+            // resolved identity reports itself as.
+            assert_eq!(
+                via_bib.to_639_3(),
+                term,
+                "{bib}'s terminologic form is {term} per ISO 639-2"
+            );
+        }
+    }
+
+    /// The production table must cover the standard's set exactly: every /B
+    /// code in it, and no invented rows. A missing row is a language request
+    /// that silently matches nothing; an extra row is a code the standard does
+    /// not define as bibliographic.
+    #[test]
+    fn the_bibliographic_table_covers_exactly_the_standard_set() {
+        for (bib, term, _) in BIB_TERM_ISO1 {
+            assert_eq!(
+                bib_to_terminologic(bib),
+                Some(term),
+                "the /B → /T table disagrees with ISO 639-2 for {bib}"
+            );
+        }
+        // Codes that are NOT /B-vs-/T divergences must not be in the table:
+        // `eng`/`spa`/`jpn`/`nor` are their own /T forms, `qqq` is not a
+        // language, and a stray row would shadow a real 639-3 code.
+        for not_bib in ["eng", "spa", "jpn", "nor", "deu", "fra", "zho", "qqq"] {
+            assert_eq!(
+                bib_to_terminologic(not_bib),
+                None,
+                "{not_bib} is not an ISO 639-2 bibliographic-only code"
             );
         }
     }

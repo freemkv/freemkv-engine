@@ -8,8 +8,22 @@
 //! 25 bad would have the patch skip 32-4096 sectors after a couple of
 //! failures, leaping over the entire range AND the good middle.
 //!
-//! The fix: cap each skip at `range_remaining/4`. These tests exercise
-//! that boundary.
+//! The fix AT THE TIME: cap each skip at `range_remaining/4`.
+//!
+//! HISTORY, so nobody goes looking for that cap: `range_remaining`,
+//! `compute_damage_skip` and `MAX_SKIPS_PER_RANGE` do not exist in `src/` any
+//! more. The per-section handler chain in `recovery/section_recover.rs`
+//! (driven per bad range by `recovery/patch.rs`) replaced that loop wholesale,
+//! and it is what recovers the good middle of a bad range today — by walking
+//! the range from several angles under a time budget, not by bounding a skip
+//! distance. The same note is on `tests/passn_handler_ab.rs`, the sibling
+//! fixture from the same rework.
+//!
+//! What survived, and what these tests still pin, is the OBSERVABLE contract:
+//! a 100-sector bad range whose middle 50 sectors are readable must come back
+//! with that middle recovered, not leapt over. That assertion is independent of
+//! which mechanism does it, which is why the file kept its value when the
+//! mechanism it was named for was deleted.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::PatchOptions;
@@ -161,9 +175,11 @@ fn prep_iso_and_mapfile(
 }
 
 /// THE critical test. A 100-sector "bad" range hides 50 good sectors in
-/// the middle (LBAs 125-174). Pre-fix patch would skip-escalate at 32+
-/// sectors and leap over the whole range. Post-fix: skip is capped at
-/// range_remaining/4 (=25 sectors initially), which forces convergence.
+/// the middle (LBAs 125-174). The pre-fix patch loop would skip-escalate at
+/// 32+ sectors and leap over the whole range, good middle included. The
+/// recovered middle below is the contract; the `range_remaining/4` cap that
+/// first delivered it is long gone (see this file's header) and the handler
+/// chain delivers it now.
 #[test]
 fn patch_recovers_good_middle_of_a_bad_range() {
     let capacity_sectors: u32 = 1024;

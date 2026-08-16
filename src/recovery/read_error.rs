@@ -1,10 +1,17 @@
 //! Single source of truth for what to do when a sector read fails.
 //!
-//! Pass 1 (`Disc::sweep`) calls into `handle_read_error` after every failed
-//! `read_sectors`. The handler classifies the error, updates the in-flight
-//! context (counters, damage window, retry budgets), and returns a
-//! `ReadAction` the caller dispatches on. Pass N patch has its own
-//! `handle_read_failure` in `disc/patch.rs` that does not route here.
+//! Pass 1 (`recovery::sweep_internal`, this crate) calls into
+//! `handle_read_error` after every failed `read_sectors` — the ONE production
+//! call site. The handler classifies the error, updates the in-flight context
+//! (counters, damage window, retry budgets), and returns a `ReadAction` the
+//! caller dispatches on.
+//!
+//! Pass N does not route here: its recovery is the time-bounded handler chain
+//! in `section_recover.rs`, driven by `patch.rs`. (`ReadCtx::for_patch` and the
+//! Pass-N constants below are the relocated Pass-N tuning, exercised by this
+//! module's own tests; the named `handle_read_failure` in `disc/patch.rs` that
+//! this doc used to point at belongs to a module layout that no longer exists —
+//! there is no `src/disc/` in this crate, and no function of that name.)
 //!
 //! Adding a new error class = add one arm in `handle_read_error`.
 //! Adding new logging on errors = one place.
@@ -16,8 +23,8 @@ use libfreemkv::scsi::SenseFamily;
 /// In-flight bookkeeping a read loop must keep across iterations. The
 /// handler reads and mutates this. Caller owns the storage.
 pub struct ReadCtx {
-    /// Number of sectors per read attempt. The handler uses this to
-    /// decide whether to bisect (only worthwhile when batch > 1).
+    /// Number of sectors per read attempt. Scales the damage-jump
+    /// distance, so a jump clears a whole multiple of the read size.
     pub batch: u16,
     /// Successful reads since the last failure. Resets to 0 on failure.
     /// Used by callers to drive damage-zone exit / speed restoration.
@@ -25,11 +32,10 @@ pub struct ReadCtx {
     /// Failed reads since the last success. Resets to 0 on success.
     /// Drives long-pause escalation on persistent failure.
     pub consecutive_failures: u64,
-    /// Failed OUTER batch reads since the last outer success — bisect
-    /// inner-sector failures are NOT counted here. Drives the
+    /// Failed batch reads since the last success. Drives the
     /// fast-entry damage-jump on Pass 1 (skip the disc-level grind
     /// once we're clearly in a damaged region; Pass N will recover
-    /// the actual sectors). Reset on outer success.
+    /// the actual sectors). Reset on success.
     pub consecutive_outer_failures: u64,
     /// Sliding window of recent read outcomes (true=ok, false=fail).
     /// Capped at `damage_window_max`. Drives damage-jump decisions.
@@ -47,8 +53,7 @@ pub struct ReadCtx {
     /// the 2026-05-11 rewrite in `for_sweep`) so we don't spend ~40
     /// minutes grinding to fill a 16-block window before the first jump
     /// on a damage zone we entered cleanly. Pass N uses a larger value
-    /// (or disables this — see `bisect_on_marginal`) because Pass N's
-    /// whole job IS to grind on the bad ranges.
+    /// because Pass N's whole job IS to grind on the bad ranges.
     pub fast_jump_threshold: u64,
     /// Multiplier applied to damage-jump distance. Doubles each jump,
     /// resets to 1 after `damage_window_max` consecutive good reads.
@@ -58,19 +63,14 @@ pub struct ReadCtx {
     pub not_ready_retries: u32,
     /// Bridge-degradation cooldowns used so far.
     pub bridge_degradation_count: u32,
-    /// Whether we're currently inside a damage-jump bisect attempt.
-    /// Caller sets this true when entering single-sector mode for a
-    /// failed batch, so the handler doesn't recursively request another
-    /// bisect on the inner-sector failures.
-    pub bisecting: bool,
-    /// Whether to return `Bisect` on a marginal-media batch failure.
-    /// Pass 1 sweep sets this false: a failed batch becomes
-    /// SkipBlock (mark the whole 32-sector ECC block NonTrimmed,
-    /// advance, let Pass N recover the salvageable sectors with
-    /// proper recovery semantics). Pass N sets this true: bisection
-    /// is its core job, and it has the right tools (single-sector
-    /// reads, 60s recovery timeout, retry budget, escalating skip).
-    pub bisect_on_marginal: bool,
+    /// Which pass this context belongs to: `false` = Pass 1 sweep,
+    /// `true` = a Pass N patch. It selects the wedge-skip distance
+    /// (Pass 1 jumps `WEDGE_JUMP_SECTORS`; Pass N only
+    /// `WEDGE_PASS_N_SKIP_SECTORS`, because it is already grinding a
+    /// single known-bad range), exempts Pass N from the zone-entry
+    /// cooldown (being inside damage is its normal state, not a
+    /// transition worth a 30s pause), and labels the wedge logs.
+    pub patch_pass: bool,
     /// Count of consecutive firmware-wedge responses (HARDWARE_ERROR
     /// or ILLEGAL_REQUEST sense keys) since the last successful read.
     /// Pass 1 uses this to drive the wedge-skip path: each wedge
@@ -115,6 +115,19 @@ pub struct ReadCtx {
     /// good reads after the last error in the cluster." Used to count
     /// zone entries and to bound zone_reads accurately.
     pub in_damage_zone: bool,
+    /// Count of long-streak pause escalations taken this pass — the
+    /// `consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD`
+    /// branch of the pause selection.
+    ///
+    /// The escalation currently resolves to the same number of seconds as
+    /// the ordinary inter-error pause (see
+    /// `CONSECUTIVE_FAIL_LONG_PAUSE_SECS`), so it has NO effect a caller
+    /// could observe from the returned `ReadAction` — deleting the branch
+    /// outright changed nothing any test could see. Counting it makes the
+    /// policy observable in its own right: the pass summary can say how
+    /// often the drive was in a long failure streak, and the branch cannot
+    /// be removed without a test noticing.
+    pub long_pause_escalations: u64,
     /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
     /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
     /// marked NonTrimmed for a Pass N re-read; the count is reported in the
@@ -126,9 +139,9 @@ pub struct ReadCtx {
 impl ReadCtx {
     /// Initial context for a Pass 1 sweep. The job is "fast and
     /// accurate, get the most data in the shortest time" — Pass N
-    /// is the one that grinds on the bad ranges. So bisect-on-
-    /// marginal is OFF (failed batches become SkipBlock; whole 32-
-    /// sector blocks marked NonTrimmed for Pass N to revisit), and
+    /// is the one that grinds on the bad ranges. So a failed batch
+    /// becomes SkipBlock (whole 32-sector blocks marked NonTrimmed
+    /// for Pass N to revisit), and
     /// the damage-jump fast-path triggers after just 1 consecutive
     /// outer-batch failure — the user's wedge-prevention principle
     /// (2026-05-11): once the drive returns ANY recoverable error,
@@ -153,8 +166,7 @@ impl ReadCtx {
             jump_multiplier: 1,
             not_ready_retries: 0,
             bridge_degradation_count: 0,
-            bisecting: false,
-            bisect_on_marginal: false,
+            patch_pass: false,
             wedge_count: 0,
             last_success_at: None,
             last_error_at: None,
@@ -164,15 +176,23 @@ impl ReadCtx {
             zones_entered: 0,
             jumps_taken: 0,
             in_damage_zone: false,
+            long_pause_escalations: 0,
             marginal_recovered: 0,
         }
     }
 
     /// Initial context for a Pass 2-N patch. Pass N's whole reason to
-    /// exist is to recover sectors Pass 1 skipped — bisection on
-    /// marginal media is part of the job, and the fast-jump
-    /// threshold is loose so we don't bail too early on a range that
+    /// exist is to recover sectors Pass 1 skipped, so the fast-jump
+    /// threshold is loose: we don't bail too early on a range that
     /// has scattered good sectors mixed in.
+    ///
+    /// No production caller: Pass N's read effort is owned by the
+    /// handler chain in `section_recover.rs`, which does its own read
+    /// sizing and its own error classification and never routes
+    /// through [`handle_read_error`]. This constructor is kept as the
+    /// Pass-N half of this module's tuning table — `for_sweep`'s
+    /// values only mean anything next to it, and the wedge and
+    /// zone-entry branches below still read `patch_pass`.
     ///
     /// `damage_threshold_pct = 6` is looser than Pass 1 (12%): Pass N triggers
     /// the damage-skip at half Pass 1 density because the patch loop exists to chip
@@ -193,8 +213,7 @@ impl ReadCtx {
             jump_multiplier: 1,
             not_ready_retries: 0,
             bridge_degradation_count: 0,
-            bisecting: false,
-            bisect_on_marginal: true,
+            patch_pass: true,
             wedge_count: 0,
             last_success_at: None,
             last_error_at: None,
@@ -204,6 +223,7 @@ impl ReadCtx {
             zones_entered: 0,
             jumps_taken: 0,
             in_damage_zone: false,
+            long_pause_escalations: 0,
             marginal_recovered: 0,
         }
     }
@@ -224,12 +244,7 @@ impl ReadCtx {
         // whole pass and later degradations skip the cooldown retry,
         // needlessly losing data.
         self.bridge_degradation_count = 0;
-        // Outer-success only: a good single-sector read inside a
-        // bisect doesn't mean we've left the damaged batch. Only an
-        // outer-batch success resets the outer-failure counter.
-        if !self.bisecting {
-            self.consecutive_outer_failures = 0;
-        }
+        self.consecutive_outer_failures = 0;
         self.damage_window.push(true);
         if self.damage_window.len() > self.damage_window_max {
             self.damage_window.remove(0);
@@ -262,6 +277,7 @@ impl ReadCtx {
             total_errors: self.total_errors,
             zones_entered: self.zones_entered,
             jumps_taken: self.jumps_taken,
+            long_pause_escalations: self.long_pause_escalations,
             marginal_recovered: self.marginal_recovered,
         }
     }
@@ -276,6 +292,9 @@ pub struct PassSummary {
     pub total_errors: u64,
     pub zones_entered: u64,
     pub jumps_taken: u64,
+    /// Long-streak pause escalations taken — see
+    /// [`ReadCtx::long_pause_escalations`].
+    pub long_pause_escalations: u64,
     /// RECOVERED ERROR (marginal) reads distrusted and re-queued for Pass N.
     pub marginal_recovered: u64,
 }
@@ -289,10 +308,6 @@ pub enum ReadAction {
     /// transient conditions (NOT_READY, bridge degradation) that the
     /// drive may recover from on its own.
     Retry { pause_secs: u64 },
-    /// Re-issue the failed batch as `batch` single-sector reads. Each
-    /// inner read is itself dispatched through `handle_read_error` with
-    /// `bisecting = true` so it cannot recurse.
-    Bisect,
     /// Mark the failed range NonTrimmed (zero-fill, retry in Pass N+),
     /// then pause `pause_secs` before resuming the next LBA.
     SkipBlock { pause_secs: u64 },
@@ -310,8 +325,10 @@ pub enum ReadAction {
 // bridge wedges 524 ms after a 5.4-second internal ECC retry. The
 // post-failure pauses give the drive — and the bridge — time to settle.
 /// Pause between a failed read and the next read attempt — applied
-/// by Pass 1 sweep via `handle_read_error`. Pass N patch uses its own
-/// `POST_FAILURE_PAUSE_SECS` (see `disc/patch.rs`).
+/// by Pass 1 sweep via `handle_read_error`. (Pass N used to carry a separate
+/// `POST_FAILURE_PAUSE_SECS` in the old `disc/patch.rs`; neither the constant
+/// nor that module exists any more — see the reframe below, and
+/// `section_recover.rs` for the pauses Pass N applies today.)
 ///
 /// 2026-05-11 reframe: a failed read is a failed read, regardless of
 /// which pass is running. The prior split (1s for Pass N, 5s for Pass
@@ -433,13 +450,7 @@ pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     ctx.consecutive_failures += 1;
     ctx.consecutive_good = 0;
-    // Outer-failure counter — only OUTER batch failures count toward
-    // the fast-jump trigger. Bisect inner failures are part of
-    // recovering an already-failed batch and don't represent
-    // independent damage signal.
-    if !ctx.bisecting {
-        ctx.consecutive_outer_failures += 1;
-    }
+    ctx.consecutive_outer_failures += 1;
 
     // Diagnostic instrumentation — compute timing context BEFORE
     // mutating the timestamps so the log reflects the gap to the
@@ -481,7 +492,6 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         total_errors = ctx.total_errors,
         total_reads_ok = ctx.total_reads_ok,
         batch = ctx.batch,
-        bisecting = ctx.bisecting,
         wedge_count = ctx.wedge_count,
         sense_family = ?current_family,
         sense_key = err.scsi_sense().map(|s| s.sense_key),
@@ -575,7 +585,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //
     // A RECOVERED_ERROR (marginal read) is still explicitly NOT damage-zone
     // signal — see the SkipBlock branch below, which also returns early.
-    let is_zone_entry_transition = !ctx.in_damage_zone && !ctx.bisecting && !is_recovered;
+    let is_zone_entry_transition = !ctx.in_damage_zone && !is_recovered;
     if is_zone_entry_transition {
         ctx.in_damage_zone = true;
         ctx.zones_entered += 1;
@@ -588,10 +598,10 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    and the wedge is a code-induced state we can avoid via
     //    pacing + skip):
     //
-    //    - Pass 1 sweep (bisect_on_marginal=false): jump
+    //    - Pass 1 sweep (`patch_pass=false`): jump
     //      WEDGE_JUMP_SECTORS (1 GB) ahead, pause WEDGE_PAUSE_SECS,
     //      mark skipped region NonTrimmed.
-    //    - Pass N patch (bisect_on_marginal=true): give up on the
+    //    - Pass N patch (`patch_pass=true`): give up on the
     //      current sector (the granular target), pause for cooldown,
     //      let the outer patch loop move to the next NonTrimmed
     //      range. Implemented as a small JumpAhead so the same code
@@ -604,12 +614,10 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    AbortPass after N consecutive wedges with no successful
     //    read in between.
     if sense_key == scsi::SENSE_KEY_HARDWARE_ERROR || sense_key == scsi::SENSE_KEY_ILLEGAL_REQUEST {
-        // Count every wedge, including bisect-inner ones. A wedge is a
-        // firmware fast-fail state regardless of whether we're inside a
-        // bisect; if we did NOT count bisect-inner wedges, a drive that
-        // wedges mid-bisect would burn a 30s WEDGE_PAUSE cooldown per
-        // inner sector and never reach WEDGE_ABORT_THRESHOLD from inside
-        // the bisect — ~16 min of cooldown sleeping on a batch=32 bisect.
+        // Count every wedge. A wedge is a firmware fast-fail state, and
+        // this counter is what carries the pass toward
+        // WEDGE_ABORT_THRESHOLD instead of burning a 30s WEDGE_PAUSE
+        // cooldown per read forever.
         ctx.wedge_count += 1;
         if ctx.wedge_count >= WEDGE_ABORT_THRESHOLD {
             tracing::warn!(
@@ -617,12 +625,12 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
                 phase = "wedge_abort",
                 wedge_count = ctx.wedge_count,
                 threshold = WEDGE_ABORT_THRESHOLD,
-                pass = if ctx.bisect_on_marginal { "N" } else { "1" },
+                pass = if ctx.patch_pass { "N" } else { "1" },
                 "wedge-skip exhausted — drive appears permanently stuck"
             );
             return ReadAction::AbortPass;
         }
-        let jump_sectors = if ctx.bisect_on_marginal {
+        let jump_sectors = if ctx.patch_pass {
             WEDGE_PASS_N_SKIP_SECTORS
         } else {
             WEDGE_JUMP_SECTORS
@@ -630,7 +638,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         tracing::warn!(
             target: "freemkv::disc",
             phase = "wedge_skip",
-            pass = if ctx.bisect_on_marginal { "N" } else { "1" },
+            pass = if ctx.patch_pass { "N" } else { "1" },
             wedge_count = ctx.wedge_count,
             jump_sectors,
             pause_secs = WEDGE_PAUSE_SECS,
@@ -673,41 +681,16 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         };
     }
 
-    // 5. Marginal media (MEDIUM_ERROR / ABORTED_COMMAND) on a multi-
-    //    sector batch: the drive can often read the same sectors
-    //    individually. Bisect into single-sector reads (gentler on the
-    //    bridge too — shorter SCSI transactions). Avoid recursive
-    //    bisect.
-    //
-    //    Pass 1 sweep sets `bisect_on_marginal=false` to skip this:
-    //    its job is "fast and accurate, get the most data in the
-    //    shortest time." Pass N is purpose-built to recover
-    //    individual sectors with proper recovery semantics, and Pass
-    //    1 grinding through 32-sector bisects costs ~2.5 min per bad
-    //    block AND fills the damage window slower than it should.
-    //    Whole-block NonTrimmed → SkipBlock → advance → Pass N
-    //    revisits.
-    let is_marginal = matches!(
-        sense_key,
-        scsi::SENSE_KEY_MEDIUM_ERROR | scsi::SENSE_KEY_ABORTED_COMMAND
-    );
-    if is_marginal && ctx.batch > 1 && !ctx.bisecting && ctx.bisect_on_marginal {
-        return ReadAction::Bisect;
-    }
-
-    // 6. Single-sector failure or unbisectable error — record in
-    //    damage window, decide between skip-in-place vs damage-jump.
-    //
-    //    SKIP damage-window updates while bisecting: the window
-    //    represents per-batch outcomes, not per-sector. Updating it
-    //    inside a bisect inner loop (potentially 32+ sector failures
-    //    per batch) would over-weight the window and cause runaway
-    //    JumpAhead distance via excessive multiplier doublings.
-    if !ctx.bisecting {
-        ctx.damage_window.push(false);
-        if ctx.damage_window.len() > ctx.damage_window_max {
-            ctx.damage_window.remove(0);
-        }
+    // 5. Read failure — record it in the damage window, then decide
+    //    between skip-in-place and a damage-jump. Marginal media
+    //    (MEDIUM_ERROR / ABORTED_COMMAND) lands here too: the failed
+    //    batch becomes a whole-block NonTrimmed → SkipBlock → advance,
+    //    and Pass N revisits it with the handler chain, which is
+    //    purpose-built to recover individual sectors with proper
+    //    recovery semantics.
+    ctx.damage_window.push(false);
+    if ctx.damage_window.len() > ctx.damage_window_max {
+        ctx.damage_window.remove(0);
     }
 
     let bad_count = ctx.damage_window.iter().filter(|&&b| !b).count();
@@ -731,13 +714,14 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     // mean we landed in another bad cluster — same pacing applies.)
     //
     // Long-streak escalation: same 5s currently; kept as a separate
-    // branch for future tuning. Pass N (bisect_on_marginal=true)
-    // uses the standard pauses — it's running single-sector retries
-    // on already-known-bad LBAs by design.
-    let is_zone_entry = is_zone_entry_transition && !ctx.bisecting && !ctx.bisect_on_marginal;
+    // branch for future tuning. Pass N (`patch_pass`) uses the
+    // standard pauses — it's running single-sector retries on
+    // already-known-bad LBAs by design.
+    let is_zone_entry = is_zone_entry_transition && !ctx.patch_pass;
     let pause_secs = if is_zone_entry {
         ZONE_ENTRY_COOLDOWN_SECS
     } else if ctx.consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD {
+        ctx.long_pause_escalations += 1;
         CONSECUTIVE_FAIL_LONG_PAUSE_SECS
     } else {
         FAIL_PAUSE_SECS
@@ -770,7 +754,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //       and Pass 1's fallback if the failures are scattered
     //       enough that we don't hit the consecutive threshold.
     const MAX_JUMP_MULTIPLIER: u64 = 64;
-    let fast_trigger = !ctx.bisecting && ctx.consecutive_outer_failures >= ctx.fast_jump_threshold;
+    let fast_trigger = ctx.consecutive_outer_failures >= ctx.fast_jump_threshold;
     let window_trigger =
         ctx.damage_window.len() >= ctx.damage_window_max && bad_pct >= ctx.damage_threshold_pct;
     if fast_trigger || window_trigger {
@@ -919,10 +903,15 @@ mod tests {
             ReadAction::Retry { pause_secs } => pause_secs,
             other => panic!("expected a paused action, got {other:?}"),
         };
+        // 30 s is the documented cooldown (see ZONE_ENTRY_COOLDOWN_SECS's own
+        // doc: the 2026-05-11 incident put the BU40N into permanent fast-fail
+        // after 7 errors in 6.5 s). Written as a literal: `>= the constant` is
+        // satisfied by a constant of 0, which is exactly the value that
+        // reintroduces the wedge.
         assert!(
-            pause >= ZONE_ENTRY_COOLDOWN_SECS,
-            "the real zone entry must get the {ZONE_ENTRY_COOLDOWN_SECS}s wedge \
-             cooldown, got {pause}s — the NOT_READY retries had eaten the transition"
+            pause >= 30,
+            "the real zone entry must get the 30 s wedge cooldown, got {pause}s \
+             — the NOT_READY retries had eaten the transition"
         );
     }
 
@@ -966,20 +955,13 @@ mod tests {
     }
 
     #[test]
-    fn pass_n_marginal_with_batch_gt_1_bisects() {
-        let mut ctx = ReadCtx::for_patch(32);
-        let action = handle_read_error(&medium_err(), &mut ctx);
-        assert_eq!(action, ReadAction::Bisect);
-    }
-
-    #[test]
-    fn pass_1_marginal_jumps_immediately_not_bisecting() {
+    fn pass_1_marginal_jumps_immediately() {
         // 2026-05-11 wedge-prevention rewrite: Pass 1 jumps on the
         // FIRST marginal error (fast_jump_threshold=1) rather than
         // SkipBlock. Retrying the same LBA quickly is what triggers
         // the BU40N's firmware fast-fail transition; immediate jump
-        // prevents the cascade. Pass N still bisects (its job is
-        // per-sector recovery on already-known-bad LBAs).
+        // prevents the cascade. Pass N revisits the block later with
+        // the handler chain, which does per-sector recovery.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
@@ -994,17 +976,6 @@ mod tests {
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
             ReadAction::SkipBlock { pause_secs } => assert!(pause_secs >= 1),
-            other => panic!("expected SkipBlock, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn medium_error_while_bisecting_does_not_recurse() {
-        let mut ctx = ReadCtx::for_patch(32);
-        ctx.bisecting = true;
-        let action = handle_read_error(&medium_err(), &mut ctx);
-        match action {
-            ReadAction::SkipBlock { .. } => {}
             other => panic!("expected SkipBlock, got {other:?}"),
         }
     }
@@ -1027,55 +998,75 @@ mod tests {
 
     #[test]
     fn pass_n_does_not_fast_jump() {
-        // Pass N's whole reason to exist is to grind on bad ranges.
-        // It should NOT bail after 4 consecutive failures the way
-        // Pass 1 does — it bisects and skips with proper recovery.
+        // Pass N's whole reason to exist is to grind on bad ranges, so the
+        // fast-entry trigger must be OFF for it — however long the failure
+        // run gets.
+        //
+        // This ran four failures against a stock `for_patch(32)` ctx, whose
+        // 16-entry damage window cannot fill in four reads: the loop ended
+        // before EITHER jump trigger could fire, so `fast_jump_threshold`
+        // was never observed. Setting `for_patch`'s threshold to 8 left the
+        // whole suite green.
+        //
+        // Suppress the WINDOW trigger with an unsatisfiable density (bad_pct
+        // maxes out at 100) so the fast path is the only one left, then run
+        // a streak far longer than any plausible finite threshold.
         let mut ctx = ReadCtx::for_patch(32);
-        for _ in 0..4 {
+        assert_eq!(
+            ctx.fast_jump_threshold,
+            u64::MAX,
+            "Pass N's fast-entry trigger must be disabled outright, not merely \
+             set high"
+        );
+        ctx.damage_threshold_pct = 101;
+        for i in 1..=256 {
             let a = handle_read_error(&medium_err(), &mut ctx);
             assert!(
                 !matches!(a, ReadAction::JumpAhead { .. }),
-                "Pass N must not fast-jump; got {a:?}"
+                "Pass N must not fast-jump, and did on failure {i}: {a:?}"
             );
         }
+        assert_eq!(ctx.jumps_taken, 0, "no jump of any kind should have fired");
+        assert_eq!(
+            ctx.consecutive_outer_failures, 256,
+            "the outer-failure counter must keep climbing — a reset would mean \
+             a jump fired and the assertions above were vacuous"
+        );
     }
 
     #[test]
     fn outer_success_resets_consecutive_outer_failures() {
-        // With fast_jump_threshold=1 each Pass 1 error fires a jump
-        // and resets `consecutive_outer_failures` to 0 inside the
-        // handler. So we can't accumulate "3" the old way — instead,
-        // verify the counter goes back to 0 after on_success too.
-        let mut ctx = ReadCtx::for_sweep(32);
-        handle_read_error(&medium_err(), &mut ctx);
-        // After fast-jump, consecutive_outer_failures already 0.
-        assert_eq!(ctx.consecutive_outer_failures, 0);
-        // on_success keeps it at 0 (defensive).
-        ctx.bisecting = false;
-        ctx.on_success();
-        assert_eq!(ctx.consecutive_outer_failures, 0);
-    }
-
-    #[test]
-    fn bisect_inner_success_does_not_reset_outer_counter() {
-        let mut ctx = ReadCtx::for_patch(32);
+        // `on_success` must clear the outer-failure counter, or a disc with
+        // scattered single failures accumulates them across CLEAN regions and
+        // fires the fast-entry damage-jump on a drive that has been reading
+        // perfectly since the last error.
+        //
+        // This used to drive the counter on a Pass 1 ctx, where the handler's
+        // own fast-jump path had already reset it to 0 before `on_success` was
+        // ever called — so it asserted 0 == 0 twice and deleting the reset in
+        // `on_success` left the suite green. Accumulate on a ctx that does NOT
+        // jump (Pass N's fast trigger is off, and the window is suppressed), so
+        // the counter is genuinely non-zero when `on_success` runs.
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.damage_threshold_pct = 101; // no window jump; nothing else resets it
         for _ in 0..3 {
             handle_read_error(&medium_err(), &mut ctx);
         }
-        assert_eq!(ctx.consecutive_outer_failures, 3);
-        // A successful inner-sector read during bisect is not the
-        // same as escaping the bad outer batch.
-        ctx.bisecting = true;
-        ctx.on_success();
         assert_eq!(
             ctx.consecutive_outer_failures, 3,
-            "bisect inner success must not reset outer-failure counter"
+            "fixture invalid: the failures must have accumulated, or the reset \
+             below is asserted against a counter that was already 0"
+        );
+        ctx.on_success();
+        assert_eq!(
+            ctx.consecutive_outer_failures, 0,
+            "a successful read ends the outer-failure streak"
         );
     }
 
     #[test]
     fn pass_1_hardware_error_jumps_ahead_not_aborts() {
-        // New wedge-skip policy: Pass 1 (bisect_on_marginal=false)
+        // New wedge-skip policy: Pass 1 (`patch_pass=false`)
         // should JumpAhead with a 1 GB skip + cooldown pause instead
         // of immediately aborting. Aborting on first wedge was the
         // pre-fix behavior that killed rips at 48% on damaged discs.
@@ -1086,8 +1077,15 @@ mod tests {
                 sectors,
                 pause_secs,
             } => {
-                assert_eq!(sectors, WEDGE_JUMP_SECTORS);
-                assert_eq!(pause_secs, WEDGE_PAUSE_SECS);
+                // Literals, not `WEDGE_JUMP_SECTORS` / `WEDGE_PAUSE_SECS`:
+                // comparing the returned value to the very constant that
+                // produced it holds for ANY value of that constant, so
+                // shrinking the jump from 1 GiB to 2 MB (which stops it
+                // clearing a damage cluster) and dropping the cooldown to 0
+                // (which is how the drive wedged in the first place) both left
+                // this green. 1 GiB / 2048 B per sector = 524_288.
+                assert_eq!(sectors, 1_073_741_824 / 2048);
+                assert_eq!(pause_secs, 30);
             }
             other => panic!("expected JumpAhead, got {other:?}"),
         }
@@ -1150,8 +1148,13 @@ mod tests {
                 sectors,
                 pause_secs,
             } => {
-                assert_eq!(sectors, WEDGE_PASS_N_SKIP_SECTORS);
-                assert_eq!(pause_secs, WEDGE_PAUSE_SECS);
+                // Literals, for the reason given in
+                // `pass_1_hardware_error_jumps_ahead_not_aborts`. 64 sectors is
+                // "past the bricked LBA plus a small buffer" — deliberately
+                // NOT the 1 GiB Pass-1 jump, which would blow past the
+                // NonTrimmed range Pass N came back for.
+                assert_eq!(sectors, 64);
+                assert_eq!(pause_secs, 30);
             }
             other => panic!("expected JumpAhead, got {other:?}"),
         }
@@ -1185,22 +1188,31 @@ mod tests {
     fn long_failure_streak_extends_pause_on_pass_n() {
         // Pass N keeps the cooldown behaviour: after many consecutive
         // failures, pauses extend to give the drive time to recover.
-        // Pass 1 explicitly does NOT pause — see
-        // `pass_1_does_not_pause_on_skip` below.
+        // This used to read "Pass 1 explicitly does NOT pause — see
+        // `pass_1_does_not_pause_on_skip` below". No such test exists, and the
+        // claim is backwards: the pause selection above is shared by both
+        // passes (5 s), and Pass 1 pays MORE, not less — it alone takes the
+        // 30 s `ZONE_ENTRY_COOLDOWN_SECS` on a clean→damaged transition
+        // (`is_zone_entry_transition && !ctx.patch_pass`), which is the
+        // exemption Pass N has. The two tests that do pin this are
+        // `pass_n_pauses_uniformly_on_failed_read` and
+        // `pass_1_zone_entry_uses_long_cooldown`.
         let mut ctx = ReadCtx::for_patch(1);
         for _ in 0..15 {
             handle_read_error(&medium_err(), &mut ctx);
         }
         let final_action = handle_read_error(&medium_err(), &mut ctx);
+        // Literal 5 s: `>= CONSECUTIVE_FAIL_LONG_PAUSE_SECS` is the constant
+        // compared against itself and held for any value, including 0.
         match final_action {
-            ReadAction::SkipBlock { pause_secs } => {
-                assert!(pause_secs >= CONSECUTIVE_FAIL_LONG_PAUSE_SECS);
-            }
-            ReadAction::JumpAhead { pause_secs, .. } => {
-                assert!(pause_secs >= CONSECUTIVE_FAIL_LONG_PAUSE_SECS);
-            }
+            ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, 5),
+            ReadAction::JumpAhead { pause_secs, .. } => assert_eq!(pause_secs, 5 + 2),
             other => panic!("expected long-pause action, got {other:?}"),
         }
+        assert!(
+            ctx.long_pause_escalations > 0,
+            "a 16-failure streak must have taken the escalation branch"
+        );
     }
 
     #[test]
@@ -1211,18 +1223,31 @@ mod tests {
         // The long pause prevents the retry cadence that triggers
         // firmware fast-fail. Subsequent errors in the same zone fall
         // back to the standard 5 s FAIL_PAUSE_SECS.
+        //
+        // The expectation is the LITERAL 32 s, not the constants added back
+        // together: asserting `ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA` is
+        // the same arithmetic the production line performs, so setting the
+        // cooldown to 0 left this (and every other zone-entry test) green.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
             ReadAction::JumpAhead { pause_secs, .. } => {
                 assert_eq!(
-                    pause_secs,
-                    ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
-                    "first-error pause should be 30 + 2 = 32 s"
+                    pause_secs, 32,
+                    "first-error pause is the 30 s zone-entry cooldown plus the \
+                     2 s post-jump extra"
                 );
             }
             other => panic!("expected JumpAhead on first Pass 1 error, got {other:?}"),
         }
+        // And the cooldown is a real pause, not merely "some number": it must
+        // dwarf the ordinary 5 s inter-error pause, which is the whole reason
+        // the constant exists.
+        assert_eq!(
+            ZONE_ENTRY_COOLDOWN_SECS, 30,
+            "the zone-entry cooldown is 30 s — the value the 2026-05-11 wedge \
+             incident was tuned against"
+        );
     }
 
     #[test]
@@ -1236,10 +1261,9 @@ mod tests {
         // First error: genuine zone entry, gets the long cooldown.
         let first = handle_read_error(&medium_err(), &mut ctx);
         match first {
-            ReadAction::JumpAhead { pause_secs, .. } => assert_eq!(
-                pause_secs,
-                ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS
-            ),
+            // Literal 30 + 2, for the reason given in
+            // `pass_1_zone_entry_uses_long_cooldown`.
+            ReadAction::JumpAhead { pause_secs, .. } => assert_eq!(pause_secs, 32),
             other => panic!("expected JumpAhead on first error, got {other:?}"),
         }
         // We are now still in the damage zone; the jump reset the outer
@@ -1252,31 +1276,31 @@ mod tests {
             other => panic!("expected pausing action, got {other:?}"),
         };
         assert_ne!(
-            pause,
-            ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
+            pause, 32,
             "subsequent in-zone error must not pay the 30 s zone-entry cooldown"
         );
         assert!(
-            pause <= FAIL_PAUSE_SECS + POST_JUMP_EXTRA_PAUSE_SECS,
-            "subsequent in-zone pause should be the standard fail pause, got {pause}"
+            pause <= 7,
+            "subsequent in-zone pause should be the standard 5 s fail pause \
+             (+2 s post-jump), got {pause}"
         );
     }
 
     #[test]
     fn pass_n_pauses_uniformly_on_failed_read() {
-        // Pass N (bisect_on_marginal=true) is exempt from the
+        // Pass N (`patch_pass`) is exempt from the
         // zone-entry long pause — its whole job is to retry single
         // sectors on already-known-bad LBAs, and the 30 s pause every
         // single-sector failure would multiply slow recovery
         // pointlessly. Pass N keeps the standard 5 s FAIL_PAUSE_SECS.
         let mut ctx = ReadCtx::for_patch(1);
         let action = handle_read_error(&medium_err(), &mut ctx);
+        // Literals, like the rest of this module's pause assertions: written
+        // against `FAIL_PAUSE_SECS` these held for any value of it, INCLUDING
+        // 0 — and 0 is precisely the un-paced hammering that wedged the BU40N.
         match action {
-            ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, FAIL_PAUSE_SECS),
-            ReadAction::JumpAhead { pause_secs, .. } => {
-                assert_eq!(pause_secs, FAIL_PAUSE_SECS + POST_JUMP_EXTRA_PAUSE_SECS)
-            }
-            ReadAction::Bisect => {}
+            ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, 5),
+            ReadAction::JumpAhead { pause_secs, .. } => assert_eq!(pause_secs, 5 + 2),
             other => panic!("expected pausing action, got {other:?}"),
         }
     }
@@ -1357,7 +1381,6 @@ mod tests {
             "expected the multiplier to inflate inside a damage zone"
         );
         // Exit the zone: damage_window_max consecutive good reads.
-        ctx.bisecting = false;
         for _ in 0..ctx.damage_window_max {
             ctx.on_success();
         }
@@ -1380,12 +1403,10 @@ mod tests {
     }
 
     #[test]
-    fn wedge_abort_reachable_during_bisect() {
-        // A drive that wedges mid-bisect must still reach the abort
-        // threshold rather than burning a WEDGE_PAUSE cooldown per inner
-        // sector forever.
+    fn wedge_abort_threshold_is_reachable() {
+        // A permanently wedged drive must reach the abort threshold
+        // rather than burning a WEDGE_PAUSE cooldown per read forever.
         let mut ctx = ReadCtx::for_patch(32);
-        ctx.bisecting = true;
         let mut aborted = false;
         for _ in 0..WEDGE_ABORT_THRESHOLD {
             if matches!(
@@ -1398,7 +1419,7 @@ mod tests {
         }
         assert!(
             aborted,
-            "wedge abort threshold must be reachable from inside a bisect"
+            "a permanently wedged drive must reach the abort threshold"
         );
     }
 
@@ -1409,7 +1430,6 @@ mod tests {
             handle_read_error(&medium_err(), &mut ctx);
         }
         assert!(ctx.consecutive_failures > 0);
-        ctx.bisecting = false;
         ctx.on_success();
         assert_eq!(ctx.consecutive_good, 1);
         assert_eq!(ctx.consecutive_failures, 0);
@@ -1464,8 +1484,7 @@ mod tests {
         // CLAUDE.md "Bad-sector handling" mode 1: NOT READY -> "Pause 3s,
         // retry up to 3x, then mark NonTrimmed." NOT_READY_MAX_RETRIES=3.
         // The 1st-3rd NOT_READY must Retry; the 4th must NOT Retry (it
-        // falls through to skip). Pass N (batch=1) so the marginal-bisect
-        // branch is irrelevant.
+        // falls through to skip).
         // Mutation that makes this RED: change `ctx.not_ready_retries <
         // NOT_READY_MAX_RETRIES` to `<=` (retries 4 times) or to `>`
         // (never retries).
@@ -1486,17 +1505,16 @@ mod tests {
     }
 
     #[test]
-    fn transport_failure_aborts_even_mid_bisect() {
+    fn transport_failure_aborts_on_both_passes() {
         // CLAUDE.md "Bad-sector handling" mode 2: a transport failure
         // (bridge crash, status 0xFF) aborts the pass so the outer loop
-        // can re-enumerate the bridge. This must hold even while
-        // bisecting and even on Pass N - the wedge-skip/jump paths must
-        // NOT swallow a real transport crash into a JumpAhead.
+        // can re-enumerate the bridge. This must hold on Pass N as well
+        // as Pass 1 - the wedge-skip/jump paths must NOT swallow a real
+        // transport crash into a JumpAhead.
         // Mutation that makes this RED: move the transport-failure check
         // below the HARDWARE/ILLEGAL wedge arm, so a transport failure
         // that also carried a wedge-family sense would JumpAhead instead.
         let mut ctx = ReadCtx::for_patch(32);
-        ctx.bisecting = true;
         assert_eq!(
             handle_read_error(&transport_failure_err(), &mut ctx),
             ReadAction::AbortPass
@@ -1610,8 +1628,6 @@ mod tests {
         ctx.damage_threshold_pct = 0;
         let mut last_jump_sectors = 0u64;
         for _ in 0..40 {
-            // Reset bisecting flag defensively; these are outer failures.
-            ctx.bisecting = false;
             if let ReadAction::JumpAhead { sectors, .. } =
                 handle_read_error(&medium_err(), &mut ctx)
             {
@@ -1624,123 +1640,139 @@ mod tests {
                 MAX_JUMP_MULTIPLIER
             );
         }
-        // After saturation, the jump distance is exactly base*batch*cap.
-        let expected = JUMP_BASE_SECTORS * batch as u64 * MAX_JUMP_MULTIPLIER;
+        // After saturation, the jump distance is a LITERAL number of sectors,
+        // not `JUMP_BASE_SECTORS * batch * MAX_JUMP_MULTIPLIER` — that is the
+        // production expression itself, so it agreed with any value of the
+        // base and multiplying the base by 1024 left this test green.
+        //
+        // 1024 sectors of base × 32 sectors of batch × 64 = 2_097_152 sectors
+        // = 4 GiB at 2048 B/sector, which is the documented cap.
         assert_eq!(
-            last_jump_sectors, expected,
-            "saturated jump distance must equal base*batch*64"
+            last_jump_sectors, 2_097_152,
+            "the saturated jump is 4 GiB (2_097_152 sectors at batch=32)"
         );
     }
 
-    // ── Regression tests for bisect inner-loop ReadAction dispatch ───────────
-    //
-    // Before the fix the bisect inner loop discarded the ReadAction returned by
-    // handle_read_error:
-    //
-    //   let _ = read_error::handle_read_error(&inner_err, &mut read_ctx);
-    //
-    // Consequences:
-    //   (a) Retry{pause_secs} — cooldown skipped; sector immediately marked
-    //       BisectBad, hammering a degraded drive (violates Hard Rule #2).
-    //   (b) AbortPass — ignored; loop kept issuing reads against a crashed drive.
-    //
-    // The fix replaces the discard with a match.  The tests below prove the
-    // required ReadAction values are produced by handle_read_error in the
-    // bisect-inner context (bisecting=true, batch=1), so that any regression
-    // to `let _ = ...` would break real behaviour on the tested error paths.
-
-    /// NOT_READY inside a bisect must return Retry, not SkipBlock.
-    /// If the inner loop discarded the action the 3-second cooldown would be
-    /// skipped, hammering the drive during a transient NOT_READY condition.
-    #[test]
-    fn bisect_inner_not_ready_returns_retry_with_pause() {
-        let not_ready_err = Error::DiscRead {
-            sector: 500,
-            status: Some(scsi::SCSI_STATUS_CHECK_CONDITION),
-            sense: Some(ScsiSense {
-                sense_key: scsi::SENSE_KEY_NOT_READY,
-                asc: 0x04,
-                ascq: 0x00, // not 0x3E — generic NOT_READY, not bridge degradation
-            }),
-        };
-
-        let mut ctx = ReadCtx::for_patch(1);
-        ctx.bisecting = true; // simulate being inside the bisect inner loop
-
-        let action = handle_read_error(&not_ready_err, &mut ctx);
-        match action {
-            ReadAction::Retry { pause_secs } => {
-                assert!(
-                    pause_secs > 0,
-                    "NOT_READY retry must carry a non-zero pause; got {pause_secs}s"
-                );
-            }
-            other => panic!(
-                "bisect inner NOT_READY must return Retry{{pause_secs}}, got {other:?}; \
-                 a discard (`let _ = ...`) would skip this pause and hammer the drive"
-            ),
-        }
-    }
-
-    /// A transport failure inside a bisect must return AbortPass.
-    /// If the inner loop discarded the action the loop would continue
-    /// issuing reads against a crashed bridge, producing spurious BisectBad
-    /// entries and potentially looping until the batch is exhausted.
-    #[test]
-    fn bisect_inner_transport_failure_returns_abort_pass() {
-        let transport_err = Error::DiscRead {
-            sector: 500,
-            status: Some(scsi::SCSI_STATUS_TRANSPORT_FAILURE),
-            sense: None,
-        };
-
-        let mut ctx = ReadCtx::for_patch(1);
-        ctx.bisecting = true;
-
-        let action = handle_read_error(&transport_err, &mut ctx);
-        assert_eq!(
-            action,
-            ReadAction::AbortPass,
-            "bisect inner transport failure must return AbortPass; \
-             a discard (`let _ = ...`) would silently keep looping against a crashed drive"
-        );
-    }
-
-    /// After enough consecutive wedge errors with bisecting=true the handler
-    /// must eventually return AbortPass.  Before the fix, the inner loop
-    /// discarded the returned action and kept issuing reads against a permanently
-    /// wedged drive at full rate.
+    /// The FIRST damage-jump distance, which the base constant alone decides.
     ///
-    /// The threshold is 16 consecutive wedges (WEDGE_ABORT_THRESHOLD in
-    /// read_error.rs); we drive 20 iterations to give the assertion headroom
-    /// without hard-coding the internal constant here.
+    /// Nothing pinned it: the only test that looked at a jump distance
+    /// compared it against the same `JUMP_BASE_SECTORS` expression the
+    /// handler evaluates, so doubling the base (64 MB → 128 MB first jump —
+    /// exactly the 2026-05-10 retune, in reverse) passed the whole suite.
+    /// The distance is the amount of disc a Pass 1 sweep writes off as
+    /// NonTrimmed on the first error in a zone, so it is a data-loss-shaped
+    /// number and belongs in a literal.
     #[test]
-    fn bisect_inner_wedge_abort_threshold_reached_returns_abort_pass() {
-        let hardware_err = || Error::DiscRead {
-            sector: 500,
-            status: Some(scsi::SCSI_STATUS_CHECK_CONDITION),
-            sense: Some(ScsiSense {
-                sense_key: scsi::SENSE_KEY_HARDWARE_ERROR,
-                asc: 0x44,
-                ascq: 0x00,
-            }),
-        };
-
-        let mut ctx = ReadCtx::for_patch(1);
-        ctx.bisecting = true;
-
-        let mut aborted = false;
-        for _ in 0..20 {
-            let action = handle_read_error(&hardware_err(), &mut ctx);
-            if action == ReadAction::AbortPass {
-                aborted = true;
-                break;
+    fn the_first_damage_jump_clears_exactly_64_mib() {
+        let mut ctx = ReadCtx::for_sweep(32);
+        assert_eq!(ctx.jump_multiplier, 1, "the first jump is un-multiplied");
+        match handle_read_error(&medium_err(), &mut ctx) {
+            ReadAction::JumpAhead { sectors, .. } => {
+                // 1024 (base) × 32 (batch) = 32_768 sectors × 2048 B = 64 MiB.
+                assert_eq!(
+                    sectors, 32_768,
+                    "the first jump at batch=32 clears 64 MiB — the BU40N's \
+                     damage clusters are 100+ MB wide and a shorter jump lands \
+                     back inside the cluster"
+                );
+                assert_eq!(sectors * 2048, 67_108_864, "= 64 MiB");
             }
+            other => panic!("expected JumpAhead on the first Pass 1 error, got {other:?}"),
         }
-        assert!(
-            aborted,
-            "bisect inner wedge loop must reach AbortPass after consecutive hardware errors; \
-             a discard (`let _ = ...`) would loop forever on a bricked drive"
+        // The second jump doubles it, and no further: the multiplier is the
+        // only thing that grows.
+        ctx.jump_multiplier = 2;
+        match handle_read_error(&medium_err(), &mut ctx) {
+            ReadAction::JumpAhead { sectors, .. } => assert_eq!(
+                sectors, 65_536,
+                "one doubling of the multiplier is 128 MiB, not more"
+            ),
+            other => panic!("expected JumpAhead, got {other:?}"),
+        }
+    }
+
+    /// The long-streak pause escalation, which nothing could see.
+    ///
+    /// `CONSECUTIVE_FAIL_LONG_PAUSE_SECS` is deliberately the same 5 s as
+    /// `FAIL_PAUSE_SECS`, so the branch returns a value indistinguishable
+    /// from the ordinary path and deleting it outright left all 38 tests
+    /// green. `ReadCtx::long_pause_escalations` now records that the branch
+    /// was taken, which makes both the branch and its threshold pinnable —
+    /// and gives the end-of-pass summary an honest count of how long the
+    /// drive spent in a sustained failure streak.
+    #[test]
+    fn the_long_streak_escalation_fires_at_its_threshold() {
+        let mut ctx = ReadCtx::for_patch(1);
+        ctx.damage_threshold_pct = 101; // window jumps off; pause path only
+
+        // Failures 1..=9 are ordinary: the standard 5 s pause, no escalation.
+        for i in 1..=9 {
+            match handle_read_error(&medium_err(), &mut ctx) {
+                ReadAction::SkipBlock { pause_secs } => assert_eq!(
+                    pause_secs, 5,
+                    "failure {i} is below the streak threshold and gets the \
+                     ordinary 5 s pause"
+                ),
+                other => panic!("failure {i}: expected SkipBlock, got {other:?}"),
+            }
+            assert_eq!(
+                ctx.long_pause_escalations, 0,
+                "the escalation must not fire before its 10-failure threshold \
+                 (fired on failure {i})"
+            );
+        }
+
+        // The 10th consecutive failure crosses CONSECUTIVE_FAIL_LONG_PAUSE_
+        // THRESHOLD and every failure after it stays escalated.
+        for i in 10..=13u64 {
+            match handle_read_error(&medium_err(), &mut ctx) {
+                ReadAction::SkipBlock { pause_secs } => assert_eq!(pause_secs, 5),
+                other => panic!("failure {i}: expected SkipBlock, got {other:?}"),
+            }
+            assert_eq!(
+                ctx.long_pause_escalations,
+                i - 9,
+                "failure {i} is inside the streak and must take the escalation"
+            );
+        }
+
+        // A good read ends the streak, so the next failure is ordinary again.
+        ctx.on_success();
+        handle_read_error(&medium_err(), &mut ctx);
+        assert_eq!(
+            ctx.long_pause_escalations, 4,
+            "the streak ended at the successful read; the next failure is not \
+             an escalation"
+        );
+        assert_eq!(
+            ctx.pass_summary().long_pause_escalations,
+            4,
+            "the pass summary reports the escalations, or the operator cannot \
+             see them"
+        );
+    }
+
+    /// A zone entry outranks a long streak: the 30 s cooldown is the pause
+    /// that prevents the firmware wedge, and a streak must not downgrade it
+    /// to 5 s.
+    #[test]
+    fn the_zone_entry_cooldown_outranks_the_streak_escalation() {
+        let mut ctx = ReadCtx::for_sweep(1);
+        ctx.fast_jump_threshold = u64::MAX;
+        ctx.damage_threshold_pct = 101;
+        // Pre-load a long failure streak WITHOUT entering the zone, so both
+        // conditions hold on the next error.
+        ctx.consecutive_failures = 50;
+        match handle_read_error(&medium_err(), &mut ctx) {
+            ReadAction::SkipBlock { pause_secs } => assert_eq!(
+                pause_secs, 30,
+                "the zone-entry cooldown wins over the streak escalation"
+            ),
+            other => panic!("expected SkipBlock, got {other:?}"),
+        }
+        assert_eq!(
+            ctx.long_pause_escalations, 0,
+            "the escalation branch must not also run"
         );
     }
 }

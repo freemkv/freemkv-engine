@@ -177,6 +177,12 @@ pub fn decide_title(
 pub enum RipOutcome {
     /// Every selected title that mattered succeeded (skippable stubs may have
     /// been skipped). Carries the count actually written.
+    ///
+    /// `titles_written: 0` is NOT a rip: no file was produced, either because
+    /// the selection was empty or because every title in it was a skippable
+    /// stub. It is still `Ok` — nothing failed — but a front-end must branch on
+    /// the count before it reports success to the user. `run_titles` logs an
+    /// Error line naming which of the two happened.
     Ok { titles_written: usize },
     /// A disc-level key failure surfaced — the whole disc can't be decrypted,
     /// so the loop stopped (fail-fast) rather than iterate every title.
@@ -304,6 +310,28 @@ where
         }
     }
 
+    // A rip that wrote NOTHING must not return silently. Every other exit from
+    // this loop reports through the Sink; this one did not, so the two ways to
+    // reach it — an empty `indices` (a caller that bypassed `preflight`: it
+    // said Ready, `resolve_selection` said `[]`, and the rip "succeeded" with
+    // no file), and a selection whose every title turned out to be a skippable
+    // stub — both surfaced as success, exit 0, and no explanation anywhere.
+    //
+    // The variant stays `Ok`: `titles_written` is the machine-readable half of
+    // the answer and a new variant would break every front-end's `match`
+    // (`RipOutcome` is public and not `#[non_exhaustive]`, and sibling repos
+    // match it exhaustively). What changes is that it is no longer silent.
+    if titles_written == 0 {
+        sink.log(
+            Level::Error,
+            if indices.is_empty() {
+                "no titles were selected — nothing was written"
+            } else {
+                "every selected title was skipped (empty/uncrackable stub) — \
+                 nothing was written"
+            },
+        );
+    }
     RipOutcome::Ok { titles_written }
 }
 
@@ -943,6 +971,61 @@ mod tests {
             visited.load(Ordering::Relaxed),
             1,
             "halt on title 0 must stop before title 1"
+        );
+    }
+
+    /// A rip that writes NO title must say so, whatever emptied it.
+    ///
+    /// `Ok { titles_written: 0 }` is success, exit 0, no file — and it is
+    /// reachable two ways: an empty `indices` (a caller that skipped
+    /// `preflight`, the shape that shipped once already: preflight said Ready,
+    /// `resolve_selection` said `[]`, the rip "succeeded" and wrote nothing),
+    /// and a selection whose every title turned out to be a skippable stub. In
+    /// both, every other arm of this loop reports through the Sink and this one
+    /// returned silently, so nothing anywhere told the user why the disc
+    /// produced no output. The outcome stays `Ok` — the count is the machine-
+    /// readable half of the answer and changing the variant would break every
+    /// front-end's `match` — but it must not be SILENT.
+    #[test]
+    fn a_rip_that_writes_nothing_says_so_rather_than_returning_a_silent_ok() {
+        #[derive(Default)]
+        struct LogSink {
+            errors: std::sync::Mutex<Vec<String>>,
+        }
+        impl Sink for LogSink {
+            fn log(&self, level: Level, msg: &str) {
+                if matches!(level, Level::Error) {
+                    self.errors.lock().unwrap().push(msg.to_string());
+                }
+            }
+        }
+
+        // (a) No titles selected at all.
+        let sink = LogSink::default();
+        let outcome = run_titles(&[], false, &sink, |_| Ok(()));
+        assert_eq!(outcome, RipOutcome::Ok { titles_written: 0 });
+        assert_eq!(
+            sink.errors.lock().unwrap().len(),
+            1,
+            "an empty selection wrote nothing and must not pass for a rip"
+        );
+
+        // (b) A non-empty selection whose every title is a skippable stub.
+        let d = disc(3, false, false);
+        let sink = LogSink::default();
+        let outcome = run_titles(&[1, 2], false, &sink, |_| Err(stub_err()));
+        let _ = &d;
+        assert_eq!(
+            outcome,
+            RipOutcome::Ok { titles_written: 0 },
+            "skipping stubs is not a failure — but it is not a written title \
+             either"
+        );
+        assert_eq!(
+            sink.errors.lock().unwrap().len(),
+            1,
+            "every selected title was skipped: nothing was written, and the \
+             user has to be told"
         );
     }
 
