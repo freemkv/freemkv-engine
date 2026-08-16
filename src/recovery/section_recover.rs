@@ -90,17 +90,20 @@ const WEDGE_FASTFAIL_MS: u64 = 500;
 // counts any 16 consecutive wedge-family failures with no latency gate at all.
 // Both are 16, and both mean "the drive is wedged", but they disagree on a real
 // input: 16 consecutive HARDWARE_ERRORs each returned after seconds of genuine
-// ECC recovery. Pass 1 (here) keeps going, because a slow failure is a drive
-// that is honestly trying; Pass N (there) declares it wedged.
+// ECC recovery. Pass N (HERE — this file is the Pass-N handler chain) keeps
+// going, because a slow failure is a drive that is honestly trying; Pass 1
+// (THERE — `read_error.rs`, whose only production caller is the sweep loop)
+// declares it wedged.
 //
-// This is intended, not drift. The two passes want different things. Pass 1
-// sweeps the whole disc and its value is the honest mapfile it produces, so
-// bailing early on a merely-damaged region would discard exactly what the pass
-// exists to build. Pass N is already committed to slow, targeted recovery of
-// ranges Pass 1 marked bad, so it can afford a blunter give-up rule.
+// This is intended, not drift. The two passes want different things. Pass N is
+// already committed to slow, targeted recovery of the ranges Pass 1 marked bad,
+// and it is the LAST attempt those sectors get, so it spends the seconds a
+// genuine ECC retry costs. Pass 1 sweeps the whole disc, and anything it gives
+// up on is left in the mapfile for Pass N to attack later — so it can afford
+// the blunter give-up rule, and bailing costs nothing permanent.
 //
 // They also reset differently on purpose: this streak clears on any non-wedge
-// failure, Pass N's only on a success.
+// failure, Pass 1's only on a success.
 //
 // Confirmed as a deliberate product decision by the owner. Do NOT "unify" these
 // two constants to make them match — an audit flagged the difference as the
@@ -667,10 +670,18 @@ impl SectionHandler for Bisect {
 }
 
 /// Blow through a LARGE dead run fast. Reads forward in batches; after
-/// [`JUMP_AFTER_FAILS`] consecutive failed batches it SKIPS AHEAD an escalating
-/// distance (1 MiB → 2 → 4 … capped at [`JUMP_CAP_BYTES`]), leaving the skipped
-/// span bad, to find where readable data RESUMES — mirroring the Pass-1
-/// damage-jump. A later handler / `Bisect` pins the exact good/bad boundary the
+/// [`JUMP_AFTER_FAILS`] consecutive failed batches it SKIPS AHEAD to the MIDDLE
+/// of what is left of the range (`remaining / 2`, sector-aligned, minimum one
+/// sector), leaving the skipped span bad, to find where readable data RESUMES —
+/// mirroring the Pass-1 damage-jump.
+///
+/// Halving, not an escalating fixed distance. There is deliberately no cap:
+/// the jump is a FRACTION of the remaining span, so it can never overshoot the
+/// range, and a big dead run is crossed in ~log2 jumps. (This doc described a
+/// `1 MiB → 2 → 4 …` escalation "capped at `JUMP_CAP_BYTES`" — an identifier
+/// that appears nowhere else in the crate, describing a jump rule the fixed
+/// 8 MiB version was replaced BECAUSE it leapt clean over ranges smaller than
+/// itself.) A later handler / `Bisect` pins the exact good/bad boundary the
 /// jump stepped over. Uses fast reads (this is a scout, not a deep-recovery
 /// pass). Without it a linear walk pays one up-to-10 s read per dead batch
 /// across the whole run, so a deadline-bounded pass never reaches readable data
@@ -790,8 +801,37 @@ impl SectionHandler for SpeedSweep {
                             bad.remove(pos, SECTOR);
                             break;
                         }
-                        // This speed didn't read it; try the next one.
-                        ReadHit::Bad => continue,
+                        // This speed didn't read it; try the next one — but
+                        // every remaining speed is another WHOLE read at the
+                        // handler's timeout (a full 60 s on the
+                        // `ReadParams::deep()` roster `build_tier_handlers`
+                        // gives tier 2), so honour a stop between them
+                        // exactly as `Oscillate` does between its own reads.
+                        // A single check per sector left a Stop unobserved
+                        // for the better part of a minute.
+                        //
+                        // Nothing is uncommitted at this arm: a read that
+                        // landed takes the `Good` arm, which has already
+                        // claimed the span via `bad.remove`. So returning
+                        // here discards no recovery.
+                        //
+                        // `timed_out`, not `past`: `past` folds in the
+                        // early-yield dead streak, and a run of failing reads
+                        // is not a stall HERE — it is how the sweep gets to
+                        // the slower speed that actually reads the sector,
+                        // which is the whole technique. Yielding mid-sweep
+                        // would retire the sector having tried only the fast
+                        // speed. (Same reasoning `Bisect`'s boundary probes
+                        // use.) The deadline itself still stops it.
+                        ReadHit::Bad => {
+                            if ctx.halted() {
+                                return HandlerOutcome::Halted;
+                            }
+                            if ctx.timed_out(deadline) {
+                                return HandlerOutcome::Remaining;
+                            }
+                            continue;
+                        }
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
                     }
                 }
@@ -941,6 +981,14 @@ impl SectionHandler for Oscillate {
                         ReadHit::Bad => {}
                     }
                 }
+                // Any prime-below recovery above is already committed via
+                // `bad.remove` — safe to check and return here.
+                if ctx.halted() {
+                    return HandlerOutcome::Halted;
+                }
+                if ctx.past(deadline) {
+                    return HandlerOutcome::Remaining;
+                }
                 let mut recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                     ReadHit::Good => {
                         bad.remove(pos, SECTOR);
@@ -965,6 +1013,14 @@ impl SectionHandler for Oscillate {
                 // Skipping the prime just means this one sector gets the
                 // forward-into attempt only.
                 if !recovered && prime_above_is_in_range(pos, ctx.reader.capacity_sectors()) {
+                    // The target-forward read above already committed any
+                    // recovery via `bad.remove` — safe to check and return here.
+                    if ctx.halted() {
+                        return HandlerOutcome::Halted;
+                    }
+                    if ctx.past(deadline) {
+                        return HandlerOutcome::Remaining;
+                    }
                     // Claim a successful prime — see the prime-below comment.
                     // Above `pos` the exposure is worse: `pos + SECTOR` is the
                     // NEXT still-bad sector whenever this sub-range is two or
@@ -974,6 +1030,14 @@ impl SectionHandler for Oscillate {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
                         ReadHit::Good => bad.remove(pos + SECTOR, SECTOR),
                         ReadHit::Bad => {}
+                    }
+                    // The prime-above recovery above is already committed —
+                    // safe to check and return before the final target read.
+                    if ctx.halted() {
+                        return HandlerOutcome::Halted;
+                    }
+                    if ctx.past(deadline) {
+                        return HandlerOutcome::Remaining;
                     }
                     recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                         ReadHit::Good => {
@@ -1565,12 +1629,86 @@ mod tests {
         );
     }
 
+    /// `Linear`'s DIRECTION axis, which nothing exercised.
+    ///
+    /// `coordinator_drains_the_readable_set_through_the_chain` below is named
+    /// for direction but cannot see it: its section is 16 sectors against a
+    /// `BATCH_SECTORS` of 32, so forward and reverse each issue ONE identical
+    /// read of the whole section, both fail, and every recovered sector in that
+    /// test comes from `Bisect`. Swapping the two `Direction` arms there — or
+    /// making `Direction::Reverse` walk forward — changed nothing.
+    ///
+    /// Here the section spans three batches and the middle one holds a sector
+    /// the drive only reads when the head arrives from ABOVE (the
+    /// `dir_reverse_only` model, the same one `Oscillate`'s test uses). Forward
+    /// must leave that batch behind; reverse must clear the section.
     #[test]
-    fn coordinator_reverse_then_forward_makes_progress_direction_matters() {
-        // Two dead sectors at opposite ends won't both be cleared by one
-        // direction alone in this contrived fixture, but the CHAIN clears every
-        // readable sector regardless of order. Prove the coordinator runs
-        // handler after handler and drains the readable set.
+    fn linear_reverse_recovers_a_batch_forward_cannot_approach() {
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        // Sector 40 sits in the middle batch [32, 64) and reads only from above.
+        disc.dir_reverse_only = [40u32].into_iter().collect();
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut disc,
+            sink: &mut sink,
+            now: &now,
+            halt: None,
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+            cur_speed: SPEED_MAX_KBS,
+        };
+        let section = 96 * SECTOR; // 3 batches of BATCH_SECTORS (32)
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+
+        // Forward: batches [0,32) and [64,96) read, [32,64) cannot — the head
+        // always arrives at sector 40 from below.
+        let mut bad = SubRanges::from_section(0, section);
+        let out = Linear {
+            direction: Direction::Forward,
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining, "forward cannot finish");
+        assert_eq!(
+            bad.total_len(),
+            32 * SECTOR,
+            "exactly the middle batch must be left behind"
+        );
+        assert_eq!(bad.ranges()[0].0, 32 * SECTOR, "and it is that batch");
+
+        // Reverse: the walk reaches [32,64) having just read [64,96), so the
+        // head comes from above and the batch reads.
+        let mut bad = SubRanges::from_section(0, section);
+        let out = Linear {
+            direction: Direction::Reverse,
+            params: ReadParams::deep(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(
+            out,
+            HandlerOutcome::Complete,
+            "reverse approaches from above and must clear the section"
+        );
+        assert!(bad.is_empty());
+        assert_eq!(
+            sink.got.get(&(32 * SECTOR)).copied(),
+            Some(32 * SECTOR as usize),
+            "the middle batch was handed to the sink whole"
+        );
+    }
+
+    #[test]
+    fn coordinator_drains_the_readable_set_through_the_chain() {
+        // Two dead sectors at opposite ends of a section SHORTER than one batch,
+        // so both `Linear` arms issue the same single failing read and every
+        // recovered sector below comes from `Bisect`. That makes this a test of
+        // the COORDINATOR — it runs handler after handler and drains the
+        // readable set — and not of the direction axis, which
+        // `linear_reverse_recovers_a_batch_forward_cannot_approach` covers.
         let dead = [0u32, 15u32]; // ends of a 16-sector section
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
         let mut disc = disc;
@@ -1730,13 +1868,28 @@ mod tests {
             HandlerOutcome::TransportFault,
             "a wholly-wedged section must escalate to TransportFault"
         );
-        // The whole point: it bailed after a short streak, not after grinding all
-        // 1000 sectors. Generous bound (handlers read in batches) but far below
-        // the section size.
-        assert!(
-            h.read_count() < 100,
-            "wedge must abort fast; did {} reads on a 1000-sector wedged section",
-            h.read_count()
+        // The whole point: it bailed after exactly the documented streak, not
+        // after grinding all 1000 sectors.
+        //
+        // 16, spelled out, and derived from `WEDGE_ABORT_STREAK`'s own doc:
+        // every read here is a fast-fail wedge, so each one advances the streak
+        // by exactly 1 and `read_span` escalates to Transport on the read that
+        // reaches the threshold — 16 reads, and the tier-0 chain's own budget
+        // (4 handlers x UNPRODUCTIVE_YIELD = 4) is exactly enough to get there
+        // in one `run_handlers` call. The clock is the injected fake, so this is
+        // deterministic rather than machine-dependent.
+        //
+        // It used to read `< 100` ("generous but far below the section size"),
+        // which was a bound nothing derived and which held in BOTH wrong
+        // directions: quartering `WEDGE_ABORT_STREAK` to 4 — the drive declared
+        // wedged after 4 failed reads, abandoning discs that would have
+        // recovered — left it green.
+        assert_eq!(
+            h.read_count(),
+            16,
+            "wedge must abort on the 16th consecutive fast-fail — no sooner \
+             (that abandons a recoverable disc) and no later (that grinds a \
+             dead drive)"
         );
     }
 
@@ -1887,6 +2040,205 @@ mod tests {
         let out = lin.recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Halted);
         assert_eq!(h.read_count(), 0, "halt must precede any read");
+    }
+
+    /// A `SectorSource` wrapper that flips a shared halt flag right after the
+    /// `after`-th underlying read completes — used to prove a handler observes
+    /// `ctx.halted()` BETWEEN reads, not just once at the top of its loop.
+    struct HaltAfterN<'a> {
+        inner: &'a mut FakeDisc,
+        halt: &'a AtomicBool,
+        after: u64,
+        seen: u64,
+    }
+
+    impl SectorSource for HaltAfterN<'_> {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> Result<usize> {
+            self.read_sectors_fua(lba, count, buf, recovery, false)
+        }
+
+        fn capacity_sectors(&self) -> u32 {
+            self.inner.capacity_sectors()
+        }
+
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+            fua: bool,
+        ) -> Result<usize> {
+            let r = self.inner.read_sectors_fua(lba, count, buf, recovery, fua);
+            self.seen += 1;
+            if self.seen == self.after {
+                self.halt.store(true, Ordering::Relaxed);
+            }
+            r
+        }
+
+        fn set_speed(&mut self, kbs: u16) {
+            self.inner.set_speed(kbs)
+        }
+    }
+
+    /// Drives `Oscillate::recover` over a two-sector sub-range (lba 5 dead,
+    /// lba 6 readable) with the halt flag flipping right after the
+    /// `flip_after`-th underlying read completes, and returns
+    /// `(outcome, total reads performed)`.
+    ///
+    /// lba 5 dead means BOTH the forward-into and reverse-into target reads
+    /// fail, so a fully unchecked Oscillate burns all four reads on it
+    /// (prime-below lba4, target lba5, prime-above lba6, target-reverse
+    /// lba5) before the top-of-loop check (ahead of lba 6) can ever catch
+    /// the flag. Flipping the flag after read N and asserting the handler
+    /// stops at EXACTLY N reads pins down each of the three inter-read gaps
+    /// (after prime-below, after the forward target, after prime-above)
+    /// individually — a check missing from just one of those gaps lets the
+    /// handler run one read past where it should have stopped.
+    fn oscillate_halt_after(flip_after: u64) -> (HandlerOutcome, u64) {
+        let dead = [5u32];
+        let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
+        let mut disc = disc;
+        let halt = AtomicBool::new(false);
+        let mut wrapped = HaltAfterN {
+            inner: &mut disc,
+            halt: &halt,
+            after: flip_after,
+            seen: 0,
+        };
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut wrapped,
+            sink: &mut sink,
+            now: &now,
+            halt: Some(&halt),
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+            cur_speed: SPEED_MAX_KBS,
+        };
+        let mut bad = SubRanges::from_section(5 * SECTOR, 2 * SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(10);
+        let mut osc = Oscillate {
+            params: ReadParams::fast(),
+        };
+        let out = osc.recover(&mut ctx, &mut bad, deadline);
+        (out, h.read_count())
+    }
+
+    #[test]
+    fn oscillate_halts_promptly_after_prime_below() {
+        // Flag flips right after read 1 (prime-below lba4). A correct
+        // handler checks immediately after and returns Halted having issued
+        // NO further reads.
+        let (out, reads) = oscillate_halt_after(1);
+        assert_eq!(out, HandlerOutcome::Halted);
+        assert_eq!(
+            reads, 1,
+            "halt flipped after the prime-below read — the handler must \
+             check before the forward target read, not after it (got {reads} reads)"
+        );
+    }
+
+    #[test]
+    fn oscillate_halts_promptly_after_forward_target() {
+        // Flag flips right after read 2 (forward target lba5, which is dead
+        // so `recovered` stays false and the reverse-into branch is
+        // entered). A correct handler checks immediately on entering that
+        // branch and returns Halted before the prime-above read.
+        let (out, reads) = oscillate_halt_after(2);
+        assert_eq!(out, HandlerOutcome::Halted);
+        assert_eq!(
+            reads, 2,
+            "halt flipped after the forward target read — the handler must \
+             check before the prime-above read, not after it (got {reads} reads)"
+        );
+    }
+
+    #[test]
+    fn oscillate_halts_promptly_after_prime_above() {
+        // Flag flips right after read 3 (prime-above lba6). A correct
+        // handler checks immediately after and returns Halted before the
+        // final (reverse-into) target read.
+        let (out, reads) = oscillate_halt_after(3);
+        assert_eq!(out, HandlerOutcome::Halted);
+        assert_eq!(
+            reads, 3,
+            "halt flipped after the prime-above read — the handler must \
+             check before the reverse-into target read, not after it (got {reads} reads)"
+        );
+    }
+
+    /// Drives `SpeedSweep::recover` over a two-sector sub-range (lba 5 dead,
+    /// lba 6 readable) with the halt flag flipping right after the
+    /// `flip_after`-th underlying read completes, and returns
+    /// `(outcome, total reads performed)`.
+    ///
+    /// lba 5 dead means BOTH speeds fail on it, so the sweep spends its full
+    /// Max→Min pair there before the top-of-loop check (ahead of lba 6) can
+    /// see the flag. Flipping after read 1 and asserting the handler stops at
+    /// EXACTLY 1 read pins down the single inter-read gap — the one between
+    /// the Max read and the Min read, each of which is a full
+    /// `TimeoutPref::Deep` (60 s) recovery read on the tier-2 roster
+    /// `build_tier_handlers` builds.
+    fn speed_sweep_halt_after(flip_after: u64) -> (HandlerOutcome, u64) {
+        let dead = [5u32];
+        let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
+        let mut disc = disc;
+        let halt = AtomicBool::new(false);
+        let mut wrapped = HaltAfterN {
+            inner: &mut disc,
+            halt: &halt,
+            after: flip_after,
+            seen: 0,
+        };
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut wrapped,
+            sink: &mut sink,
+            now: &now,
+            halt: Some(&halt),
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+            cur_speed: SPEED_MAX_KBS,
+        };
+        let mut bad = SubRanges::from_section(5 * SECTOR, 2 * SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(10);
+        let mut sweep = SpeedSweep {
+            params: ReadParams::fast(),
+        };
+        let out = sweep.recover(&mut ctx, &mut bad, deadline);
+        (out, h.read_count())
+    }
+
+    #[test]
+    fn speed_sweep_halts_promptly_between_its_max_and_min_reads() {
+        // Flag flips right after read 1 (the Max-speed read of the dead lba
+        // 5). A correct handler checks immediately after and returns Halted
+        // having issued NO further reads — the Min-speed read is another
+        // whole deep-timeout read, and on real media that is up to a minute
+        // of the operator staring at a Stop button that did nothing. Same
+        // defect the sibling Oscillate handler was fixed for.
+        let (out, reads) = speed_sweep_halt_after(1);
+        assert_eq!(out, HandlerOutcome::Halted);
+        assert_eq!(
+            reads, 1,
+            "halt flipped after the max-speed read — the handler must check \
+             before dropping the spindle for the min-speed read, not after \
+             it (got {reads} reads)"
+        );
     }
 
     #[test]
@@ -2278,9 +2630,20 @@ mod tests {
         );
     }
 
-    /// ...and a source that does NOT know its capacity still gets the prime.
+    /// ...and the range predicate that decides it, at its three boundaries.
+    ///
+    /// Named for the helper, because the helper is all it drives: it was called
+    /// `oscillate_still_primes_from_above_when_the_capacity_is_unknown` and
+    /// never built an `Oscillate` or called `.recover(..)`, so a regression in
+    /// how `Oscillate` CALLS this predicate (wrong argument order, called under
+    /// the wrong condition) was never in its reach. That end-to-end claim is
+    /// covered where it can actually be observed — flipping the
+    /// unknown-capacity answer below to `false` turns
+    /// `oscillate_recovers_a_direction_dependent_sector_forward_linear_misses`
+    /// (whose `FakeDisc` reports capacity 0 and whose target sector reads ONLY
+    /// when approached from above) from Complete to Remaining.
     #[test]
-    fn oscillate_still_primes_from_above_when_the_capacity_is_unknown() {
+    fn prime_above_is_in_range_treats_an_unknown_capacity_as_no_bound() {
         assert!(
             prime_above_is_in_range(19 * SECTOR, 0),
             "an unknown capacity is not permission to invent a bound"

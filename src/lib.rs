@@ -39,6 +39,16 @@
 // The engine is app-layer, so (unlike libfreemkv) it may carry English text in
 // diagnostics. Front-ends localize via the message + code carried on events.
 
+// This crate has no reason to reach for `unsafe`, and the one block it did
+// have was a test helper calling `std::env::set_var` with a SAFETY note that
+// justified the wrong condition (a per-key mutex, where the real requirement
+// is that no thread anywhere touches the environment concurrently — and
+// sibling tests call `std::env::temp_dir()` on cargo's other test threads).
+// `forbid` rather than `deny` so it cannot be re-allowed locally with an
+// attribute; a knob that must reach production code belongs in a parameter or
+// a thread-local, not in `environ`.
+#![forbid(unsafe_code)]
+
 mod extract;
 mod job;
 mod keys;

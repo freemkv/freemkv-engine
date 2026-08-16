@@ -85,6 +85,11 @@ const PROGRESS_TICK_MS: u64 = 250;
 /// after `run_handlers` returns.
 struct PatchRecoverySink<'a> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
+    /// Cancellation token for the send below — the caller's external Stop bit
+    /// when there is one (see `patch_region`). Without it this send had no way
+    /// to observe a Stop at all: `WRITE_THROUGH_DEPTH` is 1, so a consumer
+    /// stalled inside its write parks the producer in `send` indefinitely.
+    halt: &'a libfreemkv::halt::Halt,
     err: Option<Error>,
 }
 
@@ -93,14 +98,24 @@ impl RecoverySink for PatchRecoverySink<'_> {
         if self.err.is_some() {
             return;
         }
-        if let Err(e) = send_or_abort(
+        match super::send_bounded(
             self.pipe,
             PatchItem::Recovered {
                 pos,
                 buf: buf.to_vec(),
             },
+            self.halt,
         ) {
-            self.err = Some(e);
+            Ok(()) => {}
+            // Halt is an OUTCOME, not an error: the latch is already set (it
+            // is what released this send), so the handler chain unwinds to
+            // `HandlerOutcome::Halted` at its next inter-read check and the
+            // pass reports halted exactly as it does for a halt observed
+            // anywhere else. Recording an error here would turn a Stop into a
+            // failed pass. The in-flight span is dropped — the mapfile still
+            // calls it bad, so a later pass re-reads it.
+            Err(super::SendStall::Halted) => {}
+            Err(stall) => self.err = Some(stall.into_error()),
         }
     }
 }
@@ -149,30 +164,54 @@ pub(super) enum PatchItem {
 
 /// Mapfile snapshot the sink republishes after every record so the
 /// producer can drive its stall / progress logic without holding the
-/// mapfile lock for long. `bad_ranges` is the DAMAGE set
+/// mapfile lock for long. Derived from the DAMAGE set
 /// (`NonTrimmed + Unreadable + NonScraped`) — NOT NonTried, which is the unread
 /// remainder, not damage. Including NonTried inflated the live located drilldown
 /// (at-risk movie time + range count) with unread sectors; excluding it matches
 /// the one-shot progress path.
+///
+/// The snapshot holds the DERIVED figures, not the raw damage list. It used to
+/// republish the range list itself, capped at 8192 entries, on the stated
+/// rationale that consumers "only sample the head of the list". That rationale
+/// was false at the only consumer: `report_patch_progress` fed the capped Vec
+/// into `bytes_bad_in_title` and `locate_ranges` as TOTALS, so past 8192
+/// fragments the at-risk figures under-reported by whatever damage sat in the
+/// dropped tail — and the "+N more" count under-reported too, since
+/// `locate_ranges` derives it from the length of what it is handed.
+///
+/// Deriving here instead fixes that at the source and bounds the snapshot MORE
+/// tightly than the old cap did: `locate_ranges` keeps the 50 largest ranges
+/// (its own `MAX_LOCATED`) and reports the rest as `truncated`, so the
+/// republished state is O(50) regardless of fragmentation while every total is
+/// computed over the complete damage set. (The old cap never bounded the
+/// allocation it claimed to bound either — `ranges_with` builds the whole Vec
+/// before `truncate` shortens it.)
 pub(super) struct SharedPatchState {
     pub stats: MapStats,
-    pub bad_ranges: Vec<(u64, u64)>,
+    /// Damage bytes intersecting the main title's extents, over the COMPLETE
+    /// damage set. `PassProgress::bytes_bad_in_main_title` verbatim.
+    pub bad_bytes_in_title: u64,
+    /// The rendered drilldown — located ranges, section count, "+N more" tail,
+    /// at-risk movie time — computed over the COMPLETE damage set.
+    pub located: libfreemkv::progress::LocatedProgress,
 }
 
 impl SharedPatchState {
-    /// Cap on the republished `bad_ranges` Vec. Consumers (progress display,
-    /// scheduler) only sample the head of the list. NOTE: there is no mapfile
-    /// entry cap — `Mapfile.entries` is unbounded — so this truncation is the
-    /// only thing keeping a pathologically fragmented disc from making every
-    /// per-record republish allocate without limit.
-    const MAX_BAD_RANGES: usize = 8192;
-
-    fn from_map(map: &Mapfile) -> Self {
-        let mut bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
-        bad_ranges.truncate(Self::MAX_BAD_RANGES);
+    /// `title` is the main feature (`disc.titles.first()`); `None` on a disc
+    /// with no titles, where there is nothing to locate damage against.
+    fn from_map(map: &Mapfile, title: Option<&libfreemkv::DiscTitle>) -> Self {
+        let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
+        let (bad_bytes_in_title, located) = match title {
+            Some(t) => (
+                bytes_bad_in_title(t, &bad_ranges),
+                libfreemkv::disc::locate_ranges(&bad_ranges, t),
+            ),
+            None => (0, libfreemkv::progress::LocatedProgress::default()),
+        };
         Self {
             stats: map.stats(),
-            bad_ranges,
+            bad_bytes_in_title,
+            located,
         }
     }
 }
@@ -199,10 +238,14 @@ pub(super) struct PatchSink {
     is_regular: bool,
     /// Snapshot the producer reads. Updated after every successful
     /// `record()` call. `Mutex` rather than separate atomics because
-    /// the producer wants stats + bad_ranges as a coherent pair.
+    /// the producer wants stats + drilldown as a coherent pair.
     shared: Arc<Mutex<SharedPatchState>>,
-    /// Last time the shared snapshot was republished. `from_map` allocates
-    /// O(bad_ranges) every call, so the per-record path throttles to a time
+    /// Main feature, so the snapshot's drilldown can be derived here from the
+    /// complete damage set rather than from a capped copy on the reader's side.
+    /// Cloned once at construction; `patch` never mutates `disc.titles`.
+    title: Option<libfreemkv::DiscTitle>,
+    /// Last time the shared snapshot was republished. `from_map` walks the
+    /// whole damage set every call, so the per-record path throttles to a time
     /// cadence (`REPUBLISH_CADENCE`); the final close always forces a publish.
     last_republish: Option<std::time::Instant>,
 }
@@ -219,10 +262,11 @@ impl PatchSink {
         path: &std::path::Path,
         map: Mapfile,
         is_regular: bool,
+        title: Option<libfreemkv::DiscTitle>,
     ) -> Result<(Self, Arc<Mutex<SharedPatchState>>)> {
         let file =
             libfreemkv::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
-        let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map)));
+        let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map, title.as_ref())));
         let shared_clone = shared.clone();
         Ok((
             Self {
@@ -230,6 +274,7 @@ impl PatchSink {
                 map,
                 is_regular,
                 shared,
+                title,
                 last_republish: None,
             },
             shared_clone,
@@ -262,7 +307,7 @@ impl PatchSink {
             .shared
             .lock()
             .expect("PatchSink shared state mutex poisoned");
-        *guard = SharedPatchState::from_map(&self.map);
+        *guard = SharedPatchState::from_map(&self.map, self.title.as_ref());
     }
 }
 
@@ -351,15 +396,6 @@ use libfreemkv::sector::SectorSource;
 /// tiers 0-1 leave (the true hardened residual). See `PatchCtx::run` and
 /// `build_tier_handlers`.
 const PATCH_TIERS: usize = 3;
-
-/// Send a `PatchItem` and translate a `SendError` (consumer thread died
-/// / panicked) into a library error so the caller propagates cleanly.
-pub(super) fn send_or_abort(
-    pipe: &Pipeline<PatchItem, PatchSummary>,
-    item: PatchItem,
-) -> Result<()> {
-    pipe.send(item).map_err(|_| Error::PipelineConsumerGone)
-}
 
 /// Phase A pre-snapshot. Loads the mapfile, captures the fields the
 /// patch loop needs after the live `Mapfile` moves into the consumer
@@ -478,7 +514,6 @@ pub(super) struct SubRanges {
     ranges: Vec<(u64, u64)>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 /// Widen a mapfile byte-range outward to whole 2048-byte sectors.
 ///
 /// This is the single ingress where mapfile byte-ranges become read requests,
@@ -686,23 +721,19 @@ pub(super) struct PatchLoopState {
     pub now: fn() -> std::time::Instant,
     // Snapshot at construction — these stay constant for the whole pass.
     pub bytes_good_before: u64,
-    #[allow(dead_code)]
-    pub total_bytes: u64,
+    // (No `total_bytes` here. It was carried, `#[allow(dead_code)]`, and never
+    // read: the orchestrator takes the pass denominator from `PatchCtx`'s own
+    // `total_bytes` instead. A field nothing reads cannot go stale loudly, so
+    // it is worse than absent.)
     pub initial_batch: u16,
     pub work_total: u64,
 }
 
 impl PatchLoopState {
-    pub(super) fn new(
-        bytes_good_before: u64,
-        total_bytes: u64,
-        initial_batch: u16,
-        work_total: u64,
-    ) -> Self {
+    pub(super) fn new(bytes_good_before: u64, initial_batch: u16, work_total: u64) -> Self {
         // Production clock: the real monotonic wall clock.
         Self::new_with_clock(
             bytes_good_before,
-            total_bytes,
             initial_batch,
             work_total,
             std::time::Instant::now,
@@ -714,7 +745,6 @@ impl PatchLoopState {
     /// `new` passes `Instant::now`, so the production path is unchanged.
     pub(super) fn new_with_clock(
         bytes_good_before: u64,
-        total_bytes: u64,
         initial_batch: u16,
         work_total: u64,
         now: fn() -> std::time::Instant,
@@ -724,7 +754,6 @@ impl PatchLoopState {
             wedged_exit: false,
             now,
             bytes_good_before,
-            total_bytes,
             initial_batch,
             work_total,
         }
@@ -932,12 +961,98 @@ pub(super) fn pass_kind(initial_batch: u16, reverse: bool) -> libfreemkv::progre
     }
 }
 
+/// The scheduler knobs, as pure functions of the raw env value.
+///
+/// Split out from the `std::env::var` calls below so tests can pin the parsing
+/// rules without WRITING to the process environment. `std::env::set_var` is
+/// unsafe for a reason that a per-key mutex cannot discharge: its condition is
+/// that no other thread is touching the environment AT ALL, and this crate's
+/// test binary is full of siblings calling `std::env::temp_dir()` (a read of
+/// `TMPDIR`) on cargo's other test threads. A concurrent `setenv` may free the
+/// `environ` block that `getenv` is walking.
+///
+/// See [`flat_mode_override`] for the one test that needs the value to reach a
+/// real `patch()` call.
+fn flat_mode_from_value(v: Option<&str>) -> bool {
+    matches!(v, Some(v) if !v.is_empty() && v != "0")
+}
+
+/// See [`flat_mode_from_value`]. Default 12 s, floored at 1: a zero-second
+/// deadline is already expired, so every handler would be entered and abandoned
+/// without a single read.
+///
+/// Deliberately NOT ceilinged — a long budget on a badly damaged disc is a
+/// legitimate operator choice. The absurd end is handled where it can bite,
+/// in [`handler_deadline`], which saturates instead of panicking.
+fn flat_budget_from_value(v: Option<&str>) -> u64 {
+    v.and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(12)
+        .max(1)
+}
+
+/// Test-only, thread-local overrides for the two knobs.
+///
+/// The alternative — having tests `set_var` the real keys — is unsound (see
+/// [`flat_mode_from_value`]). Thread-local because cargo runs tests
+/// concurrently and `patch()` does all its work on the calling thread, so an
+/// override cannot leak into a sibling test the way a process-global env write
+/// does.
+#[cfg(test)]
+mod knob_override {
+    use std::cell::Cell;
+    thread_local! {
+        pub static FLAT_MODE: Cell<Option<bool>> = const { Cell::new(None) };
+        pub static FLAT_BUDGET: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+}
+
+/// Set the flat-mode knob for the current thread; `None` restores the env-based
+/// value. Test-only.
+#[cfg(test)]
+fn flat_mode_override(v: Option<bool>) {
+    knob_override::FLAT_MODE.with(|c| c.set(v));
+}
+
+/// Set the per-handler budget for the current thread; `None` restores the
+/// env-based value. Test-only.
+#[cfg(test)]
+fn flat_budget_override(v: Option<u64>) {
+    knob_override::FLAT_BUDGET.with(|c| c.set(v));
+}
+
 /// True when the flat-pool bandit scheduler is requested (`FREEMKV_PATCH_FLAT`
 /// set to anything but empty / `0`). Default (unset) keeps the tier ladder.
 fn patch_flat_mode() -> bool {
-    std::env::var("FREEMKV_PATCH_FLAT")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+    #[cfg(test)]
+    if let Some(v) = knob_override::FLAT_MODE.with(|c| c.get()) {
+        return v;
+    }
+    flat_mode_from_value(std::env::var("FREEMKV_PATCH_FLAT").ok().as_deref())
+}
+
+/// The deadline `budget_secs` seconds from `now`, saturating instead of
+/// panicking.
+///
+/// `Instant + Duration` panics on overflow — it is `checked_add(..).expect(..)`
+/// underneath — and `budget_secs` comes from an env var
+/// (`FREEMKV_PATCH_FLAT_BUDGET`) that is floored at 1 but has no ceiling. A
+/// 19-digit value therefore took down the whole recovery pass with an arithmetic
+/// panic, on the one code path whose entire purpose is to survive a hostile
+/// disc. A misconfigured knob must degrade, not crash: an absurd budget means
+/// "effectively no deadline", so it saturates to the longest deadline this
+/// clock can express rather than exploding.
+///
+/// The cap is NOT applied to the knob itself: an operator who deliberately sets
+/// a long per-handler budget on a badly damaged disc must still get it.
+fn handler_deadline(now: std::time::Instant, budget_secs: u64) -> std::time::Instant {
+    let mut secs = budget_secs;
+    loop {
+        if let Some(t) = now.checked_add(std::time::Duration::from_secs(secs)) {
+            return t;
+        }
+        // Halve until it fits. Terminates: `secs == 0` always fits.
+        secs /= 2;
+    }
 }
 
 /// Short per-handler EXPLORE budget for the flat bandit (seconds). Keeps any one
@@ -945,11 +1060,11 @@ fn patch_flat_mode() -> bool {
 /// learns quickly. `FREEMKV_PATCH_FLAT_BUDGET` overrides; default 12 s, floored
 /// at 1.
 fn flat_handler_budget_secs() -> u64 {
-    std::env::var("FREEMKV_PATCH_FLAT_BUDGET")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(12)
-        .max(1)
+    #[cfg(test)]
+    if let Some(v) = knob_override::FLAT_BUDGET.with(|c| c.get()) {
+        return v;
+    }
+    flat_budget_from_value(std::env::var("FREEMKV_PATCH_FLAT_BUDGET").ok().as_deref())
 }
 
 impl PatchCtx<'_, '_> {
@@ -1095,23 +1210,54 @@ impl PatchCtx<'_, '_> {
         let now_ptr = self.state.now;
         let now_fn = move || now_ptr();
 
+        // Pass-local cancel latch. The progress tick below already asks the
+        // front-end `should_cancel()` every PROGRESS_TICK_MS, but its answer
+        // used to be discarded (`let _ = ...`), so the ONLY halt check a
+        // handler chain could see was `opts.halt` — which an EXTERNAL caller
+        // may well leave as None (in-crate, `multipass_rip` wires the job's
+        // Stop bit into every patch pass via `PatchOptions::for_patch_pass`,
+        // and `extract` wires its own). A Stop therefore had to wait out the
+        // remaining per-handler budgets (up to ~10 min on one bad range)
+        // before `report_patch_progress` was consulted at the section
+        // boundary. Latching the tick's answer here, and handing it to the
+        // handler chain as its halt token, makes cancellation land at the very
+        // next inter-read check instead.
+        //
+        // `Arc` (not a bare `AtomicBool`) so the same bit can also be viewed
+        // as a `libfreemkv::halt::Halt` — the type `Pipeline::send_with_halt`
+        // takes — when no external token is available.
+        let pass_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // Halt token for the bounded sends below. It is the CALLER's external
+        // token when there is one, NOT the pass latch, and the difference
+        // matters: the latch is only ever flipped by the progress tick, and
+        // the tick only runs on a READ. A producer parked in `send` is not
+        // reading, so the latch it hands the handler chain cannot reach it —
+        // only a bit somebody else flips can. `opts.halt` is exactly that.
+        //
+        // HONEST LIMIT: `PatchOptions.halt` IS plumbed, and the multipass
+        // driver wires it (`multipass.rs` passes the job's Stop bit into
+        // `PatchOptions::for_patch_pass`), so on that path a Stop does reach a
+        // parked producer. What is left is the caller that constructs
+        // `PatchOptions` with `halt: None` and signals Stop only through its
+        // reporter's `should_cancel()`: for those the SEND_DEADLINE remains the
+        // only bound, and the never-cancelled latch below just keeps the
+        // argument well-typed. Closing that would mean making the halt
+        // mandatory rather than optional.
+        let pass_halt = libfreemkv::halt::Halt::from_arc(
+            self.opts
+                .halt
+                .clone()
+                .unwrap_or_else(|| pass_cancel.clone()),
+        );
+
         let mut sink = PatchRecoverySink {
             pipe: self.pipe,
+            halt: &pass_halt,
             err: None,
         };
 
         let bad_before = bad.total_len();
-        // Pass-local cancel latch. The progress tick below already asks the
-        // front-end `should_cancel()` every PROGRESS_TICK_MS, but its answer
-        // used to be discarded (`let _ = ...`), so the ONLY halt check a
-        // handler chain could see was `opts.halt` — which every caller in this
-        // crate except `extract` leaves as None. A Stop therefore had to wait
-        // out the remaining per-handler budgets (up to ~10 min on one bad
-        // range) before `report_patch_progress` was consulted at the section
-        // boundary. Latching the tick's answer here, and handing it to the
-        // handler chain as its halt token, makes cancellation land at the very
-        // next inter-read check instead.
-        let pass_cancel = std::sync::atomic::AtomicBool::new(false);
         let (outcome, wedge_after) = {
             // Progress heartbeat: a throttled closure that pushes a fresh
             // snapshot to the reporter as recovery happens (called from every
@@ -1160,7 +1306,7 @@ impl PatchCtx<'_, '_> {
                 // The latch, not `opts.halt` directly: it carries BOTH the
                 // external token (mirrored above) and the front-end's
                 // `should_cancel()` answer from the progress tick.
-                halt: Some(&pass_cancel),
+                halt: Some(pass_cancel.as_ref()),
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
                 unproductive: 0,
@@ -1182,7 +1328,7 @@ impl PatchCtx<'_, '_> {
                 PER_HANDLER_BUDGET_SECS
             };
             let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
-                now_ptr() + std::time::Duration::from_secs(budget_secs)
+                handler_deadline(now_ptr(), budget_secs)
             });
             (o, ctx.wedge_streak)
         };
@@ -1213,7 +1359,18 @@ impl PatchCtx<'_, '_> {
         // still-NonTrimmed to Unreadable only after the final pass completes.
         if final_tier {
             for &(pos, len) in bad.ranges() {
-                send_or_abort(self.pipe, PatchItem::NonTrimmed { pos, len })?;
+                match super::send_bounded(self.pipe, PatchItem::NonTrimmed { pos, len }, &pass_halt)
+                {
+                    Ok(()) => {}
+                    // Same reasoning as the sink above: a Stop that lands
+                    // while this residue send is parked ends the pass halted,
+                    // not failed.
+                    Err(super::SendStall::Halted) => {
+                        self.state.halted = true;
+                        return Ok(RegionOutcome::Halted);
+                    }
+                    Err(stall) => return Err(stall.into_error()),
+                }
             }
         }
 
@@ -1261,18 +1418,17 @@ pub(super) fn report_patch_progress(
     let Some(reporter) = opts.progress else {
         return false;
     };
-    let (s, bad_ranges_now) = {
+    // Both figures come from the snapshot, already derived over the COMPLETE
+    // damage set. They used to be computed here from a range list the sink had
+    // capped at 8192 entries, which silently under-reported the at-risk bytes
+    // and the section count on a disc fragmented past that cap.
+    let (s, main_title_bad, located) = {
         let g = shared
             .lock()
             .expect("PatchSink shared state mutex poisoned");
-        (g.stats, g.bad_ranges.clone())
+        (g.stats, g.bad_bytes_in_title, g.located.clone())
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
-    let main_title_bad = disc
-        .titles
-        .first()
-        .map(|t| bytes_bad_in_title(t, &bad_ranges_now))
-        .unwrap_or(0);
     let main_title = disc.titles.first();
     // Progress = bytes RECOVERED so far (initial bad − still-bad), not a
     // per-range counter. With breadth-first tiers the readable bulk comes
@@ -1307,11 +1463,9 @@ pub(super) fn report_patch_progress(
         main_title_duration_secs: main_title.map(|t| t.duration_secs),
         main_title_size_bytes: main_title.map(|t| t.size_bytes),
         // The rendered drilldown — located ranges + at-risk movie time —
-        // computed here from the in-memory bad-range set + title so the
+        // derived by the sink from the in-memory bad-range set + title so the
         // client renders it verbatim and never reads the mapfile.
-        located: main_title
-            .map(|t| libfreemkv::disc::locate_ranges(&bad_ranges_now, t))
-            .unwrap_or_default(),
+        located,
     };
     !reporter.report(&pp)
 }
@@ -1362,8 +1516,8 @@ pub fn bytes_bad_in_title_from_mapfile(
 /// disc in the first minutes. Returns a [`PatchOutcome`] with
 /// recovered byte counts and wedge-detection signals.
 ///
-/// Paired with [`Disc::sweep`] as the library's other flat
-/// rip-phase verb. Caller drives the retry loop and the
+/// Paired with [`super::sweep`] as this crate's other flat
+/// rip-phase verb (both were `Disc::` methods in libfreemkv before 1.6.0). Caller drives the retry loop and the
 /// sweep-vs-patch dispatch.
 pub fn patch(
     disc: &libfreemkv::Disc,
@@ -1393,6 +1547,33 @@ pub fn patch(
     // and records them Finished, which is silent corruption presented as a
     // successful recovery.
     mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
+    // COVERAGE. `total_bytes` — the denominator every figure this pass reports
+    // is derived against, including `bytes_total` in the outcome — comes wholly
+    // from the untrusted mapfile's last entry (`load()` derives it as
+    // `last.pos + last.size`). Nothing compared it with the disc actually in
+    // the drive.
+    //
+    // An UNDER-covering mapfile (truncated tail, a dropped trailing line, an
+    // imported ddrescue run over part of the image) therefore describes a
+    // fraction of the disc, and a patch pass that cleans that fraction reports
+    // zero pending and zero unreadable over it: `MultipassResult::complete`
+    // stamps true for a disc most of which was never read. An OVER-covering one
+    // sends reads past capacity.
+    //
+    // `copy` already refuses to resume on ANY mismatch (`covers_disc`) and
+    // forces a fresh full sweep. `patch` has no sweep to fall back to, so — as
+    // with the truncated-image gate directly below — it refuses and leaves the
+    // choice to the caller.
+    if total_bytes != disc.capacity_bytes {
+        tracing::info!(
+            target: "freemkv::scan",
+            phase = "patch",
+            mapfile_total = total_bytes,
+            disc_capacity = disc.capacity_bytes,
+            "refusing: the mapfile does not cover the disc in the drive"
+        );
+        return Err(Error::MapfileInvalid { kind: "coverage" });
+    }
     // Same argument as the identity gate above, and the gap it left open. A
     // patch pass walks only the mapfile's BAD ranges and takes `bytes_good`
     // from its stats, so it never looks at — and never re-reads — anything the
@@ -1485,7 +1666,11 @@ pub fn patch(
     // the sink republishes after every record so producer-side
     // stall guards / progress callbacks can read consumer side-
     // effects.
-    let (sink, shared) = PatchSink::new(path, map, is_regular)?;
+    // Taken BEFORE `map` moves into the sink: if the teardown below has to
+    // abandon this consumer, that is the only way left to stop it writing
+    // its by-then-stale mapfile over a resumed pass's record.
+    let map_disown = map.disown_handle();
+    let (sink, shared) = PatchSink::new(path, map, is_regular, disc.titles.first().cloned())?;
     // Why: WRITE_THROUGH_DEPTH (=1) — patch reads ONE sector per
     // recovery decision and the producer's stall / damage-window
     // logic checks consumer-published stats inline. Sweep's
@@ -1494,6 +1679,15 @@ pub fn patch(
     // writes, which conflicts with the per-sector lockstep this
     // loop was written against.
     let pipe = Pipeline::<PatchItem, _>::spawn(WRITE_THROUGH_DEPTH, sink)?;
+    // Halt token for the teardown below (`super::finish_bounded`). Adopts the
+    // caller's Stop bit as-is, exactly as `run`'s `pass_halt` does for the
+    // sends; a caller that wires none gets a never-cancelled token, which
+    // leaves JOIN_TIMEOUT_SECS as the only bound on the join.
+    let finish_halt = opts
+        .halt
+        .clone()
+        .map(libfreemkv::halt::Halt::from_arc)
+        .unwrap_or_default();
 
     // Log ISO file size at patch start for write monitoring
     if let Ok(metadata) = std::fs::metadata(path) {
@@ -1551,11 +1745,11 @@ pub fn patch(
         opts,
         total_bytes,
         decrypt_is_aacs,
-        state: PatchLoopState::new(bytes_good_before, total_bytes, initial_batch, work_total),
+        state: PatchLoopState::new(bytes_good_before, initial_batch, work_total),
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
     };
-    // Hold the pass result rather than `?`-ing it: `pipe.finish()` below is what
+    // Hold the pass result rather than `?`-ing it: the teardown below is what
     // runs `PatchSink::close` (sync_all + mapfile.flush), and returning early
     // here skipped it on every error path — so a pass that died mid-write left
     // the on-disk damage record unflushed and disagreeing with what happened.
@@ -1567,7 +1761,13 @@ pub fn patch(
     // run sync_all + mapfile.flush, then take the final stats from the sink's
     // summary. `close` failing on a regular-file sync_all is surfaced as
     // `Error::IoError`, matching pre-split behaviour.
-    let finish_result = pipe.finish();
+    //
+    // Bounded by the SAME Stop bit `run`'s sends use. Unconditional does not
+    // mean unbounded: a plain `Pipeline::finish` blocked joining a consumer
+    // wedged on a hung mount, which is the one case `send_bounded` above had
+    // just rescued the producer from — the halt landed, and then this line
+    // swallowed it.
+    let finish_result = super::finish_bounded_disowning(pipe, &finish_halt, &map_disown);
 
     // Producer-side error wins over consumer-side — the pass failure is what
     // motivated quitting; the flush error, if any, is downstream. Mirrors the
@@ -1692,6 +1892,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A mapfile that covers only part of the disc must be REFUSED, not
+    /// patched and reported complete.
+    ///
+    /// `total_bytes` comes wholly from the mapfile's last entry, so a mapfile
+    /// describing half the disc — a dropped trailing line, a truncated file, a
+    /// ddrescue import over part of the image — makes that half the denominator
+    /// for everything the pass reports. Cleaning it yields zero pending and
+    /// zero unreadable, and `complete` stamps true for a disc whose other half
+    /// was never read. `copy` refuses this (`covers_disc`); `patch` did not.
+    ///
+    /// The image on disk is written to the mapfile's length, so the
+    /// truncated-image gate CANNOT catch this case — only a comparison with
+    /// `disc.capacity_bytes` can. NoReader panics if a sector is read.
+    #[test]
+    fn patch_refuses_a_mapfile_that_does_not_cover_the_disc() {
+        let dir = std::env::temp_dir().join(format!("fmkv-patch-cover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let iso = dir.join("half.iso");
+
+        let sectors = 64u32;
+        let disc = guard_disc(sectors);
+        // Literal, not derived from the disc: 64 sectors of 2048 = 131072.
+        assert_eq!(disc.capacity_bytes, 131_072);
+        let half = 65_536u64;
+
+        let mapfile_path = disc.mapfile_for(&iso);
+        let _ = std::fs::remove_file(&mapfile_path);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, half, "vTEST").unwrap();
+        mf.record(0, half, mapfile::SectorStatus::Finished).unwrap();
+        mf.record(2048, 2048, mapfile::SectorStatus::NonTrimmed)
+            .unwrap();
+        mf.flush().unwrap();
+        // The image matches the MAPFILE exactly, so the truncated-image gate
+        // is satisfied — this must still be refused.
+        std::fs::write(&iso, vec![0u8; half as usize]).unwrap();
+
+        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let err = match patch(&disc, &mut NoReader, &iso, &opts) {
+            Err(e) => e,
+            Ok(out) => panic!(
+                "a mapfile covering {} of {} bytes must not be patched (reported total {})",
+                half, 131_072, out.bytes_total
+            ),
+        };
+        match err {
+            Error::MapfileInvalid { kind } => assert_eq!(kind, "coverage"),
+            other => panic!("expected MapfileInvalid{{coverage}}, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(&mapfile_path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The gate must not fire on a healthy image — otherwise every normal
     /// resume would be refused.
     #[test]
@@ -1796,90 +2049,81 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Env-var scheduler knobs (`FREEMKV_PATCH_FLAT`,
-    // `FREEMKV_PATCH_FLAT_BUDGET`).
+    // Scheduler knobs (`FREEMKV_PATCH_FLAT`, `FREEMKV_PATCH_FLAT_BUDGET`).
     //
-    // Process env is GLOBAL and cargo runs tests on many threads, so every
-    // test that writes one of these keys must hold `ENV_LOCK` for as long as
-    // it needs its value to stand, and must put the previous value back.
-    // `EnvGuard` does both. `FREEMKV_PATCH_FLAT*` is read ONLY by this module
-    // (`patch_flat_mode` / `flat_handler_budget_secs`) and the only tests in
-    // the whole lib binary that reach that code are in this file, so this lock
-    // is sufficient today — ANY future test that sets these keys, wherever it
-    // lives, must take it too or it will race.
+    // These tests used to WRITE the real env vars under a per-key mutex, with
+    // a SAFETY note claiming the lock made the `set_var` sound because nothing
+    // else in the binary touched THOSE KEYS. That is not `set_var`'s safety
+    // condition. The condition is that no other thread is accessing the
+    // environment at all — any key — because a `setenv` can reallocate and
+    // free the `environ` array a concurrent `getenv` is reading. This binary
+    // breaks that continuously: `std::env::temp_dir()` reads `TMPDIR`, and a
+    // dozen sibling tests in `run.rs`, `mapfile.rs`, `mod.rs`, `sweep.rs`,
+    // `extract.rs`, `multipass.rs` and this very file call it on cargo's other
+    // test threads. The mutex could not have prevented it: those tests never
+    // took the lock, and could not be expected to.
+    //
+    // So nothing writes the environment any more. The parsing rules are pinned
+    // against the pure `*_from_value` functions, and the one test that needs a
+    // value to reach a real `patch()` call uses the thread-local override.
     // ----------------------------------------------------------------
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Holds `ENV_LOCK` and restores the captured keys on drop (including on
-    /// panic, so one failing assertion cannot leak `FREEMKV_PATCH_FLAT` into
-    /// the rest of the run).
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<String>)>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn capture(keys: &[&'static str]) -> Self {
-            // A poisoned lock only means some earlier test panicked while
-            // holding it; the guard's Drop still restored the env, so the
-            // mutex's data (`()`) is not actually corrupt.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let saved = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
-            Self { saved, _lock: lock }
-        }
-
-        fn set(&self, key: &str, val: Option<&str>) {
-            // SAFETY: single-threaded with respect to these keys — `ENV_LOCK`
-            // is held for the guard's lifetime and nothing else in the binary
-            // touches them.
-            unsafe {
-                match val {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
+    /// Restores both thread-local knob overrides on drop, including on panic,
+    /// so a failing assertion cannot leak a knob into the next test that runs
+    /// on this thread.
+    struct KnobGuard;
+    impl Drop for KnobGuard {
         fn drop(&mut self) {
-            for (k, v) in &self.saved {
-                // SAFETY: as in `set` — the lock is still held here.
-                unsafe {
-                    match v {
-                        Some(v) => std::env::set_var(k, v),
-                        None => std::env::remove_var(k),
-                    }
-                }
-            }
+            flat_mode_override(None);
+            flat_budget_override(None);
         }
     }
 
-    /// The flat-mode toggle, exercised through the real function: unset / empty
-    /// / "0" → tier ladder; anything else → flat bandit.
+    /// The flat-mode toggle's parsing rule: unset / empty / "0" → tier ladder;
+    /// anything else → flat bandit.
     ///
     /// This used to assert against a locally-defined copy of the predicate, so
     /// the function under test was never called and any rewrite of it (e.g. to
     /// `!= "1"`, which flips `"true"` and every other value) left the test
-    /// green. It now sets the real env var and calls `patch_flat_mode`.
+    /// green.
     #[test]
-    fn flat_mode_toggle_reads_the_env_var() {
-        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT"]);
+    fn flat_mode_toggle_reads_the_env_value() {
+        assert!(
+            !flat_mode_from_value(None),
+            "unset must keep the proven tier ladder"
+        );
+        assert!(!flat_mode_from_value(Some("")), "empty is not an opt-in");
+        assert!(
+            !flat_mode_from_value(Some("0")),
+            "0 is the explicit off switch"
+        );
 
-        g.set("FREEMKV_PATCH_FLAT", None);
-        assert!(!patch_flat_mode(), "unset must keep the proven tier ladder");
-        g.set("FREEMKV_PATCH_FLAT", Some(""));
-        assert!(!patch_flat_mode(), "empty is not an opt-in");
-        g.set("FREEMKV_PATCH_FLAT", Some("0"));
-        assert!(!patch_flat_mode(), "0 is the explicit off switch");
+        assert!(flat_mode_from_value(Some("1")), "1 selects the flat bandit");
+        assert!(
+            flat_mode_from_value(Some("true")),
+            "any non-empty, non-zero value opts in — not just \"1\""
+        );
+    }
 
-        g.set("FREEMKV_PATCH_FLAT", Some("1"));
-        assert!(patch_flat_mode(), "1 selects the flat bandit");
-        g.set("FREEMKV_PATCH_FLAT", Some("true"));
+    /// And `patch_flat_mode` — the function production calls — really is that
+    /// rule plus the env lookup, not a second copy of it. With no override set
+    /// and the var unset in this process, it must agree with the parser on the
+    /// shipped default.
+    #[test]
+    fn patch_flat_mode_defaults_to_the_tier_ladder() {
+        let _g = KnobGuard;
+        flat_mode_override(Some(true));
         assert!(
             patch_flat_mode(),
-            "any non-empty, non-zero value opts in — not just \"1\""
+            "the override reaches the production reader"
+        );
+        flat_mode_override(Some(false));
+        assert!(!patch_flat_mode());
+        flat_mode_override(None);
+        assert_eq!(
+            patch_flat_mode(),
+            flat_mode_from_value(std::env::var("FREEMKV_PATCH_FLAT").ok().as_deref()),
+            "with no override, the reader is exactly the parsed env value"
         );
     }
 
@@ -1890,35 +2134,59 @@ mod tests {
     /// with a zero-second deadline.
     #[test]
     fn flat_handler_budget_defaults_parses_and_floors() {
-        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT_BUDGET"]);
-
-        g.set("FREEMKV_PATCH_FLAT_BUDGET", None);
-        assert_eq!(flat_handler_budget_secs(), 12, "shipped default is 12 s");
-
-        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("30"));
-        assert_eq!(flat_handler_budget_secs(), 30, "an override is honoured");
-
-        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("  7 "));
+        assert_eq!(flat_budget_from_value(None), 12, "shipped default is 12 s");
         assert_eq!(
-            flat_handler_budget_secs(),
+            flat_budget_from_value(Some("30")),
+            30,
+            "an override is honoured"
+        );
+        assert_eq!(
+            flat_budget_from_value(Some("  7 ")),
             7,
             "surrounding space is trimmed"
         );
 
         // A zero/negative budget would make every deadline already-expired, so
         // handlers would be entered and abandoned without a single read.
-        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("0"));
-        assert_eq!(flat_handler_budget_secs(), 1, "floored at 1 s");
+        assert_eq!(flat_budget_from_value(Some("0")), 1, "floored at 1 s");
 
         // Garbage must fall back to the default, not to 0 and not to a panic.
         for junk in ["", "abc", "-5", "12s"] {
-            g.set("FREEMKV_PATCH_FLAT_BUDGET", Some(junk));
             assert_eq!(
-                flat_handler_budget_secs(),
+                flat_budget_from_value(Some(junk)),
                 12,
                 "unparseable {junk:?} must fall back to the default"
             );
         }
+    }
+
+    /// A misconfigured budget must not take the pass down with it.
+    ///
+    /// `FREEMKV_PATCH_FLAT_BUDGET` is parsed with a floor and no ceiling, and
+    /// the value goes straight into `Instant + Duration`, which PANICS on
+    /// overflow. So a 19-digit typo in an env var aborted the recovery pass —
+    /// on the code path that exists precisely to survive things going wrong.
+    ///
+    /// Asserted against the requirement (the deadline must be a real instant,
+    /// at or after now) rather than against whatever ceiling the fix chose, so
+    /// it stays honest if that ceiling ever changes.
+    #[test]
+    fn an_absurd_handler_budget_degrades_instead_of_panicking() {
+        let now = std::time::Instant::now();
+        for v in [u64::MAX.to_string(), "9999999999999999999".to_string()] {
+            let secs = flat_budget_from_value(Some(&v));
+            let deadline = handler_deadline(now, secs);
+            assert!(
+                deadline >= now,
+                "a deadline in the past is not a degradation, it is a different bug"
+            );
+        }
+        // The ordinary case is untouched: a sane budget is exactly `now + secs`.
+        assert_eq!(
+            handler_deadline(now, 12),
+            now + std::time::Duration::from_secs(12),
+            "a workable budget must not be capped, clamped or rounded"
+        );
     }
 
     /// A reader that fails every read and remembers the LBA order it was asked
@@ -1952,7 +2220,7 @@ mod tests {
     }
 
     /// Run one real patch pass over two bad ranges and return the LBA trace.
-    /// The caller owns `FREEMKV_PATCH_FLAT` (via `EnvGuard`) around this.
+    /// The caller owns the flat-mode knob (via `flat_mode_override`) around this.
     fn trace_two_range_pass(tag: &str, a: (u32, u32), b: (u32, u32)) -> Vec<u32> {
         let dir = std::env::temp_dir().join(format!("fmkv-flat-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2005,16 +2273,16 @@ mod tests {
         let in_a = |l: &u32| *l >= a.0 && *l < a.0 + a.1;
         let in_b = |l: &u32| *l >= b.0 && *l < b.0 + b.1;
 
-        let g = EnvGuard::capture(&["FREEMKV_PATCH_FLAT", "FREEMKV_PATCH_FLAT_BUDGET"]);
+        let _g = KnobGuard;
         // A 1 s per-handler budget keeps the pass quick; the handlers all yield
         // on dead reads long before it, so it does not change the walk.
-        g.set("FREEMKV_PATCH_FLAT_BUDGET", Some("1"));
+        flat_budget_override(Some(1));
 
-        g.set("FREEMKV_PATCH_FLAT", Some("1"));
+        flat_mode_override(Some(true));
         let flat = trace_two_range_pass("flat", a, b);
-        g.set("FREEMKV_PATCH_FLAT", None);
+        flat_mode_override(Some(false));
         let tiered = trace_two_range_pass("tier", a, b);
-        drop(g);
+        drop(_g);
 
         // Both schedulers must actually visit both ranges, or the ordering
         // assertions below would hold vacuously.
@@ -2198,6 +2466,100 @@ mod tests {
         assert_eq!(s.ranges(), &[(0, 1024), (2048, 2048)]);
         s.remove(512, 2048); // covers tail of first + head of second
         assert_eq!(s.ranges(), &[(0, 512), (2560, 1536)]);
+    }
+}
+
+/// The live progress drilldown is built from `SharedPatchState`, and the
+/// snapshot's range list is CAPPED. Everything `report_patch_progress` derives
+/// from it is a TOTAL — at-risk bytes in the main title, the section count, the
+/// "+N more" tail — so a disc fragmented past the cap must not make those
+/// totals silently shrink to the cap.
+#[cfg(test)]
+mod truncated_range_reporting_tests {
+    use super::*;
+    use crate::recovery::mapfile::Mapfile;
+
+    const SECTOR: u64 = 2048;
+    /// Comfortably more damaged runs than the old 8192 snapshot cap kept, so
+    /// the truncation is unambiguously exercised.
+    const DAMAGED_RUNS: u64 = 9000;
+
+    /// Build a mapfile holding `DAMAGED_RUNS` single-sector Unreadable runs,
+    /// each separated by one Finished sector so nothing coalesces. Written as
+    /// text and loaded, rather than recorded run by run, because `record()` is
+    /// O(entries) and this is deliberately the fragmented case.
+    fn fragmented_mapfile(dir: &std::path::Path) -> Mapfile {
+        let mut s = String::from(
+            "# Rescue Logfile. Created by test\n\
+             # Current pos / status / pass / pass_time\n\
+             0x000000000  ?  1  0\n\
+             #      pos        size  status\n",
+        );
+        use std::fmt::Write as _;
+        for i in 0..DAMAGED_RUNS {
+            let bad = i * 2 * SECTOR;
+            let good = bad + SECTOR;
+            let _ = writeln!(s, "0x{bad:09x}  0x{SECTOR:09x}    -");
+            let _ = writeln!(s, "0x{good:09x}  0x{SECTOR:09x}    +");
+        }
+        let p = dir.join("fragmented.mapfile");
+        std::fs::write(&p, s).unwrap();
+        Mapfile::load(&p).unwrap()
+    }
+
+    /// A title spanning the whole fragmented region, so every damaged run falls
+    /// inside its extents and the expected totals are plain literals.
+    fn spanning_title() -> libfreemkv::DiscTitle {
+        let mut t = libfreemkv::DiscTitle::empty();
+        t.extents = vec![libfreemkv::disc::Extent {
+            start_lba: 0,
+            sector_count: (DAMAGED_RUNS * 2) as u32,
+        }];
+        t.size_bytes = DAMAGED_RUNS * 2 * SECTOR;
+        t.duration_secs = 3600.0;
+        t
+    }
+
+    #[test]
+    fn snapshot_totals_account_for_the_capped_range_list() {
+        let d = std::env::temp_dir().join(format!("fmkv-trunc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let map = fragmented_mapfile(&d);
+        let title = spanning_title();
+        let shared = SharedPatchState::from_map(&map, Some(&title));
+
+        // Expected values, from literals — 9000 damaged single-sector runs,
+        // every one of them inside the title.
+        assert_eq!(shared.bad_bytes_in_title, 9000 * SECTOR);
+        assert_eq!(shared.located.num_ranges, 9000);
+        // libfreemkv's own display cap keeps the 50 biggest; the rest are
+        // reported as the "+N more" tail, not silently dropped.
+        assert_eq!(shared.located.ranges.len(), 50);
+        assert_eq!(shared.located.truncated, 8950);
+        // At-risk movie time: 9000 damaged sectors of an 18000-sector,
+        // 3600 s title = half the runtime.
+        assert!(
+            (shared.located.main_at_risk_ms - 1_800_000.0).abs() < 1.0,
+            "at-risk time {} ms should be half the runtime",
+            shared.located.main_at_risk_ms
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A disc with no titles has nothing to locate damage against; the snapshot
+    /// reports zero rather than inventing a drilldown.
+    #[test]
+    fn no_title_yields_an_empty_drilldown() {
+        let d = std::env::temp_dir().join(format!("fmkv-trunc-nt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let map = fragmented_mapfile(&d);
+        let shared = SharedPatchState::from_map(&map, None);
+        assert_eq!(shared.bad_bytes_in_title, 0);
+        assert_eq!(shared.located.num_ranges, 0);
+        assert!(shared.located.ranges.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
 

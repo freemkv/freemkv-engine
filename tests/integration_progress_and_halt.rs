@@ -712,8 +712,9 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     // Pass 1's job is "fast and accurate, get the most data in the
-    // shortest time." It no longer bisects on marginal media — that's
-    // Pass N's purpose-built role. So a BlockSizeFailingReader that
+    // shortest time." It does not retry a failed batch sector-by-
+    // sector — that's Pass N's purpose-built role. So a
+    // BlockSizeFailingReader that
     // fails on multi-sector reads and succeeds on single-sector
     // results in: every batch fails → SkipBlock → whole 32-sector
     // ECC block marked NonTrimmed → Pass N (patch) revisits and
@@ -722,7 +723,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     // Pass 1 alone:
     assert_eq!(
         result.bytes_good, 0,
-        "Pass 1 doesn't bisect on marginal media — failed batches become NonTrimmed for Pass N to revisit"
+        "Pass 1 doesn't retry a failed batch per-sector — failed batches become NonTrimmed for Pass N to revisit"
     );
     assert_eq!(
         result.bytes_pending, total_bytes,
@@ -852,7 +853,235 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
     );
 }
 
-// ── 10. Damage time calculation (unit test) ────────────────────────────────
+// ── 9b. The patch pass's live drilldown is located against the main title ──
 //
-// Verifies the formula: damage_secs = bytes_unreadable / bytes_total * duration
-// This mirrors the CLI's print_disc_progress logic.
+// `PassProgress::located` and `bytes_bad_in_main_title` are derived by the
+// patch consumer from the mapfile's damage set INTERSECTED with the main
+// feature's extents. The title reaches the consumer by being handed to the
+// sink at construction, so a disc that has a title must produce a non-empty
+// drilldown: zero here means either no damage was seen or the title never
+// arrived, and on this disc (every read fails) the first is impossible.
+
+#[test]
+fn test_patch_progress_locates_damage_against_the_main_title() {
+    let capacity_sectors: u32 = 128;
+    let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
+
+    let mut reader = FailingSectorReader::new(capacity_sectors);
+    let mut disc = synthetic_disc(capacity_sectors);
+    let mut title = synthetic_title(capacity_sectors);
+    title.duration_secs = 60.0;
+    disc.titles = vec![title];
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        ..Default::default()
+    };
+    // Pass 1 marks the whole disc NonTrimmed — the damage set the patch pass
+    // then walks.
+    freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("pass1 ok");
+
+    struct LocatedReporter {
+        bad_in_title: Arc<AtomicU64>,
+        num_ranges: Arc<AtomicU64>,
+        at_risk_ms: Arc<AtomicU64>,
+    }
+    impl libfreemkv::progress::Progress for LocatedReporter {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            self.bad_in_title
+                .store(p.bytes_bad_in_main_title, Ordering::Relaxed);
+            self.num_ranges
+                .store(p.located.num_ranges as u64, Ordering::Relaxed);
+            self.at_risk_ms
+                .store(p.located.main_at_risk_ms as u64, Ordering::Relaxed);
+            true
+        }
+    }
+    let bad_in_title = Arc::new(AtomicU64::new(0));
+    let num_ranges = Arc::new(AtomicU64::new(0));
+    let at_risk_ms = Arc::new(AtomicU64::new(0));
+    let reporter = LocatedReporter {
+        bad_in_title: bad_in_title.clone(),
+        num_ranges: num_ranges.clone(),
+        at_risk_ms: at_risk_ms.clone(),
+    };
+    let pass2_opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        progress: Some(&reporter),
+        ..Default::default()
+    };
+    freemkv_engine::copy(&disc, &mut reader, &iso_path, &pass2_opts).expect("pass2 ok");
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
+
+    // Every sector of the title is damaged and the title covers the whole
+    // disc, so the drilldown must account for all of it.
+    assert_eq!(
+        bad_in_title.load(Ordering::Relaxed),
+        total_bytes,
+        "the whole title is damaged; the live figure must say so"
+    );
+    assert!(
+        num_ranges.load(Ordering::Relaxed) >= 1,
+        "a damaged title must locate at least one range"
+    );
+    assert_eq!(
+        at_risk_ms.load(Ordering::Relaxed),
+        60_000,
+        "all 60 s of a fully damaged title are at risk"
+    );
+}
+
+// The file used to end with a section header — "10. Damage time calculation
+// (unit test)" — and no test under it. There is nothing here to unit-test: the
+// damage-time formula (unreadable / total × duration) lives in libfreemkv, not
+// in this crate, and section 9b above already pins the value this crate
+// observes end to end (`main_at_risk_ms == 60_000` for a fully damaged 60 s
+// title). A heading promising coverage that does not exist is worse than no
+// heading, so it is gone rather than restated.
+
+// ── 11. A live progress tick never counts zero-filled damage as "good" ─────
+//
+// `bytes_good_total` is what a UI puts behind the word "recovered". The sweep
+// producer's own cursor (`bytes_done`) advances on THREE damage paths as well
+// as the good one — SkipBlock (failed batch, zero-filled, NonTrimmed),
+// JumpAhead's failed block, and the zero-filled jump gap — so it measures
+// POSITION, not recovery. Feeding it to the tick (directly before the first
+// consumer snapshot lands, and through `.max()` after) let a rip grinding
+// through a damage zone report bytes it had zero-filled as bytes it had
+// recovered: data loss rendered as success, on the counter whose whole job is
+// to say how much came back.
+
+/// Fails every read with RECOVERED ERROR (a marginal read the sweep distrusts):
+/// each batch becomes a plain `SkipBlock` — zero-filled, marked NonTrimmed —
+/// with the ordinary 5 s pause and no 30 s damage-zone cooldown, so the whole
+/// disc is damage and the test stays short.
+struct MarginalSectorReader {
+    capacity: u32,
+}
+
+impl SectorSource for MarginalSectorReader {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        _count: u16,
+        _buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        Err(libfreemkv::error::Error::DiscRead {
+            sector: lba as u64,
+            status: Some(libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(libfreemkv::ScsiSense {
+                sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
+                asc: 0x17,
+                ascq: 0x01,
+            }),
+        })
+    }
+
+    fn capacity_sectors(&self) -> u32 {
+        self.capacity
+    }
+}
+
+#[test]
+fn live_progress_never_reports_zero_filled_damage_as_good_bytes() {
+    let capacity_sectors: u32 = 60; // one batch: the sweep's optical default
+    let mut reader = MarginalSectorReader {
+        capacity: capacity_sectors,
+    };
+    let disc = synthetic_disc(capacity_sectors);
+
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
+    let iso_path = tmp.path().to_path_buf();
+    drop(tmp);
+
+    /// Remembers the HIGHEST `bytes_good_total` any tick ever claimed, and
+    /// the four totals from the tick that accounted for the FEWEST bytes —
+    /// the worst case for the partition assertion below.
+    struct MaxGoodReporter {
+        max_good: Arc<AtomicU64>,
+        worst_sum: Arc<AtomicU64>,
+        worst: Arc<std::sync::Mutex<(u64, u64, u64, u64)>>,
+    }
+    impl libfreemkv::progress::Progress for MaxGoodReporter {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            self.max_good
+                .fetch_max(p.bytes_good_total, Ordering::Relaxed);
+            let sum = p.bytes_good_total
+                + p.bytes_unreadable_total
+                + p.bytes_pending_total
+                + p.bytes_retryable_total;
+            let prev = self.worst_sum.load(Ordering::Relaxed);
+            if prev == 0 || sum < prev {
+                self.worst_sum.store(sum, Ordering::Relaxed);
+                *self.worst.lock().unwrap() = (
+                    p.bytes_good_total,
+                    p.bytes_unreadable_total,
+                    p.bytes_pending_total,
+                    p.bytes_retryable_total,
+                );
+            }
+            true
+        }
+    }
+    let max_good = Arc::new(AtomicU64::new(0));
+    let worst_sum = Arc::new(AtomicU64::new(0));
+    let worst_totals = Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64)));
+    let reporter = MaxGoodReporter {
+        max_good: max_good.clone(),
+        worst_sum: worst_sum.clone(),
+        worst: worst_totals.clone(),
+    };
+
+    let opts = CopyOptions {
+        decrypt: false,
+        multipass: true,
+        progress: Some(&reporter),
+        ..Default::default()
+    };
+
+    let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy ok");
+
+    let _ = std::fs::remove_file(&iso_path);
+    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
+
+    // Fixture check: every sector must really have failed, or the assertion
+    // below is vacuous.
+    assert_eq!(
+        result.bytes_good, 0,
+        "fixture invalid: this reader never returns data, so the pass must \
+         recover nothing"
+    );
+
+    assert_eq!(
+        max_good.load(Ordering::Relaxed),
+        0,
+        "a live tick claimed recovered bytes on a disc where every single read \
+         failed and every byte written was a zero fill"
+    );
+
+    // ...and the damage must land in a BUCKET, not merely be absent from
+    // `good`. The four totals partition the disc, so on a tick where nothing
+    // was recovered every attempted byte has to show up as unreadable,
+    // retryable or pending. Reporting it in none of them is the same defect
+    // this test was written for, moved one field along: a rip losing data
+    // while every counter that exists to measure loss reads clean.
+    let total = capacity_sectors as u64 * SECTOR_SIZE as u64;
+    let (g, u, p, r) = *worst_totals.lock().unwrap();
+    assert_eq!(
+        g + u + p + r,
+        total,
+        "the live totals must account for the whole disc: good={g} \
+         unreadable={u} pending={p} retryable={r}, disc={total} — \
+         {} bytes are in no bucket at all",
+        total.saturating_sub(g + u + p + r)
+    );
+}

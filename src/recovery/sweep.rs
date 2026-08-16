@@ -1,4 +1,4 @@
-//! `Disc::sweep`'s consumer-side `Sink<WorkItem>`.
+//! The sweep producer's consumer-side `Sink<WorkItem>`.
 //!
 //! Background: the original sweep loop runs strictly serialised —
 //! SCSI read → decrypt → seek + write → mapfile.record → next iter.
@@ -11,8 +11,10 @@
 //! A producer/consumer split overlaps the two stages on the generic
 //! [`libfreemkv::io::Pipeline`] + [`libfreemkv::io::Sink`] primitive. This module
 //! is the sweep-specific `Sink` impl; the producer-side state machine
-//! (read_error context, decrypt, set_speed, halt) stays in
-//! `Disc::sweep` in `disc/mod.rs`.
+//! (read_error context, decrypt, set_speed, halt) stays with the producer —
+//! the free `sweep` fn in `recovery/mod.rs`. (It was `Disc::sweep` in
+//! libfreemkv's `disc/mod.rs` before 1.6.0; neither that method nor that
+//! module exists in this crate.)
 //!
 //! Correctness invariants preserved:
 //! - Mapfile is single-writer (consumer-only). No locking.
@@ -34,9 +36,8 @@ use libfreemkv::io::{Flow, Sink};
 
 use super::mapfile::{MapStats, Mapfile, SectorStatus};
 
-/// Reusable zero buffer for SkipFill / GapFill / BisectBad. 64 KB
-/// matches the existing zero_gap chunk size used by the pre-split
-/// sweep loop.
+/// Reusable zero buffer for SkipFill / GapFill. 64 KB matches the
+/// existing zero_gap chunk size used by the pre-split sweep loop.
 const ZERO_CHUNK: usize = 64 * 1024;
 
 /// Producer → Consumer messages. The consumer applies these in FIFO
@@ -47,14 +48,6 @@ pub(super) enum WorkItem {
     /// `opts.decrypt` was set. Consumer writes `buf` at `pos` and
     /// records the range as `Finished`.
     Good { pos: u64, buf: Vec<u8> },
-
-    /// Bisect inner-loop good single sector (already decrypted by the
-    /// producer). 2048 bytes.
-    BisectGood { pos: u64, buf: Box<[u8; 2048]> },
-
-    /// Bisect inner-loop bad single sector. Consumer writes 2048
-    /// zeros at `pos` and records the sector as `NonTrimmed`.
-    BisectBad { pos: u64 },
 
     /// Whole-batch zero-fill (failed batch on `SkipBlock`, or the
     /// failed batch portion of `JumpAhead`). Consumer streams zeros
@@ -114,8 +107,8 @@ pub(super) struct SweepSink {
     /// the latest snapshot and uses it for the progress callback;
     /// dropped sends on a full channel are by design.
     prog_tx: SyncSender<ProgressSnapshot>,
-    /// Reusable zero buffer for SkipFill / GapFill / BisectBad. Held
-    /// in the sink so each apply call doesn't reallocate.
+    /// Reusable zero buffer for SkipFill / GapFill. Held in the sink
+    /// so each apply call doesn't reallocate.
     zero: Box<[u8; ZERO_CHUNK]>,
 }
 
@@ -151,16 +144,6 @@ impl Sink<WorkItem> for SweepSink {
                 self.file.seek(SeekFrom::Start(pos))?;
                 self.file.write_all(&buf)?;
                 self.map.record(pos, len, SectorStatus::Finished)?;
-            }
-            WorkItem::BisectGood { pos, buf } => {
-                self.file.seek(SeekFrom::Start(pos))?;
-                self.file.write_all(&buf[..])?;
-                self.map.record(pos, 2048, SectorStatus::Finished)?;
-            }
-            WorkItem::BisectBad { pos } => {
-                self.file.seek(SeekFrom::Start(pos))?;
-                self.file.write_all(&self.zero[..2048])?;
-                self.map.record(pos, 2048, SectorStatus::NonTrimmed)?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
                 self.file.seek(SeekFrom::Start(pos))?;
@@ -284,9 +267,12 @@ mod tests {
         let dir = scratch("skipfill");
         let gap_start = 4096u64;
         // Two whole 64 KB chunks plus a short final one, so the chunking
-        // arithmetic runs three times with a partial tail. Sector-aligned,
-        // because `Mapfile::record` widens a ragged range to whole sectors and
-        // that would blur the "exactly len" assertion.
+        // arithmetic runs three times with a partial tail. Sector-aligned
+        // because that is what a real `SkipFill` carries: the PRODUCER snaps
+        // every span with `snap_to_sectors` (`recovery/mod.rs`) before it ever
+        // reaches this sink. (`Mapfile::record`, which this comment used to
+        // blame for the widening, stores `pos`/`size` verbatim — it rounds
+        // nothing.)
         let len = ZERO_CHUNK as u64 * 2 + 3 * 2048;
         // Trailing slack wider than one chunk, so an overshooting fill has
         // somewhere visible to overshoot INTO.
@@ -380,100 +366,6 @@ mod tests {
         assert!(got[2048..4096].iter().all(|&b| b == 0x5A));
         assert!(got[4096..].iter().all(|&b| b == 0xAA));
         assert_eq!(summary.stats.bytes_good, 2048);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A bisect-bad sector is zeroed AND recorded `NonTrimmed` — never
-    /// `Finished`.
-    ///
-    /// This is the one item in the enum whose payload is invented by the
-    /// consumer rather than read off the disc: the producer could not read the
-    /// sector, so `apply` writes 2048 zeros of its own. The status it records
-    /// is therefore the ONLY thing standing between those zeros and the user.
-    /// If this arm ever recorded `Finished`, the mapfile would call fabricated
-    /// zeros recovered data, `bytes_good` would include them, a later patch
-    /// pass would never retry the sector, and the rip would be handed over as
-    /// complete with a hole in it. Nothing else in the tree checks it: the
-    /// producer-side bisect only decides which item to send.
-    #[test]
-    fn a_bisect_bad_sector_is_zeroed_and_recorded_nontrimmed_not_finished() {
-        let dir = scratch("bisectbad");
-        let total = 8192u64;
-        let (mut sink, iso) = sink_over(&dir, total);
-
-        sink.apply(WorkItem::BisectBad { pos: 4096 }).unwrap();
-        let summary = sink.close().unwrap();
-
-        let got = std::fs::read(&iso).unwrap();
-        assert_eq!(got.len() as u64, total);
-        assert!(
-            got[..4096].iter().all(|&b| b == 0xAA),
-            "the zero-fill ran backwards past the failed sector"
-        );
-        assert!(
-            got[4096..6144].iter().all(|&b| b == 0),
-            "the failed sector must be zero-filled, not left as whatever was there"
-        );
-        assert!(
-            got[6144..].iter().all(|&b| b == 0xAA),
-            "the zero-fill wrote past the single 2048-byte sector"
-        );
-
-        assert_eq!(
-            summary.stats.bytes_good, 0,
-            "a sector the drive could not read must not count as recovered data"
-        );
-        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
-        assert_eq!(
-            reloaded.ranges_with(&[SectorStatus::NonTrimmed]),
-            vec![(4096, 2048)],
-            "exactly the failed sector is NonTrimmed, so a patch pass retries it"
-        );
-        assert!(
-            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
-            "fabricated zeros must never be recorded Finished"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A bisect-good sector lands at its own offset and is recorded `Finished`.
-    ///
-    /// The mirror of the arm above, and the pair is the point: the two carry
-    /// the same 2048-byte length and differ only in payload and status. This
-    /// one asserts the sector really is written where it says (`pos`, not the
-    /// file's current position) and really is marked `Finished` — a bisect that
-    /// recovered a sector but recorded it `NonTrimmed` would make every later
-    /// pass re-read a sector already in hand, and one that wrote to the wrong
-    /// offset would corrupt a neighbour while claiming success.
-    #[test]
-    fn a_bisect_good_sector_is_written_at_its_position_and_recorded_finished() {
-        let dir = scratch("bisectgood");
-        let total = 8192u64;
-        let (mut sink, iso) = sink_over(&dir, total);
-
-        sink.apply(WorkItem::BisectGood {
-            pos: 4096,
-            buf: Box::new([0x5Au8; 2048]),
-        })
-        .unwrap();
-        let summary = sink.close().unwrap();
-
-        let got = std::fs::read(&iso).unwrap();
-        assert!(got[..4096].iter().all(|&b| b == 0xAA));
-        assert!(
-            got[4096..6144].iter().all(|&b| b == 0x5A),
-            "the recovered sector must land at pos, not at the file's cursor"
-        );
-        assert!(got[6144..].iter().all(|&b| b == 0xAA));
-
-        assert_eq!(summary.stats.bytes_good, 2048);
-        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
-        assert_eq!(
-            reloaded.ranges_with(&[SectorStatus::Finished]),
-            vec![(4096, 2048)],
-            "a sector recovered by bisect must be Finished, or later passes re-read it forever"
-        );
-        assert!(reloaded.ranges_with(&[SectorStatus::NonTrimmed]).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

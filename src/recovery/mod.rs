@@ -212,6 +212,20 @@ pub fn copy(
     sweep_internal(disc, reader, path, opts, false)
 }
 
+/// What goes in the mapfile's `# Rescue Logfile. Created by …` header.
+///
+/// It must name the crate that actually wrote the file. `env!` expands in the
+/// crate being compiled, so the literal `"libfreemkv v"` this used to be
+/// concatenated with stamped libfreemkv's NAME onto freemkv-engine's VERSION —
+/// a provenance line naming a crate/version pair that has never existed, in the
+/// one artifact an operator reads to work out which build produced a rip.
+/// Recovery has lived in this crate since 1.6.0.
+///
+/// Header TEXT only: no parser keys off it (`load` stores the remainder of the
+/// line verbatim as `version`), so the on-disk format and its
+/// ddrescue-compatibility are untouched.
+pub(crate) const MAPFILE_CREATOR: &str = concat!("freemkv-engine v", env!("CARGO_PKG_VERSION"));
+
 /// Sectors in one AACS aligned unit (6144 bytes = 3 sectors).
 const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16;
 
@@ -251,6 +265,50 @@ pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) 
     // how the two halves of one invariant drift apart.
     let unit = UNIT_SECTORS as u64 * 2048;
     region_pos - (region_pos % unit)
+}
+
+/// Widen the PHYSICAL read of a region's LAST block out to whole AACS units.
+///
+/// The third corner of the same invariant, and the one that was missing.
+/// [`aacs_aligned_batch`] makes a full batch a whole number of units and
+/// [`aacs_aligned_region_start`] anchors the cursor to a unit boundary, but the
+/// sweep loop takes `min(region_end - pos, batch * 2048)` — and `region_end` is
+/// only SECTOR-snapped (`snap_to_sectors`), never unit-snapped. So the final
+/// read of every region is a whole number of sectors that is generally NOT a
+/// whole number of units: 6144-byte units straddle its top edge, which is
+/// exactly what the two siblings exist to prevent (`decrypt_sectors` anchors
+/// units at buffer offset 0, so a partial trailing unit decrypts under the
+/// wrong alignment and the verify gate either leaves it encrypted or aborts
+/// `DecryptFailed`).
+///
+/// Widening rather than shrinking: shrinking would leave the region's tail
+/// sectors unread forever. `limit` (the disc's total size) caps the widening so
+/// a region ending at the disc's end never reads past capacity — a disc whose
+/// capacity is not a whole number of units keeps its unavoidable partial tail
+/// unit, which is the pre-existing behaviour and not something this can fix.
+///
+/// Only the READ widens. The caller still accounts, sends, and records exactly
+/// `block_bytes`, so the extra bytes cannot shift the cursor or re-status a
+/// neighbouring range — the same widen-read-copy-back-the-window shape
+/// `patch::recovery_read` already uses for mid-unit recovery reads.
+pub(crate) fn aacs_aligned_read_bytes(
+    pos: u64,
+    block_bytes: u64,
+    limit: u64,
+    decrypt_is_aacs: bool,
+) -> u64 {
+    if !decrypt_is_aacs {
+        return block_bytes;
+    }
+    let unit = UNIT_SECTORS as u64 * 2048;
+    let rem = block_bytes % unit;
+    if rem == 0 {
+        return block_bytes;
+    }
+    let widened = block_bytes.saturating_add(unit - rem);
+    // Never past the end of the image, and never NARROWER than what the caller
+    // asked for (which `min` alone would do if `limit` were behind `pos`).
+    widened.min(limit.saturating_sub(pos)).max(block_bytes)
 }
 
 #[cfg(test)]
@@ -380,6 +438,108 @@ mod aacs_aligned_batch_tests {
     }
 }
 
+#[cfg(test)]
+mod mapfile_creator_tests {
+    use super::MAPFILE_CREATOR;
+
+    /// The provenance header must name THIS crate. `concat!` + `env!` puts the
+    /// compiling crate's version behind whatever name is written next to it,
+    /// so the wrong literal produces a plausible-looking lie
+    /// ("libfreemkv v1.6.4") rather than a compile error.
+    #[test]
+    fn the_mapfile_header_names_the_crate_that_writes_it() {
+        assert!(
+            MAPFILE_CREATOR.starts_with("freemkv-engine v"),
+            "mapfile provenance header is {MAPFILE_CREATOR:?}"
+        );
+        assert!(
+            !MAPFILE_CREATOR.contains("libfreemkv"),
+            "recovery has lived in this crate since 1.6.0: {MAPFILE_CREATOR:?}"
+        );
+        // A version is actually interpolated — not the literal `env!` call, and
+        // not an empty tail.
+        let version = MAPFILE_CREATOR
+            .strip_prefix("freemkv-engine v")
+            .expect("prefix asserted above");
+        assert!(
+            version.starts_with(|c: char| c.is_ascii_digit()),
+            "version tail is {version:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod aacs_aligned_read_bytes_tests {
+    use super::aacs_aligned_read_bytes;
+
+    /// One AACS aligned unit, spelled as the literal the format defines
+    /// (3 sectors x 2048) rather than derived from the constant under test.
+    const UNIT: u64 = 6144;
+    /// A whole disc, far past every `pos` used below, so `limit` never binds.
+    const FAR: u64 = 1 << 40;
+
+    /// The case the sweep loop actually produces: the last block of a region.
+    ///
+    /// A region ends wherever `snap_to_sectors` put it — a SECTOR boundary, not
+    /// a unit boundary. `region_end - pos` is then a whole number of sectors
+    /// that straddles a unit: 4096 bytes (2 sectors) is two thirds of a unit,
+    /// and handing that to the decrypting reader decrypts the trailing unit
+    /// under the wrong alignment.
+    #[test]
+    fn the_last_block_of_a_region_is_widened_to_a_whole_unit() {
+        assert_eq!(aacs_aligned_read_bytes(0, 4096, FAR, true), UNIT);
+        assert_eq!(aacs_aligned_read_bytes(0, 2048, FAR, true), UNIT);
+        // 33 sectors (one aligned batch) + 1 sector → 12 units.
+        assert_eq!(aacs_aligned_read_bytes(0, 69_632, FAR, true), 73_728);
+    }
+
+    /// A block that is already a whole number of units is left exactly alone —
+    /// that is every block but the last one of a region.
+    #[test]
+    fn a_unit_aligned_block_is_untouched() {
+        for bytes in [UNIT, 2 * UNIT, 11 * UNIT, 67_584] {
+            assert_eq!(aacs_aligned_read_bytes(12_288, bytes, FAR, true), bytes);
+        }
+    }
+
+    /// A NON-decrypting sweep (`--raw`, the multipass path) has no unit
+    /// geometry to respect and must read exactly what it was asked for.
+    #[test]
+    fn a_non_aacs_sweep_reads_exactly_the_block() {
+        for bytes in [2048u64, 4096, 65_536, 69_632] {
+            assert_eq!(aacs_aligned_read_bytes(0, bytes, FAR, false), bytes);
+        }
+    }
+
+    /// Widening must never read past the end of the image. A disc whose
+    /// capacity is not a whole number of units keeps its partial tail unit.
+    #[test]
+    fn widening_stops_at_the_end_of_the_disc() {
+        // 100 sectors = 204800 bytes, which is not a multiple of 6144.
+        let capacity = 204_800u64;
+        // Final block: the last 2 sectors of the disc.
+        assert_eq!(
+            aacs_aligned_read_bytes(capacity - 4096, 4096, capacity, true),
+            4096,
+            "must not read past capacity to complete a unit"
+        );
+        // A block that CAN be completed inside the disc still is.
+        assert_eq!(
+            aacs_aligned_read_bytes(0, 4096, capacity, true),
+            UNIT,
+            "room to widen inside the image"
+        );
+    }
+
+    /// Never narrower than what was asked for, even if `limit` is behind
+    /// `pos` (a mapfile whose extent disagrees with the image length).
+    #[test]
+    fn never_returns_less_than_the_requested_block() {
+        assert_eq!(aacs_aligned_read_bytes(8192, 4096, 0, true), 4096);
+        assert_eq!(aacs_aligned_read_bytes(8192, 4096, 8192, true), 4096);
+    }
+}
+
 /// What the output image's length is, for a resume decision.
 ///
 /// `NotFound` is the ONE error that genuinely means "no file yet" — the
@@ -457,13 +617,6 @@ pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageStat
     Ok(ImageState { len, want })
 }
 
-/// Whether a fresh sweep may proceed after trying to delete a stale mapfile.
-///
-/// A fresh sweep MUST start from an empty mapfile: if the stale file survives,
-/// `open_or_create` loads it and the NEW disc inherits the OLD disc's
-/// `Finished` ranges, so the producer skips them and the ISO is silently
-/// zero-filled there. `NotFound` means it was already gone, which is fine;
-/// anything else must abort rather than inherit.
 /// Whether the output is a REGULAR FILE, and therefore whether a `sync_all`
 /// failure on it is a real error and whether it should be pre-sized.
 ///
@@ -481,6 +634,17 @@ pub(crate) fn output_is_regular(m: std::io::Result<std::fs::Metadata>) -> bool {
     m.map(|md| md.file_type().is_file()).unwrap_or(true)
 }
 
+/// Whether a fresh sweep may proceed after trying to delete a stale mapfile.
+///
+/// A fresh sweep MUST start from an empty mapfile: if the stale file survives,
+/// `open_or_create` loads it and the NEW disc inherits the OLD disc's
+/// `Finished` ranges, so the producer skips them and the ISO is silently
+/// zero-filled there. `NotFound` means it was already gone, which is fine;
+/// anything else must abort rather than inherit.
+///
+/// (This paragraph used to sit at the top of `output_is_regular`'s doc block
+/// with no blank `///` between them, so rustdoc rendered it on that function
+/// and this one had no documentation at all.)
 pub(crate) fn stale_mapfile_removed(r: std::io::Result<()>) -> Result<()> {
     match r {
         Ok(()) => Ok(()),
@@ -508,6 +672,266 @@ pub(crate) fn sweep_batch_sectors(
         None if skip_on_error => ecc_sectors(format),
         None => DEFAULT_BATCH_SECTORS_OPTICAL,
     }
+}
+
+/// Deadline for ONE producer→consumer handoff on a recovery pipeline.
+///
+/// Reuses [`libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS`] (600 s) — the budget
+/// `Pipeline::finish_with_halt` already gives the same consumer to drain at
+/// join — rather than inventing a second number. A producer that gave up
+/// sooner than the joiner is willing to wait would abort passes the joiner
+/// still considers healthy.
+///
+/// It is deliberately enormous relative to a real write: one item is at most a
+/// batch of sectors (64 KiB on sweep, one recovered span on patch), so even a
+/// pathologically slow NFS mount doing a few KiB/s clears it in seconds. The
+/// deadline is only the no-halt backstop; responsiveness to Stop comes from the
+/// halt poll inside [`Pipeline::send_with_halt`], which ticks every
+/// `libfreemkv::halt::POLL_INTERVAL` (250 ms) regardless of this value.
+const SEND_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS);
+
+/// Why a send failed, for producers that must tell "the operator pressed
+/// Stop" apart from "the consumer died" apart from "the consumer is alive but
+/// has not drained a slot in [`SEND_DEADLINE`]".
+///
+/// [`Pipeline::send_with_halt`] collapses all three into `Err(item)` — it hands
+/// the item back and leaves the diagnosis to the caller. Mapping them all to
+/// `PipelineConsumerGone` would report a Stop, and a hung mount, as a dead
+/// consumer thread.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SendStall {
+    /// The halt token fired while the producer was waiting for a slot. Not an
+    /// error: the caller reports the pass as halted and drops the item.
+    Halted,
+    /// The consumer thread is gone (panicked / receiver dropped).
+    ConsumerGone,
+    /// The consumer is ALIVE but has not taken the item within
+    /// [`SEND_DEADLINE`] — the hung-mount case.
+    Stalled,
+}
+
+impl SendStall {
+    /// Numeric library error for the two fatal cases. `Halted` is included for
+    /// completeness but callers handle it as an outcome, not an error.
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            SendStall::Halted => Error::Halted,
+            SendStall::ConsumerGone => Error::PipelineConsumerGone,
+            // The only TimedOut-kind pipeline variant: "the consumer did not
+            // drain within its deadline". `finish_with_halt` returns it for the
+            // same condition observed at join instead of at send.
+            SendStall::Stalled => Error::PipelineJoinTimeout,
+        }
+    }
+}
+
+/// Halt-aware, deadline-bounded replacement for `pipe.send(item)` in the
+/// recovery producers (sweep's read loop, patch's recovered-span sink).
+///
+/// The defect this exists for: a plain `Pipeline::send` on a bounded channel
+/// blocks forever when the consumer is ALIVE but STALLED — e.g. wedged inside
+/// `WritebackFile::write_all` on a hung NFS mount. The producer polls its halt
+/// token only at the top of its loop, so a Stop issued while it is parked in
+/// `send` cannot land at all. `SendError` only ever reports the consumer being
+/// DEAD, which is a different failure.
+///
+/// Shape: try once without blocking, and only if there is no room does the
+/// halt get a vote. `Pipeline::send_with_halt` alone would drop a handoff that
+/// could not have blocked, which discards bytes the drive already recovered
+/// (see `a_raised_halt_still_delivers_when_the_channel_has_room`).
+///
+/// HONEST LIMIT: this gets the PRODUCER out — the pass stops reading the drive
+/// and the run reports `halted` — but the consumer thread is still inside its
+/// write, so the subsequent `Pipeline::finish` join still blocks until the
+/// mount answers. This buys responsiveness and a correct diagnosis; it does not
+/// cure a D-state hang.
+pub(crate) fn send_bounded<I: Send + 'static, R: Send + 'static>(
+    pipe: &libfreemkv::io::pipeline::Pipeline<I, R>,
+    item: I,
+    halt: &libfreemkv::halt::Halt,
+) -> std::result::Result<(), SendStall> {
+    send_bounded_within(pipe, item, halt, SEND_DEADLINE)
+}
+
+/// [`send_bounded`] with the deadline as a parameter. Exists so the
+/// deadline-elapsed branch is testable in milliseconds instead of the ten real
+/// minutes [`SEND_DEADLINE`] is (deliberately) set to.
+fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
+    pipe: &libfreemkv::io::pipeline::Pipeline<I, R>,
+    item: I,
+    halt: &libfreemkv::halt::Halt,
+    deadline: std::time::Duration,
+) -> std::result::Result<(), SendStall> {
+    // Try ONCE, without blocking, before the halt gets a vote.
+    //
+    // `send_with_halt` polls the halt bit BEFORE it touches the channel, so on
+    // its own it discards the next item the moment Stop is pressed — even with
+    // a free slot the handoff would have taken microseconds. That is bytes
+    // thrown away, not work avoided: on patch the item is a span the drive may
+    // have spent minutes recovering off damaged media, on sweep a batch already
+    // read. Stop means "do no MORE work", not "bin what you already have".
+    //
+    // The halt is about not PARKING on a consumer that is not draining, and
+    // that is exactly the case this probe leaves alone: a full channel falls
+    // through to `send_with_halt` below, which returns on the halt within one
+    // poll interval. Nothing here can block, so the bound the original fix
+    // introduced is untouched.
+    //
+    // A `Disconnected` error falls through too rather than short-circuiting to
+    // `ConsumerGone`: the diagnosis (and the halt-wins-over-death precedence)
+    // lives in one place, at the bottom of this function.
+    let item = match pipe.try_send(item) {
+        Ok(()) => return Ok(()),
+        Err(e) => e.into_inner(),
+    };
+    match pipe.send_with_halt(item, halt, deadline) {
+        Ok(()) => Ok(()),
+        Err(item) => {
+            if halt.is_cancelled() {
+                return Err(SendStall::Halted);
+            }
+            // Not halted, so the item came back for one of: consumer
+            // disconnected, deadline elapsed, or the consumer's `apply` has
+            // failed fatally (`send_with_halt` returns early in that case).
+            // One non-blocking probe separates them:
+            //
+            //  * `Ok`        — a slot was free after all. Two different
+            //    causes reach this outcome and the probe cannot tell them
+            //    apart: the apply-already-failed case (the consumer keeps
+            //    draining and discarding), and a plain race where the consumer
+            //    freed a slot in the window between `send_with_halt` giving up
+            //    and this retry. Either way it must stay a successful send:
+            //    today's plain `send` also succeeds there, and if an apply DID
+            //    fail, the consumer's REAL error is the one `Pipeline::finish`
+            //    returns. Aborting here instead would mask it with a numeric
+            //    "consumer gone".
+            //  * `Full`      — the consumer still has not taken a slot, i.e.
+            //    the deadline genuinely elapsed against a live consumer.
+            //  * `Disconnected` — the consumer thread is gone.
+            //
+            // Matched through `is_disconnected()` rather than by variant:
+            // `TrySendError` is crossbeam's type and libfreemkv does not
+            // re-export it, so this crate cannot name it.
+            match pipe.try_send(item) {
+                Ok(()) => Ok(()),
+                Err(e) if e.is_disconnected() => Err(SendStall::ConsumerGone),
+                Err(_) => Err(SendStall::Stalled),
+            }
+        }
+    }
+}
+
+/// Halt-aware teardown for the recovery pipelines — the join-side sibling of
+/// [`send_bounded`], and the other half of the same guarantee.
+///
+/// [`send_bounded`] gets the PRODUCER out from under a consumer that is alive
+/// but not draining. It does not get the CALLER out: the very next statement
+/// after the producer unparks is the teardown, and a plain
+/// `Pipeline::finish` is a blocking `join()` on that same stalled consumer.
+/// So a Stop that `send_bounded` finally made land still could not return —
+/// it moved the wedge from `send` to `finish` rather than removing it.
+/// `Pipeline::finish_with_halt` is the bound libfreemkv ships for exactly
+/// this, and both recovery sites used the non-halt-aware sibling.
+///
+/// Semantics come straight from `finish_with_halt`, and both matter here:
+///
+/// * Clean drain — identical to `finish`: the consumer's `close()` output is
+///   returned unchanged. `finish_with_halt` polls `is_finished()` BEFORE it
+///   looks at the halt, so even a run that ends halted still joins normally
+///   and returns its summary as long as the consumer is healthy. The halt
+///   path is reached only by a consumer that is genuinely not coming back.
+/// * Wedged consumer plus a raised halt — a `FINISH_GRACE_SECS` (5 s) spin
+///   first, so a consumer that is merely slow still joins cleanly; only past
+///   that is the thread abandoned and `Error::Halted` returned.
+///
+/// MAPFILE DURABILITY, since the consumer owns it and abandoning skips
+/// `close()` (which is where `map.flush()` lives): abandoning is still the
+/// right trade.
+///
+/// * The abandoned consumer is detached, not killed, so it is still holding
+///   the pass's `Mapfile` when its wedged write finally returns — and it
+///   would then write it, from a snapshot that is now stale, over whatever a
+///   resumed pass has since persisted. A sink that owns a `Mapfile` must
+///   therefore tear down through [`finish_bounded_disowning`], NOT through
+///   this function, which revokes that mapfile on a failed teardown. What is
+///   given up by revoking it is the abandoned thread's last
+///   `FLUSH_INTERVAL` of records, and only in the pessimistic direction.
+/// * If the process exits before that, the loss is bounded by the mapfile's
+///   one-second `FLUSH_INTERVAL`, and it is loss in the SAFE direction. Both
+///   sinks write the file BEFORE they `record()`, so a lost tail of records
+///   can only make the mapfile more pessimistic than the ISO — ranges get
+///   re-read on resume. It can never mark Finished a range the ISO did not
+///   receive, which is the only direction that would corrupt a resume.
+/// * The dangerous shape `ABANDONED` exists to stop — a leaked consumer
+///   finalising an output the caller already reported failed — does not
+///   arise here: neither recovery `close()` does anything structural, only
+///   `sync_all` + `map.flush()`, both idempotent.
+/// * And the status quo is WORSE for durability, not better. A blocked
+///   `finish` never returns, so the consumer thread never unwinds, never
+///   drops the `Mapfile`, and never flushes at all. A hang preserves nothing.
+pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
+    pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
+    halt: &libfreemkv::halt::Halt,
+) -> Result<R> {
+    // `Some(halt)` even when the caller wired no Stop bit (the token is then a
+    // never-cancelled default): that still arms `JOIN_TIMEOUT_SECS`, which is
+    // the same 600 s budget `SEND_DEADLINE` already gives one handoff. The
+    // joiner waiting exactly as long as the producer is the symmetry
+    // `SEND_DEADLINE`'s own doc-comment argues for.
+    pipe.finish_with_halt(Some(halt))
+}
+
+/// [`finish_bounded`] for a pipeline whose sink owns the `Mapfile`: on any
+/// failed teardown it DISOWNS that mapfile.
+///
+/// Both recovery pipelines must use this, not the bare `finish_bounded`.
+///
+/// The hole it closes: abandoning is detaching, not killing. The leaked
+/// consumer is still holding the pass's `Mapfile`, and when its wedged write
+/// finally returns it goes on to `record()` (whose `FLUSH_INTERVAL` check has
+/// long since elapsed, so it writes immediately) and then drops the sink,
+/// whose `Mapfile::drop` flushes again. Both rewrite the WHOLE file from a
+/// snapshot taken before the abandonment. Meanwhile the caller has had the
+/// `Err` back and — for a Stop, the single most likely next action, and for a
+/// wedge the action this crate's own docs tell the operator to take — may
+/// already have resumed the rip against that same path with a second,
+/// independent `Mapfile`. Nothing serialises two `Mapfile`s on one path (they
+/// even share the `<path>.tmp` staging name), so the abandoned thread's write
+/// can land last and silently revert sectors the resumed pass confirmed
+/// `Finished` — minutes of recovery off damaged media, thrown away with no
+/// error anywhere.
+///
+/// Raised on ANY `Err`, not just the leak errors, because on every OTHER
+/// error path it is a provable no-op: those all come back through
+/// `handle.join()`, which only observes a thread that has already terminated,
+/// so the sink — and the `Mapfile` inside it — was dropped and flushed before
+/// this function returned. That keeps the rule free of any dependence on
+/// which `Error` variant libfreemkv uses for a leak, including the
+/// close-already-in-flight leak, which has no distinct variant at all.
+///
+/// What it costs: an abandoned consumer no longer lands its last
+/// `FLUSH_INTERVAL` (1 s) of records. That is loss in the SAFE direction —
+/// both sinks write the image BEFORE they `record()`, so a mapfile missing a
+/// tail of records is merely pessimistic and those ranges get re-read on
+/// resume. It can never mark `Finished` a range the image did not receive.
+pub(crate) fn finish_bounded_disowning<I: Send + 'static, R: Send + 'static>(
+    pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
+    halt: &libfreemkv::halt::Halt,
+    disown: &mapfile::MapfileDisown,
+) -> Result<R> {
+    let result = finish_bounded(pipe, halt);
+    if let Err(ref e) = result {
+        disown.disown();
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "finish.mapfile_disowned",
+            error = %e,
+            "pipeline teardown failed; revoking the consumer's mapfile so an \
+             abandoned writer cannot overwrite a later pass's record"
+        );
+    }
+    result
 }
 
 fn sweep_internal(
@@ -731,12 +1155,8 @@ pub fn sweep(
         // ENOENT is fine (nothing to remove); any other error aborts.
         stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
     }
-    let mut map = mapfile::Mapfile::open_or_create(
-        &mapfile_path,
-        total_bytes,
-        concat!("libfreemkv v", env!("CARGO_PKG_VERSION")),
-    )
-    .map_err(|e| Error::IoError { source: e })?;
+    let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
+        .map_err(|e| Error::IoError { source: e })?;
 
     // Persist the disc's decryption state into the mapfile header so it
     // survives to deferred-mux / resume. ddrescue-safe (comment lines);
@@ -824,19 +1244,39 @@ pub fn sweep(
     // (this thread) keeps `reader`, `read_ctx`, halt + set_speed.
     // The thread name is preserved from the 0.17.x sweep_pipeline so it
     // stays identifiable in stack traces / `top -H`.
+    // Taken BEFORE `map` moves into the sink: if the teardown below has to
+    // abandon this consumer, that is the only way left to stop it writing
+    // its by-then-stale mapfile over a resumed pass's record.
+    let map_disown = map.disown_handle();
     let (sink, prog_rx) = SweepSink::new(file, map, is_regular);
     let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
         Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
 
-    // Translate `Pipeline::send` failure (consumer gone) into a
-    // numeric library error so the producer-error semantics are
-    // unchanged but no English leaks into an io::Error.
-    fn consumer_gone() -> Error {
-        Error::PipelineConsumerGone
-    }
+    // Halt token for the bounded sends below (`send_bounded`). `opts.halt` is
+    // the caller's Stop bit, adopted as-is so cancelling either view is the
+    // same bit; when the caller wires no halt, a fresh never-cancelled token
+    // keeps SEND_DEADLINE as the only bound on a handoff.
+    //
+    // Which callers those are: `multipass_rip` wires the job's Stop bit into
+    // BOTH of its Pass-1 routes (the single-pass `CopyOptions` and the
+    // multipass `SweepOptions`) as well as into every patch pass, and
+    // `extract` wires its own — so on every in-crate path a Stop DOES reach a
+    // parked producer. What is left is an external caller that constructs the
+    // options with `halt: None` and signals Stop only through its reporter.
+    let send_halt = opts
+        .halt
+        .clone()
+        .map(libfreemkv::halt::Halt::from_arc)
+        .unwrap_or_default();
 
     let mut buf = vec![0u8; batch as usize * 2048];
+    // POSITION: how far the producer's cursor has advanced, good bytes and
+    // zero-filled damage alike. Drives `work_done` and the pending remainder.
     let mut bytes_done = 0u64;
+    // RECOVERY: bytes that came off the platter and were sent to the consumer
+    // as `Good`. Never advanced by a skip or a gap fill, so it can be shown to
+    // a user as "recovered" without lying. See the progress tick below.
+    let mut bytes_good_done = 0u64;
     let mut halt_requested = false;
     let copy_t0 = std::time::Instant::now();
     tracing::info!(
@@ -928,14 +1368,22 @@ pub fn sweep(
             }
 
             let block_bytes = (region_end - pos).min(batch as u64 * 2048);
+            // The region's LAST block is `region_end - pos`, and `region_end` is
+            // only sector-snapped — so on a decrypting AACS sweep it is the one
+            // read that can end mid-unit. Widen the physical read (never the
+            // accounting) out to whole units. Fits `buf`: the widened value is
+            // at most `batch * 2048` rounded up to a unit, and `batch` is
+            // already a whole number of units (`aacs_aligned_batch`).
+            let read_bytes =
+                aacs_aligned_read_bytes(pos, block_bytes, total_bytes, decrypt_is_aacs);
             let block_lba = (pos / 2048) as u32;
-            let block_count = (block_bytes / 2048) as u16;
+            let block_count = (read_bytes / 2048) as u16;
             let recovery = !opts.skip_on_error;
 
             let read_result = reader.read_sectors(
                 block_lba,
                 block_count,
-                &mut buf[..block_bytes as usize],
+                &mut buf[..read_bytes as usize],
                 recovery,
             );
 
@@ -969,10 +1417,21 @@ pub fn sweep(
                     // owned Vec. The producer's `buf` is reused
                     // for the next read.
                     let send_buf = buf[..block_bytes as usize].to_vec();
-                    if pipe.send(WorkItem::Good { pos, buf: send_buf }).is_err() {
-                        producer_err = Some(consumer_gone());
-                        break 'outer;
+                    match send_bounded(&pipe, WorkItem::Good { pos, buf: send_buf }, &send_halt) {
+                        Ok(()) => {}
+                        // A Stop that lands while this send is parked is a
+                        // halt, not a failure: same outcome as the loop-top
+                        // check that used to be the only place it could land.
+                        Err(SendStall::Halted) => {
+                            halt_requested = true;
+                            break 'outer;
+                        }
+                        Err(stall) => {
+                            producer_err = Some(stall.into_error());
+                            break 'outer;
+                        }
                     }
+                    bytes_good_done = bytes_good_done.saturating_add(block_bytes);
                     bytes_done = bytes_done.saturating_add(block_bytes);
                     pos += block_bytes;
                 }
@@ -993,121 +1452,24 @@ pub fn sweep(
                         read_error::ReadAction::Retry { pause_secs } => {
                             sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
                         }
-                        read_error::ReadAction::Bisect => {
-                            read_ctx.bisecting = true;
-                            let saved_batch = read_ctx.batch;
-                            read_ctx.batch = 1;
-                            let mut bisect_aborted = false;
-                            for sector_offset in 0..block_count {
-                                if let Some(ref h) = opts.halt
-                                    && h.load(std::sync::atomic::Ordering::Relaxed)
-                                {
-                                    halt_requested = true;
-                                    bisect_aborted = true;
-                                    break;
-                                }
-                                let sector_lba = block_lba + (sector_offset as u32);
-                                let mut sector_buf = [0u8; 2048];
-                                let write_pos = pos + (sector_offset as u64 * 2048);
-                                match reader.read_sectors(sector_lba, 1, &mut sector_buf[..], true)
-                                {
-                                    Ok(_) => {
-                                        read_ctx.on_success();
-                                        // Plaintext via the wrapping
-                                        // DecryptingSectorSource — same
-                                        // decrypt path the batch read takes.
-                                        if pipe
-                                            .send(WorkItem::BisectGood {
-                                                pos: write_pos,
-                                                buf: Box::new(sector_buf),
-                                            })
-                                            .is_err()
-                                        {
-                                            producer_err = Some(consumer_gone());
-                                            bisect_aborted = true;
-                                            break;
-                                        }
-                                    }
-                                    Err(inner_err) => {
-                                        let inner_action = read_error::handle_read_error(
-                                            &inner_err,
-                                            &mut read_ctx,
-                                        );
-                                        match inner_action {
-                                            read_error::ReadAction::Retry { pause_secs } => {
-                                                // Transient (NOT_READY / bridge
-                                                // degradation): honour the
-                                                // cooldown pause, then mark
-                                                // BisectBad and move on. We
-                                                // are already inside a
-                                                // single-sector retry; a
-                                                // second bisect would be
-                                                // nonsensical (ctx.bisecting
-                                                // is true, so handle_read_error
-                                                // can't return Bisect).
-                                                sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
-                                            }
-                                            read_error::ReadAction::AbortPass => {
-                                                // Transport failure or
-                                                // wedge-abort threshold
-                                                // reached: stop immediately.
-                                                let (status, sense) =
-                                                    extract_scsi_context(&inner_err);
-                                                producer_err = Some(Error::DiscRead {
-                                                    sector: sector_lba as u64,
-                                                    status: Some(status),
-                                                    sense,
-                                                });
-                                                bisect_aborted = true;
-                                                break;
-                                            }
-                                            // JumpAhead / SkipBlock: honour
-                                            // any indicated pause; the
-                                            // bisect-inner loop's job is just
-                                            // to classify this specific sector,
-                                            // so we still mark BisectBad and
-                                            // continue to the next sector.
-                                            read_error::ReadAction::JumpAhead {
-                                                pause_secs,
-                                                ..
-                                            }
-                                            | read_error::ReadAction::SkipBlock { pause_secs } => {
-                                                sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
-                                            }
-                                            // Bisect cannot recurse: ctx.bisecting
-                                            // is true so handle_read_error will
-                                            // never return Bisect here.
-                                            read_error::ReadAction::Bisect => {}
-                                        }
-                                        if pipe
-                                            .send(WorkItem::BisectBad { pos: write_pos })
-                                            .is_err()
-                                        {
-                                            producer_err = Some(consumer_gone());
-                                            bisect_aborted = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                            read_ctx.bisecting = false;
-                            read_ctx.batch = saved_batch;
-                            if bisect_aborted {
-                                break 'outer;
-                            }
-                            bytes_done = bytes_done.saturating_add(block_bytes);
-                            pos += block_bytes;
-                        }
                         read_error::ReadAction::SkipBlock { pause_secs } => {
-                            if pipe
-                                .send(WorkItem::SkipFill {
+                            match send_bounded(
+                                &pipe,
+                                WorkItem::SkipFill {
                                     pos,
                                     len: block_bytes,
-                                })
-                                .is_err()
-                            {
-                                producer_err = Some(consumer_gone());
-                                break 'outer;
+                                },
+                                &send_halt,
+                            ) {
+                                Ok(()) => {}
+                                Err(SendStall::Halted) => {
+                                    halt_requested = true;
+                                    break 'outer;
+                                }
+                                Err(stall) => {
+                                    producer_err = Some(stall.into_error());
+                                    break 'outer;
+                                }
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
                             sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
@@ -1117,15 +1479,23 @@ pub fn sweep(
                             sectors,
                             pause_secs,
                         } => {
-                            if pipe
-                                .send(WorkItem::SkipFill {
+                            match send_bounded(
+                                &pipe,
+                                WorkItem::SkipFill {
                                     pos,
                                     len: block_bytes,
-                                })
-                                .is_err()
-                            {
-                                producer_err = Some(consumer_gone());
-                                break 'outer;
+                                },
+                                &send_halt,
+                            ) {
+                                Ok(()) => {}
+                                Err(SendStall::Halted) => {
+                                    halt_requested = true;
+                                    break 'outer;
+                                }
+                                Err(stall) => {
+                                    producer_err = Some(stall.into_error());
+                                    break 'outer;
+                                }
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
 
@@ -1152,15 +1522,23 @@ pub fn sweep(
                             let gap_start = pos + block_bytes;
                             let gap_bytes = jump_pos.saturating_sub(gap_start);
                             if gap_bytes > 0 {
-                                if pipe
-                                    .send(WorkItem::GapFill {
+                                match send_bounded(
+                                    &pipe,
+                                    WorkItem::GapFill {
                                         pos: gap_start,
                                         len: gap_bytes,
-                                    })
-                                    .is_err()
-                                {
-                                    producer_err = Some(consumer_gone());
-                                    break 'outer;
+                                    },
+                                    &send_halt,
+                                ) {
+                                    Ok(()) => {}
+                                    Err(SendStall::Halted) => {
+                                        halt_requested = true;
+                                        break 'outer;
+                                    }
+                                    Err(stall) => {
+                                        producer_err = Some(stall.into_error());
+                                        break 'outer;
+                                    }
                                 }
                                 bytes_done = bytes_done.saturating_add(gap_bytes);
                             }
@@ -1245,38 +1623,66 @@ pub fn sweep(
             }
 
             if let Some(reporter) = opts.progress {
-                // Use the latest consumer snapshot if we have
-                // one; otherwise synthesise a producer-side
-                // placeholder. On a fresh sweep, before the
-                // first stats round-trip lands, this means
-                // bytes_good ≈ bytes_done (producer's notion of
-                // good-so-far) and the bad-range list is empty —
-                // close enough for an early UI tick; the next
-                // real snapshot replaces it.
+                // Use the latest consumer snapshot if we have one; otherwise
+                // synthesise a producer-side placeholder from the two producer
+                // counters.
+                //
+                // This comment used to say `bytes_good ≈ bytes_done` was "close
+                // enough for an early UI tick". It was not: `bytes_done` is a
+                // POSITION and advances across skipped and zero-filled blocks,
+                // so on a damaged disc that approximation reported zero-fills
+                // as recovered bytes. Good is recovery-only now, and the
+                // leftover (done minus good) is this pass's damage — see the
+                // partition built below. The bad-range LIST is still empty
+                // until the first snapshot lands; that part was always true.
                 let main_title = disc.titles.first();
                 let main_title_bad = cached_main_title_bad;
                 // The consumer's snapshot is the source of truth for
                 // bytes_unreadable / bytes_pending (the producer doesn't
-                // see them), but its bytes_good lags producer-side
-                // `bytes_done` whenever the consumer is behind on draining
+                // see them), but its bytes_good lags what the producer has
+                // already sent whenever the consumer is behind on draining
                 // the work channel. Take the max so the user-visible
-                // counter never regresses below what the producer has
-                // already sent — Anomaly B in the 0.18.1 prod test was
-                // this regression: a stale early snapshot pinned the
-                // display to 0 GB while bytes_done was already advancing.
+                // counter never regresses below that — Anomaly B in the
+                // 0.18.1 prod test was this regression: a stale early
+                // snapshot pinned the display to 0 GB while the producer
+                // was already advancing.
+                //
+                // The floor is `bytes_good_done`, NOT `bytes_done`. Both used
+                // to be the same variable, and it advances on the three damage
+                // paths too (SkipBlock, JumpAhead's failed block, the jump's
+                // zero-filled gap), so on a disc the sweep was skipping across
+                // this reported zero-filled bytes as RECOVERED bytes — a rip
+                // losing data while the counter that exists to measure loss
+                // climbed. Position still drives `work_done` and the pending
+                // remainder below; only "good" is now recovery-only.
                 let (bytes_good, bytes_unreadable, bytes_pending, bytes_retryable) =
                     match &cached_snapshot {
                         Some(snap) => (
-                            snap.stats.bytes_good.max(bytes_done),
+                            snap.stats.bytes_good.max(bytes_good_done),
                             snap.stats.bytes_unreadable,
                             snap.stats.bytes_pending,
                             snap.stats.bytes_retryable,
                         ),
+                        // No snapshot yet: derive the partition from the two
+                        // producer counters instead of leaving a hole. Bytes
+                        // that are DONE but not GOOD are this pass's damage —
+                        // skipped blocks, a failed block, a jump's zero-filled
+                        // gap — and the sweep records them NonTrimmed, i.e.
+                        // retryable, not yet promoted to unreadable.
+                        //
+                        // Reporting them in no bucket at all was the same
+                        // defect this branch was last edited to fix, moved one
+                        // field along: `good` stopped counting zero-fills, but
+                        // `pending` is position-derived and `bytes_done`
+                        // advances on the damage paths, so the damage fell out
+                        // of the totals entirely. The four must partition the
+                        // disc, so a UI cannot show a rip losing data while
+                        // every counter that measures loss reads clean.
                         None => (
-                            bytes_done,
+                            bytes_good_done,
                             0u64,
                             total_bytes.saturating_sub(bytes_done),
-                            0u64,
+                            bytes_done.saturating_sub(bytes_good_done),
                         ),
                     };
                 let pp = libfreemkv::progress::PassProgress {
@@ -1308,10 +1714,15 @@ pub fn sweep(
     // Producer side is done. Drop the channel and let the
     // consumer drain whatever's still in flight, then run its
     // close() (drain writeback, fsync, mapfile.flush) and return
-    // the final stats. On consumer panic `pipe.finish` returns
+    // the final stats. On consumer panic `finish_bounded` returns
     // the wrapped panic message via Error::IoError — same shape
     // the previous `consumer_handle.join().map_err(...)` produced.
-    let summary = pipe.finish();
+    //
+    // Bounded by the SAME halt the sends above use. A plain
+    // `Pipeline::finish` here undid the point of `send_bounded`: it got the
+    // producer out from under a stalled consumer, and then this line blocked
+    // joining that same consumer, so Stop still never returned.
+    let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
 
     // Producer-side error wins over consumer-side (the read failure
     // is what motivated quitting; the consumer's flush error, if
@@ -1353,6 +1764,7 @@ pub fn sweep(
         total_errors = pass_sum.total_errors,
         zones_entered = pass_sum.zones_entered,
         jumps_taken = pass_sum.jumps_taken,
+        long_pause_escalations = pass_sum.long_pause_escalations,
         marginal_recovered = pass_sum.marginal_recovered,
         bytes_good = stats.bytes_good,
         bytes_pending = stats.bytes_pending,
@@ -1388,7 +1800,7 @@ pub struct CopyOptions<'a> {
     /// deferred-mux/resume decrypts directly) and the VID is NOT — keys XOR VID.
     /// Caller wires this from `Disc::aacs.unit_keys`.
     pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// On-decrypt-miss key fetch (see [`libfreemkv::keysource::key_fetch_factory`]).
+    /// On-decrypt-miss key fetch (see [`libfreemkv::sector::KeyFetch`]).
     /// When set, a read that hits AACS ciphertext no held key opens asks the
     /// application's key sources for the CPS unit's key, caches it, and retries —
     /// recovering an orphan CPS unit never sampled at resolve time. `None`
@@ -1439,7 +1851,10 @@ impl CopyResult {
     }
 }
 
-/// Options for [`Disc::sweep`] (Pass 1 / forward sequential pass).
+/// Options for [`sweep`] (Pass 1 / forward sequential pass).
+///
+/// Named `Disc::sweep` before 1.6.0, when recovery moved out of libfreemkv
+/// and the receiver became a `&Disc` argument.
 pub struct SweepOptions<'a> {
     pub decrypt: bool,
     pub resume: bool,
@@ -1458,7 +1873,7 @@ pub struct SweepOptions<'a> {
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
 }
 
-/// Options for [`Disc::patch`] (Pass N retry pass over bad ranges).
+/// Options for [`patch`] (Pass N retry pass over bad ranges).
 pub struct PatchOptions<'a> {
     pub decrypt: bool,
     /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only
@@ -1518,7 +1933,7 @@ impl<'a> PatchOptions<'a> {
     }
 }
 
-/// Result returned by [`Disc::patch`].
+/// Result returned by [`patch`].
 pub struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,
@@ -1544,19 +1959,36 @@ pub struct PatchOutcome {
 /// multipass resume never takes, since multipass implies raw. One
 /// implementation here so the two ingresses cannot drift apart.
 ///
-/// Saturating: `(pos + len).div_ceil(SECTOR) * SECTOR` overflows u64 for a
-/// range ending in the last sector of the address space, which `Mapfile::load`
-/// accepts (it checks `checked_add`, and that does not wrap).
+/// `(pos + len).div_ceil(SECTOR) * SECTOR` overflows u64 for a range ending in
+/// the last sector of the address space, which `Mapfile::load` accepts (it
+/// checks `checked_add`, and that does not wrap). The old fix saturated the
+/// END of that computation but not the LENGTH derived from it, so a range
+/// this close to `u64::MAX` came back with a length that was not a multiple
+/// of `SECTOR` (2047 instead of 0) — silently breaking the one invariant
+/// every recovery handler relies on (`count = len / SECTOR` truncates to 0,
+/// producing a zero-sector read that is reported as a successful recovery of
+/// bytes nobody read).
+///
+/// Do the rounding-up arithmetic in u128 so `pos + len` can never overflow,
+/// then cap the result at the largest sector-aligned value a u64 can hold.
+/// There is no way to represent the true end of a range whose last whole
+/// sector runs past `u64::MAX` (its top edge is `2^64`, not representable),
+/// so that case is capped down to the last representable sector boundary —
+/// which here coincides with `start` itself, correctly yielding a length of
+/// 0 rather than a fabricated sub-sector remainder. Every caller
+/// (`Linear`/`Jump`/`CachePrime` via `SubRanges::from_section`, and the sweep
+/// loop's `while pos < region_end`) already treats a 0-length range as
+/// "nothing to do here", so this stays safe: never a phantom read past the
+/// end, never a non-whole-sector length.
 pub(super) fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
     use section_recover::SECTOR;
     let start = pos - pos % SECTOR;
     if len == 0 {
         return (start, 0);
     }
-    let end = pos
-        .saturating_add(len)
-        .div_ceil(SECTOR)
-        .saturating_mul(SECTOR);
+    let end_u128 = (pos as u128 + len as u128).div_ceil(SECTOR as u128) * SECTOR as u128;
+    let max_end = (u64::MAX / SECTOR) * SECTOR;
+    let end = end_u128.min(max_end as u128) as u64;
     (start, end.saturating_sub(start))
 }
 
@@ -1692,6 +2124,754 @@ mod snap_tests {
         assert!(
             start.checked_add(len).is_some(),
             "snapped range wrapped past u64::MAX: start={start} len={len}"
+        );
+        // The returned length must ALWAYS be a whole number of sectors — the
+        // invariant every recovery handler's `count = len / SECTOR` depends
+        // on. The true final sector here runs past `u64::MAX` and cannot be
+        // represented, so the only whole-sector-respecting answer is 0, not
+        // the 2047-byte partial sector the old saturate-the-end-only fix
+        // produced (which silently truncated to a 0-sector read reported as
+        // a successful recovery).
+        assert_eq!(
+            len % 2048,
+            0,
+            "returned length must be a whole number of sectors"
+        );
+        assert_eq!(len, 0, "the final sector here cannot be represented in u64");
+    }
+
+    /// The u128 overflow-proofing above must not change ordinary, non-extreme
+    /// snapping. Pinned independently of the top-of-address-space edge test:
+    /// mutate the fix and this test should stay green while the edge test
+    /// above goes red, proving the two paths are decoupled.
+    #[test]
+    fn a_normal_range_is_unaffected_by_the_overflow_fix() {
+        assert_eq!(snap_to_sectors(512, 1024), (0, 2048));
+        assert_eq!(snap_to_sectors(1_000_000, 5_000), (999_424, 6144));
+    }
+}
+
+/// The producer-side handoff guard: what happens to a `send` when the consumer
+/// is ALIVE but not draining.
+///
+/// The defect these pin: both recovery producers used a plain
+/// `Pipeline::send`, which only ever fails when the consumer is DEAD. A
+/// consumer STALLED inside `WritebackFile::write_all` on a hung mount is alive,
+/// so the producer parked in `send` forever — it polls its halt token only at
+/// the top of its loop, so a Stop pressed at that moment could never land.
+#[cfg(test)]
+mod send_bounded_tests {
+    use super::*;
+    use libfreemkv::halt::Halt;
+    use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// Cancel is flipped this long after the producer parks in `send`. Long
+    /// enough that the send is definitely parked, short enough to keep the
+    /// test quick.
+    const HALT_AFTER: Duration = Duration::from_millis(500);
+    /// The margin this test relies on, stated explicitly. `send_with_halt`
+    /// observes the halt within one `libfreemkv::halt::POLL_INTERVAL`
+    /// (250 ms), so the expected return is ~750 ms after the send parks; 3 s
+    /// is 4x that, leaving 2.25 s of slack for a loaded box. The regression it
+    /// separates from is not "slower" but UNBOUNDED — the stalled sink is
+    /// released only after the watchdog below fires — so there is no window in
+    /// which the two behaviours could be confused.
+    const MAX_RETURN: Duration = Duration::from_secs(3);
+    /// Bound on the whole experiment so a regression FAILS instead of hanging
+    /// the suite.
+    const WATCHDOG: Duration = Duration::from_secs(10);
+
+    /// A gate a test thread can hold shut and then open.
+    #[derive(Clone)]
+    struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Gate {
+        fn shut() -> Self {
+            Self(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+        fn wait(&self) {
+            let (lock, cv) = &*self.0;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }
+        fn open(&self) {
+            let (lock, cv) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
+    /// The hung-mount consumer: healthy, alive, draining nothing because its
+    /// first `apply` is stuck in a write that never returns. Stands in for
+    /// `SweepSink`/`PatchSink` blocked inside `WritebackFile::write_all`.
+    struct StalledSink {
+        entered: Arc<AtomicUsize>,
+        gate: Gate,
+    }
+
+    impl Sink<u32> for StalledSink {
+        type Output = ();
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.wait();
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// A consumer that DIES on its first item — the case a plain `send` can
+    /// already detect, and which must stay distinguishable from the stalled
+    /// one. It has to panic: `Flow::Stop` and an `apply` error both leave the
+    /// consumer thread alive and draining, so neither disconnects the channel.
+    struct DyingSink;
+
+    impl Sink<u32> for DyingSink {
+        type Output = ();
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            panic!("test fixture: consumer thread dies here");
+        }
+        fn close(self) -> std::result::Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Park a producer against a stalled consumer, then flip the halt: the
+    /// producer must come back promptly, and must report HALTED — not
+    /// `PipelineConsumerGone`, which would be a lie about a consumer that is
+    /// alive.
+    #[test]
+    fn a_stop_lands_on_a_producer_parked_on_a_stalled_consumer() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::shut();
+        let pipe = Pipeline::<u32, ()>::spawn(
+            WRITE_THROUGH_DEPTH,
+            StalledSink {
+                entered: Arc::clone(&entered),
+                gate: gate.clone(),
+            },
+        )
+        .expect("spawn consumer");
+        let halt = Halt::new();
+
+        // Item 1 is taken by the consumer, which then wedges inside `apply`.
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let waited = Instant::now();
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "consumer never picked up the first item"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Item 2 fills the depth-1 channel. Now the pipeline is saturated and
+        // the consumer is not coming back.
+        assert_eq!(send_bounded(&pipe, 2, &halt), Ok(()));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(HALT_AFTER);
+                halt.cancel();
+            });
+            scope.spawn(|| {
+                let t0 = Instant::now();
+                // Item 3 has nowhere to go: this is the send that used to be
+                // unkillable.
+                let result = send_bounded(&pipe, 3, &halt);
+                let _ = tx.send((result, t0.elapsed()));
+            });
+
+            let observed = rx.recv_timeout(WATCHDOG);
+            // Release the consumer whatever happened, so both scoped threads
+            // can join and the failure below is a FAILURE, not a hang.
+            gate.open();
+
+            let (result, elapsed) = observed.unwrap_or_else(|_| {
+                panic!(
+                    "producer did not return within {WATCHDOG:?} of a halt \
+                     raised {HALT_AFTER:?} in: it is parked in send() on a \
+                     consumer that is alive but stalled, which is exactly the \
+                     wedge Stop has to be able to break"
+                )
+            });
+            assert_eq!(
+                result,
+                Err(SendStall::Halted),
+                "a stalled consumer plus a halt is a HALT; reporting \
+                 ConsumerGone would blame a thread that is alive"
+            );
+            assert!(
+                elapsed < MAX_RETURN,
+                "producer took {elapsed:?} to observe a halt raised at \
+                 {HALT_AFTER:?}; budget is {MAX_RETURN:?}"
+            );
+        });
+
+        drop(pipe);
+    }
+
+    /// The other side of the discrimination: a consumer that is really gone
+    /// must still report `ConsumerGone`, not `Halted`, with the halt clear.
+    #[test]
+    fn a_departed_consumer_is_reported_gone_not_halted() {
+        let pipe = Pipeline::<u32, ()>::spawn(WRITE_THROUGH_DEPTH, DyingSink).expect("spawn");
+        let halt = Halt::new();
+        // First send may land before the consumer exits; keep sending until
+        // the channel disconnects (bounded, so a regression fails).
+        let t0 = Instant::now();
+        loop {
+            match send_bounded(&pipe, 7, &halt) {
+                Ok(()) => {
+                    assert!(
+                        t0.elapsed() < WATCHDOG,
+                        "consumer never departed: sends kept succeeding"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(stall) => {
+                    assert_eq!(stall, SendStall::ConsumerGone);
+                    break;
+                }
+            }
+        }
+        assert!(!halt.is_cancelled(), "no halt was ever raised");
+    }
+
+    /// The deadline branch: consumer alive, stalled, and NO halt. The producer
+    /// must still come back — as `Stalled`, which maps to a timeout error, not
+    /// to `PipelineConsumerGone`.
+    #[test]
+    fn a_stalled_consumer_with_no_halt_times_out_rather_than_blocking() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::shut();
+        let pipe = Pipeline::<u32, ()>::spawn(
+            WRITE_THROUGH_DEPTH,
+            StalledSink {
+                entered: Arc::clone(&entered),
+                gate: gate.clone(),
+            },
+        )
+        .expect("spawn consumer");
+        let halt = Halt::new();
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let waited = Instant::now();
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(waited.elapsed() < WATCHDOG, "consumer never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(send_bounded(&pipe, 2, &halt), Ok(()));
+
+        // A short deadline stands in for SEND_DEADLINE so this costs 600 ms
+        // rather than 600 s. `send_with_halt` parks in POLL_INTERVAL slices,
+        // so anything under one slice would not exercise the loop.
+        let deadline = Duration::from_millis(600);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let t0 = Instant::now();
+                let result = send_bounded_within(&pipe, 3, &halt, deadline);
+                let _ = tx.send((result, t0.elapsed()));
+            });
+            // Same watchdog discipline as the halt test: a producer that never
+            // returns must FAIL the suite, not hang it.
+            let observed = rx.recv_timeout(WATCHDOG);
+            gate.open();
+
+            let (result, elapsed) = observed.unwrap_or_else(|_| {
+                panic!(
+                    "producer did not return within {WATCHDOG:?} against a \
+                     deadline of {deadline:?}: an unbounded send on a stalled \
+                     consumer never comes back at all"
+                )
+            });
+            assert_eq!(
+                result,
+                Err(SendStall::Stalled),
+                "an alive-but-not-draining consumer is a stall, not a death"
+            );
+            assert!(
+                matches!(SendStall::Stalled.into_error(), Error::PipelineJoinTimeout),
+                "the stall must surface as a timeout, not as PipelineConsumerGone"
+            );
+            assert!(
+                elapsed < MAX_RETURN,
+                "deadline of {deadline:?} took {elapsed:?} to fire"
+            );
+        });
+        drop(pipe);
+    }
+
+    /// The other half of the halt contract, and the regression that routing
+    /// every recovery send through `send_with_halt` introduced.
+    ///
+    /// `send_with_halt` checks the halt BEFORE it touches the channel, so once
+    /// Stop is pressed the very next item is handed straight back — even when
+    /// the channel has a free slot and the delivery would not have blocked for
+    /// a microsecond. The plain `send` it replaced delivered that item. What
+    /// gets thrown away is not a queue entry: on patch it is a span the drive
+    /// may have spent minutes clawing off a damaged disc, and on sweep a 64 KiB
+    /// batch already read. Pressing Stop asks to stop DOING more work; it does
+    /// not ask to discard work already done.
+    ///
+    /// The halt's job is to decide what happens when there is NOWHERE to put
+    /// the item — that is the parked-producer case the sibling test above pins.
+    /// It is not a licence to drop a free-slot handoff.
+    #[test]
+    fn a_raised_halt_still_delivers_when_the_channel_has_room() {
+        /// Stalls inside `apply` on the FIRST item only. That reproduces the
+        /// live shape — a consumer busy in a slow write — while leaving the
+        /// depth-1 channel EMPTY, i.e. with room for exactly one more item.
+        struct StallOnceSink {
+            entered: Arc<AtomicUsize>,
+            gate: Gate,
+            seen: Arc<Mutex<Vec<u32>>>,
+        }
+
+        impl Sink<u32> for StallOnceSink {
+            type Output = ();
+            fn apply(&mut self, item: u32) -> std::result::Result<Flow, Error> {
+                if self.entered.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.gate.wait();
+                }
+                self.seen.lock().unwrap().push(item);
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> std::result::Result<(), Error> {
+                Ok(())
+            }
+        }
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let gate = Gate::shut();
+        let pipe = Pipeline::<u32, ()>::spawn(
+            WRITE_THROUGH_DEPTH,
+            StallOnceSink {
+                entered: Arc::clone(&entered),
+                gate: gate.clone(),
+                seen: Arc::clone(&seen),
+            },
+        )
+        .expect("spawn consumer");
+        let halt = Halt::new();
+
+        // Item 1 is taken off the channel and the consumer wedges on it. The
+        // channel is now EMPTY: one free slot, no producer can block on it.
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let waited = Instant::now();
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "consumer never picked up the first item"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Stop is pressed. Item 2 is the already-recovered span in the
+        // producer's hand at that instant.
+        halt.cancel();
+        let result = send_bounded(&pipe, 2, &halt);
+
+        // Release the consumer before asserting, so a failure is a FAILURE and
+        // not a hang in `finish`.
+        gate.open();
+
+        assert_eq!(
+            result,
+            Ok(()),
+            "the channel had a free slot, so this handoff could not block: a \
+             raised halt must not discard bytes the drive already recovered"
+        );
+        pipe.finish().expect("clean close");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![1, 2],
+            "item 2 was accepted, so the consumer must have written it"
+        );
+    }
+
+    /// Guard the healthy path: with a consumer that drains, `send_bounded` is
+    /// an ordinary send — every item lands, in order, and nothing is dropped.
+    #[test]
+    fn a_draining_consumer_still_receives_every_item() {
+        struct CountingSink(Arc<AtomicUsize>);
+        impl Sink<u32> for CountingSink {
+            type Output = usize;
+            fn apply(&mut self, item: u32) -> std::result::Result<Flow, Error> {
+                self.0.fetch_add(item as usize, Ordering::SeqCst);
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> std::result::Result<usize, Error> {
+                Ok(self.0.load(Ordering::SeqCst))
+            }
+        }
+        let seen = Arc::new(AtomicUsize::new(0));
+        let pipe =
+            Pipeline::<u32, usize>::spawn(WRITE_THROUGH_DEPTH, CountingSink(Arc::clone(&seen)))
+                .expect("spawn");
+        let halt = Halt::new();
+        for i in 1..=1000u32 {
+            assert_eq!(send_bounded(&pipe, i, &halt), Ok(()));
+        }
+        assert_eq!(pipe.finish().expect("clean close"), 500_500);
+    }
+}
+
+/// The join-side half of the same guarantee `send_bounded_tests` pins.
+///
+/// The defect these pin: `send_bounded` gets the PRODUCER out from under a
+/// stalled consumer, but the statement immediately after it unparks is the
+/// teardown — and both recovery sites tore down with plain `Pipeline::finish`,
+/// a blocking `join()` on that same stalled consumer. So a Stop that
+/// `send_bounded` finally made land still never returned to the caller; the
+/// wedge had only moved from `send` to `finish`. `finish_with_halt` is the
+/// bound libfreemkv ships for it, and nothing in this crate called it.
+#[cfg(test)]
+mod finish_bounded_tests {
+    use super::*;
+    use libfreemkv::halt::Halt;
+    use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// THE MARGIN THIS TEST RELIES ON. `finish_with_halt` observes the halt
+    /// within one `libfreemkv::halt::POLL_INTERVAL` (250 ms), then spends a
+    /// fixed `FINISH_GRACE_SECS` (5 s) spin-polling before it accepts the
+    /// abandonment — so a correct teardown returns at ~5.3 s. 15 s is ~3x
+    /// that, leaving ~10 s of slack for a loaded box.
+    ///
+    /// The regression this separates from is not "slower" but UNBOUNDED: the
+    /// stalled sink is released only after the watchdog below fires, so
+    /// `pipe.finish()` cannot return early by luck and the two behaviours have
+    /// no window in which they could be confused.
+    const MAX_RETURN: Duration = Duration::from_secs(15);
+    /// Bound on the whole experiment so a regression FAILS rather than hanging
+    /// the suite — the teardown under test is precisely a call that does not
+    /// come back, so an unguarded `join()` here would wedge `cargo test`.
+    const WATCHDOG: Duration = Duration::from_secs(45);
+
+    /// A gate a test thread can hold shut and then open.
+    #[derive(Clone)]
+    struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Gate {
+        fn shut() -> Self {
+            Self(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+        fn wait(&self) {
+            let (lock, cv) = &*self.0;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }
+        fn open(&self) {
+            let (lock, cv) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
+    /// The hung-mount consumer: alive, healthy, and stuck in its first `apply`
+    /// forever. Stands in for `SweepSink`/`PatchSink` blocked inside
+    /// `WritebackFile::write_all` on a mount that never answers.
+    struct StalledSink {
+        entered: Arc<AtomicUsize>,
+        gate: Gate,
+        closed: Arc<AtomicUsize>,
+    }
+
+    impl Sink<u32> for StalledSink {
+        type Output = u32;
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.wait();
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> std::result::Result<u32, Error> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    /// Park a consumer inside `apply`, raise the halt, then tear the pipeline
+    /// down. The teardown must COME BACK — this is the last link in the Stop
+    /// chain, and until it returns the operator's Stop has not happened no
+    /// matter how promptly the producer unparked.
+    #[test]
+    fn a_stop_lands_on_a_teardown_joining_a_stalled_consumer() {
+        let entered = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let gate = Gate::shut();
+        let pipe = Pipeline::<u32, u32>::spawn(
+            WRITE_THROUGH_DEPTH,
+            StalledSink {
+                entered: Arc::clone(&entered),
+                gate: gate.clone(),
+                closed: Arc::clone(&closed),
+            },
+        )
+        .expect("spawn consumer");
+        let halt = Halt::new();
+
+        // Item 1 is taken; the consumer wedges inside `apply` and never
+        // returns. This is the state `send_bounded` leaves behind after it
+        // hands the producer back on a halt.
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let waited = Instant::now();
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "consumer never picked up the first item"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The operator's Stop. Raised BEFORE the teardown, exactly as the
+        // production sites see it: the producer has already observed this bit
+        // and broken out of its read loop.
+        halt.cancel();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let t0 = Instant::now();
+                // The teardown that used to be unkillable.
+                let result = finish_bounded(pipe, &halt);
+                let _ = tx.send((result.is_err(), t0.elapsed()));
+            });
+
+            let observed = rx.recv_timeout(WATCHDOG);
+            // Release the stalled consumer whatever happened, so the scoped
+            // thread can join and the assertion below is a FAILURE, not a hang.
+            gate.open();
+
+            let (was_err, elapsed) = observed.unwrap_or_else(|_| {
+                panic!(
+                    "teardown did not return within {WATCHDOG:?} of a halt \
+                     raised before it was even called: it is blocked in \
+                     join() on a consumer that is alive but stalled. \
+                     send_bounded got the producer out of exactly this wedge; \
+                     leaving it here means Stop still never returns"
+                )
+            });
+            assert!(
+                was_err,
+                "a consumer that never came back has no summary to report: \
+                 the teardown must say Halted, not invent a result"
+            );
+            assert!(
+                elapsed < MAX_RETURN,
+                "teardown took {elapsed:?} to return after a halt; budget is \
+                 {MAX_RETURN:?} (5 s grace + one 250 ms poll, ~3x margin)"
+            );
+        });
+
+        // The abandoned consumer must NOT go on to run `close()`. For the
+        // recovery sinks that call is `sync_all` + `map.flush()` against an
+        // output the caller has already reported as interrupted.
+        assert_eq!(
+            closed.load(Ordering::SeqCst),
+            0,
+            "an abandoned consumer must not finalise the output"
+        );
+    }
+
+    /// Sets a flag when it is dropped. Declared AFTER the `Mapfile` field in
+    /// [`MapSink`] so it fires only once that mapfile has been dropped —
+    /// i.e. after its `Drop` flush has had its chance at the file.
+    struct SignalOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The hung-mount consumer of the recovery pipelines, in miniature: it
+    /// owns the pass's `Mapfile`, it blocks inside `apply` exactly where
+    /// `PatchSink`/`SweepSink` block (in the write, BEFORE the `record`),
+    /// and it records once the write comes back.
+    struct MapSink {
+        map: mapfile::Mapfile,
+        done: SignalOnDrop,
+        gate: Gate,
+        entered: Arc<AtomicUsize>,
+    }
+
+    impl Sink<u32> for MapSink {
+        type Output = u32;
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            // The wedged write on the hung mount.
+            self.gate.wait();
+            // …which eventually returns, and the sink records it — the
+            // interval since the last persist is long past, so this alone
+            // rewrites the whole mapfile.
+            self.map
+                .record(0, 2048, mapfile::SectorStatus::Unreadable)
+                .map_err(|e| Error::IoError { source: e })?;
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> std::result::Result<u32, Error> {
+            Ok(0)
+        }
+    }
+
+    /// A STOP MUST NOT COST THE NEXT PASS ITS RECORD. The consumer abandoned
+    /// on a hung mount is detached, not killed: it still owns the pass's
+    /// `Mapfile`, and its stale snapshot must never reach the path again —
+    /// because by the time its write returns, the operator has done the
+    /// ordinary next thing after a Stop (or the thing this crate's docs tell
+    /// them to do after a wedge) and resumed the rip, whose own `Mapfile` is
+    /// now the record. A whole-file rewrite from the old snapshot silently
+    /// reverts sectors the resumed pass confirmed `Finished` — minutes of
+    /// recovery off damaged media, discarded with no error anywhere.
+    #[test]
+    fn an_abandoned_consumer_cannot_overwrite_a_resumed_passs_mapfile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.iso.mapfile");
+        let total = 4096u64;
+
+        // The abandoned pass's mapfile, with in-memory state that has not
+        // reached disk (record() batches by FLUSH_INTERVAL).
+        let mut map = mapfile::Mapfile::create(&path, total, "abandoned-pass")
+            .expect("create the pass mapfile");
+        map.record(2048, 2048, mapfile::SectorStatus::NonTrimmed)
+            .expect("record");
+        let disown = map.disown_handle();
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = Gate::shut();
+        let pipe = Pipeline::<u32, u32>::spawn(
+            WRITE_THROUGH_DEPTH,
+            MapSink {
+                map,
+                done: SignalOnDrop(Arc::clone(&dropped)),
+                gate: gate.clone(),
+                entered: Arc::clone(&entered),
+            },
+        )
+        .expect("spawn consumer");
+        let halt = Halt::new();
+
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let waited = Instant::now();
+        while entered.load(Ordering::SeqCst) == 0 {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "consumer never picked up the first item"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // The operator's Stop, and the teardown that abandons the wedged
+        // consumer — the SAME call both recovery passes make.
+        halt.cancel();
+        assert!(
+            finish_bounded_disowning(pipe, &halt, &disown).is_err(),
+            "a consumer that never came back has no summary to report"
+        );
+
+        // The resume. A second, independent `Mapfile` on the same path, as
+        // `sweep`/`patch` would build it, recording real progress.
+        {
+            let mut resumed = mapfile::Mapfile::create(&path, total, "resumed-pass")
+                .expect("create the resumed mapfile");
+            resumed
+                .record(0, total, mapfile::SectorStatus::Finished)
+                .expect("record");
+            resumed.flush().expect("flush the resumed mapfile");
+        }
+        let after_resume = std::fs::read_to_string(&path).expect("read the resumed mapfile");
+        assert!(
+            after_resume.contains("resumed-pass"),
+            "fixture check: the resumed pass's mapfile is what is on disk"
+        );
+
+        // The mount comes back and the abandoned thread runs on: its
+        // `record` persists, then its sink — and the mapfile in it — drops.
+        gate.open();
+        let waited = Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "the abandoned consumer never released its mapfile"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let now = std::fs::read_to_string(&path).expect("read the mapfile");
+        assert_eq!(
+            now, after_resume,
+            "the abandoned consumer overwrote the resumed pass's mapfile with \
+             its own stale snapshot — the resume's recorded progress is gone \
+             from disk and those ranges will be read off the damaged disc all \
+             over again"
+        );
+    }
+
+    /// THE CLEAN PATH MUST BE EXACT. A healthy consumer is joined and its
+    /// `close()` output returned unchanged — including on a run that ended
+    /// halted, which is the common Stop, and which must still report the real
+    /// summary rather than an error.
+    #[test]
+    fn a_healthy_consumer_is_still_joined_and_its_summary_returned() {
+        struct CountingSink(u32);
+        impl Sink<u32> for CountingSink {
+            type Output = u32;
+            fn apply(&mut self, item: u32) -> std::result::Result<Flow, Error> {
+                self.0 += item;
+                Ok(Flow::Continue)
+            }
+            fn close(self) -> std::result::Result<u32, Error> {
+                Ok(self.0)
+            }
+        }
+
+        // (a) No halt raised: an ordinary end-of-pass teardown.
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, CountingSink(0)).expect("spawn");
+        let halt = Halt::new();
+        for i in 1..=1000u32 {
+            assert_eq!(send_bounded(&pipe, i, &halt), Ok(()));
+        }
+        assert_eq!(
+            finish_bounded(pipe, &halt).expect("a draining consumer joins cleanly"),
+            500_500,
+            "the clean path must return the consumer's summary unchanged"
+        );
+
+        // (b) Halt RAISED, consumer healthy — the common Stop. The halt must
+        // not cost the caller its summary: `finish_with_halt` checks
+        // `is_finished()` before it checks the halt, so a consumer that is
+        // coming back is still joined normally.
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, CountingSink(0)).expect("spawn");
+        let halt = Halt::new();
+        for i in 1..=100u32 {
+            assert_eq!(send_bounded(&pipe, i, &halt), Ok(()));
+        }
+        halt.cancel();
+        let t0 = Instant::now();
+        assert_eq!(
+            finish_bounded(pipe, &halt)
+                .expect("a halted-but-healthy run still reports its summary"),
+            5_050,
+            "pressing Stop must not turn a completed pass's summary into an error"
+        );
+        assert!(
+            t0.elapsed() < MAX_RETURN,
+            "a healthy consumer must join promptly even with the halt up, \
+             not sit out the full grace period"
         );
     }
 }
@@ -2100,7 +3280,7 @@ mod patch_preset_tests {
     fn the_wedged_threshold_is_reported_not_enforced() {
         let o = PatchOptions::for_patch_pass(false, None, None, None);
 
-        let state = patch::PatchLoopState::new(0, 4096, patch::initial_batch_of(&o), 4096);
+        let state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
         let summary = patch::PatchSummary {
             stats: mapfile::MapStats::default(),
         };
