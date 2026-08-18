@@ -803,11 +803,18 @@ fn profile_08_batch_fail_singles_ok() {
 /// A single dead sector in one range structurally cannot reach either exit:
 /// `WEDGE_ABORT_THRESHOLD=16` needs 16 CONSECUTIVE wedge-family senses within a
 /// range, and the `wedged_threshold=50` exit additionally needs `range_idx > 0`
-/// (a prior range already processed). No test anywhere asserts
-/// `PatchOutcome::wedged_exit == true`. A real wedge-exit fixture (a first
+/// (a prior range already processed). A real wedge-exit fixture (a first
 /// throwaway range, then a second range of >=16 sectors that ALL always-fail
 /// with HARDWARE_ERROR, in reverse mode) is a separate, larger synthetic build;
 /// left out here rather than bent into this shared single-sector helper.
+///
+/// This comment used to end "no test anywhere asserts
+/// `PatchOutcome::wedged_exit == true`", and that is NO LONGER TRUE — do not
+/// act on it. `multipass::tests::a_wedged_result_is_distinguishable_from_a_
+/// cancelled_one` (in `src/multipass.rs`) drives a real `multipass_rip` whose
+/// patch pass meets a transport failure and asserts `result.wedged`, reaching
+/// the `PassExit::Wedged` arm end to end. The gap left here is this HELPER's,
+/// not the crate's, and the wedge arm is live code with a live test behind it.
 fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats {
     let capacity_sectors: u32 = 256;
     let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);

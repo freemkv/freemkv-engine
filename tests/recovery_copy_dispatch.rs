@@ -2612,3 +2612,102 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
         "every scrambled sector must have been descrambled on the way to the ISO"
     );
 }
+
+/// A reader that under-delivers must not have its buffer written to the ISO.
+///
+/// The sweep's producer reads into ONE `buf` that is reused for every block,
+/// then ships `buf[..block_bytes]` down the pipeline as `WorkItem::Good`. The
+/// match arm read `Ok(_)`, discarding the byte count `SectorSource` returns —
+/// so a source that answered `Ok(n)` with `n < requested` would have the tail
+/// of the PREVIOUS block written into the image and recorded `Finished`. A rip
+/// that exits 0 with a perfect mapfile and somebody else's sectors inside the
+/// movie is the most expensive failure this crate can produce, and no reader in
+/// the tree does this TODAY — which is exactly why the guard has to be here
+/// rather than in the readers.
+///
+/// The fixture makes the corruption visible: block 0 comes back in full as
+/// 0xBB, then every later read claims only ONE sector (0x11) of the eight it
+/// was asked for. Revert `require_full_read` at the sweep site and this test
+/// fails twice over — `sweep` returns `Ok`, and the image carries 0xBB in
+/// blocks the drive never delivered.
+#[test]
+fn a_short_read_is_a_failed_read_and_never_reaches_the_image() {
+    struct ShortAfterFirstBlock {
+        total_sectors: u32,
+        first_done: bool,
+    }
+    impl libfreemkv::sector::SectorSource for ShortAfterFirstBlock {
+        fn read_sectors(
+            &mut self,
+            _lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::error::Result<usize> {
+            let want = count as usize * 2048;
+            if !self.first_done {
+                self.first_done = true;
+                buf[..want].fill(0xBB);
+                return Ok(want);
+            }
+            // GOOD status, one sector delivered, the rest of `buf` untouched —
+            // i.e. still holding block 0's 0xBB.
+            buf[..2048].fill(0x11);
+            Ok(2048)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.total_sectors
+        }
+    }
+
+    let sectors: u32 = 64;
+    let batch: u16 = 8;
+    let disc = make_test_disc(sectors, "SHORTREAD");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso_path = tmp.path().join("short.iso");
+    let mut reader = ShortAfterFirstBlock {
+        total_sectors: sectors,
+        first_done: false,
+    };
+    let opts = SweepOptions {
+        batch_sectors: Some(batch),
+        // Hard-fail mode, so the short read must surface as the sweep's error
+        // rather than as a skip. Nothing is retried and the test is fast.
+        ..plain_sweep_opts(false, false)
+    };
+
+    let err = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
+        .expect_err("a short transfer is a failed read, not a partial success");
+    // `sector: 8` is the second block — the first one the reader short-changed.
+    // The status is whatever the sweep's own `extract_scsi_context` rebuild
+    // puts there for a non-SCSI error; what matters is that the block surfaced
+    // as a READ FAILURE at all rather than as delivered data.
+    assert!(
+        matches!(
+            err,
+            libfreemkv::error::Error::DiscRead {
+                sector: 8,
+                sense: None,
+                ..
+            }
+        ),
+        "the failure must be reported against the block that came up short: {err:?}"
+    );
+
+    let good = Mapfile::load(&disc.mapfile_for(&iso_path))
+        .expect("the sweep flushes its mapfile before returning the error")
+        .stats()
+        .bytes_good;
+    assert_eq!(
+        good,
+        batch as u64 * 2048,
+        "only the ONE block the reader actually delivered may be recorded good"
+    );
+
+    let image = std::fs::read(&iso_path).expect("the partial image is on disk");
+    assert!(
+        image[batch as usize * 2048..].iter().all(|&b| b != 0xBB),
+        "block 0's bytes were written into a later block — this is the silent \
+         corruption the guard exists to stop"
+    );
+}

@@ -179,7 +179,9 @@ let mp: MultipassResult = multipass_rip(
     &sink,
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
-// mp.main_lost_ms (NaN = unquantifiable), mp.severity (DamageSeverity),
+// mp.main_lost_ms (NaN = unquantifiable; always scoped to the MAIN TITLE's
+//                  extents, even when is_iso_output widens the abort gate to
+//                  the whole disc), mp.severity (DamageSeverity),
 // mp.passes, mp.aborted_for_loss, mp.halted,
 // mp.wedged, mp.complete
 ```
