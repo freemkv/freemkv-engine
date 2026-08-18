@@ -20,6 +20,43 @@ use libfreemkv::sector::SectorSource;
 
 pub use patch::patch;
 
+/// A SHORT transfer is a FAILED read, never a partial success.
+///
+/// [`SectorSource::read_sectors`] answers with the number of BYTES it actually
+/// transferred, and every read site in this module ships `buf[..requested]`
+/// onward out of a buffer that is REUSED across iterations. If a reader ever
+/// answered `Ok(n)` with `n < requested`, the tail of that slice would still
+/// hold the PREVIOUS LBA's bytes — and those bytes would be written into the
+/// ISO and recorded `Finished`. That is the worst shape of failure this crate
+/// has: a rip that reports rc=0 and a clean mapfile while carrying somebody
+/// else's sectors inside the movie. (The same class already shipped once, as
+/// ~9 MB of ciphertext at rc=0.)
+///
+/// The live-drive path already makes exactly this call — `Drive::read_one`
+/// gates its success arm on `bytes_transferred == count * 2048` and documents
+/// "treat a short transfer as a failed read", answering the very
+/// `DiscRead { status: None, sense: None }` reproduced here so the two paths
+/// classify identically. The engine-side sites matched `Ok(_)` and discarded
+/// the count, so they would have believed a short read.
+///
+/// No `SectorSource` in the tree can trip this today (`FileSectorSource` uses
+/// `read_exact`; `Drive` gates as above; `PrefetchedSectorSource` *can* return
+/// a short count but the engine never builds one). The trait itself neither
+/// permits nor forbids it. This is therefore hardening, not a live bug fix:
+/// it makes it impossible for a FUTURE reader implementation to corrupt output
+/// silently, and it costs one comparison per read.
+fn require_full_read(result: Result<usize>, requested: usize, lba: u32) -> Result<usize> {
+    match result {
+        Ok(n) if n == requested => Ok(n),
+        Ok(_) => Err(Error::DiscRead {
+            sector: lba as u64,
+            status: None,
+            sense: None,
+        }),
+        other => other,
+    }
+}
+
 pub fn copy(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
@@ -1380,11 +1417,20 @@ pub fn sweep(
             let block_count = (read_bytes / 2048) as u16;
             let recovery = !opts.skip_on_error;
 
-            let read_result = reader.read_sectors(
+            // `require_full_read`, not a bare `Ok(_)`: `buf` is reused across
+            // every iteration of this loop, so a short transfer would put the
+            // PREVIOUS block's tail into the `WorkItem::Good` payload below and
+            // write it to the ISO as recovered data. Routed into the Err arms
+            // instead, where it becomes a normal read failure.
+            let read_result = require_full_read(
+                reader.read_sectors(
+                    block_lba,
+                    block_count,
+                    &mut buf[..read_bytes as usize],
+                    recovery,
+                ),
+                read_bytes as usize,
                 block_lba,
-                block_count,
-                &mut buf[..read_bytes as usize],
-                recovery,
             );
 
             match read_result {
