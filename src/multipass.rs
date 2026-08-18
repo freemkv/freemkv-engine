@@ -490,13 +490,30 @@ fn main_title_lost_ms(disc: &libfreemkv::Disc, main_bad_bytes: u64) -> f64 {
 /// sink, so nothing could reach it — which is exactly how it shipped answering
 /// `0.0` for damage it could not measure. A test of the PREDICATE alone does
 /// not guard the gate: the bug was that the gate did not consult the predicate.
+///
+/// SCOPE — this figure is ALWAYS main-title-scoped, whatever the deliverable
+/// is, and it derives its own byte count from `title` + `bad_ranges` rather
+/// than accepting the ABORT GATE's count. Those two counts are deliberately
+/// different things and conflating them was a real defect: the gate's count
+/// ([`abort_lost_bytes`]) is whole-disc for an ISO deliverable, and feeding
+/// that whole-disc figure into `main_title_lost_ms` scaled every unreadable
+/// byte on the disc — scratched menus, trailers, a damaged bonus feature — by
+/// the MAIN TITLE's size and duration. A disc whose main title was untouched
+/// reported tens of seconds of "main-title playback loss", and since
+/// `classify_damage` escalates at 30 s that inflated number could stamp
+/// `Serious` on an intact feature. It failed safe (an ISO run has
+/// `effective_abort_secs == 0`, so `lost_bytes > 0` refuses the rip anyway),
+/// but the reported number and the badge were both wrong, and `main_lost_ms`
+/// carried a value its own doc says it does not. Scoping is always possible
+/// here — `bytes_bad_in_title` needs only the extents and the bad ranges,
+/// both of which the ISO caller already has in hand — so there is no reason
+/// to reach for the NaN escape hatch except when the extents are missing,
+/// which is the branch below.
 pub fn end_of_recovery_lost_ms(
     promotion_intact: bool,
-    is_iso: bool,
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
     disc: &libfreemkv::Disc,
-    lost_bytes: u64,
 ) -> (f64, Option<&'static str>) {
     if !promotion_intact {
         // The damage record itself is incomplete, so nothing derived from it
@@ -509,7 +526,13 @@ pub fn end_of_recovery_lost_ms(
             ),
         );
     }
-    if loss_is_unscopable(is_iso, title, bad_ranges) {
+    // `loss_is_unscopable`'s `is_iso` parameter answers the question the ABORT
+    // GATE asks ("can the gate's byte count be produced without extents?" —
+    // for whole-disc ISO scope, yes). The question HERE is a different one and
+    // the answer never depends on the deliverable: a main-title millisecond
+    // figure always needs the main title's extents, so ask it in title terms.
+    const MS_IS_ALWAYS_TITLE_SCOPED: bool = false;
+    if loss_is_unscopable(MS_IS_ALWAYS_TITLE_SCOPED, title, bad_ranges) {
         return (
             f64::NAN,
             Some(
@@ -518,7 +541,8 @@ pub fn end_of_recovery_lost_ms(
             ),
         );
     }
-    (main_title_lost_ms(disc, lost_bytes), None)
+    let main_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, bad_ranges);
+    (main_title_lost_ms(disc, main_bad_bytes), None)
 }
 
 /// The result of a multipass run.
@@ -531,6 +555,11 @@ pub struct MultipassResult {
     /// Good bytes recovered across all passes.
     pub good_bytes: u64,
     /// Main-title playback milliseconds lost (NaN if unquantifiable).
+    ///
+    /// ALWAYS scoped to the main title's own extents, even on an ISO rip whose
+    /// abort gate counts bytes across the whole disc — an unreadable menu or
+    /// trailer is not lost feature playback, and reporting it as such once
+    /// stamped `Serious` on a movie the drive had read perfectly.
     pub main_lost_ms: f64,
     /// Damage classification from the residual loss.
     pub severity: crate::DamageSeverity,
@@ -578,12 +607,15 @@ pub struct MultipassOpts {
     pub abort_on_lost_secs: u64,
     /// True when the deliverable is a whole-disc ISO image. Scopes both the
     /// per-pass convergence check ([`scope_bad_bytes`]) and the end-of-
-    /// recovery abort gate ([`abort_lost_bytes`] for the byte count, then
-    /// `end_of_recovery_lost_ms` → `main_title_lost_ms` for the
-    /// milliseconds — NOT [`abort_lost_ms`], which no longer sits on that
-    /// path) to the
-    /// whole disc instead of just the muxed title's extents, and forces
+    /// recovery abort gate's BYTE count ([`abort_lost_bytes`]) to the whole
+    /// disc instead of just the muxed title's extents, and forces
     /// `abort_on_lost_secs` to `0` via [`effective_abort_secs`].
+    ///
+    /// It does NOT widen the MILLISECOND figure. `end_of_recovery_lost_ms`
+    /// stays main-title-scoped whatever the deliverable is (see its doc, and
+    /// [`MultipassResult::main_lost_ms`]) — widening it meant off-title damage
+    /// was reported as lost feature playback. Neither path goes through
+    /// [`abort_lost_ms`], which no longer sits on it at all.
     pub is_iso_output: bool,
 }
 
@@ -927,14 +959,14 @@ fn multipass_rip_inner(
                 // the damage record is incomplete, the loss is unquantifiable,
                 // and NaN makes `loss_aborts` fire regardless of threshold
                 // rather than delivering a possibly-lossy rip as perfect.
-                let (lost_ms, unquantifiable) = end_of_recovery_lost_ms(
-                    promotion_intact,
-                    opts.is_iso_output,
-                    main_title,
-                    &bad_ranges,
-                    disc,
-                    lost_bytes,
-                );
+                // NOTE the asymmetry, it is deliberate: `lost_bytes` above is
+                // the GATE's count (whole-disc for an ISO deliverable) and
+                // feeds `loss_aborts`, while `end_of_recovery_lost_ms` scopes
+                // its own bytes to the main title. Handing the gate's count to
+                // the millisecond conversion is what reported off-title damage
+                // as main-title playback loss.
+                let (lost_ms, unquantifiable) =
+                    end_of_recovery_lost_ms(promotion_intact, main_title, &bad_ranges, disc);
                 if let Some(why) = unquantifiable {
                     sink.log(Level::Error, why);
                 }
@@ -1211,10 +1243,8 @@ mod tests {
         // the gate, because the bug was never in the predicate: it was that
         // the gate did not consult one. Call what the gate calls.
         let disc = disc_with(vec![empty.clone()]);
-        let (lost_ms, why) = end_of_recovery_lost_ms(
-            /* promotion_intact */ true, /* is_iso */ false, &empty, &damage, &disc,
-            /* lost_bytes, as abort_lost_bytes computed it */ 0,
-        );
+        let (lost_ms, why) =
+            end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage, &disc);
         assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
         assert!(why.is_some(), "an unquantifiable verdict must say why");
         assert!(
@@ -1256,7 +1286,10 @@ mod tests {
         t.size_bytes = 1_000_000;
         t.duration_secs = 100.0;
         let disc = disc_with(vec![t.clone()]);
-        let (ms, why) = end_of_recovery_lost_ms(true, false, &t, &[(0, 4096)], &disc, 100_000);
+        // 100_000 bad bytes, all of them INSIDE the title's 0..100-sector
+        // extent, so the gate's scoping and the millisecond scoping agree:
+        // 100_000 / 1_000_000 * 100 s = 10 s.
+        let (ms, why) = end_of_recovery_lost_ms(true, &t, &[(0, 100_000)], &disc);
         assert!(
             why.is_none(),
             "measurable loss must not be flagged: {why:?}"
@@ -1269,7 +1302,7 @@ mod tests {
     fn the_gate_reports_an_incomplete_damage_record_first() {
         let t = test_title(0, 100);
         let disc = disc_with(vec![t.clone()]);
-        let (ms, why) = end_of_recovery_lost_ms(false, false, &t, &[], &disc, 0);
+        let (ms, why) = end_of_recovery_lost_ms(false, &t, &[], &disc);
         assert!(ms.is_nan());
         assert!(why.unwrap().contains("damage record is incomplete"));
     }
@@ -2693,6 +2726,85 @@ mod tests {
             "{} ms of loss is well inside a {GENEROUS_TOLERANCE_SECS}s tolerance",
             result.main_lost_ms
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On an ISO rip, damage that lies entirely OUTSIDE the main title must
+    /// not be reported as main-title playback loss.
+    ///
+    /// The two byte counts at the gate are different quantities and were being
+    /// conflated. `abort_lost_bytes` is WHOLE-DISC for an ISO deliverable (an
+    /// ISO is a backup of the whole disc, so every unreadable byte counts
+    /// against it), and that whole-disc total was handed straight to
+    /// `main_title_lost_ms`, which divides by the MAIN TITLE's size and
+    /// multiplies by the MAIN TITLE's runtime. A scratch in a trailer, a menu
+    /// or a bonus feature therefore came back as seconds — here, 72 of them
+    /// off ONE bad sector — of lost playback in a feature the drive read
+    /// perfectly. `classify_damage` escalates at 30 s, so the badge read
+    /// `Serious` on an intact movie, and `main_lost_ms` carried a number its
+    /// own doc says it does not.
+    ///
+    /// The mutation this catches: hand the gate's `lost_bytes` back to
+    /// `end_of_recovery_lost_ms` instead of letting it scope its own bytes to
+    /// the title. With that mutation `main_lost_ms` is 72_000 — one off-title
+    /// sector (2048 B) scaled by a 100-sector title's 204_800 B and 7200 s
+    /// runtime — and `severity` is `Serious`; both assertions below fail.
+    ///
+    /// Note what does NOT change: the run is still refused. `effective_abort_secs`
+    /// forces an ISO tolerance to 0, so `loss_aborts` fires on the whole-disc
+    /// `lost_bytes > 0` term regardless of the millisecond figure. That is why
+    /// this was a wrong NUMBER and not a shipped-bad-rip — and why the fix must
+    /// not disturb `aborted_for_loss`, which is asserted here too.
+    #[test]
+    fn iso_damage_outside_the_main_title_is_not_reported_as_main_title_loss() {
+        let (dir, iso) = scratch_iso("iso-off-title-loss");
+        let sectors = 4096u32;
+        // The title occupies sectors 0..100 ONLY. The never-healing spot is at
+        // LBA 1000, comfortably outside it.
+        let disc = test_disc(sectors, vec![test_title(0, 100)]);
+        let mut reader = never_healing_reader();
+        let job = raw_job(&iso);
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("permanent off-title damage is a reported result, not an Err");
+
+        assert!(
+            result.unreadable_bytes > 0,
+            "the fixture must actually end with confirmed loss"
+        );
+        assert_eq!(
+            libfreemkv::disc::bytes_bad_in_title(&test_title(0, 100), &[(1000 * 2048, 2048)]),
+            0,
+            "sanity: the damaged LBA really is outside the title's extents"
+        );
+        assert_eq!(
+            result.main_lost_ms, 0.0,
+            "the main title was read perfectly; its playback loss is zero"
+        );
+        assert_eq!(
+            result.severity,
+            crate::DamageSeverity::Cosmetic,
+            "a handful of off-title bad sectors is Cosmetic, not Serious"
+        );
+        assert!(
+            result.aborted_for_loss,
+            "an ISO deliverable still refuses ANY unreadable byte — the honest \
+             millisecond figure must not weaken the whole-disc gate"
+        );
+        assert!(!result.complete, "a rip the gate refused is never complete");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

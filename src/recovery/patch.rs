@@ -485,17 +485,33 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
         let span = head + count as usize;
         let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
         let mut scratch = vec![0u8; aligned_count * 2048];
-        reader.read_sectors_fua(
+        // `require_full_read` before the copy-back, not a bare `?`: `scratch`
+        // is freshly zeroed here, so a short transfer would splice ZEROS into
+        // the middle of a sector and the caller would commit them as
+        // recovered. A short read is a failed read (see the helper).
+        super::require_full_read(
+            reader.read_sectors_fua(
+                aligned_lba,
+                aligned_count as u16,
+                &mut scratch,
+                recovery,
+                fua,
+            ),
+            aligned_count * 2048,
             aligned_lba,
-            aligned_count as u16,
-            &mut scratch,
-            recovery,
-            fua,
         )?;
         buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
         Ok(bytes)
     } else {
-        reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua)
+        // The unaligned branch hands the caller's own reused buffer to the
+        // reader, so the stale bytes a short transfer leaves behind are the
+        // PREVIOUS span's — the exact silent-corruption shape the helper
+        // exists to stop.
+        super::require_full_read(
+            reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua),
+            bytes,
+            lba,
+        )
     }
 }
 
@@ -2402,6 +2418,81 @@ mod tests {
         assert_eq!(
             buf[0], 4u8,
             "copied back the requested sector (lba 4), not the unit head (lba 3)"
+        );
+    }
+
+    /// A reader that under-delivers must not have its buffer believed.
+    ///
+    /// The mutation this catches: put back the bare `Ok(_)` / bare `?` that
+    /// `recovery_read` used to have on each of its two branches. `buf` here is
+    /// pre-filled with 0xAA — stale bytes standing in for the PREVIOUS span
+    /// that a real recovery handler's reused buffer would be holding — and the
+    /// reader writes only the first sector. With the guard removed,
+    /// `recovery_read` answers `Ok(bytes)` and `read_span` hands
+    /// `ctx.sink.recovered` a span whose tail is that stale filler, writing it
+    /// to the ISO and recording it `Finished`: a corrupt rip at rc=0. With the
+    /// guard, a short transfer is a failed read — the same `DiscRead` verdict
+    /// `Drive::read_one` gives a residual underrun on the live path — so the
+    /// span stays bad and is retried.
+    ///
+    /// Both branches are exercised because they fail differently: the plain
+    /// branch reads into the CALLER's buffer, and the AACS-widening branch
+    /// reads into a freshly-zeroed `scratch` and would splice zeros in.
+    #[test]
+    fn recovery_read_rejects_a_short_transfer_on_both_branches() {
+        /// Reports `Ok(full)` while filling only the FIRST sector.
+        struct ShortReader;
+        impl SectorSource for ShortReader {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                buf: &mut [u8],
+                _recovery: bool,
+            ) -> Result<usize> {
+                buf[..2048].fill(0x11);
+                Ok(2048)
+            }
+        }
+
+        // Plain branch: 4 sectors requested, 1 delivered.
+        let mut buf = vec![0xAAu8; 4 * 2048];
+        let err = recovery_read(&mut ShortReader, false, 9, 4, &mut buf, true, false)
+            .expect_err("a short transfer is a failed read, not a partial success");
+        assert!(
+            matches!(
+                err,
+                Error::DiscRead {
+                    sector: 9,
+                    status: None,
+                    sense: None
+                }
+            ),
+            "classified exactly as Drive::read_one classifies a residual \
+             underrun, got {err:?}"
+        );
+
+        // AACS branch: lba 4 is mid-unit, so the read widens to 3 sectors at
+        // lba 3 and goes through `scratch` instead.
+        let mut buf = vec![0xAAu8; 2048];
+        let err = recovery_read(&mut ShortReader, true, 4, 1, &mut buf, true, false)
+            .expect_err("the widened read is short too, and must not copy back");
+        assert!(
+            matches!(
+                err,
+                Error::DiscRead {
+                    sector: 3,
+                    status: None,
+                    sense: None
+                }
+            ),
+            "reported against the WIDENED lba the drive was actually asked \
+             for, got {err:?}"
+        );
+        assert_eq!(
+            buf,
+            vec![0xAAu8; 2048],
+            "nothing may be copied back into the caller's buffer on a failed read"
         );
     }
 

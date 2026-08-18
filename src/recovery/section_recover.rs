@@ -353,9 +353,25 @@ fn read_span(
         recovery,
         params.fua,
     ) {
-        Ok(_) => {
+        Ok(n) if n == bytes => {
             ctx.sink.recovered(pos, &buf[..bytes]);
             ReadHit::Good
+        }
+        // A SHORT transfer is a FAILED read, not a partial recovery. `buf` is
+        // reused across every read a handler makes, so committing
+        // `buf[..bytes]` after a short transfer would hand the sink the tail of
+        // a PREVIOUS span and record it recovered — silent corruption inside a
+        // rip that reports success. `recovery_read` already converts a short
+        // count into `DiscRead` (as `Drive::read_one` does on the live path),
+        // so this arm should be unreachable; it is kept as the local statement
+        // of the invariant, because the cost is one comparison and the cost of
+        // being wrong is a corrupt movie. Treated as `Bad`: leave the span in
+        // the still-bad set so the next pass retries it — a loud miss. Not a
+        // wedge sense, so the streak resets exactly as the non-wedge error arm
+        // below does.
+        Ok(_) => {
+            ctx.wedge_streak = 0;
+            ReadHit::Bad
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
         Err(e) => {
