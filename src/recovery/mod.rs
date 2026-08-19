@@ -48,11 +48,34 @@ pub use patch::patch;
 fn require_full_read(result: Result<usize>, requested: usize, lba: u32) -> Result<usize> {
     match result {
         Ok(n) if n == requested => Ok(n),
-        Ok(_) => Err(Error::DiscRead {
-            sector: lba as u64,
-            status: None,
-            sense: None,
-        }),
+        Ok(n) => {
+            // Mirror `Drive::read_one`'s warning on the SAME event. That method
+            // gates its success arm on `bytes_transferred == count * 2048` and,
+            // before answering the very `DiscRead { status: None, sense: None }`
+            // reproduced here, emits a WARN naming `transferred` vs `expected`.
+            // This helper reproduced the verdict but not the log, so if it ever
+            // fired the only trace would be a generic no-sense read failure —
+            // indistinguishable in the log from any ordinary bad sector, exactly
+            // the two-populations-collapse the drive-side log was added to end.
+            // `status`/`sense` are deliberately absent: the read SUCCEEDED, so
+            // there is no sense data; `transferred` vs `expected` is the whole
+            // signal. Currently unreachable in-tree (no `SectorSource`
+            // short-reads on success — see this module's `require_full_read`
+            // doc), so this is defensive parity, not a live-bug fix.
+            tracing::warn!(
+                target: "freemkv::disc",
+                lba,
+                transferred = n,
+                expected = requested,
+                code = libfreemkv::error::E_DISC_READ,
+                "read returned success with a residual underrun; refusing the short transfer"
+            );
+            Err(Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            })
+        }
         other => other,
     }
 }
@@ -1774,10 +1797,23 @@ pub fn sweep(
     // is what motivated quitting; the consumer's flush error, if
     // any, is downstream).
     if let Some(e) = producer_err {
-        // Drop the consumer's result if we already have a producer
-        // error, but propagate consumer-panic on top of nothing
-        // since that's strictly informative.
-        let _ = summary;
+        // The producer error is returned, so the consumer's result is
+        // dropped here — but do NOT let a consumer close() failure vanish
+        // silently on the both-failed path: it is the only signal that the
+        // mapfile on disk is now untrustworthy. Log it before dropping,
+        // mirroring the patch path's `patch.finish.dropped` branch. (The old
+        // comment claimed this line "propagated" the consumer panic; it never
+        // did — `let _ = summary` discards it. Surfacing it in the log is what
+        // that claim was reaching for.)
+        if let Err(close_err) = &summary {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "sweep.finish.dropped",
+                read_error = %e,
+                close_error = %close_err,
+                "sweep: consumer close failed while the pass was already failing — the mapfile on disk may be incomplete"
+            );
+        }
         return Err(e);
     }
     let summary = summary?;
