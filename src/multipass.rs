@@ -461,24 +461,32 @@ fn recovery_is_complete(aborted_for_loss: bool, unreadable_bytes: u64, pending_b
     !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0
 }
 
-/// Milliseconds of main-title playback lost, given the bad bytes in the main
-/// title and the title's own size + duration. Scales the main title's bad
-/// bytes by its OWN size and runtime (the dimensionally-correct figure the CLI
+/// Milliseconds of main-title playback lost, given the bad bytes in `title`
+/// and `title`'s own size + duration. Scales those bad bytes by the SAME
+/// title's OWN size and runtime (the dimensionally-correct figure the CLI
 /// switched to — a whole-disc ratio × first-title duration was wrong once bonus
 /// content made the disc larger than the main title). Returns NaN when the
 /// title has no measurable bitrate but does have loss (unquantifiable → fails
 /// safe in the gate).
-fn main_title_lost_ms(disc: &libfreemkv::Disc, main_bad_bytes: u64) -> f64 {
+///
+/// The divisor is taken from the very `title` its caller scoped `main_bad_bytes`
+/// to, NOT from `disc.titles.first()`. Those agree for today's only caller (the
+/// main title IS the first title), but re-deriving the divisor from the disc
+/// re-opened, inside the helper written to close it, exactly the title/count
+/// mismatch [`end_of_recovery_lost_ms`] exists to prevent: a future
+/// main-title-by-longest/largest selection would scope bytes to one title and
+/// silently divide by another. Threading `title` makes the two share one
+/// parameter, so they cannot diverge.
+fn main_title_lost_ms(title: &libfreemkv::DiscTitle, main_bad_bytes: u64) -> f64 {
     if main_bad_bytes == 0 {
         return 0.0;
     }
-    match disc.titles.first() {
-        Some(t) if t.size_bytes > 0 && t.duration_secs > 0.0 && t.duration_secs.is_finite() => {
-            main_bad_bytes as f64 / t.size_bytes as f64 * t.duration_secs * MILLIS_PER_SEC
-        }
+    if title.size_bytes > 0 && title.duration_secs > 0.0 && title.duration_secs.is_finite() {
+        main_bad_bytes as f64 / title.size_bytes as f64 * title.duration_secs * MILLIS_PER_SEC
+    } else {
         // Loss exists but we can't quantify it (no bitrate) → NaN, which the
         // gate treats as fail-safe abort.
-        _ => f64::NAN,
+        f64::NAN
     }
 }
 
@@ -513,7 +521,6 @@ pub fn end_of_recovery_lost_ms(
     promotion_intact: bool,
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
-    disc: &libfreemkv::Disc,
 ) -> (f64, Option<&'static str>) {
     if !promotion_intact {
         // The damage record itself is incomplete, so nothing derived from it
@@ -542,7 +549,7 @@ pub fn end_of_recovery_lost_ms(
         );
     }
     let main_bad_bytes = libfreemkv::disc::bytes_bad_in_title(title, bad_ranges);
-    (main_title_lost_ms(disc, main_bad_bytes), None)
+    (main_title_lost_ms(title, main_bad_bytes), None)
 }
 
 /// The result of a multipass run.
@@ -966,7 +973,7 @@ fn multipass_rip_inner(
                 // the millisecond conversion is what reported off-title damage
                 // as main-title playback loss.
                 let (lost_ms, unquantifiable) =
-                    end_of_recovery_lost_ms(promotion_intact, main_title, &bad_ranges, disc);
+                    end_of_recovery_lost_ms(promotion_intact, main_title, &bad_ranges);
                 if let Some(why) = unquantifiable {
                     sink.log(Level::Error, why);
                 }
@@ -1242,9 +1249,8 @@ mod tests {
         // `loss_is_unscopable(..)`, and it passed with the guard deleted from
         // the gate, because the bug was never in the predicate: it was that
         // the gate did not consult one. Call what the gate calls.
-        let disc = disc_with(vec![empty.clone()]);
         let (lost_ms, why) =
-            end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage, &disc);
+            end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage);
         assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
         assert!(why.is_some(), "an unquantifiable verdict must say why");
         assert!(
@@ -1258,26 +1264,6 @@ mod tests {
         );
     }
 
-    /// A disc carrying exactly these titles.
-    fn disc_with(titles: Vec<libfreemkv::DiscTitle>) -> libfreemkv::Disc {
-        libfreemkv::Disc {
-            volume_id: "T".into(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::BluRay,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles,
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs: None,
-            css: None,
-            encrypted: false,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
-        }
-    }
-
     /// The gate must still produce a real number when the loss IS measurable —
     /// the guard must not swallow the normal path.
     #[test]
@@ -1285,11 +1271,10 @@ mod tests {
         let mut t = test_title(0, 100);
         t.size_bytes = 1_000_000;
         t.duration_secs = 100.0;
-        let disc = disc_with(vec![t.clone()]);
         // 100_000 bad bytes, all of them INSIDE the title's 0..100-sector
         // extent, so the gate's scoping and the millisecond scoping agree:
         // 100_000 / 1_000_000 * 100 s = 10 s.
-        let (ms, why) = end_of_recovery_lost_ms(true, &t, &[(0, 100_000)], &disc);
+        let (ms, why) = end_of_recovery_lost_ms(true, &t, &[(0, 100_000)]);
         assert!(
             why.is_none(),
             "measurable loss must not be flagged: {why:?}"
@@ -1301,8 +1286,7 @@ mod tests {
     #[test]
     fn the_gate_reports_an_incomplete_damage_record_first() {
         let t = test_title(0, 100);
-        let disc = disc_with(vec![t.clone()]);
-        let (ms, why) = end_of_recovery_lost_ms(false, &t, &[], &disc);
+        let (ms, why) = end_of_recovery_lost_ms(false, &t, &[]);
         assert!(ms.is_nan());
         assert!(why.unwrap().contains("damage record is incomplete"));
     }
@@ -1343,7 +1327,7 @@ mod tests {
         let mut ok = libfreemkv::DiscTitle::empty();
         ok.size_bytes = 1_000_000;
         ok.duration_secs = 100.0;
-        let ms = main_title_lost_ms(&disc_with(vec![ok]), damage);
+        let ms = main_title_lost_ms(&ok, damage);
         assert!(
             ms.is_finite() && ms > 0.0,
             "expected a real figure, got {ms}"
@@ -1360,7 +1344,7 @@ mod tests {
             ("duration only", dur_only),
             ("neither", libfreemkv::DiscTitle::empty()),
         ] {
-            let ms = main_title_lost_ms(&disc_with(vec![t]), damage);
+            let ms = main_title_lost_ms(&t, damage);
             assert!(ms.is_nan(), "{name}: expected NaN, got {ms}");
         }
 
@@ -1368,17 +1352,17 @@ mod tests {
         let mut zero_size = libfreemkv::DiscTitle::empty();
         zero_size.size_bytes = 0;
         zero_size.duration_secs = 100.0;
-        assert!(main_title_lost_ms(&disc_with(vec![zero_size]), damage).is_nan());
+        assert!(main_title_lost_ms(&zero_size, damage).is_nan());
 
         let mut zero_dur = libfreemkv::DiscTitle::empty();
         zero_dur.size_bytes = 1_000_000;
         zero_dur.duration_secs = 0.0;
-        assert!(main_title_lost_ms(&disc_with(vec![zero_dur]), damage).is_nan());
+        assert!(main_title_lost_ms(&zero_dur, damage).is_nan());
 
-        // No titles at all.
-        assert!(main_title_lost_ms(&disc_with(vec![]), damage).is_nan());
+        // An extent-less / bitrate-less title (the shape a failed scan leaves).
+        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), damage).is_nan());
         // And no damage is genuinely zero regardless of the title.
-        assert_eq!(main_title_lost_ms(&disc_with(vec![]), 0), 0.0);
+        assert_eq!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 0), 0.0);
     }
 
     /// `abort_lost_ms`'s arithmetic, pinned so the operators cannot drift.
@@ -1429,26 +1413,31 @@ mod tests {
         let mut t = libfreemkv::DiscTitle::empty();
         t.size_bytes = 1_000_000;
         t.duration_secs = 100.0;
-        let disc = libfreemkv::Disc {
-            volume_id: "T".into(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::BluRay,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles: vec![t],
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs: None,
-            css: None,
-            encrypted: false,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
-        };
         // 10% of the title bad → 10% of 100s = 10s = 10_000 ms.
-        assert!((main_title_lost_ms(&disc, 100_000) - 10_000.0).abs() < 1e-6);
+        assert!((main_title_lost_ms(&t, 100_000) - 10_000.0).abs() < 1e-6);
         // No loss → 0.
-        assert_eq!(main_title_lost_ms(&disc, 0), 0.0);
+        assert_eq!(main_title_lost_ms(&t, 0), 0.0);
+    }
+
+    /// `end_of_recovery_lost_ms` must scope BOTH the bad-byte count AND its
+    /// ms divisor to the passed `title`, never to some other title.
+    /// This pins the round-2 fix: before it, the ms divisor was re-derived from
+    /// `disc.titles.first()` while the bytes were scoped to `title`, so a caller
+    /// that passed a title other than the first would scope bytes to one title
+    /// and divide by another. Here `title` is a SECOND title (0..100 sectors,
+    /// 1_000_000 B / 100 s); a divisor keyed off "the first title" would answer a
+    /// different figure. 100_000 in-title bad bytes / (1_000_000/100) = 10 s.
+    #[test]
+    fn end_of_recovery_lost_ms_scopes_divisor_to_the_passed_title() {
+        let mut title = test_title(0, 100);
+        title.size_bytes = 1_000_000;
+        title.duration_secs = 100.0;
+        let (ms, why) = end_of_recovery_lost_ms(true, &title, &[(0, 100_000)]);
+        assert!(
+            why.is_none(),
+            "measurable loss must not be flagged: {why:?}"
+        );
+        assert!((ms - 10_000.0).abs() < 1e-6, "expected 10s, got {ms}");
     }
 
     /// Minimal `DiscTitle` whose single extent spans `[start_lba, start_lba +
@@ -1809,24 +1798,9 @@ mod tests {
 
     #[test]
     fn main_title_lost_ms_is_nan_when_unquantifiable() {
-        // A title with loss but no measurable bitrate → NaN (fail-safe abort).
-        let disc = libfreemkv::Disc {
-            volume_id: "T".into(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::BluRay,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles: vec![libfreemkv::DiscTitle::empty()], // size 0, dur 0
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs: None,
-            css: None,
-            encrypted: false,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
-        };
-        assert!(main_title_lost_ms(&disc, 4096).is_nan());
+        // A title with loss but no measurable bitrate (size 0, dur 0) → NaN
+        // (fail-safe abort).
+        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096).is_nan());
     }
 
     // ─────────────────────────────────────────────────────────────────────
