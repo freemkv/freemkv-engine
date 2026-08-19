@@ -106,11 +106,10 @@ pub(crate) fn with_cancel_watcher<T>(
 /// returning `!sink.should_cancel()` so the library's cooperative-cancellation
 /// bool (`false` = stop) is driven by the front-end's Cancel/Ctrl-C exactly as
 /// it is today.
-/// Bridges libfreemkv's low-level `Progress` callback onto the engine
-/// [`Sink`]. `pub(crate)` so [`crate::multipass::multipass_rip`] can reuse the
-/// exact same bridge — one speed/ETA derivation, shared by every caller that
-/// drives a recovery primitive directly (see the struct-level doc above for
-/// why there is only ever one of these).
+///
+/// `pub(crate)` so [`crate::multipass::multipass_rip`] can reuse the exact same
+/// bridge — one speed/ETA derivation, shared by every caller that drives a
+/// recovery primitive directly.
 pub(crate) struct ProgressBridge<'a> {
     sink: &'a dyn Sink,
     // The engine's ONE speed/ETA derivation. `report` takes `&self`, and the
