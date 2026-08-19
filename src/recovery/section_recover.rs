@@ -328,13 +328,29 @@ fn read_span(
     let lba = (pos / SECTOR) as u32;
     let bytes = count as usize * SECTOR as usize;
     // Every SubRange enters via `from_section` / `remove`, which keep byte
-    // offsets sector-aligned, so a handler never asks for a sub-sector span. Pin
-    // that invariant: a zero `count` (span < SECTOR) would be a 0-sector read
-    // that silently "recovers" nothing — surface the caller bug in tests.
-    debug_assert!(
-        count >= 1 && pos.is_multiple_of(SECTOR),
-        "read_span requires a sector-aligned, >=1-sector span (pos={pos}, count={count})"
-    );
+    // offsets sector-aligned, so a handler never asks for a sub-sector span.
+    //
+    // Enforce that invariant at RUNTIME, in every build. A `debug_assert!` here
+    // compiled out under `--release` (which this crate's CI runs), and there a
+    // zero `count` (span < SECTOR) is silently catastrophic: `bytes` is 0,
+    // `recovery_read` answers `Ok(0)`, the `Ok(n) if n == bytes` arm below sees
+    // `0 == 0` and fires the *Good* path, and `sink.recovered(pos, &buf[..0])`
+    // records a span that was NEVER READ as recovered — a rip that reports a
+    // clean, complete mapfile over unread media. Unreachable today
+    // (`snap_to_sectors` runs before every `SubRanges::from_section`), so this
+    // is the loud, release-safe statement of the invariant, not a live path:
+    // refuse the span as a failed read (leaving it in the still-bad set for the
+    // next pass) and log it, rather than quietly "recovering" nothing. Absence
+    // of a log on a swallowed invariant breach is itself a bug.
+    if count == 0 || !pos.is_multiple_of(SECTOR) {
+        tracing::error!(
+            target: "freemkv::disc",
+            pos,
+            count,
+            "read_span: refused a non-sector-aligned or empty span before reading; treating as a failed read so it is never falsely marked recovered"
+        );
+        return ReadHit::Bad;
+    }
     // Program the spindle speed ONLY when it changes — a `SET CD SPEED` per read
     // would thrash the drive. `run_handlers` restores max after the handler.
     let want_speed = params.speed.kbs();
@@ -1472,6 +1488,51 @@ mod tests {
 
     fn lba(pos: u64) -> u32 {
         (pos / SECTOR) as u32
+    }
+
+    /// `read_span` must refuse an empty (`count == 0`) span as a FAILED read in
+    /// EVERY build — not just debug. The round-2 fix replaced a `debug_assert!`
+    /// (compiled out under `--release`, which this crate's CI runs) with a
+    /// runtime guard. The mutation this pins is "let a `count == 0` span reach
+    /// the reader": there `bytes == 0`, `recovery_read` answers `Ok(0)`, the
+    /// `Ok(n) if n == bytes` arm sees `0 == 0` and fires the *Good* path, and
+    /// `sink.recovered(pos, &buf[..0])` marks a NEVER-READ span as recovered.
+    /// The guard must instead return `Bad` and touch neither the sink nor the
+    /// reader. `pos == 0` is sector-aligned and (in `Harness`, no dead sectors)
+    /// perfectly readable, so ONLY the `count == 0` guard can keep this span
+    /// out of the Good arm.
+    #[test]
+    fn read_span_refuses_an_empty_span_as_a_failed_read() {
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = HandlerCtx {
+            reader: &mut disc,
+            sink: &mut sink,
+            now: &now,
+            halt: None,
+            decrypt_is_aacs: false,
+            tick: None,
+            unproductive: 0,
+            wedge_streak: 0,
+            cur_speed: SPEED_MAX_KBS,
+        };
+        let mut buf = [0u8; SECTOR as usize];
+        let hit = read_span(&mut ctx, &mut buf, 0, 0, ReadParams::fast());
+        assert!(
+            matches!(hit, ReadHit::Bad),
+            "an empty span must be classified as a failed read"
+        );
+        assert!(
+            sink.got.is_empty(),
+            "an empty span must NEVER be recorded as recovered"
+        );
+        assert_eq!(
+            h.read_count(),
+            0,
+            "the guard must fire before any read is issued"
+        );
     }
 
     #[test]
