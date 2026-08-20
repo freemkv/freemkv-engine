@@ -1,5 +1,63 @@
 # Changelog
 
+## [1.6.5] — 2026-08-20
+
+### Security
+
+- **A rip could write sectors the drive never delivered into your disc image
+  and still exit clean.** Three read sites reused one buffer, shipped a
+  fixed-length slice of it downstream, and ignored the byte count the read
+  returned — so a source that answered "OK" with a short transfer would leave
+  the tail of the *previous* sector inside the ISO and record the range as
+  Finished, a success exit over somebody else's data. Reads are now checked
+  against the length requested: a short read is treated as a failed read, the
+  range stays bad and is retried, and nothing partial is ever committed as
+  good.
+
+### Fixed
+
+- **An ISO backup of a disc whose movie was untouched could be flagged
+  seriously damaged.** For an ISO rip the damage gate counts every unreadable
+  byte on the whole disc, which is correct — but that whole-disc figure was
+  then scaled against the main title's size and runtime, so damage sitting
+  entirely in menus, trailers, or a bonus feature came back as seconds of lost
+  *feature* playback. One bad off-title sector could report over a minute of
+  loss and push an intact movie past the threshold where it is badged Serious.
+  The playback-loss figure is now always measured against the main title's own
+  extents, whatever the deliverable, so off-title damage no longer inflates it.
+
+- **A disc where every read failed could report itself as fully recovered.**
+  The live progress accounting let read positions count as recovered bytes, so
+  a rip that salvaged nothing still showed a clean, complete result. Recovered,
+  pending, retryable, and unreadable bytes now partition the disc so every byte
+  lands in exactly one bucket, and the reported bad-sector count and truncated
+  bad-range list no longer silently under-report a heavily damaged disc. A
+  mapfile that fails to load is now reported as Unknown rather than Converged.
+
+- **Cancelling a rip could throw away sectors the drive had just spent minutes
+  recovering.** A Stop request could discard an in-flight recovered span
+  instead of handing it off, and could hang on a stalled teardown. Stop now
+  preserves already-recovered work, bounds the teardown so it lands promptly,
+  and is honoured between the two long deep-read passes that previously ran
+  back to back with no cancellation check.
+
+- **A corrupt mapfile was silently skipped instead of refused.** A malformed
+  identity header or a truncated data line now fails loudly rather than being
+  quietly ignored, and a resume refuses when the mapfile's recorded disc total
+  disagrees with the disc in the drive, so a stale or mismatched mapfile can no
+  longer be trusted into a bad recovery.
+
+### Changed
+
+- **Hardened several latent traps that logged nothing when they fired.** A
+  zero-length recovery span is now refused as a failed read in release builds
+  too (previously only caught in debug, where it could otherwise mark a
+  never-read span as recovered); the playback-loss helper now derives its
+  divisor from the same title it scopes damage to, so the two cannot drift
+  apart; and a consumer close() failure on an already-failing pass is now
+  logged, since it is the one signal that the mapfile on disk may be
+  incomplete.
+
 ## [1.6.4] — 2026-08-15
 
 ### Fixed
