@@ -11,7 +11,7 @@ freemkv-engine    ← THIS: recovery strategy + rip orchestration + the Sink sea
    └── freemkv-gui ← you
 ```
 
-Status: the engine is built, green, and tested on Rust 1.97 (the toolchain CI
+Status: the engine is built, green, and tested on Rust 1.90 (the toolchain CI
 pins and `Cargo.toml`'s `rust-version`). It is
 **off crates.io** — depend on it by path/git tag like the other freemkv crates.
 

@@ -10,6 +10,10 @@
   discontinuity, instead of splicing post-gap audio mid-stream — fixing
   decoder-choking seams on discs whose stream carries a continuity-counter gap;
   see the libfreemkv 1.6.10 notes).
+- MSRV lowered from 1.97 to 1.90 (`rust-version` in `Cargo.toml` and the CI
+  toolchain pin). 1.90 was the lowest toolchain that built, linted, and passed
+  the test suite clean; 1.85 fails because libfreemkv's `build.rs` uses
+  let-chains, stabilized in 1.88.
 
 ## [1.6.9] — 2026-08-22
 
