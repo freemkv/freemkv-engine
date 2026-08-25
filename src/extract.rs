@@ -140,7 +140,7 @@ mod tests {
         };
         let l_fi = name_field.len();
         let mut fid = vec![0u8; 38];
-        fid[0..2].copy_from_slice(&257u16.to_le_bytes());
+        fid[0..2].copy_from_slice(&257u16.to_le_bytes()); // Tag ID 257 = FID
         let mut file_chars = 0u8;
         if is_dir {
             file_chars |= 0x02;
@@ -148,10 +148,10 @@ mod tests {
         if is_parent {
             file_chars |= 0x08;
         }
-        fid[18] = file_chars;
-        fid[19] = l_fi as u8;
-        fid[24..28].copy_from_slice(&icb_lba.to_le_bytes());
-        fid[36..38].copy_from_slice(&0u16.to_le_bytes());
+        fid[18] = file_chars; // FileCharacteristics
+        fid[19] = l_fi as u8; // LengthOfFileIdentifier
+        fid[24..28].copy_from_slice(&icb_lba.to_le_bytes()); // ICB LogicalBlockNumber
+        fid[36..38].copy_from_slice(&0u16.to_le_bytes()); // l_iu = 0 (no impl-use)
         buf.extend_from_slice(&fid);
         buf.extend_from_slice(&name_field);
         let used = buf.len() - start;
