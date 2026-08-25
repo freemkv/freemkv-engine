@@ -99,7 +99,7 @@ jobs:
           libfreemkv = { path = "../libfreemkv" }
           freemkv-keysources = { path = "../freemkv-keysources" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-engine
@@ -140,7 +140,7 @@ jobs:
           libfreemkv = { path = "../libfreemkv" }
           freemkv-keysources = { path = "../freemkv-keysources" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: dtolnay/rust-toolchain@1.97.0
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
@@ -185,7 +185,7 @@ jobs:
           libfreemkv = { path = "../libfreemkv" }
           freemkv-keysources = { path = "../freemkv-keysources" }
           EOF
-      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-engine
