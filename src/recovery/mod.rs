@@ -1085,7 +1085,7 @@ pub fn sweep(
     // read error → skip / NonTrimmed → patch re-read), NOT by decrypt structure.
     // (The old decrypt-VERIFY read gate — which mis-aligned the disc-absolute
     // unit grid against clip-file-anchored AACS units and false-failed good
-    // clips like Dunkirk's orphan-CPS clip — was removed. There is no scratch
+    // clips with an orphan CPS unit — was removed. There is no scratch
     // verify and no post-sweep clip-anchored pass; decryptability is proven at
     // mux time, not at capture time.)
     let mut keys = if opts.decrypt {
