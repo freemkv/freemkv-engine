@@ -405,6 +405,7 @@ jobs:
         working-directory: freemkv-engine
       - uses: codecov/codecov-action@v5
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: freemkv-engine/lcov.info
           slug: freemkv/freemkv-engine
           fail_ci_if_error: false
