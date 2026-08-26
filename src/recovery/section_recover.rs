@@ -717,7 +717,7 @@ impl SectionHandler for Bisect {
 /// jump stepped over. Uses fast reads (this is a scout, not a deep-recovery
 /// pass). Without it a linear walk pays one up-to-10 s read per dead batch
 /// across the whole run, so a deadline-bounded pass never reaches readable data
-/// buried behind a big dead front (exactly the 192 MB range on Dune).
+/// buried behind a big dead front (exactly the 192 MB range seen on a real disc).
 pub(super) struct Jump {
     pub params: ReadParams,
 }

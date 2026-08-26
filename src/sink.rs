@@ -27,7 +27,7 @@ pub enum Level {
 /// with no hour-carry; `autorip/src/ripper/mux.rs` received an already-
 /// formatted `eta: String` from yet another call site; the CLI's `fmt_eta`
 /// took raw seconds and did its own `h:mm:ss` formatting. Three algorithms,
-/// not just three renderers — exactly the drift class that let the Bourne
+/// not just three renderers — exactly the drift class that let a real
 /// `key_fetch` bug happen (§2 of the design doc): the same computation
 /// answered twice, and the two answers disagreed.
 ///
