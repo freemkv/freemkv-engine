@@ -655,7 +655,7 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     //    it (ECC worked hard / retried). We enable reporting of these via MODE
     //    SELECT PER=1 at drive-prep precisely so they surface: on marginal/dirty
     //    media the drive's best-effort correction can be silently WRONG (a rip
-    //    that "passed clean" but decoded with errors — the Bourne case). We
+    //    that "passed clean" but decoded with errors — seen on real discs). We
     //    distrust it: mark THIS block NonTrimmed and let Pass N re-read it with
     //    proper recovery (FUA cache-bypass) — a clean re-read wins, a persistent
     //    marginal becomes an honest concealed gap.
