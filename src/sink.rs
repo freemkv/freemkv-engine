@@ -58,8 +58,8 @@ pub struct Progress {
     pub speed_bps: u64,
     /// Estimated seconds remaining for the current operation, engine-
     /// computed from `speed_bps`, once the estimate has converged (`None`
-    /// during the warm-up window — mirrors the MakeMKV "Elapsed only, then
-    /// ETA" behaviour the UI study observed).
+    /// during the warm-up window — shows elapsed-only during warm-up, then
+    /// switches to ETA, per the UI study observed).
     pub eta_secs: Option<u64>,
 }
 
