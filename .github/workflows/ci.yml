@@ -356,3 +356,55 @@ jobs:
         working-directory: freemkv
       - run: cargo check --all-targets
         working-directory: autorip
+
+  # Coverage — additive, NON-REQUIRED (not wired into any release gate; failure
+  # here does not block a push or a release). Mirrors the `test` job's sibling
+  # checkout + .cargo/config.toml patch layout so llvm-cov builds this branch's
+  # tip against the sibling dev tips, exactly like the real test build; `--locked`
+  # is deliberately absent for the same reason as everywhere else (Cargo.lock is
+  # gitignored). Uploads tokenless to Codecov and never fails CI on upload error.
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: freemkv-engine
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-keysources
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: freemkv-engine
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          EOF
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: freemkv-engine
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+        working-directory: freemkv-engine
+      - uses: codecov/codecov-action@v5
+        with:
+          files: freemkv-engine/lcov.info
+          slug: freemkv/freemkv-engine
+          fail_ci_if_error: false
