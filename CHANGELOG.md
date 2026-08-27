@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.12] — UNRELEASED
+
+### Fixed
+
+- A mid-rip UNIT ATTENTION (media changed / disc remounted or swapped / bus reset) now aborts the pass to reacquire and re-verify the disc, instead of treating the change as a bad-sector skip that silently drops data.
+
+### Changed
+
+- Comment and documentation cleanup.
+
 ## [1.6.11] — 2026-08-26
 
 ### Changed
