@@ -78,16 +78,9 @@ pub struct ReadCtx {
     /// `WEDGE_ABORT_THRESHOLD` consecutive wedges with no good read
     /// in between → real AbortPass.
     pub wedge_count: u64,
-    // ── Diagnostic counters (added 2026-05-10) ──
-    //
-    // Aggregate state for post-mortem analysis of wedge incidents.
-    // Every Pass 1 / Pass N sweep now produces a structured summary
-    // at the WARN log on each error AND an end-of-pass INFO summary.
-    // Goal: when a wedge happens, the operator should be able to tell
-    // from the logs whether it was triggered by ONE read at a
-    // physically-damaged sector (immediate failure) or by accumulated
-    // exposure across MANY reads (firmware-state buildup), and what
-    // the timing pattern looked like.
+    // Diagnostic counters (added 2026-05-10): aggregate state for post-mortem
+    // analysis, so an operator can tell from the logs whether a wedge was one
+    // read at physically-damaged media vs. accumulated firmware-state buildup.
     /// `Instant` of the most recent successful read. Used to compute
     /// "time since last good" for the WARN log on each error. None
     /// before the first successful read.
@@ -237,12 +230,9 @@ impl ReadCtx {
         // drive recovered, so further wedges should reset the skip
         // budget instead of accumulating toward a real abort.
         self.wedge_count = 0;
-        // A successful read also means the bridge recovered, so the
-        // 15s-cooldown retry budget should be available again for the
-        // next bridge-degradation event. Without this reset the budget
-        // saturates permanently after 5 cumulative events across the
-        // whole pass and later degradations skip the cooldown retry,
-        // needlessly losing data.
+        // A successful read means the bridge recovered too, so its
+        // 15s-cooldown retry budget must be freed — otherwise it saturates
+        // permanently after 5 cumulative events and later degradations lose data.
         self.bridge_degradation_count = 0;
         self.consecutive_outer_failures = 0;
         self.damage_window.push(true);
@@ -258,19 +248,15 @@ impl ReadCtx {
         if self.in_damage_zone && self.consecutive_good >= self.damage_window_max as u64 {
             self.in_damage_zone = false;
             self.last_error_family = None;
-            // Reset the damage-jump multiplier so the NEXT zone starts
-            // from the base jump distance. Without this the multiplier
-            // stays at whatever the prior zone inflated it to (up to
-            // MAX_JUMP_MULTIPLIER=64), so the next zone's first jump is
-            // 64x oversized and skips recoverable data. The field doc
-            // promises this reset.
+            // Reset the jump multiplier so the NEXT zone starts at the base
+            // distance — otherwise it carries over the prior zone's inflation
+            // (up to 64x) and the next zone's first jump skips recoverable data.
             self.jump_multiplier = 1;
         }
     }
 
-    /// Final per-pass summary suitable for an INFO log at the end of
-    /// `sweep` / `patch`. Caller renders this to a single structured
-    /// log line.
+    /// Final per-pass summary suitable for an INFO log at the end of a
+    /// Pass 1 `sweep`. Caller renders this to a single structured log line.
     pub fn pass_summary(&self) -> PassSummary {
         PassSummary {
             total_reads_ok: self.total_reads_ok,
@@ -381,29 +367,9 @@ const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
 /// 2 jumps.
 const JUMP_BASE_SECTORS: u64 = 1024;
 
-// Firmware-wedge skip policy for Pass 1 sweep
-// ===========================================
-//
-// When the BU40N (or similar drives) hits a physical-damage cluster,
-// its firmware can transition into a "wedge" state where it returns
-// HARDWARE_ERROR or ILLEGAL_REQUEST for every subsequent read —
-// often for many LBAs after the actual bad sector. Once wedged,
-// recovery requires either a physical eject + reload or a significant
-// cool-down period; hammering the same LBA only deepens the state.
-//
-// Pass 1's pre-fix behavior was to immediately AbortPass on the
-// first HARDWARE_ERROR / ILLEGAL_REQUEST, killing the rip at
-// whatever percentage it had reached. That's the wrong call when:
-//   - the damage zone may be small (jumping past it could resume
-//     normal reads), AND
-//   - even if the drive stays wedged, finishing the sweep gives us
-//     an honest mapfile for Pass N to attack later.
-//
-// New policy: treat wedge sense codes the same way the damage-window
-// treats persistent failure — JumpAhead by a large distance with a
-// cooldown pause. Allow up to WEDGE_ABORT_THRESHOLD consecutive
-// wedges (no successful read in between) before declaring the drive
-// truly stuck and surfacing AbortPass to autorip.
+// Firmware-wedge skip policy: a damaged drive's firmware can latch into
+// returning HARDWARE_ERROR/ILLEGAL_REQUEST for every later read; instead of
+// aborting immediately we JumpAhead + cooldown, aborting only after N wedges.
 
 /// One-gigabyte jump (1024 MiB) on each wedge. Big enough to clear
 /// almost any single-cluster damage zone we've seen.
@@ -474,10 +440,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     ctx.total_errors += 1;
     ctx.last_error_at = Some(now);
 
-    // Wedge transition: previous error was MEDIUM, this one is
-    // HARDWARE or ILLEGAL_REQUEST. That's the moment the drive's
-    // firmware flipped into fast-fail mode. Distinct WARN so logs
-    // make it unambiguous when the wedge "started."
+    // Wedge transition: previous error was MEDIUM, this one HARDWARE or
+    // ILLEGAL_REQUEST — the moment firmware flips into fast-fail mode.
+    // Distinct WARN so logs make it unambiguous when the wedge "started."
     let is_wedge_transition = matches!(ctx.last_error_family, Some(prev) if !prev.is_wedge_family())
         && current_family.is_wedge_family();
     ctx.last_error_family = Some(current_family);
@@ -502,12 +467,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     );
 
     if is_wedge_transition {
-        // NOTE: this is the FIRST escalation into the hardware/illegal-request
-        // sense family — NOT a confirmed wedge. Drives frequently recover and keep
-        // reading after one such error (a single bad spot), so calling it a "wedge"
-        // here over-claims (it sent past investigations chasing a drive ghost). A
-        // genuine wedge is PERSISTENT — see the `wedge_skip` / WEDGE_ABORT_THRESHOLD
-        // path below, which only fires after repeated fast-fails with no recovery.
+        // NOTE: this is the FIRST escalation into hardware/illegal-request, NOT a
+        // confirmed wedge — drives often recover after one such error, so calling
+        // it a wedge here over-claims; a genuine wedge is PERSISTENT (see below).
         tracing::warn!(
             target: "freemkv::disc",
             phase = "fastfail_escalation",
@@ -519,25 +481,30 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         );
     }
 
-    // 1. Transport failure: bridge crash / USB disconnect. The outer
-    //    pass loop knows how to handle this (rediscover sg path,
-    //    re-open drive). Inline single-sector retry here was tried in
-    //    pre-v0.17.0 builds and observed to make wedges worse.
+    // 1. Transport failure: bridge crash / USB disconnect. The outer pass loop
+    //    re-discovers the sg path / re-opens the drive; inline single-sector
+    //    retry here was tried pre-v0.17.0 and observed to make wedges worse.
     if err.is_scsi_transport_failure() {
         return ReadAction::AbortPass;
     }
 
-    // 2. Bridge degradation: the SCSI status byte is non-standard —
-    //    neither GOOD (0x00), CHECK CONDITION (0x02), nor TRANSPORT
-    //    FAILURE (0xFF). The USB bridge firmware returns these bogus
-    //    status bytes (e.g. 0x04, 0x05) with empty sense data when it
-    //    enters a semi-stuck state preceding a crash. This is keyed on
-    //    the status byte alone, NOT on sense_key/ASC/ASCQ — a real
-    //    NOT_READY 04/3E bad-sector error arrives as CHECK CONDITION
-    //    (0x02) and is handled by the generic NOT_READY branch below.
-    //    The bridge typically recovers after a long cooldown; if we've
-    //    exhausted our retry budget, fall through to the marginal/skip
-    //    path below.
+    // 1b. Medium change (UNIT ATTENTION): media/bus state changed under us, so
+    //     resumed LBAs no longer match the mapped image — abort (not retry/skip)
+    //     so the outer loop reacquires; kept above NOT_READY/wedge to avoid swallowing.
+    if err.scsi_sense().is_some_and(|s| s.is_unit_attention()) {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "medium_change",
+            asc = err.scsi_sense().map(|s| s.asc),
+            ascq = err.scsi_sense().map(|s| s.ascq),
+            "UNIT ATTENTION (media/bus state changed) — aborting pass to reacquire"
+        );
+        return ReadAction::AbortPass;
+    }
+
+    // 2. Bridge degradation: a non-standard SCSI status byte (e.g. 0x04/0x05,
+    //    not GOOD/CHECK CONDITION/TRANSPORT FAILURE) with empty sense — the USB
+    //    bridge's semi-stuck state before a crash; retries then falls through.
     if err.is_bridge_degradation() && ctx.bridge_degradation_count < BRIDGE_DEGRADATION_MAX_RETRIES
     {
         ctx.bridge_degradation_count += 1;
@@ -560,64 +527,22 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         ctx.not_ready_retries = 0;
     }
 
-    // Zone-entry tracking: this is the first error after a clean run (or the
-    // first error of the sweep). Capture the genuine clean->damaged transition
-    // here, BEFORE mutating in_damage_zone, so the 30 s zone-entry cooldown
-    // below keys off the real transition rather than re-deriving it from a
-    // counter the fast-jump path resets after every jump.
-    //
-    // Latched AFTER every branch above that RETURNS EARLY, not before them.
-    // The three early exits — transport failure, bridge degradation, and the
-    // generic NOT_READY retry — never reach the cooldown selection at the
-    // bottom, so a transition latched before them is consumed by an error that
-    // could not use it. That was not hypothetical: a Pass 1 sweep whose first
-    // error is the documented BU40N bad-sector signature (NOT READY / 04 / 3E)
-    // latched the zone on call 1 and then returned `Retry{3s}` for the whole
-    // retry budget; by the time the budget was spent and the code reached the
-    // pause selection the transition was gone, and the drive got the ordinary
-    // 5 s pause instead of the 30 s cooldown — the constant defeated for exactly
-    // the sense family it was written for, at the moment the module doc says
-    // quiet is what prevents the firmware fast-fail wedge. The same hazard was
-    // already recognised for RECOVERED_ERROR and guarded with `!is_recovered`;
-    // moving the latch here covers all four with one rule instead of a growing
-    // list of exceptions, and stops `zones_entered` counting transient
-    // NOT_READYs as damage zones.
-    //
-    // A RECOVERED_ERROR (marginal read) is still explicitly NOT damage-zone
-    // signal — see the SkipBlock branch below, which also returns early.
+    // Zone-entry tracking: latch the clean->damaged transition AFTER every
+    // early-return branch (transport failure, bridge, NOT_READY), not before —
+    // else a transient retry burns it, starving a real error of the 30s cooldown.
     let is_zone_entry_transition = !ctx.in_damage_zone && !is_recovered;
     if is_zone_entry_transition {
         ctx.in_damage_zone = true;
         ctx.zones_entered += 1;
     }
 
-    // 4. Hardware error / illegal request — the firmware-wedge family.
-    //    The drive transitioned into a fast-fail state where it
-    //    rejects reads near the LBA. Same response shape for both
-    //    passes (2026-05-11 reframe — error handling is centralized,
-    //    and the wedge is a code-induced state we can avoid via
-    //    pacing + skip):
-    //
-    //    - Pass 1 sweep (`patch_pass=false`): jump
-    //      WEDGE_JUMP_SECTORS (1 GB) ahead, pause WEDGE_PAUSE_SECS,
-    //      mark skipped region NonTrimmed.
-    //    - Pass N patch (`patch_pass=true`): give up on the
-    //      current sector (the granular target), pause for cooldown,
-    //      let the outer patch loop move to the next NonTrimmed
-    //      range. Implemented as a small JumpAhead so the same code
-    //      path serves both — Pass N's batch=1 means JumpAhead by
-    //      WEDGE_PASS_N_SKIP_SECTORS effectively skips just this
-    //      sector and a small buffer (gives the drive room to
-    //      recover before the next per-sector attempt).
-    //
-    //    Both paths share the WEDGE_ABORT_THRESHOLD budget — only
-    //    AbortPass after N consecutive wedges with no successful
-    //    read in between.
+    // 4. Hardware error / illegal request — the firmware-wedge family; same
+    //    pacing+skip response both passes. Pass 1 jumps 1 GB, Pass N jumps just
+    //    past the sector (not abandoning its target range); both share the abort budget.
     if sense_key == scsi::SENSE_KEY_HARDWARE_ERROR || sense_key == scsi::SENSE_KEY_ILLEGAL_REQUEST {
-        // Count every wedge. A wedge is a firmware fast-fail state, and
-        // this counter is what carries the pass toward
-        // WEDGE_ABORT_THRESHOLD instead of burning a 30s WEDGE_PAUSE
-        // cooldown per read forever.
+        // Count every wedge — this is what carries the pass toward
+        // WEDGE_ABORT_THRESHOLD instead of burning a 30s cooldown per read
+        // forever on a firmware fast-fail state.
         ctx.wedge_count += 1;
         if ctx.wedge_count >= WEDGE_ABORT_THRESHOLD {
             tracing::warn!(
@@ -651,21 +576,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         };
     }
 
-    // 4b. RECOVERED ERROR — the drive returned this sector but had to fight for
-    //    it (ECC worked hard / retried). We enable reporting of these via MODE
-    //    SELECT PER=1 at drive-prep precisely so they surface: on marginal/dirty
-    //    media the drive's best-effort correction can be silently WRONG (a rip
-    //    that "passed clean" but decoded with errors — seen on real discs). We
-    //    distrust it: mark THIS block NonTrimmed and let Pass N re-read it with
-    //    proper recovery (FUA cache-bypass) — a clean re-read wins, a persistent
-    //    marginal becomes an honest concealed gap.
-    //
-    //    Critically this is a per-block SkipBlock, NOT the damage-jump path: a
-    //    recovered error is a single marginal sector, not a clustered hard-damage
-    //    zone, so it must NOT trigger the 64 MB JumpAhead (which would nuke huge
-    //    swaths of good data on a lightly-smudged disc). It also does NOT touch
-    //    the damage window / multiplier — a recovered read is not damage-zone
-    //    signal. Returns before the fast-jump logic below.
+    // 4b. RECOVERED ERROR — the drive fought for this sector (ECC worked hard),
+    //    which can be silently WRONG on marginal media, so distrust it: SkipBlock
+    //    (not damage-jump — a single sector, not a cluster) for Pass N re-read.
     if sense_key == scsi::SENSE_KEY_RECOVERED_ERROR {
         ctx.marginal_recovered += 1;
         tracing::warn!(
@@ -681,13 +594,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         };
     }
 
-    // 5. Read failure — record it in the damage window, then decide
-    //    between skip-in-place and a damage-jump. Marginal media
-    //    (MEDIUM_ERROR / ABORTED_COMMAND) lands here too: the failed
-    //    batch becomes a whole-block NonTrimmed → SkipBlock → advance,
-    //    and Pass N revisits it with the handler chain, which is
-    //    purpose-built to recover individual sectors with proper
-    //    recovery semantics.
+    // 5. Read failure — record it in the damage window, then decide between
+    //    skip-in-place and a damage-jump. Marginal media (MEDIUM_ERROR /
+    //    ABORTED_COMMAND) lands here too: SkipBlock now, Pass N revisits later.
     ctx.damage_window.push(false);
     if ctx.damage_window.len() > ctx.damage_window_max {
         ctx.damage_window.remove(0);
@@ -700,23 +609,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         bad_count * 100 / ctx.damage_window.len()
     };
 
-    // Inter-error pause — wedge prevention via pacing.
-    //
-    // Zone-entry case (first error after a clean run): apply the
-    // long ZONE_ENTRY_COOLDOWN_SECS pause. The empirical wedge
-    // observed 2026-05-11 happened ~7 errors into a damage zone,
-    // each retry adding to the firmware's internal counter. A 30s
-    // pause at zone entry lets the drive's bridge / firmware
-    // counters reset before we issue the next read.
-    //
-    // Subsequent errors in the same zone: the standard 5s pause.
-    // (We've already jumped past the initial damage; further errors
-    // mean we landed in another bad cluster — same pacing applies.)
-    //
-    // Long-streak escalation: same 5s currently; kept as a separate
-    // branch for future tuning. Pass N (`patch_pass`) uses the
-    // standard pauses — it's running single-sector retries on
-    // already-known-bad LBAs by design.
+    // Inter-error pause — wedge prevention via pacing. Zone entry (first error
+    // after a clean run) gets the long ZONE_ENTRY_COOLDOWN_SECS pause (a
+    // 2026-05-11 wedge hit after ~7 errors in 6.5s); others get the standard 5s.
     let is_zone_entry = is_zone_entry_transition && !ctx.patch_pass;
     let pause_secs = if is_zone_entry {
         ZONE_ENTRY_COOLDOWN_SECS
@@ -727,32 +622,9 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         FAIL_PAUSE_SECS
     };
 
-    // 7. Damage-jump: too many failures → skip ahead by an escalating
-    //    gap. Multiplier capped so we can't accidentally skip the
-    //    entire rest of the disc (observed 2026-05-07: a saturated
-    //    multiplier produced a 56 GB jump). Saturating arithmetic on
-    //    the sector calc as defence in depth.
-    //
-    //    Jump base bumped 2026-05-10 from 256 to 1024 sectors per
-    //    multiplier unit (= 64 MB first jump at batch=32, up from
-    //    16 MB). The smaller base routinely landed jumps back inside
-    //    damage clusters of 100+ MB, each landing adding to the
-    //    firmware's wedge counter. 64 MB initial + 128 MB second +
-    //    256 MB third clears almost any single-cluster damage
-    //    pattern we've seen in 2 jumps.
-    //
-    //    Two triggers, evaluated in order:
-    //
-    //    a. **Fast-entry** — `consecutive_outer_failures >= fast_jump_threshold`.
-    //       Fires on Pass 1 (threshold=1) so we don't spend ~40 min
-    //       grinding to fill a 16-block damage window before the
-    //       first jump on a damage zone we entered cleanly. Doesn't
-    //       fire on Pass N (threshold=u64::MAX).
-    //
-    //    b. **Window-based** — original behaviour: 12% bad in a
-    //       sliding window of 16 outer reads. Pass N's only path,
-    //       and Pass 1's fallback if the failures are scattered
-    //       enough that we don't hit the consecutive threshold.
+    // 7. Damage-jump: too many failures → skip ahead by an escalating gap,
+    //    capped (a saturated multiplier once produced a 56 GB jump), sized to
+    //    clear 100+ MB clusters in ~2 jumps via fast-entry (Pass 1) or window (Pass N).
     const MAX_JUMP_MULTIPLIER: u64 = 64;
     let fast_trigger = ctx.consecutive_outer_failures >= ctx.fast_jump_threshold;
     let window_trigger =
@@ -835,10 +707,9 @@ mod tests {
 
     #[test]
     fn recovered_error_skips_block_not_jump_pass_1() {
-        // A recovered (marginal) read on Pass 1 must NOT trigger the 64 MB
-        // damage-jump — that would nuke huge good regions on a lightly-smudged
-        // disc. It marks just this block NonTrimmed (SkipBlock) for a Pass N
-        // re-read, and is counted as marginal_recovered.
+        // A recovered (marginal) read on Pass 1 must NOT trigger the damage-jump
+        // (would nuke good regions); it SkipBlocks for a Pass N re-read instead,
+        // counted as marginal_recovered.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&recovered_err(), &mut ctx);
         assert!(
@@ -903,11 +774,9 @@ mod tests {
             ReadAction::Retry { pause_secs } => pause_secs,
             other => panic!("expected a paused action, got {other:?}"),
         };
-        // 30 s is the documented cooldown (see ZONE_ENTRY_COOLDOWN_SECS's own
-        // doc: the 2026-05-11 incident put the BU40N into permanent fast-fail
-        // after 7 errors in 6.5 s). Written as a literal: `>= the constant` is
-        // satisfied by a constant of 0, which is exactly the value that
-        // reintroduces the wedge.
+        // 30 s is the documented cooldown (2026-05-11 incident: BU40N wedged
+        // after 7 errors in 6.5 s). Literal, not `>= the constant` — that would
+        // pass even if the constant were 0, reintroducing the wedge.
         assert!(
             pause >= 30,
             "the real zone entry must get the 30 s wedge cooldown, got {pause}s \
@@ -956,12 +825,9 @@ mod tests {
 
     #[test]
     fn pass_1_marginal_jumps_immediately() {
-        // 2026-05-11 wedge-prevention rewrite: Pass 1 jumps on the
-        // FIRST marginal error (fast_jump_threshold=1) rather than
-        // SkipBlock. Retrying the same LBA quickly is what triggers
-        // the BU40N's firmware fast-fail transition; immediate jump
-        // prevents the cascade. Pass N revisits the block later with
-        // the handler chain, which does per-sector recovery.
+        // 2026-05-11 rewrite: Pass 1 jumps on the FIRST marginal error
+        // (fast_jump_threshold=1) instead of SkipBlock — retrying the same
+        // LBA quickly triggers the BU40N firmware fast-fail; Pass N revisits later.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
@@ -982,12 +848,9 @@ mod tests {
 
     #[test]
     fn pass_1_jumps_immediately_on_first_outer_failure() {
-        // 2026-05-11 rewrite: fast_jump_threshold is 1 on Pass 1, not
-        // 4. Even ONE error triggers a jump because BU40N's firmware
-        // fast-fail mode is sensitive to retry cadence. The wedge
-        // observed 2026-05-11 happened at 7 errors / 6.5s — by then
-        // we were already wedged. Jumping on error #1 means we
-        // physically can't reach the cascade.
+        // 2026-05-11 rewrite: fast_jump_threshold=1, not 4 — even ONE error
+        // triggers a jump since firmware fast-fail is sensitive to retry cadence
+        // (the observed wedge hit at 7 errors/6.5s); jumping on #1 avoids the cascade.
         let mut ctx = ReadCtx::for_sweep(32);
         let a = handle_read_error(&medium_err(), &mut ctx);
         assert!(
@@ -998,19 +861,9 @@ mod tests {
 
     #[test]
     fn pass_n_does_not_fast_jump() {
-        // Pass N's whole reason to exist is to grind on bad ranges, so the
-        // fast-entry trigger must be OFF for it — however long the failure
-        // run gets.
-        //
-        // This ran four failures against a stock `for_patch(32)` ctx, whose
-        // 16-entry damage window cannot fill in four reads: the loop ended
-        // before EITHER jump trigger could fire, so `fast_jump_threshold`
-        // was never observed. Setting `for_patch`'s threshold to 8 left the
-        // whole suite green.
-        //
-        // Suppress the WINDOW trigger with an unsatisfiable density (bad_pct
-        // maxes out at 100) so the fast path is the only one left, then run
-        // a streak far longer than any plausible finite threshold.
+        // Pass N's fast-entry trigger must stay OFF (it grinds on bad ranges),
+        // however long the run gets. Suppress the window trigger (unsatisfiable
+        // density) and run a long streak, since 4 failures never filled the window.
         let mut ctx = ReadCtx::for_patch(32);
         assert_eq!(
             ctx.fast_jump_threshold,
@@ -1036,17 +889,9 @@ mod tests {
 
     #[test]
     fn outer_success_resets_consecutive_outer_failures() {
-        // `on_success` must clear the outer-failure counter, or a disc with
-        // scattered single failures accumulates them across CLEAN regions and
-        // fires the fast-entry damage-jump on a drive that has been reading
-        // perfectly since the last error.
-        //
-        // This used to drive the counter on a Pass 1 ctx, where the handler's
-        // own fast-jump path had already reset it to 0 before `on_success` was
-        // ever called — so it asserted 0 == 0 twice and deleting the reset in
-        // `on_success` left the suite green. Accumulate on a ctx that does NOT
-        // jump (Pass N's fast trigger is off, and the window is suppressed), so
-        // the counter is genuinely non-zero when `on_success` runs.
+        // `on_success` must clear the outer-failure counter, or scattered
+        // failures across clean regions would fire a fast-entry jump. Use a Pass
+        // N ctx (fast-jump off, window suppressed) so the counter stays non-zero.
         let mut ctx = ReadCtx::for_patch(1);
         ctx.damage_threshold_pct = 101; // no window jump; nothing else resets it
         for _ in 0..3 {
@@ -1066,10 +911,9 @@ mod tests {
 
     #[test]
     fn pass_1_hardware_error_jumps_ahead_not_aborts() {
-        // New wedge-skip policy: Pass 1 (`patch_pass=false`)
-        // should JumpAhead with a 1 GB skip + cooldown pause instead
-        // of immediately aborting. Aborting on first wedge was the
-        // pre-fix behavior that killed rips at 48% on damaged discs.
+        // Pass 1 should JumpAhead with a 1 GB skip + cooldown instead of
+        // aborting immediately — the pre-fix behavior killed rips at 48%
+        // on damaged discs.
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&hardware_err(), &mut ctx);
         match action {
@@ -1077,13 +921,9 @@ mod tests {
                 sectors,
                 pause_secs,
             } => {
-                // Literals, not `WEDGE_JUMP_SECTORS` / `WEDGE_PAUSE_SECS`:
-                // comparing the returned value to the very constant that
-                // produced it holds for ANY value of that constant, so
-                // shrinking the jump from 1 GiB to 2 MB (which stops it
-                // clearing a damage cluster) and dropping the cooldown to 0
-                // (which is how the drive wedged in the first place) both left
-                // this green. 1 GiB / 2048 B per sector = 524_288.
+                // Literals, not the constants themselves: comparing a value to
+                // the constant that produced it holds for any value, so shrinking
+                // the jump or zeroing the cooldown would still pass. 1 GiB = 524_288 sectors.
                 assert_eq!(sectors, 1_073_741_824 / 2048);
                 assert_eq!(pause_secs, 30);
             }
@@ -1094,11 +934,9 @@ mod tests {
 
     #[test]
     fn pass_1_hardware_error_aborts_after_threshold() {
-        // After WEDGE_ABORT_THRESHOLD consecutive wedges with no good
-        // read in between, autorip should see a real AbortPass so it
-        // can surface "drive is stuck, power-cycle required" to the
-        // user — rather than looping forever on a permanently bricked
-        // drive.
+        // After WEDGE_ABORT_THRESHOLD consecutive wedges with no good read
+        // between them, autorip should see a real AbortPass to surface "drive
+        // stuck, power-cycle required" rather than looping forever.
         let mut ctx = ReadCtx::for_sweep(32);
         for i in 0..WEDGE_ABORT_THRESHOLD - 1 {
             let action = handle_read_error(&hardware_err(), &mut ctx);
@@ -1114,10 +952,9 @@ mod tests {
 
     #[test]
     fn pass_1_good_read_resets_wedge_count() {
-        // A single successful read between wedges must clear the
-        // skip counter — otherwise a disc with a few scattered bad
-        // zones would eventually run out of skip budget even though
-        // the drive was recovering between zones.
+        // A single successful read between wedges must clear the skip
+        // counter, or a disc with scattered bad zones would eventually run
+        // out of skip budget even though the drive kept recovering.
         let mut ctx = ReadCtx::for_sweep(32);
         for _ in 0..(WEDGE_ABORT_THRESHOLD - 1) {
             handle_read_error(&hardware_err(), &mut ctx);
@@ -1133,14 +970,9 @@ mod tests {
 
     #[test]
     fn pass_n_hardware_error_also_skips_not_aborts() {
-        // 2026-05-11 reframe: error handling is centralized, the
-        // wedge is a code-induced state, and the avoidance principle
-        // (skip + pause + continue) applies to Pass N too. Previously
-        // Pass N AbortPass'd on first wedge — same fatal-at-48% bug
-        // Pass 1 had pre-fix. Now Pass N gets a smaller skip
-        // (WEDGE_PASS_N_SKIP_SECTORS, not the 1 GB Pass 1 jump)
-        // because Pass N's job IS to revisit specific NonTrimmed
-        // ranges; over-skipping abandons recoverable sectors.
+        // 2026-05-11 reframe: skip+pause+continue applies to Pass N too
+        // (previously it AbortPass'd on first wedge, same bug Pass 1 had).
+        // Pass N's skip is smaller than Pass 1's 1 GB — over-skipping would abandon its target range.
         let mut ctx = ReadCtx::for_patch(1);
         let action = handle_read_error(&hardware_err(), &mut ctx);
         match action {
@@ -1148,11 +980,9 @@ mod tests {
                 sectors,
                 pause_secs,
             } => {
-                // Literals, for the reason given in
-                // `pass_1_hardware_error_jumps_ahead_not_aborts`. 64 sectors is
-                // "past the bricked LBA plus a small buffer" — deliberately
-                // NOT the 1 GiB Pass-1 jump, which would blow past the
-                // NonTrimmed range Pass N came back for.
+                // Literals, per `pass_1_hardware_error_jumps_ahead_not_aborts`.
+                // 64 sectors is "past the bricked LBA + small buffer", deliberately
+                // not the 1 GiB Pass-1 jump, which would blow past Pass N's target range.
                 assert_eq!(sectors, 64);
                 assert_eq!(pause_secs, 30);
             }
@@ -1186,17 +1016,9 @@ mod tests {
 
     #[test]
     fn long_failure_streak_extends_pause_on_pass_n() {
-        // Pass N keeps the cooldown behaviour: after many consecutive
-        // failures, pauses extend to give the drive time to recover.
-        // This used to read "Pass 1 explicitly does NOT pause — see
-        // `pass_1_does_not_pause_on_skip` below". No such test exists, and the
-        // claim is backwards: the pause selection above is shared by both
-        // passes (5 s), and Pass 1 pays MORE, not less — it alone takes the
-        // 30 s `ZONE_ENTRY_COOLDOWN_SECS` on a clean→damaged transition
-        // (`is_zone_entry_transition && !ctx.patch_pass`), which is the
-        // exemption Pass N has. The two tests that do pin this are
-        // `pass_n_pauses_uniformly_on_failed_read` and
-        // `pass_1_zone_entry_uses_long_cooldown`.
+        // Pass N keeps the cooldown behaviour: pauses extend after many
+        // consecutive failures. Pass 1 pays MORE, not less (it alone takes the
+        // 30s zone-entry cooldown); see the two tests named below for both sides.
         let mut ctx = ReadCtx::for_patch(1);
         for _ in 0..15 {
             handle_read_error(&medium_err(), &mut ctx);
@@ -1217,17 +1039,9 @@ mod tests {
 
     #[test]
     fn pass_1_zone_entry_uses_long_cooldown() {
-        // 2026-05-11 wedge-prevention rewrite: Pass 1's FIRST error
-        // (zone entry) gets a 30 s ZONE_ENTRY_COOLDOWN_SECS pause +
-        // a 2 s POST_JUMP_EXTRA on top (since we're also jumping).
-        // The long pause prevents the retry cadence that triggers
-        // firmware fast-fail. Subsequent errors in the same zone fall
-        // back to the standard 5 s FAIL_PAUSE_SECS.
-        //
-        // The expectation is the LITERAL 32 s, not the constants added back
-        // together: asserting `ZONE_ENTRY_COOLDOWN_SECS + POST_JUMP_EXTRA` is
-        // the same arithmetic the production line performs, so setting the
-        // cooldown to 0 left this (and every other zone-entry test) green.
+        // Pass 1's FIRST error (zone entry) gets 30s cooldown + 2s post-jump
+        // extra, preventing the retry cadence that triggers firmware fast-fail.
+        // Literal 32s, not the constants summed (that would pass even at cooldown=0).
         let mut ctx = ReadCtx::for_sweep(32);
         let action = handle_read_error(&medium_err(), &mut ctx);
         match action {
@@ -1252,11 +1066,9 @@ mod tests {
 
     #[test]
     fn pass_1_subsequent_in_zone_errors_skip_long_cooldown() {
-        // Regression: the fast-jump path resets consecutive_outer_failures
-        // to 0 after each jump, so the next in-zone error re-increments it
-        // to 1. Zone-entry must key off the genuine clean->damaged
-        // transition (in_damage_zone), not the counter, otherwise every
-        // error in a damaged region pays the 30 s cooldown.
+        // Regression: fast-jump resets consecutive_outer_failures after each
+        // jump, so zone-entry must key off in_damage_zone, not that counter —
+        // otherwise every error in a damaged region pays the 30s cooldown.
         let mut ctx = ReadCtx::for_sweep(32);
         // First error: genuine zone entry, gets the long cooldown.
         let first = handle_read_error(&medium_err(), &mut ctx);
@@ -1288,11 +1100,9 @@ mod tests {
 
     #[test]
     fn pass_n_pauses_uniformly_on_failed_read() {
-        // Pass N (`patch_pass`) is exempt from the
-        // zone-entry long pause — its whole job is to retry single
-        // sectors on already-known-bad LBAs, and the 30 s pause every
-        // single-sector failure would multiply slow recovery
-        // pointlessly. Pass N keeps the standard 5 s FAIL_PAUSE_SECS.
+        // Pass N is exempt from the zone-entry long pause — it retries single
+        // sectors on already-known-bad LBAs, and a 30s pause per failure would
+        // pointlessly slow recovery. Keeps the standard 5s FAIL_PAUSE_SECS.
         let mut ctx = ReadCtx::for_patch(1);
         let action = handle_read_error(&medium_err(), &mut ctx);
         // Literals, like the rest of this module's pause assertions: written
@@ -1436,13 +1246,9 @@ mod tests {
         assert!(*ctx.damage_window.last().unwrap());
     }
 
-    // ----------------------------------------------------------------
     // Additional hardening: retry-budget boundaries, transport-abort
-    // precedence, and the bounded-jump invariant. These guard against
-    // off-by-one in the retry caps (which would either hammer a wedging
-    // drive or give up a recovery one attempt early) and against an
-    // unbounded jump multiplier skipping the rest of the disc.
-    // ----------------------------------------------------------------
+    // precedence, and the bounded-jump invariant — guards against off-by-one
+    // retry caps and an unbounded jump multiplier skipping the rest of the disc.
 
     /// NOT_READY check-condition (status 0x02 so it is NOT classified as
     /// bridge degradation, which keys off non-standard status bytes).
@@ -1479,15 +1285,25 @@ mod tests {
         }
     }
 
+    /// UNIT ATTENTION (sense key 6, ASC 28h "medium may have changed"),
+    /// status 0x02 so it is a real CHECK CONDITION, not a transport failure.
+    fn unit_attention_err() -> Error {
+        Error::DiscRead {
+            sector: 100,
+            status: Some(libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION),
+            sense: Some(ScsiSense {
+                sense_key: scsi::SENSE_KEY_UNIT_ATTENTION,
+                asc: 0x28,
+                ascq: 0x00,
+            }),
+        }
+    }
+
     #[test]
     fn not_ready_retries_capped_at_three_then_falls_through() {
-        // CLAUDE.md "Bad-sector handling" mode 1: NOT READY -> "Pause 3s,
-        // retry up to 3x, then mark NonTrimmed." NOT_READY_MAX_RETRIES=3.
-        // The 1st-3rd NOT_READY must Retry; the 4th must NOT Retry (it
-        // falls through to skip).
-        // Mutation that makes this RED: change `ctx.not_ready_retries <
-        // NOT_READY_MAX_RETRIES` to `<=` (retries 4 times) or to `>`
-        // (never retries).
+        // CLAUDE.md "Bad-sector handling" mode 1: NOT READY -> pause 3s, retry
+        // up to 3x (NOT_READY_MAX_RETRIES), then mark NonTrimmed. The 1st-3rd
+        // must Retry, the 4th must fall through to skip.
         let mut ctx = ReadCtx::for_patch(1);
         for i in 0..NOT_READY_MAX_RETRIES {
             let a = handle_read_error(&not_ready_err(), &mut ctx);
@@ -1506,14 +1322,9 @@ mod tests {
 
     #[test]
     fn transport_failure_aborts_on_both_passes() {
-        // CLAUDE.md "Bad-sector handling" mode 2: a transport failure
-        // (bridge crash, status 0xFF) aborts the pass so the outer loop
-        // can re-enumerate the bridge. This must hold on Pass N as well
-        // as Pass 1 - the wedge-skip/jump paths must NOT swallow a real
-        // transport crash into a JumpAhead.
-        // Mutation that makes this RED: move the transport-failure check
-        // below the HARDWARE/ILLEGAL wedge arm, so a transport failure
-        // that also carried a wedge-family sense would JumpAhead instead.
+        // CLAUDE.md "Bad-sector handling" mode 2: transport failure (bridge
+        // crash, status 0xFF) aborts the pass to re-enumerate the bridge — must
+        // hold on both passes, not get swallowed into a JumpAhead by wedge-skip.
         let mut ctx = ReadCtx::for_patch(32);
         assert_eq!(
             handle_read_error(&transport_failure_err(), &mut ctx),
@@ -1528,15 +1339,28 @@ mod tests {
     }
 
     #[test]
+    fn unit_attention_aborts_the_pass_not_treated_as_a_bad_sector() {
+        // A mid-read medium change must abort so the outer loop reacquires,
+        // not fall through to the bad-sector path (SkipBlock/JumpAhead) and
+        // stitch post-change sectors into the ISO. RED before the UA branch.
+        let mut ctx = ReadCtx::for_sweep(32);
+        assert_eq!(
+            handle_read_error(&unit_attention_err(), &mut ctx),
+            ReadAction::AbortPass
+        );
+        // Pass N too: the wedge/jump arms must not swallow it into a JumpAhead.
+        let mut ctx_n = ReadCtx::for_patch(32);
+        assert_eq!(
+            handle_read_error(&unit_attention_err(), &mut ctx_n),
+            ReadAction::AbortPass
+        );
+    }
+
+    #[test]
     fn bridge_degradation_retries_to_budget_then_falls_through() {
-        // The bridge-degradation cooldown retry is bounded by
-        // BRIDGE_DEGRADATION_MAX_RETRIES (=5). The first 5 degradation
-        // errors must Retry with the long bridge cooldown; the 6th must
-        // fall through to skip/jump rather than retrying forever and
-        // stalling the pass.
-        // Mutation that makes this RED: change the budget comparison
-        // `ctx.bridge_degradation_count < BRIDGE_DEGRADATION_MAX_RETRIES`
-        // to `<=` (retries 6 times).
+        // Bridge-degradation cooldown retry is bounded by
+        // BRIDGE_DEGRADATION_MAX_RETRIES (=5): first 5 errors Retry with the
+        // long cooldown, the 6th falls through rather than retrying forever.
         let mut ctx = ReadCtx::for_patch(1);
         for i in 0..BRIDGE_DEGRADATION_MAX_RETRIES {
             let a = handle_read_error(&bridge_degradation_err(), &mut ctx);
@@ -1575,13 +1399,9 @@ mod tests {
 
     #[test]
     fn not_ready_04_3e_does_not_take_bridge_branch() {
-        // Regression guard for the misleading-comment fix: the bridge
-        // branch keys on the *status byte* (non-standard, i.e. not
-        // GOOD/CHECK/TRANSPORT), NOT on the NOT_READY 04/3E sense. A real
-        // 04/3E bad-sector error arrives as CHECK CONDITION (0x02), so
-        // `is_bridge_degradation()` must be false for it, and it must
-        // route to the generic NOT_READY retry (3 s pause) rather than
-        // the bridge cooldown (15 s pause).
+        // Regression guard: the bridge branch keys on the status byte alone,
+        // NOT the NOT_READY 04/3E sense — a real 04/3E error arrives as CHECK
+        // CONDITION, so it must route to the NOT_READY retry, not bridge cooldown.
         let err = not_ready_04_3e_err();
         assert!(
             !err.is_bridge_degradation(),
@@ -1609,16 +1429,9 @@ mod tests {
 
     #[test]
     fn jump_multiplier_caps_and_jump_distance_stays_bounded() {
-        // CLAUDE.md damage-jump: multiplier doubles per jump but is
-        // capped at MAX_JUMP_MULTIPLIER=64 (the "4 GiB cap"); a single
-        // jump must never be allowed to grow without bound and skip the
-        // rest of the disc. Drive a long single-sector failure streak on
-        // a sweep ctx with a tiny window so window-trigger jumps fire
-        // repeatedly, and verify the multiplier saturates at 64 and the
-        // emitted jump distance equals JUMP_BASE_SECTORS * batch * 64.
-        // Mutation that makes this RED: remove the
-        // `.min(MAX_JUMP_MULTIPLIER)` on the multiplier doubling, or use
-        // wrapping/non-saturating mul -> distance overshoots or panics.
+        // CLAUDE.md damage-jump: multiplier doubles per jump but is capped at
+        // MAX_JUMP_MULTIPLIER=64 (the "4 GiB cap"), so a single jump can never
+        // grow unbounded and skip the rest of the disc; verify saturation holds.
         const MAX_JUMP_MULTIPLIER: u64 = 64;
         let batch: u16 = 32;
         let mut ctx = ReadCtx::for_sweep(batch);
@@ -1640,13 +1453,9 @@ mod tests {
                 MAX_JUMP_MULTIPLIER
             );
         }
-        // After saturation, the jump distance is a LITERAL number of sectors,
-        // not `JUMP_BASE_SECTORS * batch * MAX_JUMP_MULTIPLIER` — that is the
-        // production expression itself, so it agreed with any value of the
-        // base and multiplying the base by 1024 left this test green.
-        //
-        // 1024 sectors of base × 32 sectors of batch × 64 = 2_097_152 sectors
-        // = 4 GiB at 2048 B/sector, which is the documented cap.
+        // After saturation the jump distance is a LITERAL sector count, not
+        // the production expression itself (which would agree with any base).
+        // 1024 base × 32 batch × 64 = 2_097_152 sectors = 4 GiB, the documented cap.
         assert_eq!(
             last_jump_sectors, 2_097_152,
             "the saturated jump is 4 GiB (2_097_152 sectors at batch=32)"
