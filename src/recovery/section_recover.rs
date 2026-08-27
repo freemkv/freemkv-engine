@@ -26,7 +26,7 @@
 //! handler and the coordinator are unit-testable against a synthetic
 //! `SectorSource` with a fake clock — no live drive, no real sleeps.
 //!
-//! Wired into `patch_region` (#55): [`run_handlers`] is the live Pass-N recovery
+//! Wired into `recover_section` (#55): [`run_handlers`] is the live Pass-N recovery
 //! engine. `SubRanges` stays the shared still-bad set.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -86,29 +86,9 @@ const WEDGE_ABORT_STREAK: u32 = 16;
 /// a true fast-fail.
 const WEDGE_FASTFAIL_MS: u64 = 500;
 
-// DELIBERATE DIVERGENCE from `read_error.rs`'s `WEDGE_ABORT_THRESHOLD`, which
-// counts any 16 consecutive wedge-family failures with no latency gate at all.
-// Both are 16, and both mean "the drive is wedged", but they disagree on a real
-// input: 16 consecutive HARDWARE_ERRORs each returned after seconds of genuine
-// ECC recovery. Pass N (HERE — this file is the Pass-N handler chain) keeps
-// going, because a slow failure is a drive that is honestly trying; Pass 1
-// (THERE — `read_error.rs`, whose only production caller is the sweep loop)
-// declares it wedged.
-//
-// This is intended, not drift. The two passes want different things. Pass N is
-// already committed to slow, targeted recovery of the ranges Pass 1 marked bad,
-// and it is the LAST attempt those sectors get, so it spends the seconds a
-// genuine ECC retry costs. Pass 1 sweeps the whole disc, and anything it gives
-// up on is left in the mapfile for Pass N to attack later — so it can afford
-// the blunter give-up rule, and bailing costs nothing permanent.
-//
-// They also reset differently on purpose: this streak clears on any non-wedge
-// failure, Pass 1's only on a success.
-//
-// Confirmed as a deliberate product decision by the owner. Do NOT "unify" these
-// two constants to make them match — an audit flagged the difference as the
-// project's recurring one-policy-implemented-twice pattern, and it is the one
-// case where the two copies are supposed to differ.
+// DELIBERATE DIVERGENCE from read_error.rs's WEDGE_ABORT_THRESHOLD (also 16, no
+// latency gate): Pass N is the last, targeted attempt, so it affords slow genuine
+// ECC retries; Pass 1 sweeps cheaply. Confirmed deliberate — do NOT "unify".
 
 /// Max read speed sentinel for `SET CD SPEED` (0xFFFF = "as fast as the drive
 /// will go"). The default for every read; a handler that wants to slow the
@@ -123,7 +103,7 @@ const SPEED_MIN_KBS: u16 = 1385;
 
 /// Which spindle speed a read requests. `Max` is the streaming default; `Min`
 /// slows the spindle for marginal-sector recovery (more servo dwell + ECC
-/// integration). `Mid` is reserved for a future resonance step (SpeedSweep).
+/// integration).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SpeedPref {
     Max,
@@ -327,21 +307,9 @@ fn read_span(
 ) -> ReadHit {
     let lba = (pos / SECTOR) as u32;
     let bytes = count as usize * SECTOR as usize;
-    // Every SubRange enters via `from_section` / `remove`, which keep byte
-    // offsets sector-aligned, so a handler never asks for a sub-sector span.
-    //
-    // Enforce that invariant at RUNTIME, in every build. A `debug_assert!` here
-    // compiled out under `--release` (which this crate's CI runs), and there a
-    // zero `count` (span < SECTOR) is silently catastrophic: `bytes` is 0,
-    // `recovery_read` answers `Ok(0)`, the `Ok(n) if n == bytes` arm below sees
-    // `0 == 0` and fires the *Good* path, and `sink.recovered(pos, &buf[..0])`
-    // records a span that was NEVER READ as recovered — a rip that reports a
-    // clean, complete mapfile over unread media. Unreachable today
-    // (`snap_to_sectors` runs before every `SubRanges::from_section`), so this
-    // is the loud, release-safe statement of the invariant, not a live path:
-    // refuse the span as a failed read (leaving it in the still-bad set for the
-    // next pass) and log it, rather than quietly "recovering" nothing. Absence
-    // of a log on a swallowed invariant breach is itself a bug.
+    // Enforce sector-alignment at runtime, every build (not debug_assert!, which
+    // compiles out under --release): a zero count would make `Ok(0) == bytes`
+    // fire the Good path, falsely recording an unread span as recovered.
     if count == 0 || !pos.is_multiple_of(SECTOR) {
         tracing::error!(
             target: "freemkv::disc",
@@ -373,35 +341,18 @@ fn read_span(
             ctx.sink.recovered(pos, &buf[..bytes]);
             ReadHit::Good
         }
-        // A SHORT transfer is a FAILED read, not a partial recovery. `buf` is
-        // reused across every read a handler makes, so committing
-        // `buf[..bytes]` after a short transfer would hand the sink the tail of
-        // a PREVIOUS span and record it recovered — silent corruption inside a
-        // rip that reports success. `recovery_read` already converts a short
-        // count into `DiscRead` (as `Drive::read_one` does on the live path),
-        // so this arm should be unreachable; it is kept as the local statement
-        // of the invariant, because the cost is one comparison and the cost of
-        // being wrong is a corrupt movie. Treated as `Bad`: leave the span in
-        // the still-bad set so the next pass retries it — a loud miss. Not a
-        // wedge sense, so the streak resets exactly as the non-wedge error arm
-        // below does.
+        // A short transfer is a failed read, not partial recovery: `buf` is reused
+        // across reads, so committing buf[..bytes] here would hand the sink a
+        // previous span's tail. Should be unreachable; kept as a defensive check.
         Ok(_) => {
             ctx.wedge_streak = 0;
             ReadHit::Bad
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
         Err(e) => {
-            // Wedge watch: the drive's fast-fail wedge REJECTS every CDB in <100ms
-            // without attempting recovery, with a Hardware / IllegalRequest sense.
-            // Both signals are required to count toward the streak:
-            //   (1) wedge-family sense (Hardware / IllegalRequest), AND
-            //   (2) the failure came back FAST (< WEDGE_FASTFAIL_MS).
-            // The latency gate is what keeps a genuine uncorrectable sector on
-            // Hardware-error media from false-tripping the wedge abort: a real
-            // ECC-recovery attempt takes far longer than a fast-fail rejection, so
-            // a SLOW Hardware-error is real damage (resets the streak, retried
-            // next pass), while only the fast rejections — the actual wedge —
-            // accumulate. A medium error or any success below also resets it.
+            // Wedge watch: only a wedge-family sense AND a fast return (<
+            // WEDGE_FASTFAIL_MS) count toward the streak. The latency gate keeps a
+            // genuine slow ECC-recovery failure from false-tripping the abort.
             let sense_is_wedge = e
                 .scsi_sense()
                 .map(|s| SenseFamily::from_sense_key(s.sense_key).is_wedge_family())
@@ -430,10 +381,9 @@ fn read_span(
         }
         // A Bad read is unproductive grinding — advance the yield streak.
         ReadHit::Bad => ctx.unproductive = ctx.unproductive.saturating_add(1),
-        // A Transport hit aborts the handler immediately (bus fault / wedge
-        // escalation), so it is NOT unproductive grinding — leave the streak
-        // untouched (the counter is never read again after TransportFault, but
-        // keep the semantics honest in case an arm is ever reordered).
+        // A Transport hit aborts the handler immediately, so it is NOT unproductive
+        // grinding — leave the streak untouched (kept honest in case an arm is
+        // ever reordered, though it's never read again after TransportFault).
         ReadHit::Transport => {}
     }
     // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
@@ -538,10 +488,8 @@ impl SectionHandler for Linear {
                 match read_span(ctx, &mut buf, pos, count, self.params) {
                     ReadHit::Good => bad.remove(pos, span),
                     // Keep reads at the full batch — no per-sector grind (proven
-                    // worse on the BU40N, and it's what stalled a handler on a
-                    // dead front). Leave the failed batch bad and advance; the
-                    // readable tail past it is reached by the next batch, and
-                    // Bisect salvages readable islands inside a dead batch.
+                    // worse on the BU40N, and stalled a handler on a dead front).
+                    // Leave the failed batch bad; Bisect salvages islands within it.
                     ReadHit::Bad => {}
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
                 }
@@ -585,10 +533,9 @@ impl SectionHandler for Bisect {
         let batch = BATCH_SECTORS * SECTOR;
         let mut buf = vec![0u8; batch as usize];
         let mut probe = [0u8; SECTOR as usize];
-        // Work stack of still-bad chunks. A good probe recovers the readable
-        // island around it and pushes the two (smaller) failing ends; a dead
-        // probe pushes the two halves. Either way the stack shrinks toward small
-        // bad clusters, so it drains in bounded steps.
+        // Work stack of still-bad chunks. A good probe recovers the readable island
+        // and pushes the two smaller failing ends; a dead probe pushes the two
+        // halves. Either way the stack shrinks toward small clusters, draining bounded.
         let mut stack: Vec<(u64, u64)> = bad.ranges().to_vec();
         while let Some((rp, rl)) = stack.pop() {
             if rl == 0 {
@@ -665,10 +612,9 @@ impl SectionHandler for Bisect {
                             ReadHit::Transport => return HandlerOutcome::TransportFault,
                         }
                     }
-                    // Locating this readable island was productive work; the
-                    // failed reads that pinned its dead edges are boundary probes,
-                    // not a stall. Clear the streak so the re-bisect (and the next
-                    // handler) start fresh.
+                    // Locating this readable island was productive work; the failed
+                    // reads pinning its dead edges are boundary probes, not a stall.
+                    // Clear the streak so the re-bisect starts fresh.
                     ctx.unproductive = 0;
                     // The two failing ends stay bad — bisect them again to pin
                     // the exact dead sectors.
@@ -758,14 +704,9 @@ impl SectionHandler for Jump {
                     ReadHit::Bad => {
                         consec_fail += 1;
                         if consec_fail >= JUMP_AFTER_FAILS {
-                            // Sustained dead run — jump to the MIDDLE of the
-                            // remaining span (never overshoot the range). Halving
-                            // adapts to any size: a big dead run is crossed in
-                            // ~log2 jumps, and a small range lands mid-range
-                            // instead of being skipped past entirely (the 8 MiB
-                            // fixed jump used to leap clean over a <8 MiB range and
-                            // miss readable data in its middle). The skipped span
-                            // stays bad for Bisect to reclaim.
+                            // Sustained dead run — jump to the middle of the remaining
+                            // span. Halving adapts to any size (the old fixed 8 MiB
+                            // jump leapt over smaller ranges); skipped span stays bad.
                             let remaining = rl - off;
                             let step = ((remaining / 2) / SECTOR).max(1) * SECTOR;
                             off += step;
@@ -833,28 +774,9 @@ impl SectionHandler for SpeedSweep {
                             bad.remove(pos, SECTOR);
                             break;
                         }
-                        // This speed didn't read it; try the next one — but
-                        // every remaining speed is another WHOLE read at the
-                        // handler's timeout (a full 60 s on the
-                        // `ReadParams::deep()` roster `build_tier_handlers`
-                        // gives tier 2), so honour a stop between them
-                        // exactly as `Oscillate` does between its own reads.
-                        // A single check per sector left a Stop unobserved
-                        // for the better part of a minute.
-                        //
-                        // Nothing is uncommitted at this arm: a read that
-                        // landed takes the `Good` arm, which has already
-                        // claimed the span via `bad.remove`. So returning
-                        // here discards no recovery.
-                        //
-                        // `timed_out`, not `past`: `past` folds in the
-                        // early-yield dead streak, and a run of failing reads
-                        // is not a stall HERE — it is how the sweep gets to
-                        // the slower speed that actually reads the sector,
-                        // which is the whole technique. Yielding mid-sweep
-                        // would retire the sector having tried only the fast
-                        // speed. (Same reasoning `Bisect`'s boundary probes
-                        // use.) The deadline itself still stops it.
+                        // Try the next speed, but check for a stop between them (each
+                        // is a read at up to 60s). Uses `timed_out` not `past`: a run
+                        // of failing reads here is the technique itself, not a stall.
                         ReadHit::Bad => {
                             if ctx.halted() {
                                 return HandlerOutcome::Halted;
@@ -994,18 +916,9 @@ impl SectionHandler for Oscillate {
                     return HandlerOutcome::Remaining;
                 }
                 let pos = rp + off;
-                // Forward-into: prime from the sector below, then read the target
-                // (the head approaches from a lower LBA).
-                //
-                // A prime that SUCCEEDS is a recovery like any other and must be
-                // claimed: `read_span` has already handed those bytes to the
-                // sink (its contract leaves removing the span to the caller),
-                // and the prime target is not always outside the residual — the
-                // sector below `pos` is the one this loop just failed to read
-                // whenever `off > 0`. Left in `bad`, it is re-recorded
-                // NonTrimmed by the final tier, promoted to Unreadable after the
-                // last pass, and reported as permanent loss for bytes that are
-                // already correct in the image.
+                // Forward-into: prime from the sector below, then read the target. A
+                // successful prime must be claimed via bad.remove — read_span already
+                // handed the bytes to the sink; left in `bad` it reports false loss.
                 if pos >= SECTOR {
                     match read_span(ctx, &mut probe, pos - SECTOR, 1, self.params) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
@@ -1029,21 +942,9 @@ impl SectionHandler for Oscillate {
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
                     ReadHit::Bad => false,
                 };
-                // Reverse-into: prime from the sector above, then read the target
-                // (the head approaches from a higher LBA).
-                //
-                // Bounded at the top of the image, mirroring the `pos >= SECTOR`
-                // guard on the forward-into prime above. Unbounded, a residual
-                // sector in the LAST sector of the disc primed from
-                // `capacity_sectors` — one past the end. A real drive answers
-                // that with ILLEGAL REQUEST, which is a wedge-family sense, so
-                // `read_span` feeds it into `wedge_streak` and the pass can
-                // abort on a firmware wedge the engine manufactured; a
-                // file-backed source (ISO re-recovery) answers with an IO error,
-                // which `is_scsi_transport_failure` reports as true, so the
-                // handler returns `TransportFault` and kills the pass outright.
-                // Skipping the prime just means this one sector gets the
-                // forward-into attempt only.
+                // Reverse-into: prime from the sector above (head from higher LBA).
+                // Bounded at the top, mirroring the forward-into guard: unbounded, priming
+                // one-past-end draws a wedge sense / IO error and aborts the pass.
                 if !recovered && prime_above_is_in_range(pos, ctx.reader.capacity_sectors()) {
                     // The target-forward read above already committed any
                     // recovery via `bad.remove` — safe to check and return here.
@@ -1053,11 +954,9 @@ impl SectionHandler for Oscillate {
                     if ctx.past(deadline) {
                         return HandlerOutcome::Remaining;
                     }
-                    // Claim a successful prime — see the prime-below comment.
-                    // Above `pos` the exposure is worse: `pos + SECTOR` is the
-                    // NEXT still-bad sector whenever this sub-range is two or
-                    // more sectors long, so a landed prime here is routinely a
-                    // real recovery of a sector still marked bad.
+                    // Claim a successful prime — see the prime-below comment. Above
+                    // `pos`, `pos + SECTOR` is the next still-bad sector for ranges
+                    // two+ sectors long, so a landed prime is a real recovery.
                     match read_span(ctx, &mut probe, pos + SECTOR, 1, self.params) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
                         ReadHit::Good => bad.remove(pos + SECTOR, SECTOR),
@@ -1160,10 +1059,9 @@ impl HandlerScoreboard {
         match self.stats.get(name) {
             // Never attempted → top, so every handler is calibrated once.
             None => u64::MAX,
-            // Attempted but no timed sample yet — e.g. it returned `Halted` on
-            // its first check or did zero reads. It proved nothing, so rank it at
-            // the BOTTOM (0), not the top: otherwise a called-but-idle handler
-            // perpetually crowds out proven performers.
+            // Attempted but no timed sample yet (e.g. returned Halted immediately).
+            // Ranked at the bottom (0), not the top: otherwise a called-but-idle
+            // handler perpetually crowds out proven performers.
             Some(s) => match s.ewma_rate {
                 None => 0,
                 Some(r) => r.max(0.0).min(u64::MAX as f64) as u64,
@@ -1278,10 +1176,8 @@ mod tests {
         per_read: Duration,
         reads: Arc<AtomicU64>,
         // ── Physical failure-mode models (all default-empty) ─────────────────
-        // Each conditional sector reads ONLY when the drive state the handler
-        // manipulates (speed / FUA / approach direction) matches — so a test
-        // that recovers it PROVES the technique was actually exercised, not that
-        // a plain read happened to work.
+        // Each conditional sector reads only when the drive state the handler
+        // manipulates matches — so recovering it proves the technique was exercised.
         /// Current `SET CD SPEED` value (updated by `set_speed`); max at build.
         speed: u16,
         /// Reads ONLY at min speed (fails at max) → SlowSpin / SpeedSweep.
@@ -1355,9 +1251,8 @@ mod tests {
             }
             for l in lba..lba + count as u32 {
                 if self.wedge.contains(&l) {
-                    // Fast-fail wedge sense: ILLEGAL REQUEST / INVALID FIELD IN
-                    // CDB (0x05/0x24), the real BU40N wedge signature. Non-
-                    // transport status so it isn't caught as a bus fault, but
+                    // Fast-fail wedge sense: ILLEGAL REQUEST 0x05/0x24, the real BU40N
+                    // signature. Non-transport status so it isn't a bus fault, but
                     // carries sense so the wedge classifier sees it.
                     return Err(Error::ScsiError {
                         opcode: libfreemkv::scsi::SCSI_READ_10,
@@ -1538,11 +1433,8 @@ mod tests {
     #[test]
     fn chain_recovers_readable_in_a_dead_batch_leaving_only_dead() {
         // Section [0, 10 sectors). Dead: sectors 3 and 7. Linear reads it as one
-        // batch, which fails (it contains dead sectors), so Linear leaves the
-        // whole batch bad — NO per-sector grind (that's the point of dropping
-        // narrow_batch). Bisect then probes/expands and salvages the 8 readable
-        // sectors, leaving ONLY 3 and 7. Proves the Linear→Bisect division of
-        // labour: Linear sweeps at batch granularity, Bisect finds the islands.
+        // failing batch and leaves it whole (no per-sector grind). Bisect then
+        // probes/expands, salvaging the 8 readable sectors and leaving only 3, 7.
         let dead = [3u32, 7u32];
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
         let mut disc = disc;
@@ -1780,12 +1672,9 @@ mod tests {
 
     #[test]
     fn coordinator_drains_the_readable_set_through_the_chain() {
-        // Two dead sectors at opposite ends of a section SHORTER than one batch,
-        // so both `Linear` arms issue the same single failing read and every
-        // recovered sector below comes from `Bisect`. That makes this a test of
-        // the COORDINATOR — it runs handler after handler and drains the
-        // readable set — and not of the direction axis, which
-        // `linear_reverse_recovers_a_batch_forward_cannot_approach` covers.
+        // Two dead sectors at opposite ends of a section shorter than one batch, so
+        // both Linear arms fail and Bisect recovers everything. Tests the
+        // coordinator (handler-after-handler drain), not the direction axis.
         let dead = [0u32, 15u32]; // ends of a 16-sector section
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
         let mut disc = disc;
@@ -1893,13 +1782,9 @@ mod tests {
 
     #[test]
     fn wedged_drive_aborts_fast_instead_of_grinding() {
-        // Regression for the 2026-07-01 incident: a fast-fail wedge (drive
-        // returns ILLEGAL REQUEST on every CDB) was classified as an ordinary
-        // bad sector, so the chain ground a dead drive for 28 min at 0 B/s.
-        // Now a sustained run of wedge-family senses escalates to TransportFault
-        // so the pass aborts and the caller spin-cycles. A big section (1000
-        // sectors) that is ENTIRELY wedged must bail after ~WEDGE_ABORT_STREAK
-        // reads, not after reading the whole thing.
+        // Regression for the 2026-07-01 incident: a fast-fail wedge was classified
+        // as ordinary bad sectors, grinding a dead drive for 28 min. A wholly-wedged
+        // 1000-sector section must now bail after ~WEDGE_ABORT_STREAK reads.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.wedge = (0..1000u32).collect();
@@ -1945,22 +1830,9 @@ mod tests {
             HandlerOutcome::TransportFault,
             "a wholly-wedged section must escalate to TransportFault"
         );
-        // The whole point: it bailed after exactly the documented streak, not
-        // after grinding all 1000 sectors.
-        //
-        // 16, spelled out, and derived from `WEDGE_ABORT_STREAK`'s own doc:
-        // every read here is a fast-fail wedge, so each one advances the streak
-        // by exactly 1 and `read_span` escalates to Transport on the read that
-        // reaches the threshold — 16 reads, and the tier-0 chain's own budget
-        // (4 handlers x UNPRODUCTIVE_YIELD = 4) is exactly enough to get there
-        // in one `run_handlers` call. The clock is the injected fake, so this is
-        // deterministic rather than machine-dependent.
-        //
-        // It used to read `< 100` ("generous but far below the section size"),
-        // which was a bound nothing derived and which held in BOTH wrong
-        // directions: quartering `WEDGE_ABORT_STREAK` to 4 — the drive declared
-        // wedged after 4 failed reads, abandoning discs that would have
-        // recovered — left it green.
+        // The whole point: bailed after exactly the documented streak (16, derived
+        // from WEDGE_ABORT_STREAK), not after grinding all 1000 sectors. Used to
+        // read `< 100`, an arbitrary bound that stayed green even quartered.
         assert_eq!(
             h.read_count(),
             16,
@@ -1972,13 +1844,9 @@ mod tests {
 
     #[test]
     fn slow_hardware_error_media_does_not_false_trip_wedge_abort() {
-        // A genuine uncorrectable sector on Hardware-error media reports a
-        // wedge-FAMILY sense (IllegalRequest here) but comes back SLOW — the drive
-        // spent real time on ECC recovery before failing. That must NOT count
-        // toward the wedge abort (which targets the drive's <100ms fast-fail
-        // rejection). Each read here costs 600ms (> WEDGE_FASTFAIL_MS), so even a
-        // wholly-"wedge-sense" section never escalates to TransportFault — it just
-        // leaves the residue bad for the next pass, exactly like ordinary damage.
+        // A genuine uncorrectable sector reports a wedge-family sense but comes back
+        // slow (real ECC recovery), which must not count toward the abort. Each read
+        // costs 600ms (> WEDGE_FASTFAIL_MS), so it never escalates to TransportFault.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(600));
         let mut disc = disc;
         disc.wedge = (0..1000u32).collect();
@@ -2031,12 +1899,9 @@ mod tests {
 
     #[test]
     fn wedge_streak_persists_across_sections_for_tier1() {
-        // Tier 1 is only TWO handlers, so one wedged section builds at most
-        // 2 × UNPRODUCTIVE_YIELD = 8 streak — below WEDGE_ABORT_STREAK (16). The
-        // wedge is caught only because the pass-level wedge_streak PERSISTS across
-        // sections. Simulate what PatchCtx does: carry wedge_streak in/out of each
-        // per-section run_handlers call, and assert the abort lands on a LATER
-        // section, not the first.
+        // Tier 1 is only two handlers, so one section builds at most 8 streak (below
+        // WEDGE_ABORT_STREAK=16); caught only because wedge_streak persists across
+        // sections. Simulate PatchCtx by carrying it across run_handlers calls.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.wedge = (0..4000u32).collect();
@@ -2228,10 +2093,9 @@ mod tests {
 
     #[test]
     fn oscillate_halts_promptly_after_forward_target() {
-        // Flag flips right after read 2 (forward target lba5, which is dead
-        // so `recovered` stays false and the reverse-into branch is
-        // entered). A correct handler checks immediately on entering that
-        // branch and returns Halted before the prime-above read.
+        // Flag flips right after read 2 (forward target lba5, dead, so `recovered`
+        // stays false and reverse-into is entered). A correct handler checks
+        // immediately and returns Halted before the prime-above read.
         let (out, reads) = oscillate_halt_after(2);
         assert_eq!(out, HandlerOutcome::Halted);
         assert_eq!(
@@ -2302,12 +2166,9 @@ mod tests {
 
     #[test]
     fn speed_sweep_halts_promptly_between_its_max_and_min_reads() {
-        // Flag flips right after read 1 (the Max-speed read of the dead lba
-        // 5). A correct handler checks immediately after and returns Halted
-        // having issued NO further reads — the Min-speed read is another
-        // whole deep-timeout read, and on real media that is up to a minute
-        // of the operator staring at a Stop button that did nothing. Same
-        // defect the sibling Oscillate handler was fixed for.
+        // Flag flips right after read 1 (Max-speed read of dead lba 5). A correct
+        // handler checks immediately and returns Halted with no further reads — the
+        // Min-speed read is another whole deep-timeout read (up to a minute).
         let (out, reads) = speed_sweep_halt_after(1);
         assert_eq!(out, HandlerOutcome::Halted);
         assert_eq!(
@@ -2454,10 +2315,9 @@ mod tests {
 
     #[test]
     fn fua_retry_recovers_a_stochastic_sector_a_cached_read_keeps_missing() {
-        // Sector 9 lands only on its 2nd PHYSICAL (FUA) read; a cached (non-FUA)
-        // re-read never gets it (the cache masks the good re-read). FuaRetry =
-        // the Linear fwd + rev + Bisect group at FUA params: across its reads the
-        // sector gets enough physical attempts to land, where cached reads can't.
+        // Sector 9 lands only on its 2nd physical (FUA) read; a cached re-read
+        // never gets it. FuaRetry = Linear fwd+rev + Bisect at FUA params: across
+        // its reads the sector gets enough physical attempts to land.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.fua_need = [(9u32, 2u32)].into_iter().collect();
@@ -2734,10 +2594,9 @@ mod tests {
 
     #[test]
     fn cache_prime_recovers_a_boundary_sector_that_needs_a_warm_channel() {
-        // Sector 15 reads ONLY when the immediately-preceding sector was just
-        // read (servo primed) — a boundary the drive can't lock onto from a cold
-        // seek. A cold Linear read of the island misses it; CachePrime reads the
-        // preceding good sector first, then lands it warm.
+        // Sector 15 reads only when the preceding sector was just read (servo
+        // primed) — a boundary the drive can't lock onto from a cold seek. Cold
+        // Linear misses it; CachePrime reads the preceding sector first, then lands it warm.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.prime_only = [15u32].into_iter().collect();

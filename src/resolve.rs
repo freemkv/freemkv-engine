@@ -2,7 +2,7 @@
 //!
 //! A front-end (the desktop UI's keydb strip, the CLI's status line, autorip's
 //! web state) needs to answer "are we decrypting this disc, and from where?"
-//! without scraping a log. [`resolve_keys`] reads the scanned [`Disc`]'s
+//! without scraping a log. [`resolve_keys`] reads the scanned [`libfreemkv::Disc`]'s
 //! already-resolved AACS/CSS state and returns it as a [`KeyStatus`].
 //!
 //! The actual key *derivation* happens in libfreemkv during `Disc::scan` /
@@ -36,24 +36,18 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     }
 
     if let Some(aacs) = &disc.aacs {
-        // `aacs` being present does NOT mean keys were found. The library
-        // synthesizes a PLACEHOLDER AACS state (`KeyOrigin::ExternalUk`, empty
-        // `unit_keys`) during a VID-only scan, before any key source is
-        // consulted. Decryption consumes `unit_keys` (derivable from a VUK), so
-        // the honest "resolved" signal is real key material — non-empty
-        // `unit_keys` OR a present VUK — not the origin tag alone. (Reporting
-        // `resolved: true` off the origin is the bug the desktop UI had to work
-        // around with its own `key_summary`; gating here lets it drop that.)
+        // `aacs` present does NOT mean keys were found: a PLACEHOLDER AACS state
+        // is synthesized during a VID-only scan. "resolved" means real key
+        // material — non-empty `unit_keys` OR a present VUK — not the tag alone.
         let have_key = !aacs.unit_keys.is_empty() || aacs.vuk.is_some();
         if have_key {
             let summary = match aacs.key_source {
                 libfreemkv::KeyOrigin::KeyDb
                 | libfreemkv::KeyOrigin::KeyDbDerived
                 | libfreemkv::KeyOrigin::KeyDbUnitKeys => "resolved-keydb",
-                // `ExternalUk` = "unit key supplied by the caller" — it is
-                // SOURCE-AGNOSTIC (an online service, a mapfile, a cert file, a
-                // built-in). The origin does not imply the network, so we must
-                // not label it "online".
+                // `ExternalUk` = "unit key supplied by the caller" — SOURCE-
+                // AGNOSTIC (online service, mapfile, cert file, built-in), so it
+                // must not be labeled "online".
                 libfreemkv::KeyOrigin::ExternalUk => "resolved-external",
                 libfreemkv::KeyOrigin::DeviceKey | libfreemkv::KeyOrigin::ProcessingKey => {
                     "resolved-derived"
@@ -112,11 +106,9 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
 pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
     disc.ensure_decryptable(raw)?;
     if disc.encrypted && !raw && !resolve_keys(disc).resolved {
-        // A disc whose key SOURCE failed keeps that verdict here too. The library
-        // gate already raises it when the disc carries AACS state; this arm covers
-        // the `aacs: None, aacs_error: Some(..)` disc the library gate passes, so
-        // the two predicates cannot disagree about WHY the disc is undecryptable
-        // any more than they disagree about WHETHER it is.
+        // A disc whose key SOURCE failed keeps that verdict here too, covering
+        // the `aacs: None, aacs_error: Some(..)` disc the library gate passes,
+        // so the two predicates can't disagree about WHY, not just WHETHER.
         match disc.aacs_error {
             Some(libfreemkv::Error::KeyServiceUnavailable) => {
                 return Err(libfreemkv::Error::KeyServiceUnavailable);
@@ -165,8 +157,7 @@ mod tests {
         let guide = include_str!("../USING_THE_ENGINE.md");
         // Scope the scan to `resolve_keys`' own body — anchored structurally,
         // like both sibling tests, so an unrelated string literal elsewhere in
-        // the file (a `tracing` field, a test fixture) can neither add a
-        // phantom key nor mask a missing one.
+        // the file can neither add a phantom key nor mask a missing one.
         let body = src
             .split_once("pub fn resolve_keys(")
             .expect("the file declares resolve_keys")

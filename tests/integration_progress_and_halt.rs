@@ -232,24 +232,9 @@ fn test_disc_copy_progress_callback_fires() {
 
 #[test]
 fn test_halt_aborts_disc_copy_promptly() {
-    // "Promptly" measured in READS, not seconds.
-    //
-    // This test used to run the copy on a worker thread, sleep 200 ms, set the
-    // halt flag, and give the thread 2 s to exit — with a reader sleeping 10 ms
-    // per call so the un-halted run took ~10 s and the deadline meant
-    // something. That made a release gate out of thread scheduling: nothing
-    // bounds "the spawned thread gets to run and finish within 2 s" on a loaded
-    // CI box running the suite in parallel, twice (debug + release).
-    //
-    // The invariant it was actually reaching for is exact and countable: the
-    // sweep polls `halt` at the top of every batch iteration, immediately
-    // before issuing the read, so the number of reads that happen AFTER the
-    // flag goes up is exactly zero. The reader below raises the flag itself
-    // mid-read, which removes the race the sleep was papering over — and the
-    // assertion is now strictly stronger than the old deadline. Make the poll
-    // fire once per N batches instead of every batch and the count goes to
-    // N-1, whatever the machine's speed; drop the poll entirely and the sweep
-    // runs all ~1000 batches of this fixture.
+    // "Promptly" measured in READS, not seconds: the sweep polls `halt` at the
+    // top of every batch, before the read, so reads after the flag goes up
+    // must be exactly zero — no wall-clock budget, no scheduler dependence.
     let capacity_sectors: u32 = 60_000; // ~1000 batches at 60 sectors/batch
     let halt_after_reads: u64 = 5;
 
@@ -325,22 +310,9 @@ fn test_drop_impls_do_not_panic_or_block() {
     )
     .unwrap();
 
-    // Two separate things are being proved here, and they used to share one
-    // 100 ms budget on the main thread — which meant the worker thread's
-    // scheduling latency was charged against the drop's time. Under a parallel
-    // test binary nothing bounds that at 100 ms, so the test could fail on a
-    // busy runner with a perfectly well-behaved Drop.
-    //
-    // Split them:
-    //   1. Drop must not panic and must RETURN — proved by the worker thread
-    //      reaching the send and by `join()` returning Ok. The recv timeout
-    //      here is a deadlock backstop only, so it is deliberately generous
-    //      (60 s); it is not the thing being measured, and no plausible amount
-    //      of scheduler noise reaches it.
-    //   2. Drop must not BLOCK — proved by timing the `drop` call itself,
-    //      inside the worker, with nothing else between the two clock reads.
-    //      A Drop that waits on a thread/lock/IO shows up here regardless of
-    //      how long the worker took to get scheduled.
+    // Two things are proved here, each with its own budget: (1) Drop must not
+    // panic and must RETURN, backstopped by a generous 60 s recv timeout; (2)
+    // Drop must not BLOCK, measured by timing the `drop` call itself in the worker.
     let (tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let t0 = Instant::now();
@@ -411,20 +383,8 @@ fn test_file_sector_reader_round_trip() {
 }
 
 // ── 6. Pass 1 sweeps the entire disc even when every read fails ───────────
-//
-// Per the rip design: copy() must reach the end of the disc
-// regardless of how many reads fail. The only legitimate early exit is the
-// halt flag. With `skip_on_error` and a reader that returns
-// Err for every read, Pass 1 must:
-//   - mark every sector NonTrimmed (so Pass 2 can retry them)
-//   - return cleanly (no panic, no hang)
-//   - bytes_good = 0
-//   - bytes_pending = total_bytes (NonTrimmed counts as pending in mapfile
-//     accounting; see disc/mapfile.rs::stats)
-//   - bytes_unreadable = 0 (only Pass 2 marks Unreadable)
-//   - complete = false (work remains for Pass 2)
-//   - halted = false (no user stop)
-//   - ISO file is `total_bytes` size on disk (sparse zeros)
+// copy() must reach disc end regardless of read failures; only halt exits
+// early. Expect: all NonTrimmed, bytes_good=0, bytes_unreadable=0, incomplete.
 
 /// Reader that returns Err for every read. Optionally signals a halt
 /// flag on the first read so tests can exercise the halt-during-skip-forward
@@ -469,11 +429,9 @@ impl SectorSource for FailingSectorReader {
         if let Some(h) = self.halt_on_first_read.take() {
             h.store(true, Ordering::Relaxed);
         }
-        // Model what a real damaged-disc read returns: CHECK CONDITION +
-        // MEDIUM ERROR (sense_key 3, ASC 0x11 UNRECOVERED READ ERROR,
-        // ASCQ 0x05 L-EC UNCORRECTABLE). copy()'s hysteresis must
-        // engage on this — `Error::DiscRead` is libfreemkv's own
-        // post-classification signal, not what a real reader emits.
+        // Model a real damaged-disc read: CHECK CONDITION + MEDIUM ERROR
+        // (UNRECOVERED READ ERROR / L-EC UNCORRECTABLE), not the crate's own
+        // `Error::DiscRead` post-classification signal.
         Err(libfreemkv::error::Error::ScsiError {
             opcode: libfreemkv::scsi::SCSI_READ_10,
             status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
@@ -521,14 +479,9 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
-    // Hard bound — Pass 1 must NOT infinite-loop on a fully-failing
-    // reader. The threshold accommodates the 2026-05-10 wedge-
-    // avoidance pause (PASS_1_FAIL_PAUSE_SECS = 5 s on each failed
-    // batch). With batch=32 and 1024 sectors that's up to ~5 batch
-    // failures + a few damage-jump pauses before fast-trigger jumps
-    // us past end-of-disc — well-bounded total, ~20-30 s typical.
-    // The point of this test is "finishes cleanly, not infinitely",
-    // not "completes in milliseconds."
+    // Hard bound — Pass 1 must NOT infinite-loop on a fully-failing reader.
+    // Accommodates the wedge-avoidance pause (5 s/failed batch); well-bounded
+    // total (~20-30 s typical), not "completes in milliseconds."
     assert!(
         elapsed < Duration::from_secs(60),
         "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 60 s (not infinite)"
@@ -560,23 +513,14 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     );
     assert!(!result.halted, "no halt was set; halted must be false");
 
-    // ISO file should be the full disc size on disk (sparse zeros where
-    // reads failed).
-    // Note: tempfile was dropped above; the file may or may not still exist
-    // depending on cleanup ordering. We only assert what we can observe in
-    // the CopyResult.
+    // ISO should be full disc size on disk (sparse zeros where reads failed).
+    // tempfile was dropped above so the file may not still exist; we only
+    // assert what CopyResult itself reports.
 }
 
 // ── 7. Halt during Pass 1 skip-forward path returns promptly (deterministic) ─
-//
-// Per RIP_DESIGN.md §3: halt is the only legitimate early exit from Pass 1.
-// Even when every read is failing (skip-forward path), a halt must be
-// honored within a small bounded time.
-//
-// Deterministic fixture: the reader signals halt on its FIRST read. The
-// inner copy loop's halt check fires on the next iteration, breaking out
-// of 'outer. This avoids any wallclock race on fast CI runners (where a
-// 2 GB synthetic disc can sweep skip-forward in <100 ms).
+// Halt is the only legitimate early exit from Pass 1, even mid skip-forward.
+// Fixture: reader signals halt on read #1, avoiding any wallclock race.
 
 #[test]
 fn test_disc_copy_halts_promptly_on_failing_reader() {
@@ -617,16 +561,9 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
         "the sweep issued {} read(s) after the reader raised halt on read #1",
         reads.saturating_sub(1)
     );
-    // The wall clock is kept for the one thing the read count cannot see: the
-    // post-failure cooldown that runs BETWEEN the failing read and the next
-    // halt poll (zone-entry cooldown, 30 s) has to be halt-aware, or the copy
-    // sits in `sleep_secs_or_halt` long after the user pressed stop. There is
-    // no countable proxy for that from outside the crate — a build that
-    // ignores halt mid-sleep produces exactly the same read count. So the
-    // bound is deliberately generous relative to the ~10 ms this actually
-    // takes, and still an order of magnitude below the 30 s regression it
-    // exists to catch. (`sleep_secs_or_halt`'s own unit tests in
-    // src/recovery/mod.rs pin the behaviour directly.)
+    // The wall clock catches what the read count can't: the post-failure
+    // cooldown (30 s zone-entry) must itself be halt-aware, so this bound is
+    // generous vs the ~10 ms actual, yet well below the 30 s regression.
     assert!(
         elapsed < Duration::from_secs(10),
         "halt returned in {elapsed:?}; the post-failure cooldown is not being \
@@ -644,10 +581,8 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
 }
 
 // ── 8. Hysteresis recovers data the drive can read individually ──────────
-//
-// Pass 1 reads in batch (32 sectors = 1 ECC block). Failed blocks are marked
-// NonTrimmed for Pass 2 recovery. This test verifies that a reader where every
-// multi-sector read fails produces all NonTrimmed output with zero bytes_good.
+// Pass 1 reads in 32-sector batches; a reader whose multi-sector reads all
+// fail must mark every ECC block NonTrimmed, with zero bytes_good.
 
 struct BlockSizeFailingReader {
     capacity: u32,
@@ -711,16 +646,9 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     let _ = std::fs::remove_file(&iso_path);
     let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
-    // Pass 1's job is "fast and accurate, get the most data in the
-    // shortest time." It does not retry a failed batch sector-by-
-    // sector — that's Pass N's purpose-built role. So a
-    // BlockSizeFailingReader that
-    // fails on multi-sector reads and succeeds on single-sector
-    // results in: every batch fails → SkipBlock → whole 32-sector
-    // ECC block marked NonTrimmed → Pass N (patch) revisits and
-    // recovers via single-sector reads with proper recovery semantics.
-    //
-    // Pass 1 alone:
+    // Pass 1 is "fast, get the most data" — it never retries a failed batch
+    // sector-by-sector (that's Pass N's job). BlockSizeFailingReader fails
+    // multi-sector reads, so every batch → SkipBlock → whole block NonTrimmed.
     assert_eq!(
         result.bytes_good, 0,
         "Pass 1 doesn't retry a failed batch per-sector — failed batches become NonTrimmed for Pass N to revisit"
@@ -736,14 +664,8 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
 }
 
 // ── 9. PassProgress carries separate unreadable vs pending byte counts ─────
-//
-// 2026-05-11 design call: Pass N never marks bytes as `Unreadable` mid-multipass —
-// failed reads stay `NonTrimmed` so the next pass can retry them. The orchestrator
-// (autorip) promotes still-NonTrimmed bytes to Unreadable after the FINAL retry
-// pass completes. This test was rewritten from its pre-design-call shape (which
-// asserted Pass 2 produced bytes_unreadable > 0) to verify the new invariant:
-// pass-level retries keep failed bytes in `bytes_pending` so subsequent passes
-// get more shots at them.
+// 2026-05-11 design: failed reads stay NonTrimmed for retry, not Unreadable,
+// until the orchestrator promotes them after the final pass.
 
 #[test]
 fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
@@ -818,10 +740,9 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
         pass2.bytes_good, 0,
         "pass2: still no good sectors (reader always fails)"
     );
-    // 2026-05-11 design: pass-level retries do NOT promote failed bytes
-    // to Unreadable. Failed bytes stay NonTrimmed (pending) so a later
-    // pass can retry. End-of-recovery promotion is an orchestrator
-    // concern (autorip), not the patch loop's.
+    // 2026-05-11 design: pass-level retries do NOT promote failed bytes to
+    // Unreadable; they stay NonTrimmed (pending) for a later pass. Promotion
+    // is an orchestrator (autorip) concern, not the patch loop's.
     assert_eq!(
         pass2.bytes_unreadable, 0,
         "pass2: Disc::patch never marks Unreadable mid-multipass — orchestrator promotes after final pass"
@@ -854,13 +775,8 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
 }
 
 // ── 9b. The patch pass's live drilldown is located against the main title ──
-//
-// `PassProgress::located` and `bytes_bad_in_main_title` are derived by the
-// patch consumer from the mapfile's damage set INTERSECTED with the main
-// feature's extents. The title reaches the consumer by being handed to the
-// sink at construction, so a disc that has a title must produce a non-empty
-// drilldown: zero here means either no damage was seen or the title never
-// arrived, and on this disc (every read fails) the first is impossible.
+// `located`/`bytes_bad_in_main_title` intersect damage with the main title's
+// extents; zero would mean the title never reached the consumer.
 
 #[test]
 fn test_patch_progress_locates_damage_against_the_main_title() {
@@ -939,25 +855,13 @@ fn test_patch_progress_locates_damage_against_the_main_title() {
     );
 }
 
-// The file used to end with a section header — "10. Damage time calculation
-// (unit test)" — and no test under it. There is nothing here to unit-test: the
-// damage-time formula (unreadable / total × duration) lives in libfreemkv, not
-// in this crate, and section 9b above already pins the value this crate
-// observes end to end (`main_at_risk_ms == 60_000` for a fully damaged 60 s
-// title). A heading promising coverage that does not exist is worse than no
-// heading, so it is gone rather than restated.
+// Section 10 ("Damage time calculation") used to be an empty heading — the
+// formula lives in libfreemkv, not here, and 9b above already pins the value
+// end to end. A heading promising coverage that doesn't exist was removed.
 
 // ── 11. A live progress tick never counts zero-filled damage as "good" ─────
-//
-// `bytes_good_total` is what a UI puts behind the word "recovered". The sweep
-// producer's own cursor (`bytes_done`) advances on THREE damage paths as well
-// as the good one — SkipBlock (failed batch, zero-filled, NonTrimmed),
-// JumpAhead's failed block, and the zero-filled jump gap — so it measures
-// POSITION, not recovery. Feeding it to the tick (directly before the first
-// consumer snapshot lands, and through `.max()` after) let a rip grinding
-// through a damage zone report bytes it had zero-filled as bytes it had
-// recovered: data loss rendered as success, on the counter whose whole job is
-// to say how much came back.
+// The sweep cursor also advances on damage paths (SkipBlock, JumpAhead, gaps),
+// so feeding it straight to bytes_good_total would render data loss as success.
 
 /// Fails every read with RECOVERED ERROR (a marginal read the sweep distrusts):
 /// each batch becomes a plain `SkipBlock` — zero-filled, marked NonTrimmed —
@@ -1069,11 +973,8 @@ fn live_progress_never_reports_zero_filled_damage_as_good_bytes() {
     );
 
     // ...and the damage must land in a BUCKET, not merely be absent from
-    // `good`. The four totals partition the disc, so on a tick where nothing
-    // was recovered every attempted byte has to show up as unreadable,
-    // retryable or pending. Reporting it in none of them is the same defect
-    // this test was written for, moved one field along: a rip losing data
-    // while every counter that exists to measure loss reads clean.
+    // `good`: the four totals partition the disc, so on a tick with nothing
+    // recovered, every byte must be unreadable, retryable, or pending.
     let total = capacity_sectors as u64 * SECTOR_SIZE as u64;
     let (g, u, p, r) = *worst_totals.lock().unwrap();
     assert_eq!(

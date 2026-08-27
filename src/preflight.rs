@@ -1,4 +1,4 @@
-//! Validate a [`Job`] against a scanned [`Disc`] WITHOUT executing it.
+//! Validate a [`Job`] against a scanned [`libfreemkv::Disc`] WITHOUT executing it.
 //!
 //! This is the "grey out Start and say why" logic the desktop UI needs on
 //! every selection change (UI-doc §4.3.2), and the same check the CLI does up
@@ -112,46 +112,17 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         Selection::MainMovie | Selection::All | Selection::Longest => {}
     }
 
-    // Does the selection actually resolve to a title? Ask the ONE function that
-    // decides it rather than restating the answer here.
-    //
-    // This block used to be an assumption in a comment — "MainMovie / All /
-    // Longest always resolve to at least one title on a disc with titles" — and
-    // that is a second copy of a policy `mux::resolve_selection` owns. The
-    // copies diverged the moment the owner was hardened: `Longest` drops
-    // non-finite durations before folding (a NaN reaching the accumulator first
-    // is never displaced by `t > NaN` and would otherwise win outright), so a
-    // disc whose every playlist has an unparseable runtime resolves to NOTHING.
-    // Preflight said `Ready`, the loop was handed an empty index list, and
-    // `run_titles` returned `Ok { titles_written: 0 }`: success, exit 0, no
-    // file. The gate is deliberately last and conditional on no earlier reason,
-    // so an explicit out-of-range selection still blocks with the reason that
-    // names the index instead of a vaguer duplicate.
-    //
-    // `resolve_selection` is pure — no drive, no file, no read — so calling it
-    // keeps preflight's no-side-effects contract.
+    // Does the selection resolve to a title? Ask the ONE function that decides
+    // it (pure) rather than restate the policy here: `Longest` can resolve to
+    // NOTHING (all-NaN durations), which a prior duplicated assumption missed.
     let resolved = crate::mux::resolve_selection(disc, &job.selection);
     if reasons.is_empty() && resolved.is_empty() {
         reasons.push(Reason::new("empty-selection"));
     }
 
-    // A language request no selected title can honour. `StreamChoice::
-    // unmatched` has computed this all along and nothing called it: the
-    // resolved `StreamSelection` simply came back with no PIDs for the class,
-    // the mux wrote the file without it, and the run exited 0 — `-a jpn` on a
-    // disc with no Japanese audio delivered a video-only MKV and reported
-    // success. Detected, and not reported, is the same as not detected.
-    //
-    // Judged across the whole selection, not per title: a batch where the
-    // language is present on SOME selected title can honour the request, and
-    // blocking it would refuse ordinary multi-title rips. Only a request that
-    // no selected title can satisfy is a rip that will certainly ship without
-    // the track. A class no selected title carries at all is not a miss —
-    // there was never a track to keep.
-    //
-    // Conditional on no earlier reason for the same purpose as the gate above:
-    // a job blocked for an out-of-range index gets the reason that names the
-    // index, not a second, vaguer one derived from titles it never selected.
+    // A language request no selected title can honour. Previously `-a jpn` on a
+    // disc with no Japanese audio silently muxed a video-only MKV, exit 0.
+    // Judged across the whole selection so multi-title rips aren't over-refused.
     if reasons.is_empty() {
         for class in job
             .streams
@@ -161,30 +132,16 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         }
     }
 
-    // Multipass implies raw. A multipass rip is a whole-disc image recovery:
-    // it sweeps, patches and resumes against a mapfile that records progress
-    // in DISC geometry, and every pass re-reads sectors the previous pass
-    // could not get. Decryption has no place in that loop, and the two flags
-    // were independent all the way down — the CLI passes `raw` and
-    // `multipass` as separate booleans, and all three recovery call sites set
-    // `decrypt: !job.raw` regardless of mode, so nothing anywhere refused the
-    // combination.
-    //
-    // Refused rather than silently forced: a caller that asked for decryption
-    // and got a raw image would be handed an undecrypted ISO it believes is
-    // playable, which is the same wrong-artifact-at-exit-0 shape this crate
-    // has been bitten by before. Blocking says so before a sector is read.
+    // Multipass implies raw: it's whole-disc image recovery where decryption
+    // has no place, yet `raw`/`multipass` were independent booleans nothing
+    // refused combining. Refused rather than forced, avoiding an undecrypted ISO.
     if matches!(job.mode, crate::job::RipMode::Multi) && !job.raw {
         reasons.push(Reason::new("multipass-requires-raw"));
     }
 
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key.
-    // `disc.encrypted` is the library's authoritative "needs decryption" flag.
-    // Delegate the "do we actually have a key?" judgment to `resolve_keys` — the
-    // ONE place that decides it — so preflight and the key-status report can
-    // never disagree (a bare `aacs.is_some()` here would pass a VID-only
-    // placeholder scan that `resolve_keys` correctly reports as unresolved).
-    // Raw passes (the user wants ciphertext); unencrypted passes.
+    // Delegate to `resolve_keys` — the ONE place that judges it — so preflight
+    // can't disagree with the key-status report (unlike a bare `aacs.is_some()`).
     if disc.encrypted && !job.raw && !crate::resolve::resolve_keys(disc).resolved {
         reasons.push(Reason::new("encrypted-no-key"));
     }
@@ -419,9 +376,8 @@ mod tests {
     #[test]
     fn blocks_encrypted_placeholder_aacs_without_key_material() {
         // A VID-only scan leaves `aacs = Some(..)` with EMPTY unit_keys and no
-        // VUK. preflight must NOT treat that as keyed (the bug: gating on
-        // `aacs.is_some()` passed it) — it now delegates to resolve_keys, which
-        // reports unresolved, so the decrypt gate blocks.
+        // VUK. preflight must NOT treat that as keyed (gating on `aacs.is_some()`
+        // did); it now delegates to resolve_keys, which reports unresolved.
         let mut d = disc_with(2, true, true);
         if let Some(a) = d.aacs.as_mut() {
             a.unit_keys = Vec::new();
