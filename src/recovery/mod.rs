@@ -49,19 +49,9 @@ fn require_full_read(result: Result<usize>, requested: usize, lba: u32) -> Resul
     match result {
         Ok(n) if n == requested => Ok(n),
         Ok(n) => {
-            // Mirror `Drive::read_one`'s warning on the SAME event. That method
-            // gates its success arm on `bytes_transferred == count * 2048` and,
-            // before answering the very `DiscRead { status: None, sense: None }`
-            // reproduced here, emits a WARN naming `transferred` vs `expected`.
-            // This helper reproduced the verdict but not the log, so if it ever
-            // fired the only trace would be a generic no-sense read failure —
-            // indistinguishable in the log from any ordinary bad sector, exactly
-            // the two-populations-collapse the drive-side log was added to end.
-            // `status`/`sense` are deliberately absent: the read SUCCEEDED, so
-            // there is no sense data; `transferred` vs `expected` is the whole
-            // signal. Currently unreachable in-tree (no `SectorSource`
-            // short-reads on success — see this module's `require_full_read`
-            // doc), so this is defensive parity, not a live-bug fix.
+            // Mirror `Drive::read_one`'s WARN on the same event, so a hit here isn't
+            // indistinguishable in the log from an ordinary bad sector. `status`/
+            // `sense` are None: read succeeded, so `transferred` vs `expected` is it.
             tracing::warn!(
                 target: "freemkv::disc",
                 lba,
@@ -86,30 +76,19 @@ pub fn copy(
     path: &std::path::Path,
     opts: &CopyOptions,
 ) -> Result<CopyResult> {
-    // Pre-flight decrypt gate. A decrypting copy (`opts.decrypt == true`,
-    // i.e. NOT `--raw`) of an encrypted disc with no usable key would wrap
-    // the reader in a pass-through `DecryptingSectorSource` and write
-    // ciphertext to the ISO, then return `Ok` (bytes_good > 0) — a silent
-    // garbage success at exit 0. Refuse here, BEFORE any sweep/patch reads a
-    // single sector, so the failure is pre-flight and no partial ISO is
-    // written. `opts.decrypt == false` is `--raw`: the gate is a no-op (the
-    // user wants the encrypted image), and an unencrypted disc passes too.
+    // Pre-flight decrypt gate: without it, a decrypting copy of an encrypted disc
+    // with no usable key would silently write ciphertext to the ISO and still
+    // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
-    // Mapfile-driven resume dispatch. This runs for BOTH plain and
-    // `--multipass` copies: an interrupted plain `disc:// → iso://` writes
-    // a per-block-flushed mapfile (crash-safe), and re-issuing the SAME
-    // command must pick up where it stopped rather than re-sweep from
-    // sector 0 (the help/CLI examples promise "auto-resumes if
-    // interrupted"). The ONLY multipass-specific behaviour is the patch
-    // (Pass N) dispatch on retryable bytes — plain mode has no patch pass,
-    // so it returns a terminal result there instead.
+    // Mapfile-driven resume dispatch, shared by plain and `--multipass` copies: an
+    // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
+    // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
         let map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
-        // BEFORE any resume decision — including the "already complete, return
-        // without reading a sector" branch below, which is the worst case to
-        // get wrong: a wrong disc whose predecessor finished would report the
-        // job done having never touched the disc in the drive.
+        // BEFORE any resume decision, including "already complete" below: a wrong
+        // disc whose predecessor finished would otherwise report the job done
+        // having never touched the disc actually in the drive.
         mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
@@ -126,32 +105,16 @@ pub fn copy(
             stats.bytes_pending,
             stats.bytes_unreadable,
         );
-        // The mapfile and the ISO are two separate files and the shortcut
-        // below was checking only one of them. A staging cleanup, a remount,
-        // or an operator freeing space can remove or truncate the image while
-        // the mapfile survives — and then "every range is Finished" describes
-        // an ISO that is no longer there. `sweep()` already guards this exact
-        // inconsistency (see its inconsistent-resume guard); the dispatch
-        // shortcut needs it too, or a rip reports a full disc of good bytes
-        // having written nothing and the caller muxes from a missing file.
-        //
-        // Classified by `iso_len_from_metadata`, NOT `unwrap_or(0)`. This was
-        // the third copy of that classification and the only one still
-        // unhardened, which made it the dangerous one: on a FINISHED rip — an
-        // all-Finished mapfile and an intact image — a transient EIO/ESTALE
-        // from the staging volume read as "zero bytes", failed
-        // `iso_is_intact`, and routed to a fresh `sweep_internal`, which
-        // removes the mapfile and `File::create`s the image. A stat blip
-        // destroyed a completed recovery and re-ripped the disc from LBA 0.
+        // Mapfile and ISO are separate files; checking only the mapfile risks a false
+        // "disc complete" verdict when the image was removed/truncated. Classify via
+        // `iso_len_from_metadata`, not `unwrap_or(0)`, so a stat blip can't re-rip a disc.
         let image = image_state(path, disc_size)?;
         let iso_len = image.len;
         let iso_is_intact = image.is_intact();
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && !iso_is_intact {
-            // Complete mapfile, but the image it describes is gone or short.
-            // A resume cannot repair this: the producer builds work only from
-            // NonTried ranges and there are none, so it would return a
-            // terminal success having written nothing. Force a fresh full
-            // sweep, exactly as the covers_disc=false case below does.
+            // Complete mapfile, but the image is gone or short. A resume can't repair
+            // this — no NonTried ranges means the producer builds no work — so force
+            // a fresh full sweep, as the covers_disc=false case below does.
             tracing::info!(
                 "copy dispatch: → sweep (mapfile complete but ISO is {} — {} of {} bytes)",
                 if iso_len == 0 {
@@ -178,22 +141,9 @@ pub fn copy(
             ));
         }
         if !covers_disc {
-            // Mapfile capacity != disc capacity. Force a full (non-
-            // resume) sweep on ANY mismatch so [0, disc_size) is covered
-            // as one fresh region (the non-resume path also set_len's the
-            // ISO to the full capacity).
-            //
-            // UNDER-cover (map.total_size() < disc_size): a resume sweep
-            // builds its region list only from the mapfile's NonTried
-            // entries and would silently never read the tail
-            // [map.total_size(), disc_size) — abandoning readable data
-            // and the ISO's tail.
-            //
-            // OVER-cover (map.total_size() > disc_size): a resume sweep's
-            // NonTried regions extend past the disc; `reader.read_sectors`
-            // would then read LBAs beyond capacity (the promised
-            // capacity clamp was never actually applied). A fresh sweep
-            // sized to the real disc avoids reading past the end.
+            // Mapfile capacity != disc capacity: force a full (non-resume) sweep so
+            // [0, disc_size) is covered fresh. Under-cover would abandon the readable
+            // tail; over-cover would let a resume sweep read LBAs past disc capacity.
             tracing::info!(
                 "copy dispatch: → sweep (covers_disc=false, resume=false, map={}, disc={})",
                 map.total_size(),
@@ -201,18 +151,9 @@ pub fn copy(
             );
             return sweep_internal(disc, reader, path, opts, false);
         }
-        // NonTried bytes mean a prior sweep was halted mid-way (Ctrl-C /
-        // crash) and the mapfile still has un-attempted ranges (the un-swept
-        // tail). The sweep pass's job is to read those — route to a resume
-        // sweep FIRST, even when retryable bytes also exist. Checking
-        // retryable before this (and routing straight to patch) would
-        // silently abandon the un-swept tail: patch only revisits the
-        // mapfile's bad ranges, never the NonTried ones. The retry
-        // (patch) passes run after, driven separately by the caller's
-        // pass loop, and pick up the retryable bytes the sweep leaves.
-        // This is the plain-copy resume path too: a clean disc interrupted
-        // by Ctrl-C leaves exactly this state (NonTried tail), so a re-run
-        // resumes the sweep instead of restarting from sector 0.
+        // NonTried bytes mean a prior sweep was halted (Ctrl-C/crash) mid-way — route
+        // to resume sweep FIRST, even with retryable bytes present, since patch only
+        // revisits bad ranges, never NonTried ones (also the plain-copy resume path).
         if stats.bytes_nontried > 0 {
             tracing::info!(
                 "copy dispatch: → sweep resume (covers_disc=true, \
@@ -232,11 +173,9 @@ pub fn copy(
                 );
                 return patch_internal(disc, reader, path, opts);
             }
-            // Fallthrough: covers_disc=true, nontried=0, retryable=0.
-            // All sectors were attempted; any remaining bad bytes are
-            // already Unreadable. A resume sweep would visit zero new
-            // sectors and patch has nothing retryable — return the
-            // terminal result immediately.
+            // Fallthrough: nontried=0, retryable=0 — all sectors attempted, remaining
+            // bad bytes are already Unreadable. Resume sweep/patch would both be
+            // no-ops, so return the terminal result immediately.
             tracing::info!(
                 "copy dispatch: all bad sectors already Unreadable \
                  (retryable=0, nontried=0) — returning terminal result",
@@ -250,12 +189,9 @@ pub fn copy(
                 false,
             ));
         }
-        // Plain (non-multipass) copy: there is no patch pass and the sweep
-        // aborts on the first read error, so a fully-attempted mapfile with
-        // bad bytes is terminal. Re-running must NOT restart from sector 0
-        // (that re-reads the whole disc and re-hits the same bad sector);
-        // return the terminal result so the caller surfaces the failure.
-        // (`complete` is true only when no bad bytes remain.)
+        // Plain copy has no patch pass and the sweep aborts on the first read error,
+        // so a fully-attempted mapfile with bad bytes is terminal. Re-running must
+        // not restart from sector 0, so return terminal to surface the failure.
         tracing::info!(
             "copy dispatch: plain copy, disc fully attempted (bad={}) — terminal result",
             bad_bytes,
@@ -746,7 +682,7 @@ pub(crate) fn sweep_batch_sectors(
 /// batch of sectors (64 KiB on sweep, one recovered span on patch), so even a
 /// pathologically slow NFS mount doing a few KiB/s clears it in seconds. The
 /// deadline is only the no-halt backstop; responsiveness to Stop comes from the
-/// halt poll inside [`Pipeline::send_with_halt`], which ticks every
+/// halt poll inside [`libfreemkv::Pipeline::send_with_halt`], which ticks every
 /// `libfreemkv::halt::POLL_INTERVAL` (250 ms) regardless of this value.
 const SEND_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS);
@@ -755,7 +691,7 @@ const SEND_DEADLINE: std::time::Duration =
 /// Stop" apart from "the consumer died" apart from "the consumer is alive but
 /// has not drained a slot in [`SEND_DEADLINE`]".
 ///
-/// [`Pipeline::send_with_halt`] collapses all three into `Err(item)` — it hands
+/// [`libfreemkv::Pipeline::send_with_halt`] collapses all three into `Err(item)` — it hands
 /// the item back and leaves the diagnosis to the caller. Mapping them all to
 /// `PipelineConsumerGone` would report a Stop, and a hung mount, as a dead
 /// consumer thread.
@@ -823,24 +759,9 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
     halt: &libfreemkv::halt::Halt,
     deadline: std::time::Duration,
 ) -> std::result::Result<(), SendStall> {
-    // Try ONCE, without blocking, before the halt gets a vote.
-    //
-    // `send_with_halt` polls the halt bit BEFORE it touches the channel, so on
-    // its own it discards the next item the moment Stop is pressed — even with
-    // a free slot the handoff would have taken microseconds. That is bytes
-    // thrown away, not work avoided: on patch the item is a span the drive may
-    // have spent minutes recovering off damaged media, on sweep a batch already
-    // read. Stop means "do no MORE work", not "bin what you already have".
-    //
-    // The halt is about not PARKING on a consumer that is not draining, and
-    // that is exactly the case this probe leaves alone: a full channel falls
-    // through to `send_with_halt` below, which returns on the halt within one
-    // poll interval. Nothing here can block, so the bound the original fix
-    // introduced is untouched.
-    //
-    // A `Disconnected` error falls through too rather than short-circuiting to
-    // `ConsumerGone`: the diagnosis (and the halt-wins-over-death precedence)
-    // lives in one place, at the bottom of this function.
+    // Try ONCE, without blocking, before halt gets a vote: `send_with_halt` polls halt
+    // first and would otherwise discard an item that took real drive time to produce.
+    // Nothing here can block; `Disconnected` falls through too so diagnosis stays put.
     let item = match pipe.try_send(item) {
         Ok(()) => return Ok(()),
         Err(e) => e.into_inner(),
@@ -851,28 +772,9 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
             if halt.is_cancelled() {
                 return Err(SendStall::Halted);
             }
-            // Not halted, so the item came back for one of: consumer
-            // disconnected, deadline elapsed, or the consumer's `apply` has
-            // failed fatally (`send_with_halt` returns early in that case).
-            // One non-blocking probe separates them:
-            //
-            //  * `Ok`        — a slot was free after all. Two different
-            //    causes reach this outcome and the probe cannot tell them
-            //    apart: the apply-already-failed case (the consumer keeps
-            //    draining and discarding), and a plain race where the consumer
-            //    freed a slot in the window between `send_with_halt` giving up
-            //    and this retry. Either way it must stay a successful send:
-            //    today's plain `send` also succeeds there, and if an apply DID
-            //    fail, the consumer's REAL error is the one `Pipeline::finish`
-            //    returns. Aborting here instead would mask it with a numeric
-            //    "consumer gone".
-            //  * `Full`      — the consumer still has not taken a slot, i.e.
-            //    the deadline genuinely elapsed against a live consumer.
-            //  * `Disconnected` — the consumer thread is gone.
-            //
-            // Matched through `is_disconnected()` rather than by variant:
-            // `TrySendError` is crossbeam's type and libfreemkv does not
-            // re-export it, so this crate cannot name it.
+            // Not halted: item came back for disconnect/deadline/fatal-apply. One probe
+            // separates them; `Ok` stays a success even if apply failed (finish() surfaces
+            // the real error). Uses `is_disconnected()`: libfreemkv doesn't re-export the type.
             match pipe.try_send(item) {
                 Ok(()) => Ok(()),
                 Err(e) if e.is_disconnected() => Err(SendStall::ConsumerGone),
@@ -934,11 +836,9 @@ pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
     pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
     halt: &libfreemkv::halt::Halt,
 ) -> Result<R> {
-    // `Some(halt)` even when the caller wired no Stop bit (the token is then a
-    // never-cancelled default): that still arms `JOIN_TIMEOUT_SECS`, which is
-    // the same 600 s budget `SEND_DEADLINE` already gives one handoff. The
-    // joiner waiting exactly as long as the producer is the symmetry
-    // `SEND_DEADLINE`'s own doc-comment argues for.
+    // `Some(halt)` even with no Stop bit wired (a never-cancelled default) still
+    // arms `JOIN_TIMEOUT_SECS`, the same 600s budget `SEND_DEADLINE` gives one
+    // handoff — the producer/joiner symmetry `SEND_DEADLINE`'s doc argues for.
     pipe.finish_with_halt(Some(halt))
 }
 
@@ -1066,39 +966,24 @@ pub fn sweep(
     use libfreemkv::sector::{DecryptingSectorSource, SectorSource};
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
-    // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
-    // direct `sweep` caller can't bypass it). A decrypting sweep of an
-    // encrypted disc with no usable key would write ciphertext to the ISO at
-    // exit 0; refuse before reading any sector. No-op for `--raw`
-    // (`opts.decrypt == false`) and unencrypted discs.
+    // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
+    // direct `sweep` caller can't bypass it: a decrypting sweep of an encrypted
+    // disc with no usable key would write ciphertext at exit 0. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
 
     let total_bytes = disc.capacity_sectors as u64 * 2048;
-    // Decrypt-aware read.
-    //
-    // A decrypting sweep (`opts.decrypt`, e.g. `disc:// → iso://` without
-    // `--raw`) decrypts each unit IN PLACE → the ISO holds plaintext.
-    //
-    // Every other sweep (`!opts.decrypt`: the autorip / `--multipass` path and
-    // plain `--raw`) writes the ISO as CIPHERTEXT verbatim — keys = `None`, a
-    // pure pass-through. Bad sectors are found by PHYSICAL read success (a SCSI
-    // read error → skip / NonTrimmed → patch re-read), NOT by decrypt structure.
-    // (The old decrypt-VERIFY read gate — which mis-aligned the disc-absolute
-    // unit grid against clip-file-anchored AACS units and false-failed good
-    // clips with an orphan CPS unit — was removed. There is no scratch
-    // verify and no post-sweep clip-anchored pass; decryptability is proven at
-    // mux time, not at capture time.)
+    // Decrypt-aware read: `opts.decrypt` decrypts each unit in place (plaintext ISO);
+    // otherwise pure pass-through (keys = `None`). Bad sectors are found by physical
+    // read success, not decrypt structure — proven at mux time, not capture time.
     let mut keys = if opts.decrypt {
         disc.decrypt_keys()
     } else {
         libfreemkv::decrypt::DecryptKeys::None
     };
     let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
-    // AACS decrypting sweep: resolve a WHOLE-DISC key map up front (the fetch
-    // secures any missing CPS-unit key, fail-loud) and decrypt via the map —
-    // a clear nav/filesystem sector is in no range and passes through, so no
-    // separate content gate is needed. CSS keeps the content-gated
-    // self-descramble path (the map path is AACS-only).
+    // AACS sweep: resolve a whole-disc key map up front (fail-loud on missing
+    // CPS-unit key) and decrypt via the map — clear sectors are in no range and
+    // pass through, so no separate gate is needed. CSS keeps its own content-gate.
     let key_map = if opts.decrypt && decrypt_is_aacs {
         let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
         Some(std::sync::Arc::new(disc.resolve_content_key_map(
@@ -1127,22 +1012,16 @@ pub fn sweep(
 
     // Mapfile: load if resuming, else wipe + recreate.
     let mapfile_path = disc.mapfile_for(path);
-    // covers_disc reconciliation. A resume against a mapfile whose total
-    // size != the real disc size is unsafe — exactly the case copy()'s
-    // dispatch forces to a fresh sweep (see Disc::copy). Under-cover
-    // (map < disc) abandons the disc tail [map.total_size(), disc);
-    // over-cover (map > disc) reads LBAs past capacity. When sweep() is
-    // called directly (not via copy()), apply the same downgrade: drop the
-    // stale mapfile and sweep [0, total_bytes) fresh.
+    // covers_disc reconciliation: a resume against a mismatched mapfile size is
+    // unsafe (copy()'s dispatch forces a fresh sweep here too) — under-cover abandons
+    // the tail, over-cover reads past capacity. Same downgrade for direct sweep() calls.
     let mut resume = opts.resume;
     if resume && mapfile_path.exists() {
         match mapfile::Mapfile::load(&mapfile_path) {
             Ok(existing) => {
-                // Identity first, and crucially BEFORE the unconditional
-                // set_vid/set_unit_keys overwrite further down: that overwrite
-                // stamps the CURRENT job's identity onto the loaded mapfile, so
-                // a check placed after it would compare a value against itself
-                // and never fire.
+                // Identity first, crucially BEFORE the unconditional set_vid/
+                // set_unit_keys overwrite below: that stamps the current job's
+                // identity onto the mapfile, so checking after never fires.
                 mapfile::check_mapfile_identity(&existing, disc)?;
                 if existing.total_size() != total_bytes {
                     tracing::info!(
@@ -1152,31 +1031,9 @@ pub fn sweep(
                     );
                     resume = false;
                 } else {
-                    // Inconsistent-resume guard. The mapfile claims prior
-                    // progress (some range past NonTried) but the ISO is
-                    // missing or zero-length — the ISO was deleted or
-                    // truncated while the mapfile survived (reachable via
-                    // autorip ResumeMode::Require). The producer only builds
-                    // work from NonTried ranges, so any Finished range would
-                    // never be re-read and would stay ZERO in the fresh ISO,
-                    // silently holed. Downgrade to a fresh full sweep (mirror
-                    // the total_size-mismatch case) so the rip self-heals.
-                    // The comment above says "missing OR TRUNCATED", but this
-                    // only ever tested for zero length, so an ISO truncated to
-                    // a non-zero length — a partial copy, a full disk, a
-                    // half-finished transfer — passed the guard and resumed.
-                    // The producer builds work only from NonTried ranges, so
-                    // every Finished range beyond the truncation point is
-                    // never re-read and stays a hole in the final image. Short
-                    // is as inconsistent as absent; compare against the size
-                    // the mapfile claims to describe.
-                    //
-                    // A metadata ERROR is likewise not a length. Treating it
-                    // as 0 silently threw away a good resume and re-ripped
-                    // hours of work on a transient stat failure.
-                    // Missing counts as zero here: an absent image is as
-                    // inconsistent with a mapfile claiming progress as an
-                    // empty one, and both self-heal the same way.
+                    // Inconsistent-resume guard: mapfile claims progress but the ISO is
+                    // missing/short (deleted, truncated, or a stat error misread as 0).
+                    // Producer only re-reads NonTried, so downgrade to a fresh sweep.
                     let image = image_state(path, existing.total_size())?;
                     let iso_len = image.len;
                     let claims_progress = existing.stats().bytes_pending != existing.total_size();
@@ -1193,13 +1050,9 @@ pub fn sweep(
                 }
             }
             Err(_) => {
-                // The mapfile exists but is corrupt / unparseable. Proceeding
-                // with resume=true would hand a garbage (or empty) mapfile to
-                // open_or_create and silently skip already-Finished ranges or
-                // mis-track progress. Downgrade to a fresh sweep — consistent
-                // with the total_size-mismatch branch above — so the `!resume`
-                // path below drops the corrupt mapfile and the rip restarts
-                // clean.
+                // Mapfile exists but is corrupt/unparseable. resume=true would hand
+                // garbage to open_or_create and mis-track progress; downgrade so the
+                // `!resume` path below drops it and the rip restarts clean.
                 tracing::info!(
                     "sweep: mapfile at {} is corrupt/unparseable; forcing fresh sweep",
                     mapfile_path.display(),
@@ -1209,46 +1062,26 @@ pub fn sweep(
         }
     }
     if !resume {
-        // A fresh sweep MUST start from an empty mapfile. If the stale file
-        // can't be removed, open_or_create would load it and the new disc
-        // would inherit the old Finished ranges → silently zero-filled ISO.
-        // ENOENT is fine (nothing to remove); any other error aborts.
+        // A fresh sweep MUST start from an empty mapfile: if the stale file survives,
+        // open_or_create loads it and the new disc inherits old Finished ranges →
+        // silently zero-filled ISO. ENOENT is fine; any other error aborts.
         stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
     }
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(|e| Error::IoError { source: e })?;
 
-    // Persist the disc's decryption state into the mapfile header so it
-    // survives to deferred-mux / resume. ddrescue-safe (comment lines);
-    // does not touch the ISO payload. KEYS XOR VID: a keyed disc writes its
-    // unit keys (the final answer — deferred-mux decrypts directly, no key
-    // service); an unresolved disc writes only the VID (the retry marker).
+    // Persist decryption state into the mapfile header (ddrescue-safe comment
+    // lines, no ISO payload touched) so it survives to deferred-mux/resume.
+    // KEYS XOR VID: a keyed disc writes unit keys; unresolved writes only VID.
     if !opts.unit_keys.is_empty() {
         map.set_unit_keys(&opts.unit_keys);
     } else if let Some(vid) = opts.vid {
         map.set_vid(vid);
     }
 
-    // ISO file: if resuming and mapfile has Finished ranges, open existing;
-    // otherwise create fresh and pre-size to total_bytes (sparse holes for
-    // non-tried regions).
-    //
-    // `is_regular` MUST be read from the OPEN file handle, not from
-    // `metadata(path)` — on a fresh rip the path does not exist yet, so a
-    // pre-create `metadata(path)` always fails (is_regular=false), which both
-    // skips the pre-size AND makes `SweepSink::close` swallow a real
-    // `sync_all()` failure on the just-written ISO as if it were /dev/null.
-    // A metadata ERROR is not "the file is empty". Collapsing the two with
-    // unwrap_or(false) meant a transient stat failure on a populated ISO —
-    // an EIO from a flaky USB/NFS staging volume, a momentary permissions
-    // problem — fell through to the create-and-truncate branch below and
-    // permanently zeroed bytes the mapfile still records as Finished. A
-    // resume would then never re-read them, because the producer only builds
-    // work from NonTried ranges. Silent, total loss of the recovered data.
-    //
-    // NotFound is the one error that genuinely means "no file yet" (the
-    // fresh-rip case). Anything else is unknown, and destroying data on an
-    // unknown is not a decision this code gets to make.
+    // ISO file: resume + Finished ranges opens existing; otherwise creates fresh,
+    // pre-sized to total_bytes. `is_regular` MUST come from the open handle, not a
+    // pre-create `metadata(path)` stat error, which unwrap_or(false) would truncate.
     let existing_len = match iso_len_from_metadata(std::fs::metadata(path))? {
         IsoLen::Missing => None,
         IsoLen::Len(n) => Some(n),
@@ -1270,59 +1103,34 @@ pub fn sweep(
         (f, reg)
     };
 
-    // Wrap the raw `File` in our bounded-cache `WritebackFile`
-    // (drains dirty pages continuously instead of bursting; see
-    // `libfreemkv::io`). The `WritebackFile` moves into the consumer
-    // thread.
+    // Wrap the raw `File` in our bounded-cache `WritebackFile` (drains dirty
+    // pages continuously instead of bursting; see `libfreemkv::io`). It moves
+    // into the consumer thread.
     let file =
         libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
     let mut batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
-    // AACS unit alignment for a DECRYPTING sweep. AACS aligned units are 3
-    // sectors (6144 bytes); `decrypt_sectors` anchors units at buffer offset
-    // 0, so every read handed to the decrypting reader MUST start on a unit
-    // boundary AND span a whole number of units — otherwise units straddle
-    // batch/region boundaries and decrypt under the wrong CBC/unit alignment
-    // (the verify-gate then leaves content encrypted or aborts DecryptFailed).
-    //
-    // ecc_sectors() is 32 for UHD/BD, which is NOT a multiple of 3, so the
-    // default batch would start every batch-after-the-first mid-unit. Round
-    // the batch UP to the next multiple of 3 (32 → 33) when this sweep both
-    // decrypts and is AACS-keyed. Region read-starts are aligned DOWN to a
-    // unit boundary in the loop below; a fresh sweep starts at LBA 0 (already
-    // aligned), so alignment only bites on resume NonTried regions.
+    // AACS unit alignment for a decrypting sweep: units are 3 sectors and must
+    // start/span whole units or decrypt under the wrong CBC alignment. ecc_sectors()=32
+    // isn't a multiple of 3, so round batch up (32→33); region starts align down below.
     batch = aacs_aligned_batch(batch, decrypt_is_aacs);
 
-    // Pre-compute the list of NonTried regions before handing the
-    // mapfile to the consumer thread. Each region is processed by
-    // the producer in order; the consumer mutates the mapfile per
-    // work-item. Any regions left as NonTrimmed/Unreadable after
-    // sweep finishes are the patch pass's job.
+    // Pre-compute NonTried regions before handing the mapfile to the consumer
+    // thread. Producer processes them in order; consumer mutates the mapfile
+    // per work-item. Regions left NonTrimmed/Unreadable are the patch pass's job.
     let regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
 
-    // Spawn the consumer. It owns WritebackFile + Mapfile; the producer
-    // (this thread) keeps `reader`, `read_ctx`, halt + set_speed.
-    // The thread name is preserved from the 0.17.x sweep_pipeline so it
-    // stays identifiable in stack traces / `top -H`.
-    // Taken BEFORE `map` moves into the sink: if the teardown below has to
-    // abandon this consumer, that is the only way left to stop it writing
-    // its by-then-stale mapfile over a resumed pass's record.
+    // Spawn the consumer (owns WritebackFile + Mapfile; producer keeps reader/halt).
+    // `map_disown` is taken BEFORE `map` moves into the sink: it's the only way left
+    // to stop an abandoned consumer writing a stale mapfile over a resumed pass.
     let map_disown = map.disown_handle();
     let (sink, prog_rx) = SweepSink::new(file, map, is_regular);
     let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
         Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
 
-    // Halt token for the bounded sends below (`send_bounded`). `opts.halt` is
-    // the caller's Stop bit, adopted as-is so cancelling either view is the
-    // same bit; when the caller wires no halt, a fresh never-cancelled token
-    // keeps SEND_DEADLINE as the only bound on a handoff.
-    //
-    // Which callers those are: `multipass_rip` wires the job's Stop bit into
-    // BOTH of its Pass-1 routes (the single-pass `CopyOptions` and the
-    // multipass `SweepOptions`) as well as into every patch pass, and
-    // `extract` wires its own — so on every in-crate path a Stop DOES reach a
-    // parked producer. What is left is an external caller that constructs the
-    // options with `halt: None` and signals Stop only through its reporter.
+    // Halt token for `send_bounded` below: `opts.halt` is adopted as-is; with none
+    // wired, a never-cancelled token keeps SEND_DEADLINE as the only bound. Every
+    // in-crate caller wires a real Stop bit; only an external caller could omit one.
     let send_halt = opts
         .halt
         .clone()
@@ -1359,11 +1167,9 @@ pub fn sweep(
     let mut in_damage_zone = false;
     const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
     let mut cached_snapshot: Option<ProgressSnapshot> = None;
-    // Derived from `cached_snapshot.bad_ranges` + the main title ONLY, so they
-    // change exactly when a new snapshot lands — not once per batch. Computing
-    // them in the per-iteration reporter block re-ran `bytes_bad_in_title`
-    // (O(ranges x extents), twice: once directly and once inside
-    // `locate_ranges`) 400k-1.6M times per rip over a value that had not moved.
+    // Derived from `cached_snapshot.bad_ranges` + the main title only, changing
+    // exactly when a new snapshot lands — not once per batch. The old per-iteration
+    // recompute ran `bytes_bad_in_title` (O(ranges x extents)) up to 1.6M times/rip.
     let mut cached_main_title_bad: u64 = 0;
     let mut cached_located = libfreemkv::progress::LocatedProgress::default();
     let mut producer_err: Option<Error> = None;
@@ -1378,33 +1184,20 @@ pub fn sweep(
         "Disc::sweep entered (producer/consumer)"
     );
 
-    // Request the drive's max read speed for the whole sweep — removes
-    // riplock. BD/UHD get their speed from the drive unlock/init, but a
-    // DVD skips that path (the stock-mode gate, `Drive::disc_is_dvd`), so
-    // without this explicit SET CD SPEED a DVD rip sweeps at the drive's
-    // default (riplocked) speed. The damage-recovery branch below also
-    // re-asserts max speed after slowing on bad sectors; this sets it once
-    // up front so a clean disc never pays the riplock penalty.
+    // Request the drive's max read speed up front — removes riplock. BD/UHD get
+    // speed from drive unlock/init, but DVD skips that path, so without this SET CD
+    // SPEED a DVD sweeps riplocked. The damage branch below also re-asserts it later.
     reader.set_speed(0xFFFF);
 
     'outer: for (region_pos, region_size) in regions {
-        // Snap to whole sectors before the range becomes a read/write cursor.
-        // Mapfile ranges are BYTE ranges with no alignment guarantee (the
-        // format interoperates with ddrescue, whose `-b 512` emits
-        // 512-granular ranges), and an unaligned offset truncates to the wrong
-        // LBA and shifts real payload — which is then recorded Finished.
-        // `patch` has always snapped its ingress; this path did not, and the
-        // only alignment it had was gated on a decrypting AACS rip, a branch a
-        // multipass resume never takes because multipass implies raw.
+        // Snap to whole sectors before the range becomes a cursor: mapfile ranges
+        // are BYTE ranges (ddrescue `-b 512` interop), and an unaligned offset
+        // truncates to the wrong LBA and records shifted payload as Finished.
         let (region_pos, region_size) = snap_to_sectors(region_pos, region_size);
         let region_end = region_pos + region_size;
-        // AACS unit alignment: anchor the region's read cursor DOWN to the
-        // nearest 6144-byte unit boundary so the decrypting reader never gets
-        // a buffer that starts mid-unit. Re-reading the few already-covered
-        // head sectors is idempotent (they re-decrypt identically and the
-        // consumer overwrites the same ISO offsets / mapfile ranges). A fresh
-        // sweep's NonTried region starts at 0, already unit-aligned; this only
-        // shifts resume regions that begin mid-unit.
+        // AACS unit alignment: anchor the cursor DOWN to the nearest 6144-byte unit
+        // boundary so the decrypting reader never starts mid-unit. Re-reading the few
+        // already-covered head sectors is idempotent; only resume regions are shifted.
         let mut pos = if decrypt_is_aacs {
             aacs_aligned_region_start(region_pos, true)
         } else {
@@ -1428,23 +1221,18 @@ pub fn sweep(
             }
 
             let block_bytes = (region_end - pos).min(batch as u64 * 2048);
-            // The region's LAST block is `region_end - pos`, and `region_end` is
-            // only sector-snapped — so on a decrypting AACS sweep it is the one
-            // read that can end mid-unit. Widen the physical read (never the
-            // accounting) out to whole units. Fits `buf`: the widened value is
-            // at most `batch * 2048` rounded up to a unit, and `batch` is
-            // already a whole number of units (`aacs_aligned_batch`).
+            // The region's last block can end mid-unit on a decrypting AACS sweep
+            // (region_end is only sector-snapped). Widen the physical read (never
+            // accounting) to whole units; fits `buf` since `batch` is unit-aligned.
             let read_bytes =
                 aacs_aligned_read_bytes(pos, block_bytes, total_bytes, decrypt_is_aacs);
             let block_lba = (pos / 2048) as u32;
             let block_count = (read_bytes / 2048) as u16;
             let recovery = !opts.skip_on_error;
 
-            // `require_full_read`, not a bare `Ok(_)`: `buf` is reused across
-            // every iteration of this loop, so a short transfer would put the
-            // PREVIOUS block's tail into the `WorkItem::Good` payload below and
-            // write it to the ISO as recovered data. Routed into the Err arms
-            // instead, where it becomes a normal read failure.
+            // `require_full_read`, not a bare `Ok(_)`: `buf` is reused each iteration,
+            // so a short transfer would put the PREVIOUS block's tail into `Good` and
+            // write it as recovered data. Routed into the Err arms instead.
             let read_result = require_full_read(
                 reader.read_sectors(
                     block_lba,
@@ -1477,10 +1265,8 @@ pub fn sweep(
                     // bridge_degradation_count is reset inside on_success()
                     // (called above); no separate reset needed here.
 
-                    // Plaintext: the wrapped reader (DecryptingSectorSource)
-                    // applied AACS / CSS in-place during read_sectors above.
-                    // The consumer thread sees decrypted bytes; the
-                    // pre-0.18 inline decrypt_sectors call lived here.
+                    // Plaintext: the wrapped DecryptingSectorSource applied AACS/CSS
+                    // in-place during read_sectors above; consumer sees decrypted bytes.
 
                     // Move the batch into the channel via fresh
                     // owned Vec. The producer's `buf` is reused
@@ -1579,11 +1365,9 @@ pub fn sweep(
                                 );
                             }
 
-                            // Saturating throughout — the read_error side
-                            // computes the sector count with saturating_mul as
-                            // "defence in depth"; honor the same guarantee at
-                            // the consuming multiply/add so a pathological jump
-                            // distance can't wrap.
+                            // Saturating throughout: read_error computes sector count
+                            // with saturating_mul as "defence in depth"; honor the same
+                            // guarantee here so a pathological jump distance can't wrap.
                             let jump_pos = pos
                                 .saturating_add(block_bytes)
                                 .saturating_add(sectors.saturating_mul(2048))
@@ -1650,10 +1434,8 @@ pub fn sweep(
             if iter_count - last_log_iter >= 100 || time_due {
                 last_log_iter = iter_count;
                 last_log_time = std::time::Instant::now();
-                // Promoted trace -> debug ("no silent hangs"): the sweep
-                // heartbeat must be visible at the standard debug level, not
-                // only the trace firehose. Carries lba/pos/region_end and
-                // bytes_good when a consumer snapshot is available.
+                // Promoted trace -> debug ("no silent hangs"): the heartbeat must be
+                // visible at the standard debug level, not only the trace firehose.
                 let lba = (pos / 2048) as u32;
                 if let Some(ref snap) = cached_snapshot {
                     tracing::debug!(
@@ -1684,46 +1466,20 @@ pub fn sweep(
                         "Disc::sweep inner iter"
                     );
                 }
-                // Throttled stats refresh request — best-effort
-                // try_send so a busy consumer doesn't stall the
-                // producer; the cached snapshot stays current
-                // enough for one more iteration.
+                // Throttled stats refresh — best-effort try_send so a busy consumer
+                // doesn't stall the producer; the cached snapshot stays good enough.
                 let _ = pipe.try_send(WorkItem::StatsRequest);
             }
 
             if let Some(reporter) = opts.progress {
-                // Use the latest consumer snapshot if we have one; otherwise
-                // synthesise a producer-side placeholder from the two producer
-                // counters.
-                //
-                // This comment used to say `bytes_good ≈ bytes_done` was "close
-                // enough for an early UI tick". It was not: `bytes_done` is a
-                // POSITION and advances across skipped and zero-filled blocks,
-                // so on a damaged disc that approximation reported zero-fills
-                // as recovered bytes. Good is recovery-only now, and the
-                // leftover (done minus good) is this pass's damage — see the
-                // partition built below. The bad-range LIST is still empty
-                // until the first snapshot lands; that part was always true.
+                // Use the latest consumer snapshot if present, else synthesise from the
+                // two producer counters. `bytes_good` is recovery-only, NOT `bytes_done`
+                // (a position advancing over skipped/zero-fills too, once conflated).
                 let main_title = disc.titles.first();
                 let main_title_bad = cached_main_title_bad;
-                // The consumer's snapshot is the source of truth for
-                // bytes_unreadable / bytes_pending (the producer doesn't
-                // see them), but its bytes_good lags what the producer has
-                // already sent whenever the consumer is behind on draining
-                // the work channel. Take the max so the user-visible
-                // counter never regresses below that — Anomaly B in the
-                // 0.18.1 prod test was this regression: a stale early
-                // snapshot pinned the display to 0 GB while the producer
-                // was already advancing.
-                //
-                // The floor is `bytes_good_done`, NOT `bytes_done`. Both used
-                // to be the same variable, and it advances on the three damage
-                // paths too (SkipBlock, JumpAhead's failed block, the jump's
-                // zero-filled gap), so on a disc the sweep was skipping across
-                // this reported zero-filled bytes as RECOVERED bytes — a rip
-                // losing data while the counter that exists to measure loss
-                // climbed. Position still drives `work_done` and the pending
-                // remainder below; only "good" is now recovery-only.
+                // Consumer snapshot is truth for unreadable/pending, but bytes_good lags
+                // the producer when consumer is behind — take the max so display never
+                // regresses. Floor is `bytes_good_done`, not `bytes_done` (damage paths).
                 let (bytes_good, bytes_unreadable, bytes_pending, bytes_retryable) =
                     match &cached_snapshot {
                         Some(snap) => (
@@ -1732,21 +1488,9 @@ pub fn sweep(
                             snap.stats.bytes_pending,
                             snap.stats.bytes_retryable,
                         ),
-                        // No snapshot yet: derive the partition from the two
-                        // producer counters instead of leaving a hole. Bytes
-                        // that are DONE but not GOOD are this pass's damage —
-                        // skipped blocks, a failed block, a jump's zero-filled
-                        // gap — and the sweep records them NonTrimmed, i.e.
-                        // retryable, not yet promoted to unreadable.
-                        //
-                        // Reporting them in no bucket at all was the same
-                        // defect this branch was last edited to fix, moved one
-                        // field along: `good` stopped counting zero-fills, but
-                        // `pending` is position-derived and `bytes_done`
-                        // advances on the damage paths, so the damage fell out
-                        // of the totals entirely. The four must partition the
-                        // disc, so a UI cannot show a rip losing data while
-                        // every counter that measures loss reads clean.
+                        // No snapshot yet: derive the partition from the two producer
+                        // counters. Done-but-not-good bytes are this pass's damage
+                        // (skip/fail/zero-fill); they must land in a bucket, not vanish.
                         None => (
                             bytes_good_done,
                             0u64,
@@ -1780,31 +1524,18 @@ pub fn sweep(
         }
     }
 
-    // Producer side is done. Drop the channel and let the
-    // consumer drain whatever's still in flight, then run its
-    // close() (drain writeback, fsync, mapfile.flush) and return
-    // the final stats. On consumer panic `finish_bounded` returns
-    // the wrapped panic message via Error::IoError — same shape
-    // the previous `consumer_handle.join().map_err(...)` produced.
-    //
-    // Bounded by the SAME halt the sends above use. A plain
-    // `Pipeline::finish` here undid the point of `send_bounded`: it got the
-    // producer out from under a stalled consumer, and then this line blocked
-    // joining that same consumer, so Stop still never returned.
+    // Producer is done; let the consumer drain and run close() (writeback, fsync,
+    // mapfile.flush). Bounded by the SAME halt the sends above use — a plain
+    // `Pipeline::finish` would re-block on the stalled consumer, so Stop never returns.
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
 
     // Producer-side error wins over consumer-side (the read failure
     // is what motivated quitting; the consumer's flush error, if
     // any, is downstream).
     if let Some(e) = producer_err {
-        // The producer error is returned, so the consumer's result is
-        // dropped here — but do NOT let a consumer close() failure vanish
-        // silently on the both-failed path: it is the only signal that the
-        // mapfile on disk is now untrustworthy. Log it before dropping,
-        // mirroring the patch path's `patch.finish.dropped` branch. (The old
-        // comment claimed this line "propagated" the consumer panic; it never
-        // did — `let _ = summary` discards it. Surfacing it in the log is what
-        // that claim was reaching for.)
+        // Producer error is returned, dropping the consumer's result — but do NOT
+        // let a consumer close() failure vanish silently: it's the only signal the
+        // mapfile on disk is untrustworthy. Log it, mirroring `patch.finish.dropped`.
         if let Err(close_err) = &summary {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -1832,12 +1563,9 @@ pub fn sweep(
         "Disc::sweep returning"
     );
 
-    // End-of-pass diagnostic summary (added 2026-05-10 alongside
-    // the per-error timing instrumentation in read_error.rs).
-    // One INFO line per sweep that lets a post-mortem analyst tell
-    // at a glance how much damage the disc + drive saw, without
-    // grepping through the per-error WARN log. The PassSummary
-    // counters come from `ReadCtx`'s accumulated state.
+    // End-of-pass diagnostic: one INFO line per sweep letting a post-mortem
+    // analyst see disc/drive damage at a glance without grepping the per-error
+    // WARN log. Counters come from `ReadCtx`'s accumulated state.
     let pass_sum = read_ctx.pass_summary();
     tracing::info!(
         target: "freemkv::disc",
@@ -1933,7 +1661,7 @@ impl CopyResult {
     }
 }
 
-/// Options for [`sweep`] (Pass 1 / forward sequential pass).
+/// Options for [`sweep()`] (Pass 1 / forward sequential pass).
 ///
 /// Named `Disc::sweep` before 1.6.0, when recovery moved out of libfreemkv
 /// and the receiver became a `&Disc` argument.
@@ -1955,7 +1683,7 @@ pub struct SweepOptions<'a> {
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
 }
 
-/// Options for [`patch`] (Pass N retry pass over bad ranges).
+/// Options for [`patch()`] (Pass N retry pass over bad ranges).
 pub struct PatchOptions<'a> {
     pub decrypt: bool,
     /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only
@@ -2015,7 +1743,7 @@ impl<'a> PatchOptions<'a> {
     }
 }
 
-/// Result returned by [`patch`].
+/// Result returned by [`patch()`].
 pub struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,
@@ -2123,10 +1851,8 @@ mod section_recover;
 mod sweep;
 
 // The mapfile-backed main-title bad-byte reader, used by the multipass
-// abort-on-loss gate (the same figure the CLI/autorip abort gate reads). `pub`
-// so the engine can re-export it: a front-end computing "how much of the main
-// title is bad" after a rip reads it here rather than the (now-removed)
-// libfreemkv method.
+// abort-on-loss gate. `pub` so the engine can re-export it: a front-end reads
+// it here rather than the (now-removed) libfreemkv method.
 pub use patch::bytes_bad_in_title_from_mapfile;
 
 /// One-shot progress snapshot built from a mapfile on disk plus the title.
@@ -2207,13 +1933,9 @@ mod snap_tests {
             start.checked_add(len).is_some(),
             "snapped range wrapped past u64::MAX: start={start} len={len}"
         );
-        // The returned length must ALWAYS be a whole number of sectors — the
-        // invariant every recovery handler's `count = len / SECTOR` depends
-        // on. The true final sector here runs past `u64::MAX` and cannot be
-        // represented, so the only whole-sector-respecting answer is 0, not
-        // the 2047-byte partial sector the old saturate-the-end-only fix
-        // produced (which silently truncated to a 0-sector read reported as
-        // a successful recovery).
+        // Length must ALWAYS be a whole number of sectors (every handler's `count
+        // = len / SECTOR` depends on it). The true final sector runs past u64::MAX
+        // and can't be represented, so 0 is the only whole-sector-respecting answer.
         assert_eq!(
             len % 2048,
             0,
@@ -2932,10 +2654,9 @@ mod finish_bounded_tests {
             "the clean path must return the consumer's summary unchanged"
         );
 
-        // (b) Halt RAISED, consumer healthy — the common Stop. The halt must
-        // not cost the caller its summary: `finish_with_halt` checks
-        // `is_finished()` before it checks the halt, so a consumer that is
-        // coming back is still joined normally.
+        // (b) Halt RAISED, consumer healthy — the common Stop. Must not cost the
+        // caller its summary: `finish_with_halt` checks `is_finished()` before the
+        // halt, so a consumer that's coming back is still joined normally.
         let pipe =
             Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, CountingSink(0)).expect("spawn");
         let halt = Halt::new();
@@ -3037,10 +2758,9 @@ mod tests {
     fn aacs_region_start_anchors_down_to_a_unit_boundary() {
         let unit = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64; // 6144
 
-        // EXACT expected values. Properties alone are not enough: an
-        // implementation that always returned 0 would satisfy "is unit
-        // aligned" and "moved down" while silently discarding every byte of
-        // resume progress.
+        // EXACT expected values: properties alone aren't enough, since an impl
+        // that always returned 0 would satisfy "aligned"/"moved down" while
+        // silently discarding every byte of resume progress.
         for (pos, want) in [
             (0u64, 0u64),
             (2048, 0),

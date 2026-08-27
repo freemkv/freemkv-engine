@@ -245,16 +245,9 @@ impl Default for SpeedEstimator {
 #[cfg(test)]
 mod tests {
 
-    // ── Mutation-testing gaps ──────────────────────────────────────────────
-    //
-    // A mutation run over this crate found `sample` could be replaced wholesale
-    // with a constant — `(0, None)`, `(1, Some(1))`, and four other variants —
-    // without a single test failing. `sample` is the entry point
-    // `ProgressBridge` calls on every progress tick, so the one function every
-    // front-end's speed and ETA flows through was unverified. The boundary
-    // comparisons below were equally unpinned: `<` could become `<=` or `==` in
-    // `display_window_secs`, `observe`, `eta_speed_mbs` and `sample_at` with no
-    // effect on the suite.
+    // ── Mutation-testing gaps: a run found `sample` could be replaced wholesale
+    // with a constant without a test failing, and boundary comparisons
+    // (`<` -> `<=`/`==`) across this module's functions were unpinned.
 
     /// `sample_at` must report real throughput, not a constant.
     ///
@@ -326,15 +319,9 @@ mod tests {
         assert_eq!(display_window_secs(0.0), STATIC_WINDOW_SECS);
         assert_eq!(display_window_secs(59.9), STATIC_WINDOW_SECS);
 
-        // AT 60.0 the growth phase begins, and its term is zero there, so the
-        // value is the static window either way.
-        //
-        // The mutation run flagged `<` -> `<=` here as surviving. It is an
-        // EQUIVALENT MUTANT, not a coverage gap: with `<` the else-if computes
-        // t = 0 and yields STATIC_WINDOW_SECS + (MAX - STATIC) * 0, which is
-        // STATIC_WINDOW_SECS — exactly what `<=` returns directly. No input can
-        // tell them apart, so no test can kill it. Recorded here so the next
-        // person reading the survivor list does not spend the afternoon trying.
+        // AT 60.0 the growth phase begins with a zero term, so either operator
+        // yields STATIC_WINDOW_SECS. The `<` -> `<=` mutant here is EQUIVALENT,
+        // not a coverage gap — recorded so nobody chases it again.
         assert_eq!(
             display_window_secs(STATIC_PHASE_SECS),
             STATIC_WINDOW_SECS,

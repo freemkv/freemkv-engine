@@ -77,12 +77,12 @@ impl Outcome {
 pub struct KeyStatus {
     /// Whether usable decryption keys were resolved for the selected content.
     pub resolved: bool,
-    /// Where the keys came from, if resolved (keydb / online / mapfile / …).
+    /// Where the keys came from, if resolved (keydb / derived / external / CSS / …).
     pub origin: Option<libfreemkv::KeyOrigin>,
     /// Number of entries in the loaded keydb, if one was found.
     pub keydb_entries: Option<usize>,
     /// A stable, front-end-localizable summary key describing the state
-    /// (e.g. `"no-keydb"`, `"resolved-keydb"`, `"resolved-online"`). Never a
+    /// (e.g. `"no-keydb"`, `"resolved-keydb"`, `"resolved-external"`). Never a
     /// pre-rendered English sentence — front-ends map it.
     pub summary: String,
 }

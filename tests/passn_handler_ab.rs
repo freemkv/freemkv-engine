@@ -269,11 +269,8 @@ fn run_profile(
 }
 
 // ─────────────────────────── Profile 1: CLEAN ────────────────────────────
-//
-// The NonTrimmed range has zero scripted failures — every read succeeds.
-// Patch should march through the range and mark it Finished. Validates
-// the happy-path side of the failure-handler dispatch (it shouldn't
-// fire at all).
+// Zero scripted failures: patch marches through and marks Finished.
+// Validates the happy-path side of the failure-handler dispatch.
 
 #[test]
 fn profile_01_clean_all_recoverable() {
@@ -320,12 +317,8 @@ fn profile_01_clean_all_recoverable() {
 }
 
 // ─────────────────────────── Profile 2: ALL MEDIUM ───────────────────────
-//
-// Every LBA in the NonTrimmed range returns MEDIUM_ERROR every attempt.
-// The handler chain works the section down to single-sector reads, every
-// handler in turn fails to recover anything, each one returns `Remaining`
-// when its deadline passes, and the remaining bytes stay NonTrimmed (NEVER
-// marked Unreadable inside a single pass — 2026-05-11 design call).
+// Every LBA in the range returns MEDIUM_ERROR every attempt. The handler
+// chain fails to recover; bytes stay NonTrimmed, not Unreadable (2026-05-11).
 
 #[test]
 fn profile_02_all_medium_error() {
@@ -375,12 +368,9 @@ fn profile_02_all_medium_error() {
         "02_all_medium bytes_pending (NonTrimmed retained across passes)"
     );
     assert!(!pr.halted, "02_all_medium halted");
-    // Upper bound: every sector probed individually + a few batch-drop
-    // and skip-escalation attempts, PLUS scatter-recovery on each hard
-    // single sector (up to SCATTER_MAX_ATTEMPTS fresh tries, each a
-    // recalibration read + a re-read = +6 reads/sector). Still strictly
-    // bounded — the guard exists to catch an UNBOUNDED retry loop, which
-    // would be in the hundreds.
+    // Upper bound: per-sector probes + batch-drop/skip-escalation attempts
+    // + scatter-recovery retries per hard sector. Guards against an
+    // UNBOUNDED retry loop, which would be in the hundreds.
     assert!(
         trace_len <= 200,
         "02_all_medium trace_len={trace_len} exceeds 200"
@@ -388,10 +378,8 @@ fn profile_02_all_medium_error() {
 }
 
 // ───────────────────── Profile 3: ALTERNATING GOOD/BAD ───────────────────
-//
-// LBAs 100, 102, 104, ... bad; odd LBAs good. Validates that good
-// sectors interleaved with bad get recovered individually after the
-// adaptive split (batch-fail → count=1 → per-sector probe).
+// LBAs 100, 102, 104, ... bad; odd LBAs good. Validates that good sectors
+// interleaved with bad recover individually after the adaptive split.
 
 #[test]
 fn profile_03_alternating_good_bad() {
@@ -423,11 +411,9 @@ fn profile_03_alternating_good_bad() {
         trace,
     );
 
-    // GOLDEN: 8 good sectors interleaved should mostly be Finished;
-    // 8 bad stay NonTrimmed. Allow 2 sectors of slop for the actual
-    // bisect cursor advance — converging on alternating bad/good in
-    // a single pass isn't always exact at boundaries with the
-    // size-aware skip cap.
+    // GOLDEN: 8 good sectors interleaved should mostly be Finished; 8 bad
+    // stay NonTrimmed. Allow 2 sectors of slop — the bisect cursor doesn't
+    // always converge exactly at boundaries with the size-aware skip cap.
     let good_total = stats.bytes_good;
     let baseline_good = (capacity_sectors as u64 - 16) * 2048;
     let middle_recovered = good_total - baseline_good;
@@ -446,10 +432,9 @@ fn profile_03_alternating_good_bad() {
         "03_alternating expected NonTrimmed remainder, got bytes_pending=0"
     );
     assert!(!pr.halted, "03_alternating halted");
-    // Efficiency guard (catches runaway, not the tier-2 roster). The 8
-    // permanently-bad sectors are now additionally probed by the tier-2
-    // marginal specialists (SlowSpin/FuaRetry/SlowFua/CachePrime/Oscillate/
-    // SpeedSweep) before being left NonTrimmed — bounded, finite extra reads.
+    // Efficiency guard (catches runaway, not the tier-2 roster). The 8 bad
+    // sectors are additionally probed by the tier-2 marginal specialists
+    // before being left NonTrimmed — bounded, finite extra reads.
     assert!(
         trace_len <= 220,
         "03_alternating trace_len={trace_len} exceeds 220"
@@ -457,11 +442,8 @@ fn profile_03_alternating_good_bad() {
 }
 
 // ───────────────────── Profile 4: EDGE-BAD (size-aware-skip canon) ───────
-//
-// Bad at start (100..104), good middle (104..112), bad at end (112..116).
-// This is the size-aware-skip canonical case. The middle good sectors
-// MUST be recovered — pre-fix patch would skip-escalate across the
-// whole range and miss them.
+// Bad at start, good middle, bad at end — the size-aware-skip canonical
+// case. Middle good sectors MUST be recovered, not skip-escalated over.
 
 #[test]
 fn profile_04_edge_bad_good_middle() {
@@ -523,10 +505,8 @@ fn profile_04_edge_bad_good_middle() {
 }
 
 // ───────────────────── Profile 5: SINGLE BAD SECTOR ──────────────────────
-//
-// 1 bad sector in the middle of an otherwise good 16-sector NonTrimmed
-// range. Validates the common "stochastic miss in Pass 1, easily picked
-// up in Pass N" scenario.
+// 1 bad sector amid an otherwise good 16-sector range. Validates the
+// common "stochastic miss in Pass 1, easily picked up in Pass N" case.
 
 #[test]
 fn profile_05_single_bad_sector() {
@@ -573,11 +553,8 @@ fn profile_05_single_bad_sector() {
 }
 
 // ───────────────────── Profile 6: DEEP PIT ───────────────────────────────
-//
-// A contiguous 8-sector bad pit in the middle of a wider 24-sector
-// NonTrimmed range. Tests the handler chain converging on the actual pit
-// boundaries — recovering everything either side of it — instead of
-// abandoning the whole range once it hits the pit.
+// An 8-sector bad pit inside a wider 24-sector range. Tests the handler
+// chain converging on the pit boundaries instead of abandoning the range.
 
 #[test]
 fn profile_06_deep_pit() {
@@ -623,10 +600,9 @@ fn profile_06_deep_pit() {
         "06_deep_pit bytes_pending expected > 0"
     );
     assert!(!pr.halted, "06_deep_pit halted");
-    // Bounded as in profile 02: the deep pit's hard single sectors each get
-    // scatter-recovery (up to SCATTER_MAX_ATTEMPTS recalibrate + re-read
-    // tries) on top of the baseline probe/skip walk. Still bounded — a
-    // runaway loop would be in the hundreds.
+    // Bounded as in profile 02: the pit's hard single sectors each get
+    // scatter-recovery on top of the baseline probe/skip walk. A runaway
+    // loop would be in the hundreds.
     assert!(
         trace_len <= 180,
         "06_deep_pit trace_len={trace_len} exceeds 180"
@@ -634,14 +610,8 @@ fn profile_06_deep_pit() {
 }
 
 // ───────────────────── Profile 7: MEDIUM-THEN-GOOD ───────────────────────
-//
-// First N attempts at each bad LBA fail with MEDIUM_ERROR, then succeed.
-// Tests whether patch's retry semantics revisit failed sectors. Current
-// patch dispatches NonTrimmed on first failure and ADVANCES the cursor
-// — it does NOT retry the same LBA inside one pass for MEDIUM_ERROR
-// (only NOT_READY retries in-place). So the goldens here are: bad
-// sectors stay NonTrimmed in this pass (the recovery would happen in a
-// subsequent pass, which this single-pass fixture does not run).
+// Each bad LBA fails with MEDIUM_ERROR N times, then succeeds. Tests
+// whether the handler chain revisits failed sectors within one pass.
 
 #[test]
 fn profile_07_medium_then_good() {
@@ -682,14 +652,9 @@ fn profile_07_medium_then_good() {
         trace,
     );
 
-    // GOLDEN (handler-chain engine): with the script "fail, fail, ok" per bad
-    // sector, each bad sector needs three reads to recover. The chain re-reads a
-    // sector across successive handlers — linear reverse/forward (each narrows a
-    // failed batch to per-sector reads) then bisect — so every sector in the
-    // cluster is read enough times to consume its two failing steps and reach
-    // the Ok step WITHIN one pass. So all 256 sectors recover here; none defer.
-    // (The old batch-halving loop reached only 254; the chain is strictly
-    // better because more handlers re-touch each sector.)
+    // GOLDEN: with script "fail, fail, ok" per bad sector, the handler
+    // chain re-reads each sector enough times to consume both failures
+    // and reach Ok within one pass — all 256 sectors recover; none defer.
     assert_eq!(
         stats.bytes_good,
         256 * 2048,
@@ -712,18 +677,8 @@ fn profile_07_medium_then_good() {
 }
 
 // ───────────────────── Profile 8: BATCHED-FAIL ONLY ──────────────────────
-//
-// LBA 108 fails on BATCH reads (any batch including it) but succeeds
-// individually. Models a marginal sector that the drive can ECC-recover
-// when read alone but not at multi-sector throughput. Validates that
-// adaptive batch's drop-to-count=1 retries the same starting position
-// and rescues the data.
-//
-// Implementation note: the scripted reader marks the entire batch failed
-// on any failed sector. We can't easily differentiate "single vs batch"
-// without bigger plumbing — so this profile uses a script that fails
-// once then succeeds on retry at the same LBA, simulating "drive
-// recovered after retry."
+// LBA 108 fails on batch reads but succeeds individually. Script fails
+// once then succeeds on retry, simulating drop-to-count=1 recovery.
 
 #[test]
 fn profile_08_batch_fail_singles_ok() {
@@ -774,24 +729,8 @@ fn profile_08_batch_fail_singles_ok() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-//
-// Sense-family error paths in `patch`: NOT_READY-then-recover,
-// HARDWARE_ERROR, ILLEGAL_REQUEST, and ABORTED_COMMAND.
-//
-// These drive `freemkv_engine::patch(&disc, ...)` DIRECTLY rather than through `run_profile`
-// (which drives `copy`, whose SWEEP path really sleeps on NOT_READY /
-// wedge cooldowns via `sleep_secs_or_halt`). The patch handler chain itself
-// uses an injectable deadline clock (`Instant::now` in production) and never
-// `thread::sleep`s, so these paths run at full speed with no wall-time cost —
-// the earlier "sleeps aren't injectable" suppression only ever applied to the
-// copy/sweep driver, not to patch.
-//
-// The load-bearing invariant asserted across every PERSISTENT failure sense is
-// the recovery contract: a patch pass NEVER promotes a sector to Unreadable
-// (the orchestrator does that only after the final pass) and NEVER silently
-// drops bytes — a still-bad sector stays NonTrimmed (pending), so
-// good + pending always conserves the total. Exact good/pending splits are
-// left loose so wedge-skip tuning can't spuriously fail these.
+// Sense-family error paths in `patch`, driven directly rather than via
+// `run_profile`/`copy`. Invariant: a pass never promotes to Unreadable or drops bytes.
 
 /// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
 /// range) patch pass with the given failure step and return the final map
@@ -962,18 +901,8 @@ fn patch_not_ready_then_recovers_fully() {
 }
 
 // ──────── Handler chain recovers re-readable sectors inside a bad block ────────
-//
-// A bad range holds one genuinely-dead sector surrounded by readable ones. The
-// handler chain's linear pass narrows a failed batch to per-sector reads, so it
-// recovers EVERY re-readable sector and leaves ONLY the dead sector NonTrimmed —
-// strictly better than the old fast-capture path, which left the whole failed
-// 32-block untouched. (The old `fast_capture` knob was removed: the handler
-// chain supersedes it. The breadth-first "fast on all ranges, then escalate"
-// ORDERING it once provided is a scheduling concern for the handler scheduler,
-// tracked separately.)
-//
-// The load-bearing invariant is unchanged: NO data is dropped. A still-bad
-// sector becomes NonTrimmed (pending, retried by a later pass), NEVER Unreadable.
+// A bad range holds one dead sector amid readable ones. The chain narrows to
+// per-sector reads, recovering the readable ones, leaving only the dead one pending.
 
 #[test]
 fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
@@ -1009,10 +938,9 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let stats = Mapfile::load(&map_path).unwrap().stats();
 
-    // The clean sectors of [128,192) all recover; only the one always-dead
-    // sector (LBA 130) stays NonTrimmed — NOT Unreadable. The chain narrows the
-    // failed batch to per-sector reads, so 63 of the 64 range sectors come back.
-    // Conservation: 255 good + 1 still-pending = the full 256, nothing lost.
+    // The clean sectors of [128,192) all recover; only the always-dead
+    // sector (LBA 130) stays NonTrimmed, not Unreadable. Conservation:
+    // 255 good + 1 still-pending = the full 256, nothing lost.
     assert_eq!(
         stats.bytes_unreadable, 0,
         "recovery must never mark Unreadable in a pass"
