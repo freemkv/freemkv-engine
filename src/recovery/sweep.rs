@@ -159,13 +159,9 @@ impl Sink<WorkItem> for SweepSink {
             }
             WorkItem::StatsRequest => {
                 let stats = self.map.stats();
-                // DAMAGE only — NOT NonTried. NonTried is the unread remainder
-                // ahead of the sweep head, not damage; including it made the live
-                // located drilldown (at-risk movie time + range count) treat the
-                // whole unread disc as confirmed damage, so at sweep start it
-                // showed ~full-movie at-risk and melted to 0 as the sweep
-                // progressed. Matches the one-shot progress path, which already
-                // excludes NonTried.
+                // DAMAGE only — NOT NonTried (unread remainder ahead of the
+                // sweep head): including it made the live drilldown treat the
+                // whole unread disc as damage at sweep start, melting to 0.
                 let bad_ranges = self
                     .map
                     .ranges_with(&crate::recovery::mapfile::damage_sector_statuses());
@@ -266,13 +262,9 @@ mod tests {
     fn a_skip_fill_writes_exactly_the_gap_and_records_exactly_the_gap() {
         let dir = scratch("skipfill");
         let gap_start = 4096u64;
-        // Two whole 64 KB chunks plus a short final one, so the chunking
-        // arithmetic runs three times with a partial tail. Sector-aligned
-        // because that is what a real `SkipFill` carries: the PRODUCER snaps
-        // every span with `snap_to_sectors` (`recovery/mod.rs`) before it ever
-        // reaches this sink. (`Mapfile::record`, which this comment used to
-        // blame for the widening, stores `pos`/`size` verbatim — it rounds
-        // nothing.)
+        // Two whole 64 KB chunks plus a short final one, so the chunking runs
+        // three times with a partial tail. Sector-aligned since the PRODUCER
+        // snaps every span via `snap_to_sectors` before reaching this sink.
         let len = ZERO_CHUNK as u64 * 2 + 3 * 2048;
         // Trailing slack wider than one chunk, so an overshooting fill has
         // somewhere visible to overshoot INTO.

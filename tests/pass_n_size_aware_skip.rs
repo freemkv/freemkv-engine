@@ -107,12 +107,9 @@ impl SectorSource for PatternedSectorReader {
                 });
             }
         }
-        // Fill each sector with ITS OWN LBA byte, not the starting LBA's
-        // byte. This matches real drive behavior: a multi-sector READ
-        // returns per-sector-correct data. Pre-0.18.13 only single-sector
-        // reads were exercised by patch tests, so the cheaper "fill the
-        // whole batch with one byte" worked; adaptive batching needs the
-        // per-sector pattern to verify correct positioning.
+        // Fill each sector with ITS OWN LBA byte (not the starting LBA's),
+        // matching real multi-sector READ behavior; adaptive batching needs
+        // the per-sector pattern to verify correct positioning.
         for (i, chunk) in buf.chunks_mut(SECTOR_SIZE).enumerate() {
             chunk.fill(((lba + i as u32) & 0xff) as u8);
         }
@@ -238,10 +235,9 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         })
         .sum();
 
-    // Allow 2 sectors (4 KB) of boundary slop — patch's bisection may
-    // not converge exactly on the good/bad boundary in a single pass,
-    // and that's acceptable. The pre-fix behaviour would have left the
-    // entire good middle as NonTrimmed (~0 bytes recovered).
+    // Allow 2 sectors (4 KB) of boundary slop — bisection may not converge
+    // exactly on the good/bad boundary in one pass. Pre-fix behaviour would
+    // have left the entire good middle NonTrimmed (~0 bytes recovered).
     let good_middle_bytes: u64 = 50 * 2048;
     let min_acceptable: u64 = good_middle_bytes - 2 * 2048;
 
@@ -273,16 +269,9 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     let capacity_sectors: u32 = 256;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
-    // The bound on this test used to be a watchdog THREAD that set `halt`
-    // after 20 s of wall clock. That made a slow runner indistinguishable from
-    // the regression: trip the watchdog and the run comes back `halted`, which
-    // is exactly the assertion below, so a busy CI box failed the test for
-    // reasons having nothing to do with busy-spinning. The bound belongs in
-    // WORK, not seconds — a loop that never advances issues reads without
-    // limit, so a read budget catches it just as surely and cannot be tripped
-    // by slowness. 512 reads against the 3 a healthy run of this 10-sector
-    // range needs — verified to arm: drop the budget to 1 and the run comes
-    // back halted and the assertion below fires.
+    // Bound this in WORK, not wall-clock seconds: a watchdog thread made a
+    // slow runner indistinguishable from the regression. A read budget catches
+    // an unbounded loop just as surely — 512 reads vs. the 3 a healthy run needs.
     const READ_BUDGET: u64 = 512;
 
     // Small NonTrimmed range that is entirely readable (no bad LBAs), so
@@ -304,11 +293,9 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     let nontrimmed = [(100 * 2048, 10 * 2048)];
     prep_iso_and_mapfile(&iso_path, total_bytes, &finished, &nontrimmed);
 
-    // Capture the pass label the operator would see. It is the one observable
-    // the clamp still drives end-to-end (`initial_batch_of().max(1)` → a
-    // 1-sector batch → SCRAPE); an unclamped `Some(0)` renders the same pass as
-    // a TRIM. Without this the test could not tell a clamped build from an
-    // unclamped one at all.
+    // Capture the pass label the operator would see: the clamp drives it
+    // end-to-end (`.max(1)` → 1-sector batch → SCRAPE); an unclamped
+    // `Some(0)` would render the same pass as a TRIM instead.
     #[derive(Default)]
     struct KindReporter {
         kinds: Mutex<Vec<libfreemkv::progress::PassKind>>,
@@ -347,10 +334,9 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
          budget; it issued {} reads",
         reads.len()
     );
-    // The direct signature of the regression: a zero-length read reads no
-    // sectors, so a loop sized off an unclamped `Some(0)` never advances its
-    // cursor. One of these in the trace is the busy-spin, caught by inspection
-    // rather than by how long the test happened to take.
+    // The direct signature of the regression: an unclamped `Some(0)` sizes
+    // reads at zero sectors, so the cursor never advances. Caught here by
+    // inspecting the trace, not by how long the test happened to take.
     assert!(
         reads.iter().all(|&(_, count)| count >= 1),
         "every read must cover at least one sector; trace = {reads:?}"
@@ -495,10 +481,9 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
     };
     let pr = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy returns Ok");
 
-    // Bytes_good_total should advance — the good LBAs in the bad range
-    // (205-249, 45 sectors) are all reachable via per-sector retry.
-    // Initial bytes_good = 200 * 2048 + (512-250) * 2048 = 462 sectors.
-    // After patch, bytes_good should be ≥ 462 + 45 = 507 sectors worth.
+    // bytes_good should advance: the good LBAs in the bad range (205-249,
+    // 45 sectors) are reachable via per-sector retry. Initial good = 462
+    // sectors; after patch it should be ≥ 462 + 45 = 507 sectors worth.
     let initial_good_sectors: u64 = 200 + (capacity_sectors as u64 - 250);
     let min_expected_good_bytes = (initial_good_sectors + 30) * 2048;
     assert!(
@@ -535,10 +520,9 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
         );
     }
 
-    // Verify the consumer wrote the producer's bytes at the right
-    // offsets. PatternedSectorReader fills each sector with `(lba & 0xff)
-    // as u8` — picking LBA 220 (well inside the recovered region) gives
-    // a clean signature byte to check.
+    // Verify the consumer wrote the producer's bytes at the right offsets:
+    // PatternedSectorReader fills each sector with `(lba & 0xff) as u8`, so
+    // LBA 220 (inside the recovered region) gives a clean signature to check.
     use std::io::{Read, Seek, SeekFrom};
     let mut iso = std::fs::File::open(&iso_path).unwrap();
     iso.seek(SeekFrom::Start(220 * 2048)).unwrap();

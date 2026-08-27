@@ -73,13 +73,9 @@ impl StreamChoice {
     pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
         let mut out = Vec::new();
         let _ = check_class(title, &self.audio, StreamClass::Audio, &mut out);
-        // BOTH sides, each against only its own streams. A caller asking for a
-        // forced language the disc does not carry used to be told nothing at
-        // all: the rip finished at exit 0 as though the request had been
-        // honoured, with that half of it silently dropped. The two sides are
-        // chosen independently, so a miss on one is not answered by a hit on
-        // the other, and `available` must not mix them or the correction it
-        // offers names tracks the user cannot have.
+        // BOTH sides, each against only its own streams: a forced-language miss
+        // used to go unreported, exiting 0 as though honoured. The sides are
+        // chosen independently, so `available` must not mix them together.
         let _ = check_class(
             title,
             &self.subtitles.normal,
@@ -187,15 +183,9 @@ fn check_class(
     let StreamFilter::Langs(tags) = sel else {
         return ClassVerdict::Unfiltered;
     };
-    // Keep EVERY stream of the class, including ones with an empty language tag.
-    // The distinction matters: "this title has no audio at all" is not a miss,
-    // but "this title has audio that carries no language tag" is — a language
-    // filter cannot match an untagged track, so the resolved selection keeps
-    // nothing. Filtering the empties out here made the two cases identical, so
-    // an untagged title returned early, reported no miss, and shipped a
-    // video-only file at exit 0 — the exact silent-loss this check exists to
-    // prevent. DVDs authored with zero language bytes hit it (libfreemkv emits
-    // `language: ""` for them).
+    // Keep EVERY stream, including empty-language-tag ones: "no audio" is not a
+    // miss, but "audio with no language tag" is (a filter can't match it).
+    // Filtering empties out made the two identical, shipping video-only at exit 0.
     let present: Vec<String> = class_languages(title, class);
     if present.is_empty() {
         // The title has no streams of this class at all — nothing to match, and
@@ -207,10 +197,9 @@ fn check_class(
         .iter()
         .any(|l| normalize_lang(l).is_some_and(|pl| wanted.contains(&pl)));
     if !any_match {
-        // Report an untagged track as "und" (ISO 639-2 undetermined) rather than
-        // as a blank, so the message reads "available audio: und" instead of
-        // trailing off — the user needs to see that tracks exist but carry no
-        // language, which is why their filter matched nothing.
+        // Report an untagged track as "und" (ISO 639-2 undetermined), not a
+        // blank, so the message reads "available audio: und" instead of
+        // trailing off, showing the tracks exist but carry no language.
         let mut available: Vec<String> = present
             .into_iter()
             .map(|l| if l.is_empty() { "und".to_string() } else { l })

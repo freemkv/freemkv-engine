@@ -258,10 +258,9 @@ fn copy_raw_aacs_no_key_proceeds() {
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .expect("--raw copy of an encrypted disc must proceed (the encrypted image is the goal)");
-    // The mirror of the blocked case above, which checks the ISO is EMPTY.
-    // `is_ok()` alone let a gate that over-fires into a silent no-op — return
-    // Ok having written nothing — pass as "proceeded". Proceeding means the
-    // whole image is on disk.
+    // Mirror of the blocked case above (checks the ISO is EMPTY). `is_ok()`
+    // alone let an over-firing gate silently no-op and still pass as
+    // "proceeded" — proceeding must mean the whole image is on disk.
     assert!(result.complete, "a clean raw copy completes");
     let produced = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(
@@ -272,11 +271,9 @@ fn copy_raw_aacs_no_key_proceeds() {
     assert_eq!(result.bytes_good, sectors as u64 * 2048);
 }
 
-// `/dev/null` is a POSIX character device and these three tests exist to
-// exercise exactly that: writing to a character device where `set_len` returns
-// ENODEV. Windows has no equivalent — NUL is not a character device with these
-// semantics — so the tests do not merely fail there, they have nothing to
-// assert. Gate them rather than pretend the coverage is cross-platform.
+// `/dev/null` is a POSIX character device; these three tests exercise writing
+// to it where `set_len` returns ENODEV. Windows has no equivalent, so these
+// tests are gated to unix rather than pretend the coverage is cross-platform.
 #[cfg(unix)]
 #[test]
 fn sweep_to_dev_null_real() {
@@ -300,12 +297,9 @@ fn sweep_to_dev_null_real() {
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
         .expect("sweep to /dev/null must not fail with ENODEV");
-    // `is_ok()` alone constrained nothing — the identical fixture on a regular
-    // file (`sweep_to_dev_null_no_enodev`) was upgraded past that and this one,
-    // the test that actually exercises the character-device destination, was
-    // left behind. A `copy` that returned Ok having read nothing passed it.
-    // The accounting must be the SAME as on a regular file: the sink swallows
-    // the bytes, it does not excuse the bookkeeping.
+    // `is_ok()` alone constrained nothing; this is the character-device
+    // sibling of `sweep_to_dev_null_no_enodev`. Accounting must match a
+    // regular file: the sink swallows bytes, it does not excuse bookkeeping.
     assert!(
         !result.complete,
         "a disc with unreadable sectors is not complete, sink notwithstanding"
@@ -402,11 +396,9 @@ fn sweep_marks_bad_region_nontrimmed_and_engages_damage_jump() {
         "NonTrimmed must begin at the failed ECC batch (LBA 320)"
     );
 
-    // Damage-jump proof: a single ECC batch is 32 sectors. If only the failed
-    // batch were marked, NonTrimmed would be ~32 sectors. The fast-jump
-    // (JUMP_BASE_SECTORS=1024 × batch=32) overshoots this 1000-sector disc, so
-    // the entire tail from the failure to EOF is zero-filled NonTrimmed — far
-    // more than one batch. That can ONLY happen if the jump engaged.
+    // Damage-jump proof: a single ECC batch is 32 sectors, so if only the
+    // failed batch were marked, NonTrimmed would be ~32 sectors. The fast-jump
+    // overshoots this disc, zero-filling the whole tail — proving the jump engaged.
     assert!(
         bad_bytes > 32 * SEC,
         "NonTrimmed span ({} sectors) must exceed a single ECC batch — proves \
@@ -715,11 +707,9 @@ impl Drop for CleanupGuard {
     }
 }
 
-// `/dev/null` is a POSIX character device and these three tests exist to
-// exercise exactly that: writing to a character device where `set_len` returns
-// ENODEV. Windows has no equivalent — NUL is not a character device with these
-// semantics — so the tests do not merely fail there, they have nothing to
-// assert. Gate them rather than pretend the coverage is cross-platform.
+// `/dev/null` is a POSIX character device; these three tests exercise writing
+// to it where `set_len` returns ENODEV. Windows has no equivalent, so these
+// tests are gated to unix rather than pretend the coverage is cross-platform.
 #[cfg(unix)]
 #[test]
 fn sweep_dev_null_full_good() {
@@ -795,10 +785,8 @@ fn resume_sweeps_nontried_tail_even_with_retryable_present() {
     let sectors: u32 = 200;
     let disc = make_test_disc(sectors, "T6Tail");
 
-    // Pre-build a mapfile covering the whole disc:
-    //   [0..100)   Finished
-    //   [100..150) NonTrimmed (retryable)
-    //   [150..200) NonTried   (un-swept tail)
+    // Pre-build a mapfile covering the whole disc: [0..100) Finished,
+    // [100..150) NonTrimmed (retryable), [150..200) NonTried (un-swept tail).
     let mf_path = disc.mapfile_for(&iso_path);
     {
         let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
@@ -1039,11 +1027,9 @@ fn patch_dev_null_after_sweep() {
 ///
 /// Both calls now target `/dev/null`, so they share one mapfile and the second
 /// really is a patch pass over the first's damage.
-// `/dev/null` is a POSIX character device and these three tests exist to
-// exercise exactly that: writing to a character device where `set_len` returns
-// ENODEV. Windows has no equivalent — NUL is not a character device with these
-// semantics — so the tests do not merely fail there, they have nothing to
-// assert. Gate them rather than pretend the coverage is cross-platform.
+// `/dev/null` is a POSIX character device; these three tests exercise writing
+// to it where `set_len` returns ENODEV. Windows has no equivalent, so these
+// tests are gated to unix rather than pretend the coverage is cross-platform.
 #[cfg(unix)]
 #[test]
 fn patch_dev_null_direct() {
@@ -1167,10 +1153,8 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
     let disc = make_test_disc(sectors, "DispatchNonTried");
     let disc_size = sectors as u64 * 2048;
 
-    // Synthesise a mapfile that covers the disc (total_size == disc_size) with:
-    //   - [0, half_bytes): Finished
-    //   - [half_bytes, disc_size): NonTried
-    // This gives covers_disc=true, bytes_retryable=0, bytes_nontried>0.
+    // Mapfile covers the disc: [0, half_bytes) Finished, [half_bytes,
+    // disc_size) NonTried — gives covers_disc=true, bytes_retryable=0, bytes_nontried>0.
     let mf_path = disc.mapfile_for(&iso_path);
     let half_bytes = disc_size / 2;
     {
@@ -1180,10 +1164,9 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
         map.flush().expect("flush");
     }
 
-    // Create an ISO file pre-sized to the full disc size so the resume
-    // sweep can open it and write the NonTried regions at their offsets.
-    // (len > 0 selects the resume-open branch; full pre-size avoids
-    // short-seek writes past EOF.)
+    // Pre-size the ISO to the full disc so resume-sweep can open it and
+    // write NonTried regions at their offsets (len > 0 selects the
+    // resume-open branch; full pre-size avoids short-seek writes past EOF).
     {
         let f = std::fs::File::create(&iso_path).expect("create iso");
         f.set_len(disc_size).expect("pre-size iso");
@@ -1321,10 +1304,9 @@ fn resume_against_a_truncated_iso_re_reads_instead_of_leaving_a_hole() {
     };
     let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).unwrap();
 
-    // Assert CONTENT, not length. Writing the NonTried tail extends the file
-    // to full size either way, so a length check passes even when the middle
-    // is a hole — the defect is that sectors 10..100 are marked Finished, were
-    // never actually written, and are left as zero-fill.
+    // Assert CONTENT, not length: writing the NonTried tail extends the file
+    // to full size regardless, so a length check would pass even if sectors
+    // 10..100 were marked Finished but never actually written (zero-fill hole).
     let img = std::fs::read(&iso_path).unwrap();
     assert_eq!(img.len() as u64, disc_size, "ISO must be full length");
     let first_hole = img.iter().position(|&b| b != 0xAA);
@@ -1482,11 +1464,9 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
          is discarded)"
     );
 
-    // Promptness was the ONLY thing checked here, so a cancel that corrupted
-    // the byte accounting — or that wrote the bad range off as unreadable on
-    // its way out — passed unchanged. What a halted pass reports is what the
-    // orchestrator scores the rip on and what a resume starts from, so it has
-    // to be exactly as honest as an uninterrupted one.
+    // Promptness alone was checked above; also verify a cancel doesn't corrupt
+    // byte accounting or write the bad range off as unreadable — a halted
+    // pass's report drives both scoring and resume, so it must stay honest.
     const TOTAL: u64 = 500 * 2048;
     const BAD: u64 = 60 * 2048; // sectors 100..160
     assert_eq!(
@@ -1687,13 +1667,9 @@ fn mapfile_from_a_different_disc_is_refused() {
         "resuming disc A's mapfile against disc B must be refused, not spliced"
     );
 
-    // The same guard must hold for a DIRECT patch() call. `copy` refuses
-    // above because mod.rs checks identity before dispatching, but `patch` is
-    // half of the exposed sweep/patch pair a front-end drives itself on a
-    // resume, and it used to load the mapfile and trust it. Without this, disc
-    // B's recovered ranges are written into disc A's ISO and recorded
-    // Finished — corruption presented as a successful recovery, and no test
-    // covered it.
+    // The same guard must hold for a DIRECT patch() call: `patch` is half of
+    // the exposed sweep/patch pair a front-end drives itself on resume, and
+    // it used to trust the loaded mapfile without checking disc identity.
     let patch_opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
     let r = freemkv_engine::patch(&disc_b, &mut reader, &iso_path, &patch_opts);
     assert!(
@@ -2275,11 +2251,9 @@ fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
             .position(|e| *e == DriveEvent::Speed(0xFFFF))
             .expect("full speed must be restored once the disc reads cleanly again");
 
-    // The hysteresis is the point: the drive climbs back to full speed only
-    // after DAMAGE_ZONE_EXIT_THRESHOLD (16) consecutive GOOD batches. Restore
-    // it on the first clean read and the drive oscillates between minimum and
-    // maximum across a damaged region, which is the behaviour the zone exists
-    // to avoid.
+    // Hysteresis is the point: full speed returns only after 16 consecutive
+    // GOOD batches. Restoring on the first clean read would oscillate the
+    // drive between minimum and maximum across a damaged region.
     let good_between = seen[slow_at + 1..restored_at]
         .iter()
         .filter(|e| matches!(e, DriveEvent::Read { ok: true, .. }))
@@ -2526,10 +2500,9 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
                 .wrapping_mul(7)
                 .wrapping_add((i as u8).wrapping_mul(31));
         }
-        // Scrambled DVD sectors are MPEG-2 PS packs, and the descramble policy
-        // requires the pack start code as well as the flag bits — byte 0x14
-        // alone means nothing in an IFO or UDF sector, so it is not sufficient
-        // on its own to authorise descrambling.
+        // Scrambled DVD sectors are MPEG-2 PS packs; descramble policy requires
+        // the pack start code plus the flag bits — byte 0x14 alone isn't
+        // sufficient to authorise descrambling in an IFO or UDF sector.
         s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         // Bits 4-5 of the sub-header byte are the CSS scramble flag.
         s[0x14] &= !0x30;
@@ -2678,10 +2651,8 @@ fn a_short_read_is_a_failed_read_and_never_reaches_the_image() {
 
     let err = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
         .expect_err("a short transfer is a failed read, not a partial success");
-    // `sector: 8` is the second block — the first one the reader short-changed.
-    // The status is whatever the sweep's own `extract_scsi_context` rebuild
-    // puts there for a non-SCSI error; what matters is that the block surfaced
-    // as a READ FAILURE at all rather than as delivered data.
+    // `sector: 8` is the block the reader short-changed. What matters is
+    // that it surfaced as a READ FAILURE at all, not as delivered data.
     assert!(
         matches!(
             err,

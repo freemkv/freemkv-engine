@@ -41,11 +41,8 @@ pub fn extract_tree(
     sink: &dyn Sink,
 ) -> crate::Result<libfreemkv::ExtractResult> {
     // One should_cancel → halt bridge for the whole engine (see
-    // `with_cancel_watcher`), including its check-before-starting, which is
-    // what makes cancelling a small extraction deterministic instead of a race
-    // against the watcher thread's first scheduling. No progress channel here —
-    // extract_tree's `progress` option is unused by either shell today (both
-    // poll the returned per-file result at the end, not a live tick).
+    // `with_cancel_watcher`), so cancelling even a small extraction is
+    // deterministic. No progress channel: both shells poll the final result.
     crate::run::with_cancel_watcher(sink, |halt| {
         let opts = libfreemkv::ExtractOptions {
             force,
@@ -62,12 +59,9 @@ mod tests {
     use crate::sink::NoopSink;
     use std::collections::HashMap;
 
-    // ── Minimal in-memory UDF fixture: one root dir, one file. Modeled on
-    // libfreemkv's own `disc/extract.rs` test fixture (same byte layout —
-    // ECMA-167 AVDP/PD/LVD/TD/FSD + one Extended File Entry + one FID), kept
-    // to the smallest shape that makes `udf::read_filesystem` happy. Built
-    // here (rather than shared) because the fixture types are private to
-    // libfreemkv's test module and there is no cross-crate test-support seam.
+    // ── Minimal in-memory UDF fixture: one root dir, one file, modeled on
+    // libfreemkv's own `disc/extract.rs` fixture (same ECMA-167 byte layout).
+    // Duplicated here because those fixture types are private to that crate.
 
     const PART_START: u32 = 2000;
     const SECTOR: usize = 2048;

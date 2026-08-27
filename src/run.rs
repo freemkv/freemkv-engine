@@ -2,7 +2,7 @@
 //!
 //! [`recover_to_iso`] is the disc→ISO half of a rip: it runs the multipass
 //! sweep/patch dispatch ([`crate::recovery::copy`]) against a caller-provided
-//! [`SectorSource`] and reports progress through the engine [`Sink`]. It is the
+//! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`]. It is the
 //! first consumer of the relocated recovery module, and the piece a front-end
 //! composes with `mux_stream` to get disc→MKV.
 //!
@@ -52,7 +52,7 @@ impl Drop for SignalDone<'_> {
 /// Run `f` with a halt token that mirrors `sink.should_cancel()`.
 ///
 /// Cancellation needs BOTH channels, not just the progress callback.
-/// [`ProgressBridge::report`] returns `!should_cancel()`, which stops the
+/// [`libfreemkv::progress::Progress::report`] returns `!should_cancel()`, which stops the
 /// library — but only on a tick, and a damaged disc produces no ticks while it
 /// is sitting in a cooldown (`ReadAction::Retry { pause_secs }`: 3 s on a NOT
 /// READY retry, 30 s on zone entry). With no halt token the user's Stop went
@@ -72,12 +72,9 @@ pub(crate) fn with_cancel_watcher<T>(
     let halt = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Check once BEFORE starting. A watcher alone makes cancellation a race
-    // the work can win: on a small job the call can finish before the watcher
-    // thread is first scheduled, and then an already-cancelled request runs to
-    // completion. Polling cannot close that window — only asking before the
-    // work begins can. It is also the obviously right behaviour: do not start
-    // something you have already been told to stop.
+    // Check once BEFORE starting: a watcher alone makes cancellation a race
+    // the work can win on a small job. Only asking before work begins closes
+    // that window — and it's obviously right not to start what's already stopped.
     if sink.should_cancel() {
         halt.store(true, Ordering::Relaxed);
     }
@@ -153,16 +150,9 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
             pass,
             bytes_done: p.work_done,
             bytes_total: p.work_total,
-            // Damage only: permanently unreadable + queued-for-retry.
-            //
-            // NOT `bytes_pending_total`. That aggregate folds in NonTried —
-            // territory Pass 1 simply has not reached yet — so it counts the
-            // whole un-swept remainder as damage. On the first tick of a
-            // pristine 25 GB disc that is ~12 million "bad sectors" reported
-            // for a disc with none, falling toward zero as the sweep advances.
-            // The mapfile's own docs name `bytes_retryable` as the field for
-            // a "will retry" bucket and say `bytes_pending` over-counts for
-            // exactly this reason.
+            // Damage only: permanently unreadable + queued-for-retry. NOT
+            // `bytes_pending_total`, which folds in NonTried (unswept territory)
+            // and would report ~12M "bad sectors" on a pristine disc's first tick.
             sectors_bad: p
                 .bytes_unreadable_total
                 .saturating_add(p.bytes_retryable_total)
@@ -197,11 +187,8 @@ pub fn recover_to_iso(
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
     // Multipass implies raw — refuse before touching the drive. `preflight`
-    // reports this as data for a UI, but it is explicitly callable without
-    // executing, so a front-end may skip it; this is the enforcement that
-    // cannot be bypassed. Refused rather than silently forced to raw: a caller
-    // that asked to decrypt and got a raw image would be handed an
-    // undecrypted ISO it believes is playable.
+    // reports this as data, but a front-end may skip that optional check; this
+    // enforcement can't be bypassed and avoids handing back an undecrypted ISO.
     if matches!(job.mode, RipMode::Multi) && !job.raw {
         return Err(multipass_requires_raw());
     }
@@ -376,12 +363,9 @@ mod tests {
             asks: AtomicUsize::new(0),
         };
         let observed = with_cancel_watcher(&sink, |halt| {
-            // Give the watcher time to poll at least once (it sleeps 100 ms).
-            // The loop returns the instant the flag goes up, so the deadline
-            // costs nothing on the happy path — it is a liveness backstop, not
-            // a measurement, and is deliberately far past the one poll this
-            // needs so a runner that doesn't schedule the watcher promptly
-            // cannot turn a working watcher into a red build.
+            // Give the watcher time to poll at least once (it sleeps 100 ms); the
+            // loop returns the instant the flag goes up, costing nothing on the
+            // happy path. This is a liveness backstop, not a timing measurement.
             for _ in 0..400 {
                 if halt.load(std::sync::atomic::Ordering::Relaxed) {
                     return true;
@@ -399,11 +383,9 @@ mod tests {
 
     #[test]
     fn cancel_via_sink_halts_recovery() {
-        // A sink whose should_cancel is always true must make the library
-        // halt. The sweep's progress reporter is called on EVERY batch
-        // iteration (only the tracing heartbeat is throttled), so a tick — and
-        // therefore the halt — is guaranteed on the first iteration of any
-        // disc with at least one sector.
+        // A sink whose should_cancel is always true must make the library halt.
+        // The sweep's progress reporter is called on EVERY batch iteration, so
+        // a tick — and the halt — is guaranteed on the first disc iteration.
         struct CancelSink;
         impl Sink for CancelSink {
             fn should_cancel(&self) -> bool {
@@ -419,9 +401,8 @@ mod tests {
         let job = Job::new("disc:///dev/null", iso.to_string_lossy());
         let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CancelSink)
             .expect("a cancelled rip halts, it does not error");
-        // Assert the actual property. `is_ok()` alone passed even if
-        // should_cancel was never consulted, since a clean synthetic disc
-        // completes either way. Deliberately NOT asserting byte counts:
+        // Assert the actual property: `is_ok()` alone passed even if
+        // should_cancel was never consulted. NOT asserting byte counts —
         // wiring a halt token would legitimately change them.
         assert!(r.halted, "a cancelling sink must halt the rip");
         assert!(!r.complete, "a halted rip is not complete");
@@ -608,26 +589,9 @@ mod tests {
             }
         }
 
-        // NOT a sink that is already cancelled: `with_cancel_watcher`'s
-        // "check once before starting" fires on the very FIRST `should_cancel`
-        // call — before the sweep loop ever calls `read_sectors` once — so an
-        // always-true sink proves nothing about the cooldown at all: the read
-        // loop's own halt check (top of every iteration, before the read)
-        // breaks it before `NotReadyReader` is ever invoked. That was this
-        // test's original shape, and it stayed green when instrumented to
-        // confirm `read_sectors` is called zero times under it — the fixture
-        // made the cooldown branch this test is named for unreachable.
-        //
-        // A sink that flips to cancelled on the SECOND ask (as opposed to
-        // this one, elapsed-time-gated) is not enough either: the watcher
-        // thread's own first poll happens essentially immediately after
-        // `with_cancel_watcher`'s pre-start check consumes ask #1, so ask #2
-        // — the watcher's first loop iteration, no sleep yet — usually wins
-        // the race against the main thread even reaching the sweep loop,
-        // reproducing the exact same "halted before the first read" shape
-        // this test exists to rule out. Gating on wall-clock time instead
-        // gives the main thread a real window to issue the read and enter
-        // the cooldown before any observer is allowed to see a cancellation.
+        // NOT always-cancelled (pre-start check halts before the first read,
+        // cooldown unreachable) nor flip-on-2nd-ask (watcher's first poll
+        // usually wins). Wall-clock gating gives a real window to the cooldown.
         struct DelayedCancelSink {
             start: std::time::Instant,
         }
@@ -649,12 +613,8 @@ mod tests {
         job.raw = true;
 
         // ONE origin for the sink's cancel-delay and the measurement below.
-        // These used to be separate instants with `create_dir_all`, `Job::new`
-        // and path formatting in between, so filesystem latency came out of the
-        // sink's 50 ms window: on a slow runner the sink already reported
-        // cancelled before the first read, the run halted immediately, and this
-        // test failed on its OWN lower bound. It gates every release (CI runs
-        // this suite in both profiles), so the flake was a release blocker.
+        // Separate instants used to let filesystem setup eat into the sink's
+        // 50 ms window, so a slow runner failed the test on its own lower bound.
         let start = std::time::Instant::now();
         let sink = DelayedCancelSink { start };
         let r = recover_to_iso(&disc, &mut reader, &iso, &job, &sink)

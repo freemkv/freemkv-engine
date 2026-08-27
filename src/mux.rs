@@ -52,26 +52,19 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             }
         }
         Selection::All => (0..n).collect(),
-        // FIRST of the equal maxima, not the last. `Iterator::max_by` keeps
-        // the LAST element among ties, and ties are the normal case on exactly
-        // the discs this selection exists for: playlist obfuscation works by
-        // authoring dozens of decoy playlists with the SAME runtime as the
-        // feature, and the real one is conventionally the lowest index. Picking
-        // the last tied playlist rips a decoy and reports success.
+        // FIRST of the equal maxima, not the last: `Iterator::max_by` keeps the
+        // LAST tied element, but playlist obfuscation authors decoys with the
+        // SAME runtime as the feature, which is conventionally the lowest index.
         Selection::Longest => disc
             .titles
             .iter()
             .enumerate()
-            // Drop non-finite durations BEFORE folding. Rejecting them only
-            // inside the comparison is not enough: `NaN > d` and `t > NaN` are
-            // both false, so a NaN that lands in the accumulator first is never
-            // displaced and wins outright. A disc whose first playlist has an
-            // unparseable runtime would then always rip that playlist.
+            // Drop non-finite durations BEFORE folding: rejecting only inside
+            // the comparison isn't enough, since a NaN in the accumulator is
+            // never displaced (`NaN > d` and `t > NaN` are both false).
             .filter(|(_, t)| t.duration_secs.is_finite())
-            // `<=` rather than `!(_ > _)`: safe ONLY because the filter above
-            // has already removed every non-finite duration, so the two are
-            // equivalent here. Without that filter they differ — every NaN
-            // comparison is false — and clippy rejects the negated form.
+            // `<=` is safe only because the filter above already removed every
+            // non-finite duration; without it the two forms would differ.
             .fold(None::<(usize, f64)>, |best, (i, t)| match best {
                 Some((_, d)) if t.duration_secs <= d => best,
                 _ => Some((i, t.duration_secs)),
@@ -80,12 +73,8 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             .unwrap_or_default(),
         Selection::Titles(indices) => {
             // Range-filter AND de-duplicate. A repeated index (a UI adding the
-            // same title twice, or `-t 1 -t 1`) would otherwise mux the same
-            // title twice and count it twice in `titles_written`, while a
-            // front-end naming files from `title_index` writes one file — a
-            // success count that does not match what is on disk. It also
-            // flips `multi_title` on what is really a single-title rip.
-            // First-seen order is preserved so the feature title stays first.
+            // same title twice, or `-t 1 -t 1`) would mux it twice, inflating
+            // `titles_written` past what's on disk and mis-flipping `multi_title`.
             let mut seen = std::collections::HashSet::new();
             indices
                 .iter()
@@ -293,10 +282,9 @@ where
                 return RipOutcome::NoKey;
             }
             TitleAction::StopFatal => {
-                // Every other arm of this match reports through the Sink;
-                // this one returned silently, so a hard failure (disk full,
-                // permission denied) reached the front-end as a bare title
-                // index with no diagnostic anywhere.
+                // Unlike every other arm here, this one used to return silently,
+                // so a hard failure (disk full, permission denied) reached the
+                // front-end as a bare title index with no diagnostic anywhere.
                 sink.log(
                     Level::Error,
                     &format!("title {} failed — stopping the rip: {fail_detail}", idx + 1),
@@ -310,17 +298,9 @@ where
         }
     }
 
-    // A rip that wrote NOTHING must not return silently. Every other exit from
-    // this loop reports through the Sink; this one did not, so the two ways to
-    // reach it — an empty `indices` (a caller that bypassed `preflight`: it
-    // said Ready, `resolve_selection` said `[]`, and the rip "succeeded" with
-    // no file), and a selection whose every title turned out to be a skippable
-    // stub — both surfaced as success, exit 0, and no explanation anywhere.
-    //
-    // The variant stays `Ok`: `titles_written` is the machine-readable half of
-    // the answer and a new variant would break every front-end's `match`
-    // (`RipOutcome` is public and not `#[non_exhaustive]`, and sibling repos
-    // match it exhaustively). What changes is that it is no longer silent.
+    // A rip that wrote NOTHING must not return silently: an empty `indices` or
+    // an all-skippable-stub selection used to surface as exit-0 success with no
+    // explanation. `Ok` stays the variant (matched exhaustively elsewhere).
     if titles_written == 0 {
         sink.log(
             Level::Error,
@@ -433,11 +413,9 @@ fn with_mux_watcher<T>(
     use std::sync::mpsc;
 
     let halt = libfreemkv::Halt::new();
-    // Ask ONCE before starting, the same rule `with_cancel_watcher` states and
-    // enforces in `run.rs`. A watcher alone makes cancellation a race the work
-    // can win: on a short title the mux can finish before the watcher thread is
-    // first scheduled, and an already-cancelled request then runs to completion.
-    // Polling cannot close that window — only asking before the work begins can.
+    // Ask ONCE before starting (same rule as `with_cancel_watcher` in run.rs):
+    // a watcher alone makes cancellation a race the work can win on a short
+    // title, and only asking before the work begins closes that window.
     if sink.should_cancel() {
         halt.cancel();
     }
@@ -457,10 +435,9 @@ fn with_mux_watcher<T>(
     let done = Arc::new(AtomicBool::new(false));
 
     std::thread::scope(|s| {
-        // Watcher: drains progress → sink, and mirrors should_cancel → halt.
-        // `move` captures the `!Sync` Receiver into this thread; `sink` is a
-        // borrowed `&dyn Sink` (copied ref, tied to the scope); `done` is a
-        // shared Arc the main thread sets when the mux returns.
+        // Watcher: drains progress → sink, mirrors should_cancel → halt. `move`
+        // captures the `!Sync` Receiver; `sink` is a borrowed ref tied to the
+        // scope; `done` is a shared Arc the main thread sets when mux returns.
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
         s.spawn(move || {
@@ -468,12 +445,9 @@ fn with_mux_watcher<T>(
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
             loop {
-                // Coalesce all progress ticks that queued up since the last
-                // wake to the LATEST, then sample ONCE. Sampling per-message
-                // would measure `dt` as the microseconds between tight-loop
-                // iterations against a byte-delta representing ~100 ms of real
-                // work — yielding absurd multi-GB/s speeds. One sample per drain
-                // makes `dt` the real ~100 ms wake interval.
+                // Coalesce queued progress ticks to the LATEST, sample ONCE:
+                // sampling per-message would measure `dt` in microseconds
+                // against a ~100ms byte-delta, yielding absurd multi-GB/s speeds.
                 let mut latest = None;
                 while let Ok(m) = rx.try_recv() {
                     latest = Some(m);
@@ -501,10 +475,9 @@ fn with_mux_watcher<T>(
         });
 
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
-        // Same guard the recovery paths use: `mux_stream` runs on damaged and
-        // malformed media, a panic there is in scope, and storing `done` after
-        // the call means an unwind skips it — leaving thread::scope joining a
-        // watcher that loops forever. The mux would hang instead of failing.
+        // Same guard the recovery paths use: `mux_stream` runs on damaged media
+        // and can panic; storing `done` after the call would let an unwind skip
+        // it, leaving thread::scope joining a watcher that loops forever.
         let _signal_done = crate::run::SignalDone(&done);
         f(&halt, events)
     })

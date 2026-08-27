@@ -86,7 +86,7 @@ const PROGRESS_TICK_MS: u64 = 250;
 struct PatchRecoverySink<'a> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
     /// Cancellation token for the send below — the caller's external Stop bit
-    /// when there is one (see `patch_region`). Without it this send had no way
+    /// when there is one (see `recover_section`). Without it this send had no way
     /// to observe a Stop at all: `WRITE_THROUGH_DEPTH` is 1, so a consumer
     /// stalled inside its write parks the producer in `send` indefinitely.
     halt: &'a libfreemkv::halt::Halt,
@@ -107,13 +107,9 @@ impl RecoverySink for PatchRecoverySink<'_> {
             self.halt,
         ) {
             Ok(()) => {}
-            // Halt is an OUTCOME, not an error: the latch is already set (it
-            // is what released this send), so the handler chain unwinds to
-            // `HandlerOutcome::Halted` at its next inter-read check and the
-            // pass reports halted exactly as it does for a halt observed
-            // anywhere else. Recording an error here would turn a Stop into a
-            // failed pass. The in-flight span is dropped — the mapfile still
-            // calls it bad, so a later pass re-reads it.
+            // Halt is an outcome, not an error: the latch that released this send
+            // already drives the handler chain to `Halted`. Recording an error here
+            // would turn a Stop into a failed pass; the in-flight span stays bad.
             Err(super::SendStall::Halted) => {}
             Err(stall) => self.err = Some(stall.into_error()),
         }
@@ -217,11 +213,11 @@ impl SharedPatchState {
 }
 
 /// Final summary returned by [`Sink::close`] when the consumer drains
-/// cleanly. Mirrors what the pre-split patch loop computed at the end
-/// of the function — final mapfile stats plus whether `sync_all`
-/// failed on a regular file (the only kind of fsync error patch ever
-/// surfaced; `/dev/null` and pipes always fail `sync_all`, that's not
-/// a real error).
+/// cleanly. Carries the final mapfile stats; a `sync_all` failure on a
+/// regular file (the only kind of fsync error patch ever surfaced —
+/// `/dev/null` and pipes always fail `sync_all`, that's not a real error)
+/// short-circuits `close` with an `Err` before a `PatchSummary` is built,
+/// so it never appears as a field here.
 pub(super) struct PatchSummary {
     pub stats: MapStats,
 }
@@ -297,12 +293,9 @@ impl PatchSink {
     }
 
     fn publish_now(&self) {
-        // Best-effort lock — only the producer reads, only the consumer
-        // writes; contention is single-acquire so the lock is never
-        // poisoned in practice. If it ever did get poisoned we'd want
-        // the underlying error surfaced rather than silently swallowed,
-        // so we propagate the poison panic rather than silently
-        // continuing with stale shared state.
+        // Best-effort lock — only the producer reads, only the consumer writes,
+        // so it's never poisoned in practice. If it ever did poison, propagate
+        // the panic rather than continue with stale shared state.
         let mut guard = self
             .shared
             .lock()
@@ -344,9 +337,8 @@ impl Sink<PatchItem> for PatchSink {
     }
 
     fn close(mut self) -> std::result::Result<Self::Output, Error> {
-        // Drain in-flight writeback then issue a full fsync. A failure
-        // here matters only on regular files — pipes / `/dev/null` etc.
-        // always fail `sync_all`.
+        // Drain in-flight writeback then fsync; failure matters only on regular
+        // files since pipes / `/dev/null` etc. always fail `sync_all`.
         if let Err(e) = self.file.sync_all() {
             if self.is_regular {
                 tracing::warn!(
@@ -368,11 +360,8 @@ impl Sink<PatchItem> for PatchSink {
         }
         self.map.flush().map_err(|e| Error::IoError { source: e })?;
         // Final republish so anyone reading the shared snapshot after
-        // `Pipeline::finish` sees the post-flush state. (The producer
-        // already has its own copy of the final `MapStats` in the
-        // returned `PatchSummary`, but the snapshot is part of the
-        // public-ish contract of the consumer: it stays current
-        // through close.)
+        // `Pipeline::finish` sees the post-flush state; the snapshot's
+        // contract is that it stays current through close.
         self.republish(true);
         Ok(PatchSummary {
             stats: self.map.stats(),
@@ -380,11 +369,9 @@ impl Sink<PatchItem> for PatchSink {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────
-// Disc::patch + bytes_bad_in_title — extracted from disc/mod.rs in
-// 0.20.1. Behavior unchanged; the move splits the 3,900-line mod.rs
-// into a cleaner-to-read file.
-// ─────────────────────────────────────────────────────────────────
+// Disc::patch + bytes_bad_in_title — extracted from disc/mod.rs in 0.20.1.
+// Behavior unchanged; the move splits the 3,900-line mod.rs into a
+// cleaner-to-read file.
 
 use super::{PatchOptions, PatchOutcome};
 use libfreemkv::disc::bytes_bad_in_title;
@@ -421,26 +408,14 @@ pub(super) fn compute_initial_state(
     let total_bytes = map.total_size();
     let initial_stats = map.stats();
     let initial_entries: Vec<_> = map.entries().to_vec();
-    // Every retry pass acts on NonTrimmed, NonScraped, and Unreadable
-    // ranges. Including Unreadable means a sector that failed in pass N
-    // gets a fresh shot in pass N+1 — drive state evolves, the same
-    // read can succeed later. Each pass owns its own jumps/skips; if
-    // pass 5 jumps over the same zone as pass 2, fine. NonTried ranges
-    // are intentionally excluded — they are covered by a preceding
-    // sweep pass, not by patch.
-    // NOT reversed for `opts.reverse`: `PatchCtx::run` sorts this list by
-    // (size desc, pos asc) before walking it, and because `ranges_with` yields
-    // disjoint runs every `pos` is unique — a total order. Any pre-ordering
-    // here is therefore unobservable. A `bad_ranges.reverse()` lived here and
-    // did nothing; `opts.reverse` now only labels the reported `PassKind`.
+    // Retry passes act on NonTrimmed/NonScraped/Unreadable (a failed sector gets
+    // a fresh shot next pass); NonTried is excluded since a preceding sweep pass
+    // covers it. Not reversed for `opts.reverse`: `PatchCtx::run` sorts this list.
     let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
     let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
-    // Fail SAFE when metadata is indeterminate: assume a regular file so a
-    // real `sync_all` failure is surfaced, not swallowed. `/dev/null` and pipes
-    // report success-with-non-file here (so they still correctly map to
-    // `false`); only a genuine metadata error (e.g. transient NFS ESTALE) hits
-    // the default, and for a data-integrity guard "surface the error" is the
-    // right side to err on.
+    // Fail safe when metadata is indeterminate: assume a regular file so a real
+    // `sync_all` failure surfaces rather than gets swallowed. `/dev/null` and
+    // pipes still map to `false`; only a genuine metadata error hits the default.
     let is_regular = super::output_is_regular(std::fs::metadata(path));
     Ok((
         map,
@@ -485,10 +460,9 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
         let span = head + count as usize;
         let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
         let mut scratch = vec![0u8; aligned_count * 2048];
-        // `require_full_read` before the copy-back, not a bare `?`: `scratch`
-        // is freshly zeroed here, so a short transfer would splice ZEROS into
-        // the middle of a sector and the caller would commit them as
-        // recovered. A short read is a failed read (see the helper).
+        // `require_full_read` before the copy-back, not a bare `?`: `scratch` is
+        // freshly zeroed, so a short transfer would splice zeros into the
+        // sector and the caller would commit them as recovered.
         super::require_full_read(
             reader.read_sectors_fua(
                 aligned_lba,
@@ -503,10 +477,9 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
         buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
         Ok(bytes)
     } else {
-        // The unaligned branch hands the caller's own reused buffer to the
-        // reader, so the stale bytes a short transfer leaves behind are the
-        // PREVIOUS span's — the exact silent-corruption shape the helper
-        // exists to stop.
+        // Unaligned branch hands the caller's reused buffer to the reader, so a
+        // short transfer would leave the PREVIOUS span's stale bytes behind —
+        // the exact silent-corruption shape the helper exists to stop.
         super::require_full_read(
             reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua),
             bytes,
@@ -737,10 +710,8 @@ pub(super) struct PatchLoopState {
     pub now: fn() -> std::time::Instant,
     // Snapshot at construction — these stay constant for the whole pass.
     pub bytes_good_before: u64,
-    // (No `total_bytes` here. It was carried, `#[allow(dead_code)]`, and never
-    // read: the orchestrator takes the pass denominator from `PatchCtx`'s own
-    // `total_bytes` instead. A field nothing reads cannot go stale loudly, so
-    // it is worse than absent.)
+    // (No `total_bytes` here — it was carried but never read; the orchestrator
+    // takes the pass denominator from `PatchCtx`'s own `total_bytes` instead.)
     pub initial_batch: u16,
     pub work_total: u64,
 }
@@ -776,7 +747,7 @@ impl PatchLoopState {
     }
 }
 
-/// Why [`PatchCtx::patch_region`] returned. The orchestrator
+/// Why [`PatchCtx::recover_section`] returned. The orchestrator
 /// ([`PatchCtx::run`]) advances to the next bad range on `Completed` (the
 /// handler chain always drains a section to recovered-or-residue, so there is
 /// no per-range abort), and ends the whole pass only on `Halted` or
@@ -798,10 +769,10 @@ pub(super) enum RegionOutcome {
 /// reader, the consumer pipe + its shared mapfile snapshot, the options,
 /// and the accumulating [`PatchLoopState`]. Bundling these lets the
 /// orchestrator ([`PatchCtx::run`]) and the focused per-range recovery
-/// loop ([`PatchCtx::patch_region`]) be methods rather than free
+/// loop ([`PatchCtx::recover_section`]) be methods rather than free
 /// functions threading a dozen arguments. `state` carries ACROSS ranges
 /// (counters, stall timers, NOT_READY/last-skip cursors); the per-range
-/// scratch inside it is reset at the top of each `patch_region`.
+/// scratch inside it is reset at the top of each `recover_section`.
 struct PatchCtx<'a, 'o> {
     disc: &'a libfreemkv::Disc,
     reader: &'a mut dyn SectorSource,
@@ -867,14 +838,9 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                 params: ReadParams::deep(),
             }),
         ],
-        // Tier 2 — marginal specialists, run ONLY on the hardened residual that
-        // tiers 0-1 leave. Each targets ONE physical failure mode. They are all
-        // NEW configs, so the scorecard calibrates each once then ranks by its
-        // decayed rate — a specialist that doesn't fit THIS disc self-
-        // deprioritises (scores low, yields after 4 unproductive reads) and one
-        // that starts landing sectors climbs. Every read is a wedge-safe
-        // `read_span`, so they inherit the wedge-abort / unproductive-yield /
-        // deadline bounds for free. Additive: tiers 0-1 are untouched.
+        // Tier 2 — marginal specialists, run only on the hardened residual tiers
+        // 0-1 leave; each targets one failure mode and self-deprioritises via the
+        // scorecard if it doesn't fit this disc. Reads are wedge-safe; additive.
         _ => {
             // Slower spindle (more servo dwell + ECC integration per sector).
             let min_deep = ReadParams {
@@ -987,7 +953,7 @@ pub(super) fn pass_kind(initial_batch: u16, reverse: bool) -> libfreemkv::progre
 /// `TMPDIR`) on cargo's other test threads. A concurrent `setenv` may free the
 /// `environ` block that `getenv` is walking.
 ///
-/// See [`flat_mode_override`] for the one test that needs the value to reach a
+/// See `flat_mode_override` for the one test that needs the value to reach a
 /// real `patch()` call.
 fn flat_mode_from_value(v: Option<&str>) -> bool {
     matches!(v, Some(v) if !v.is_empty() && v != "0")
@@ -1090,11 +1056,9 @@ impl PatchCtx<'_, '_> {
     /// halt / wedge / transport-fault.
     fn run(&mut self, bad_ranges: &[(u64, u64)]) -> Result<()> {
         let num_ranges = bad_ranges.len();
-        // Attack the LARGEST ranges first. The big NonTrimmed regions are usually
-        // sweep-jump over-marks that read straight back, so ordering them ahead of
-        // the many tiny dead fragments lets tier 0 recover the bulk of the disc in
-        // its first minutes instead of grinding fragments first (ties: low LBA
-        // first for a predictable, mostly-sequential walk).
+        // Attack the LARGEST ranges first: big NonTrimmed regions are usually
+        // sweep-jump over-marks that read straight back, so tier 0 recovers the
+        // bulk of the disc early instead of grinding fragments (ties: low LBA).
         let mut ordered: Vec<(u64, u64)> = bad_ranges.to_vec();
         ordered.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         // Per-range still-bad sets, persisted ACROSS the breadth-first tiers so
@@ -1107,23 +1071,9 @@ impl PatchCtx<'_, '_> {
             })
             .collect();
 
-        // Two schedulers select the handler chain per range:
-        //
-        // FLAT bandit (`FREEMKV_PATCH_FLAT`): ONE range walk, the full flat pool
-        // per range. `run_handlers` orders it best-first by the live scorecard,
-        // so the data — not a fixed tier order — decides what runs first. Right
-        // for a hardened residual (late resume): the specialists get a shot on
-        // every range immediately instead of waiting out a full bucket→mug sweep.
-        //
-        // TIER ladder (default): tier 0 fast-sweeps EVERY range first — grabbing
-        // the easily-readable bulk across the whole disc (sweep-jump over-marks a
-        // big region NonTrimmed without testing each sector, so most reads back in
-        // seconds) — BEFORE any slow per-sector grind; tiers 1-2 escalate onto the
-        // residue. Right for a FRESH rip (flood still present). This is also the
-        // fix for the OLD depth-first starvation bug (full chain per range burned
-        // ~5 min on a front cluster and starved the big recoverable ranges) — but
-        // the new handlers self-limit (yield after 4 dead reads), so the flat
-        // scheduler no longer hits that.
+        // Two schedulers pick the handler chain per range: FLAT bandit runs one
+        // scorecard-ordered pass over the full pool (best for a hardened, late-
+        // resume residual); TIER sweeps easy bulk first, then escalates (fresh rip).
         if patch_flat_mode() {
             for (range_idx, &(range_pos, range_size)) in ordered.iter().enumerate() {
                 if sections[range_idx].is_empty() {
@@ -1209,12 +1159,9 @@ impl PatchCtx<'_, '_> {
         // every tier starts from the streaming default.
         self.reader.set_speed(0xFFFF);
 
-        // Handler roster. FLAT mode: the whole pool (all techniques) in one
-        // chain — `run_handlers` orders it best-first by the rip scorecard, so
-        // the data picks what runs first. TIER mode: just this tier's roster
-        // (tier 0 fast scouts, 1 slow-deep, 2 marginal specialists), likewise
-        // scorecard-ordered within the tier. Either way the scorecard re-learns
-        // per disc.
+        // Handler roster. FLAT mode: the whole pool in one chain, best-first by
+        // the rip scorecard. TIER mode: just this tier's roster, likewise
+        // scorecard-ordered within the tier. Either way the scorecard re-learns per disc.
         let mut handlers: Vec<Box<dyn SectionHandler>> = if flat {
             build_flat_pool()
         } else {
@@ -1226,40 +1173,14 @@ impl PatchCtx<'_, '_> {
         let now_ptr = self.state.now;
         let now_fn = move || now_ptr();
 
-        // Pass-local cancel latch. The progress tick below already asks the
-        // front-end `should_cancel()` every PROGRESS_TICK_MS, but its answer
-        // used to be discarded (`let _ = ...`), so the ONLY halt check a
-        // handler chain could see was `opts.halt` — which an EXTERNAL caller
-        // may well leave as None (in-crate, `multipass_rip` wires the job's
-        // Stop bit into every patch pass via `PatchOptions::for_patch_pass`,
-        // and `extract` wires its own). A Stop therefore had to wait out the
-        // remaining per-handler budgets (up to ~10 min on one bad range)
-        // before `report_patch_progress` was consulted at the section
-        // boundary. Latching the tick's answer here, and handing it to the
-        // handler chain as its halt token, makes cancellation land at the very
-        // next inter-read check instead.
-        //
-        // `Arc` (not a bare `AtomicBool`) so the same bit can also be viewed
-        // as a `libfreemkv::halt::Halt` — the type `Pipeline::send_with_halt`
-        // takes — when no external token is available.
+        // Pass-local cancel latch: the tick's `should_cancel()` answer used to be
+        // discarded, so a caller with `opts.halt: None` waited out full per-handler
+        // budgets before cancelling. `Arc` so it doubles as a `Halt` when unset.
         let pass_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Halt token for the bounded sends below. It is the CALLER's external
-        // token when there is one, NOT the pass latch, and the difference
-        // matters: the latch is only ever flipped by the progress tick, and
-        // the tick only runs on a READ. A producer parked in `send` is not
-        // reading, so the latch it hands the handler chain cannot reach it —
-        // only a bit somebody else flips can. `opts.halt` is exactly that.
-        //
-        // HONEST LIMIT: `PatchOptions.halt` IS plumbed, and the multipass
-        // driver wires it (`multipass.rs` passes the job's Stop bit into
-        // `PatchOptions::for_patch_pass`), so on that path a Stop does reach a
-        // parked producer. What is left is the caller that constructs
-        // `PatchOptions` with `halt: None` and signals Stop only through its
-        // reporter's `should_cancel()`: for those the SEND_DEADLINE remains the
-        // only bound, and the never-cancelled latch below just keeps the
-        // argument well-typed. Closing that would mean making the halt
-        // mandatory rather than optional.
+        // Halt token for the sends below: the CALLER's external token when present,
+        // not the pass latch — a producer parked in `send` can't be reached by the
+        // tick-flipped latch, only by an externally-flipped bit like `opts.halt`.
         let pass_halt = libfreemkv::halt::Halt::from_arc(
             self.opts
                 .halt
@@ -1275,22 +1196,17 @@ impl PatchCtx<'_, '_> {
 
         let bad_before = bad.total_len();
         let (outcome, wedge_after) = {
-            // Progress heartbeat: a throttled closure that pushes a fresh
-            // snapshot to the reporter as recovery happens (called from every
-            // read via `HandlerCtx::progress`), so the bar and speed move DURING
-            // a handler instead of only when a section finishes. Scoped to this
-            // block so its borrow of `self.state` ends before the post-tier
-            // accounting below.
+            // Progress heartbeat: a throttled closure pushing a fresh snapshot to the
+            // reporter on every read, so the bar/speed move during a handler, not just
+            // at section end. Scoped here so its `self.state` borrow ends before below.
             let disc = self.disc;
             let opts = self.opts;
             let shared = self.shared;
             let total_bytes = self.total_bytes;
             let state = &self.state;
-            // `None` = no tick yet, so the FIRST read ticks immediately
-            // instead of waiting out PROGRESS_TICK_MS. That makes a cancel
-            // observable on read 1 (rather than up to 250 ms in) and gets the
-            // progress bar moving at the start of a section instead of a
-            // quarter-second later.
+            // `None` = no tick yet, so the FIRST read ticks immediately instead of
+            // waiting out PROGRESS_TICK_MS — makes a cancel observable on read 1
+            // and gets the progress bar moving at section start, not a quarter-second later.
             let last_tick: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
             let cancel = &pass_cancel;
             let ext_halt = self.opts.halt.as_deref();
@@ -1332,12 +1248,9 @@ impl PatchCtx<'_, '_> {
                 // Drive was just reset to max above; read_span tracks changes.
                 cur_speed: 0xFFFF,
             };
-            // Per-handler time budget. FLAT mode is EXPLORE-first: give each
-            // handler only a short slice so all 16 get a turn on the range
-            // quickly ("test all quick"), and the scorecard learns which land
-            // bytes — a winner then earns more cumulative time across ranges and
-            // passes. TIER mode keeps the full 60 s deep-recovery window. Both
-            // env-tunable via `FREEMKV_PATCH_FLAT_BUDGET`.
+            // Per-handler time budget. FLAT is EXPLORE-first: a short slice per handler
+            // so all 16 get a quick turn and the scorecard learns which land bytes.
+            // TIER keeps the full 60 s window. Both tunable via `FREEMKV_PATCH_FLAT_BUDGET`.
             let budget_secs = if flat {
                 flat_handler_budget_secs()
             } else {
@@ -1370,9 +1283,8 @@ impl PatchCtx<'_, '_> {
         }
 
         // On the FINAL tier, whatever is still bad is this pass's residue: record
-        // NonTrimmed and account the range toward progress (once). A later pass —
-        // or a future handler — gets another shot; the orchestrator promotes
-        // still-NonTrimmed to Unreadable only after the final pass completes.
+        // NonTrimmed and account the range once. A later pass gets another shot;
+        // the orchestrator promotes to Unreadable only after the final pass.
         if final_tier {
             for &(pos, len) in bad.ranges() {
                 match super::send_bounded(self.pipe, PatchItem::NonTrimmed { pos, len }, &pass_halt)
@@ -1434,10 +1346,9 @@ pub(super) fn report_patch_progress(
     let Some(reporter) = opts.progress else {
         return false;
     };
-    // Both figures come from the snapshot, already derived over the COMPLETE
-    // damage set. They used to be computed here from a range list the sink had
-    // capped at 8192 entries, which silently under-reported the at-risk bytes
-    // and the section count on a disc fragmented past that cap.
+    // Both figures come from the snapshot, derived over the COMPLETE damage set.
+    // They used to be computed from a range list capped at 8192 entries, which
+    // silently under-reported at-risk bytes on a disc fragmented past that cap.
     let (s, main_title_bad, located) = {
         let g = shared
             .lock()
@@ -1446,20 +1357,9 @@ pub(super) fn report_patch_progress(
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
     let main_title = disc.titles.first();
-    // Progress = bytes RECOVERED so far (initial bad − still-bad), not a
-    // per-range counter. With breadth-first tiers the readable bulk comes
-    // back during tier 0 before any range is "finished", so a range-counter
-    // sits at 0% while hundreds of MB are actually recovered. Deriving it
-    // from the live still-bad count makes the bar (and the speed the client
-    // computes from its delta) reflect real recovery the instant it happens.
-    //
-    // Compose the still-bad set to MATCH `work_total` (= the initial
-    // NonTrimmed + NonScraped + Unreadable, no NonTried). `bytes_pending`
-    // alone is the wrong denominator: it INCLUDES NonTried (so on a partially
-    // swept disc it exceeds `work_total` and saturating_sub pins the bar at 0)
-    // and EXCLUDES Unreadable (so the final-tier Unreadable→NonTrimmed relabel
-    // would drive `recovered` backward). Subtract NonTried and add Unreadable
-    // back so the two sets line up and progress stays monotonic.
+    // Progress = bytes RECOVERED, not a per-range counter, since breadth-first
+    // tiers bring back readable bulk before any range "finishes". `still_bad_work`
+    // matches `work_total`: `bytes_pending` alone over/undershoots it otherwise.
     let still_bad_work = s
         .bytes_pending
         .saturating_sub(s.bytes_nontried)
@@ -1497,14 +1397,9 @@ pub fn bytes_bad_in_title_from_mapfile(
 ) -> u64 {
     let map = match mapfile::Mapfile::load(mapfile_path) {
         Ok(m) => m,
-        // A MISSING mapfile is legitimate (no damage was ever tracked — e.g. a
-        // clean single-pass rip): 0 bad bytes is correct. Any OTHER load error
-        // (corrupt / unreadable mapfile) means we CANNOT know the damage — and
-        // a returned 0 reads to the caller as "clean." Logging alone is not
-        // fail-safe: the RETURN VALUE drives the loss/abort accounting, not the
-        // log. So fail safe by reporting the ENTIRE title as bad (its full
-        // in-extent byte count) — a corrupt damage record must surface as
-        // maximal loss, never as a clean rip.
+        // A MISSING mapfile is legitimate (no damage tracked): 0 is correct. Any
+        // OTHER load error means we CANNOT know the damage, so fail safe by
+        // reporting the ENTIRE title as bad rather than returning 0 ("clean").
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
         Err(e) => {
             tracing::warn!(
@@ -1532,7 +1427,7 @@ pub fn bytes_bad_in_title_from_mapfile(
 /// disc in the first minutes. Returns a [`PatchOutcome`] with
 /// recovered byte counts and wedge-detection signals.
 ///
-/// Paired with [`super::sweep`] as this crate's other flat
+/// Paired with [`super::sweep()`] as this crate's other flat
 /// rip-phase verb (both were `Disc::` methods in libfreemkv before 1.6.0). Caller drives the retry loop and the
 /// sweep-vs-patch dispatch.
 pub fn patch(
@@ -1545,41 +1440,21 @@ pub fn patch(
     use libfreemkv::sector::DecryptingSectorSource;
 
     // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
-    // direct `patch` caller can't bypass it). A decrypting patch pass of an
-    // encrypted disc with no usable key would write ciphertext into the ISO's
-    // recovered ranges; refuse before reading any sector. No-op for `--raw`
-    // (`opts.decrypt == false`) and unencrypted discs.
+    // direct `patch` caller can't bypass it): a decrypting pass with no usable
+    // key would write ciphertext into recovered ranges. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
     let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
         compute_initial_state(path, &mapfile_path)?;
-    // Same reasoning as the decrypt gate above: `copy` and `sweep` both verify
-    // the mapfile actually describes THIS disc before acting on it, and a
-    // direct `patch` caller — the exposed sweep/patch resume pair — must not
-    // be able to skip that. Without it, a resume that resolves to a leftover
-    // mapfile from a different disc patches disc B's ranges into disc A's ISO
-    // and records them Finished, which is silent corruption presented as a
-    // successful recovery.
+    // Same reasoning as the decrypt gate: `copy`/`sweep` verify the mapfile
+    // describes THIS disc, and `patch` must not skip that — otherwise a leftover
+    // mapfile from disc B patches its ranges into disc A's ISO as "Finished".
     mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
-    // COVERAGE. `total_bytes` — the denominator every figure this pass reports
-    // is derived against, including `bytes_total` in the outcome — comes wholly
-    // from the untrusted mapfile's last entry (`load()` derives it as
-    // `last.pos + last.size`). Nothing compared it with the disc actually in
-    // the drive.
-    //
-    // An UNDER-covering mapfile (truncated tail, a dropped trailing line, an
-    // imported ddrescue run over part of the image) therefore describes a
-    // fraction of the disc, and a patch pass that cleans that fraction reports
-    // zero pending and zero unreadable over it: `MultipassResult::complete`
-    // stamps true for a disc most of which was never read. An OVER-covering one
-    // sends reads past capacity.
-    //
-    // `copy` already refuses to resume on ANY mismatch (`covers_disc`) and
-    // forces a fresh full sweep. `patch` has no sweep to fall back to, so — as
-    // with the truncated-image gate directly below — it refuses and leaves the
-    // choice to the caller.
+    // COVERAGE. `total_bytes` (the denominator every reported figure derives
+    // from) comes wholly from the untrusted mapfile, never checked against the
+    // drive. `copy` forces a fresh sweep on mismatch; `patch` refuses instead.
     if total_bytes != disc.capacity_bytes {
         tracing::info!(
             target: "freemkv::scan",
@@ -1590,26 +1465,9 @@ pub fn patch(
         );
         return Err(Error::MapfileInvalid { kind: "coverage" });
     }
-    // Same argument as the identity gate above, and the gap it left open. A
-    // patch pass walks only the mapfile's BAD ranges and takes `bytes_good`
-    // from its stats, so it never looks at — and never re-reads — anything the
-    // mapfile already calls Finished. If the image has since been truncated
-    // (a full disk, an interrupted transfer, a remount), every Finished range
-    // past the cut is a sparse hole that this pass will not touch, and the
-    // outcome still reports the whole disc as good: a successful recovery over
-    // data that was never written.
-    //
-    // `copy` and `sweep` both answer this by forcing a fresh sweep. `patch` has
-    // no sweep to fall back to, so it refuses instead and leaves the choice to
-    // the caller.
-    //
-    // REGULAR FILES ONLY. A length is only evidence of content for a regular
-    // file: a character device (`/dev/null`, the discard destination used by
-    // read-only verification passes) always stat's as 0 bytes no matter how
-    // much has been written to it, so an unconditional gate refuses every such
-    // pass. `sweep.rs::close` exempts non-regular outputs from its `sync_all`
-    // check for the same reason; `is_regular` here is the same flag, read from
-    // the open handle by `compute_initial_state`.
+    // Same argument as the identity gate: patch never re-reads what the mapfile
+    // calls Finished, so a since-truncated image reports success over data past
+    // the cut. `copy`/`sweep` force a fresh sweep on this; `patch` refuses.
     let image = crate::recovery::image_state(path, total_bytes)?;
     if is_regular && image.is_short() {
         tracing::info!(
@@ -1634,13 +1492,9 @@ pub fn patch(
     let bytes_good_before = initial_stats.bytes_good;
     let bytes_good_start = bytes_good_before;
 
-    // Decrypt-aware read — symmetric with `Disc::sweep`. A decrypting patch
-    // (`opts.decrypt`) decrypts in place (plaintext ISO); a NON-decrypting
-    // patch (the multipass / `--raw --multipass` path) copies ciphertext
-    // verbatim (keys = `None` → pass-through). Bad sectors are found by
-    // PHYSICAL read success, not by decrypt structure: a re-read that returns
-    // good bytes recovers the range; a read that errors leaves it NonTrimmed
-    // for the next pass. (The old decrypt-VERIFY read gate was removed.)
+    // Decrypt-aware read, symmetric with `Disc::sweep`: `opts.decrypt` decrypts
+    // in place, non-decrypting (multipass `--raw`) copies ciphertext verbatim.
+    // Bad sectors are found by PHYSICAL read success, not decrypt structure.
     let mut keys = if opts.decrypt {
         disc.decrypt_keys()
     } else {
@@ -1674,31 +1528,18 @@ pub fn patch(
     };
     let reader = &mut reader;
 
-    // Spawn the consumer. The `WritebackFile` (same bounded-cache
-    // wrapper sweep uses, so patch's recovery writes — sparse but
-    // can be many across a damaged region — get the burst-flush
-    // protection on slow / NFS-backed staging) and the `Mapfile`
-    // both move into the sink. We hold an `Arc<Mutex<…>>` snapshot
-    // the sink republishes after every record so producer-side
-    // stall guards / progress callbacks can read consumer side-
-    // effects.
-    // Taken BEFORE `map` moves into the sink: if the teardown below has to
-    // abandon this consumer, that is the only way left to stop it writing
-    // its by-then-stale mapfile over a resumed pass's record.
+    // Spawn the consumer: `WritebackFile`/`Mapfile` move into the sink; the shared
+    // snapshot lets producer callbacks read consumer effects. Disown taken
+    // BEFORE the move so abandoned teardown can still stop a stale mapfile write.
     let map_disown = map.disown_handle();
     let (sink, shared) = PatchSink::new(path, map, is_regular, disc.titles.first().cloned())?;
-    // Why: WRITE_THROUGH_DEPTH (=1) — patch reads ONE sector per
-    // recovery decision and the producer's stall / damage-window
-    // logic checks consumer-published stats inline. Sweep's
-    // DEFAULT_PIPELINE_DEPTH (=4) would let several sectors of
-    // recovered bytes queue up between producer decisions and
-    // writes, which conflicts with the per-sector lockstep this
-    // loop was written against.
+    // WRITE_THROUGH_DEPTH (=1): patch reads one sector per recovery decision and
+    // checks consumer-published stats inline. Sweep's depth-4 default would let
+    // recovered sectors queue between decisions, breaking this per-sector lockstep.
     let pipe = Pipeline::<PatchItem, _>::spawn(WRITE_THROUGH_DEPTH, sink)?;
-    // Halt token for the teardown below (`super::finish_bounded`). Adopts the
-    // caller's Stop bit as-is, exactly as `run`'s `pass_halt` does for the
-    // sends; a caller that wires none gets a never-cancelled token, which
-    // leaves JOIN_TIMEOUT_SECS as the only bound on the join.
+    // Halt token for the teardown below: adopts the caller's Stop bit as-is,
+    // exactly as `run`'s `pass_halt` does; a caller wiring none gets a never-
+    // cancelled token, leaving JOIN_TIMEOUT_SECS as the only bound on the join.
     let finish_halt = opts
         .halt
         .clone()
@@ -1715,16 +1556,9 @@ pub fn patch(
         );
     }
 
-    // Read sizing and fast-vs-deep recovery are owned by the handler chain
-    // (`section_recover.rs`): it reads at a fixed `BATCH_SECTORS`, bisects to
-    // isolate readable islands, and selects fast vs 60 s deep reads per
-    // handler/tier. The old adaptive `current_batch` / halve-on-failure /
-    // double-back loop that this comment used to describe no longer exists.
-    // `block_sectors` and `full_recovery` therefore no longer drive behavior
-    // — they survive only as the PassKind label and the diagnostics logged
-    // below (informational-only; a caller can't change read sizing or the
-    // recovery timeout through them). Clamp to ≥1 so the label math never
-    // underflows on a `Some(0)`.
+    // Read sizing / fast-vs-deep recovery are owned by the handler chain now, not
+    // the old adaptive current_batch loop. `block_sectors`/`full_recovery` survive
+    // only as informational PassKind labels; clamp to ≥1 to avoid underflow.
     let initial_batch = initial_batch_of(opts);
     let recovery = opts.full_recovery;
     log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
@@ -1765,31 +1599,21 @@ pub fn patch(
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
     };
-    // Hold the pass result rather than `?`-ing it: the teardown below is what
-    // runs `PatchSink::close` (sync_all + mapfile.flush), and returning early
-    // here skipped it on every error path — so a pass that died mid-write left
-    // the on-disk damage record unflushed and disagreeing with what happened.
+    // Hold the pass result rather than `?`-ing it: the teardown below runs
+    // `PatchSink::close` (sync_all + mapfile.flush), and returning early here
+    // skipped it, leaving the on-disk damage record unflushed on error paths.
     let run_result = ctx.run(&bad_ranges);
     ctx.scoreboard.log();
     let PatchCtx { state, .. } = ctx;
 
-    // Drain the consumer thread unconditionally: drop tx, wait for `close` to
-    // run sync_all + mapfile.flush, then take the final stats from the sink's
-    // summary. `close` failing on a regular-file sync_all is surfaced as
-    // `Error::IoError`, matching pre-split behaviour.
-    //
-    // Bounded by the SAME Stop bit `run`'s sends use. Unconditional does not
-    // mean unbounded: a plain `Pipeline::finish` blocked joining a consumer
-    // wedged on a hung mount, which is the one case `send_bounded` above had
-    // just rescued the producer from — the halt landed, and then this line
-    // swallowed it.
+    // Drain the consumer unconditionally: drop tx, wait for `close`, take final
+    // stats. Bounded by the SAME Stop bit `run`'s sends use — a plain
+    // `Pipeline::finish` once hung joining a wedged consumer and swallowed a halt.
     let finish_result = super::finish_bounded_disowning(pipe, &finish_halt, &map_disown);
 
-    // Producer-side error wins over consumer-side — the pass failure is what
-    // motivated quitting; the flush error, if any, is downstream. Mirrors the
-    // sweep path's documented precedence. But do not let a close() failure
-    // vanish silently on the both-failed path: it is the only signal that the
-    // mapfile on disk is now untrustworthy.
+    // Producer-side error wins over consumer-side (mirrors sweep's precedence),
+    // but don't let a close() failure vanish silently on the both-failed path:
+    // it's the only signal that the mapfile on disk is now untrustworthy.
     if let Err(ref e) = run_result
         && let Err(close_err) = &finish_result
     {
@@ -2064,25 +1888,9 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------------
-    // Scheduler knobs (`FREEMKV_PATCH_FLAT`, `FREEMKV_PATCH_FLAT_BUDGET`).
-    //
-    // These tests used to WRITE the real env vars under a per-key mutex, with
-    // a SAFETY note claiming the lock made the `set_var` sound because nothing
-    // else in the binary touched THOSE KEYS. That is not `set_var`'s safety
-    // condition. The condition is that no other thread is accessing the
-    // environment at all — any key — because a `setenv` can reallocate and
-    // free the `environ` array a concurrent `getenv` is reading. This binary
-    // breaks that continuously: `std::env::temp_dir()` reads `TMPDIR`, and a
-    // dozen sibling tests in `run.rs`, `mapfile.rs`, `mod.rs`, `sweep.rs`,
-    // `extract.rs`, `multipass.rs` and this very file call it on cargo's other
-    // test threads. The mutex could not have prevented it: those tests never
-    // took the lock, and could not be expected to.
-    //
-    // So nothing writes the environment any more. The parsing rules are pinned
-    // against the pure `*_from_value` functions, and the one test that needs a
-    // value to reach a real `patch()` call uses the thread-local override.
-    // ----------------------------------------------------------------
+    // Scheduler knobs (`FREEMKV_PATCH_FLAT`, `FREEMKV_PATCH_FLAT_BUDGET`). Tests
+    // used to WRITE real env vars under a mutex, unsound since sibling tests touch
+    // the environment concurrently regardless; now parsing uses pure fns / a thread-local.
 
     /// Restores both thread-local knob overrides on drop, including on panic,
     /// so a failing assertion cannot leak a knob into the next test that runs
@@ -2381,10 +2189,9 @@ mod tests {
 
     #[test]
     fn recovery_read_widens_unaligned_aacs_window() {
-        // A mid-unit AACS read must widen to the enclosing 3-sector unit
-        // (so the decrypting source accepts it) and copy back exactly the
-        // requested sector. Each sector is filled with its own LBA's low
-        // byte so we can prove which window came back.
+        // A mid-unit AACS read must widen to the enclosing 3-sector unit and copy
+        // back exactly the requested sector; each sector is filled with its own
+        // LBA's low byte so we can prove which window came back.
         struct RecordReader {
             saw_lba: u32,
             saw_count: u16,
@@ -2496,11 +2303,9 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------------
-    // SubRanges — the still-bad work-list the per-section recovery
-    // phases (#50) shrink. Pure data structure; exhaustively tested so
-    // each future phase helper can assert on its residual ranges.
-    // ----------------------------------------------------------------
+    // SubRanges — the still-bad work-list the per-section recovery phases (#50)
+    // shrink. Pure data structure; exhaustively tested so each future phase
+    // helper can assert on its residual ranges.
 
     #[test]
     fn subranges_from_section_and_basics() {

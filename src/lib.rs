@@ -32,21 +32,16 @@
 //! 1. **Nothing prints.** Every diagnostic flows through the [`Sink`]; the
 //!    engine never writes to stdout/stderr. A GUI has no other way to surface
 //!    it.
-//! 2. **Preflight is callable without executing.** [`preflight`] answers "can
+//! 2. **Preflight is callable without executing.** [`preflight()`] answers "can
 //!    this job run, and if not why" as *data*, so a UI can keep a Start button
 //!    honest on every selection change — without side effects.
 
 // The engine is app-layer, so (unlike libfreemkv) it may carry English text in
 // diagnostics. Front-ends localize via the message + code carried on events.
 
-// This crate has no reason to reach for `unsafe`, and the one block it did
-// have was a test helper calling `std::env::set_var` with a SAFETY note that
-// justified the wrong condition (a per-key mutex, where the real requirement
-// is that no thread anywhere touches the environment concurrently — and
-// sibling tests call `std::env::temp_dir()` on cargo's other test threads).
-// `forbid` rather than `deny` so it cannot be re-allowed locally with an
-// attribute; a knob that must reach production code belongs in a parameter or
-// a thread-local, not in `environ`.
+// No reason for this crate to use `unsafe`; a prior test helper's SAFETY note
+// justified the wrong condition for `std::env::set_var` (env access must be
+// single-threaded process-wide). `forbid`, not `deny`, so it can't be re-allowed.
 #![forbid(unsafe_code)]
 
 mod extract;
@@ -56,26 +51,15 @@ mod multipass;
 mod mux;
 mod outcome;
 mod preflight;
-// The relocated recovery strategy (sweep/patch/mapfile/read_error/
-// section_recover). `run()` drives the multipass dispatch (`recovery::copy`);
-// some producer/consumer plumbing and Pass-N-only helpers still have no
-// in-crate caller until the full run() surface lands, so allow dead_code at
-// the module boundary for now.
-// Some faithfully-relocated recovery internals (mapfile `vid`/`unit_keys`/
-// `next_with`, `ReadCtx::for_patch`, `PATCH_DAMAGE_THRESHOLD_PCT`) had lib
-// callers that aren't reachable in-crate until autorip's resume path consumes
-// the exposed `sweep`/`patch` — allow dead_code at the module boundary rather
-// than diverge from the byte-faithful move.
+// Relocated recovery strategy (sweep/patch/mapfile/read_error/section_recover).
+// Some faithfully-relocated internals have no in-crate caller yet — allow
+// dead_code here rather than diverge from the byte-faithful move.
 #[allow(dead_code)]
 mod recovery;
 
-// ─── Recovery primitives (relocated from libfreemkv) ────────────────────────
-//
-// The sweep/patch passes and their option/result types. `multipass_rip`
-// drives them for the common case; a consumer that must interleave its own
-// work between passes (autorip, whose staging/resume/watchdog state advances
-// at pass boundaries) drives `sweep`/`patch` directly. These are the same
-// primitives libfreemkv used to expose as `Disc::sweep`/`Disc::patch`.
+// Recovery primitives (relocated from libfreemkv). `multipass_rip` drives
+// sweep/patch for the common case; a consumer that must interleave its own
+// work between passes (autorip's staging/resume/watchdog) drives them directly.
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
@@ -111,12 +95,9 @@ pub use streams::{
     resolve_stream_selection_forced,
 };
 
-// ─── Re-exports so a front-end can depend on the engine alone ────────────────
-//
-// A UI (or the CLI) building on the engine needs the disc-model and cancellation
-// types to render titles/streams and wire a Cancel button. Re-export them here
-// so front-ends never have to add a *direct* libfreemkv dependency just for
-// these — the engine is their substrate.
+// Re-exports so a front-end can depend on the engine alone: a UI needs the
+// disc-model and cancellation types to render titles/streams and wire a
+// Cancel button, without a *direct* libfreemkv dependency just for these.
 pub use libfreemkv::{
     AudioStream, Codec, Disc, DiscFormat, DiscTitle, Halt, PidFilter, Resolution, Stream,
     StreamSelection, SubtitleStream, VideoStream,

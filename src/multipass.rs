@@ -109,12 +109,9 @@ pub fn abort_lost_ms(
     bad_ranges: &[(u64, u64)],
     title_bytes_per_sec: f64,
 ) -> f64 {
-    // An UNSCOPABLE mkv-output title: `bytes_bad_in_title` returns 0 when the
-    // title has no extents, which is indistinguishable from "no damage" — and
-    // an extent-less title comes from the same failed scan that leaves the
-    // bitrate at 0, so the two arrive together. Returning 0.0 here would report
-    // a damaged disc as clean. Checked BEFORE the zero-bytes early return,
-    // because that is the branch it would otherwise take.
+    // UNSCOPABLE title: no extents means `bytes_bad_in_title` returns 0,
+    // indistinguishable from "no damage" (the same failed scan zeroes the
+    // bitrate). Checked before the zero-bytes return, which would otherwise win.
     if loss_is_unscopable(output_is_iso, title, bad_ranges) {
         return f64::NAN;
     }
@@ -124,30 +121,17 @@ pub fn abort_lost_ms(
         return 0.0;
     }
     // Loss exists but cannot be converted to time. Every other unquantifiable
-    // path in this crate answers NaN, which `loss_aborts` /
-    // `should_abort_for_loss` treat as fail-safe abort; answering 0.0 let a
-    // configured seconds tolerance silently accept loss it could not measure.
-    // `<= 0.0` alone let an INFINITE bitrate through: `lost_bytes / inf` is
-    // 0.0 ms, so a tolerance accepted loss that was never measured. Any
-    // non-finite or non-positive rate is unusable.
+    // path answers NaN (fail-safe abort); 0.0 would silently accept it. An
+    // infinite bitrate must also be rejected (lost_bytes/inf == 0.0 too).
     if !(title_bytes_per_sec.is_finite() && title_bytes_per_sec > 0.0) {
         return f64::NAN;
     }
     lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
 // MULTIPASS STRATEGY DECISIONS — relocated verbatim from autorip's `rip_disc`.
-//
-// These pure functions are the loop's decision surface: pass ordering, the
-// scope-aware convergence check, the no-progress exhaustion gate, and the
-// end-of-recovery status promotion. They were characterized in place inside
-// autorip (its `char_*` tests pin them byte-for-byte) before this move, so a
-// relocation with identical signatures/bodies is behavior-preserving by
-// construction. autorip now calls these directly instead of carrying its own
-// copies; the freemkv GUI (a future front-end) will use the same
-// implementation without duplicating it.
-// ─────────────────────────────────────────────────────────────────────────────
+// Pure pass-ordering/convergence/exhaustion/promotion decisions, characterized
+// byte-for-byte in autorip's `char_*` tests before the move (behavior-preserving).
 
 /// The pass plan for a rip, derived purely from `max_retries`.
 ///
@@ -175,10 +159,9 @@ pub fn plan_passes(max_retries: u8) -> PassPlan {
             multipass: true,
             sweep_passes: 1,
             patch_passes: max_retries,
-            // saturating: max_retries is a u8 and the caller clamps to
-            // u8::MAX, so `+ 2` overflows for anything >= 254 — a panic in
-            // dev/test and a silent wrap to 1 under release, where the UI's
-            // pass denominator would then be smaller than the pass count.
+            // saturating: max_retries is u8, caller clamps to u8::MAX, so `+ 2`
+            // overflows above 253 — a dev-mode panic, or a silent wrap to 1 in
+            // release, leaving the UI's pass denominator smaller than the pass count.
             total_passes: max_retries.saturating_add(2), // pass 1 + retries + mux
         }
     } else {
@@ -310,10 +293,9 @@ pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity 
     if bad_sectors == 0 {
         return Clean;
     }
-    // An unquantifiable loss fails SAFE, matching `should_abort_for_loss`.
-    // Every NaN comparison is false, so without this a NaN fell through both
-    // tiers to Cosmetic — the badge would read "Cosmetic" on the very rip the
-    // abort gate is simultaneously refusing to deliver.
+    // An unquantifiable loss fails SAFE, matching `should_abort_for_loss`: every
+    // NaN comparison is false, so without this it fell through both tiers to
+    // Cosmetic — badging "Cosmetic" on the rip the abort gate is refusing.
     if lost_ms.is_nan() {
         return Serious;
     }
@@ -533,11 +515,9 @@ pub fn end_of_recovery_lost_ms(
             ),
         );
     }
-    // `loss_is_unscopable`'s `is_iso` parameter answers the question the ABORT
-    // GATE asks ("can the gate's byte count be produced without extents?" —
-    // for whole-disc ISO scope, yes). The question HERE is a different one and
-    // the answer never depends on the deliverable: a main-title millisecond
-    // figure always needs the main title's extents, so ask it in title terms.
+    // `loss_is_unscopable`'s `is_iso` answers the ABORT GATE's question ("can the
+    // byte count be produced without extents?"). The question HERE never depends
+    // on the deliverable: a main-title ms figure always needs title extents.
     const MS_IS_ALWAYS_TITLE_SCOPED: bool = false;
     if loss_is_unscopable(MS_IS_ALWAYS_TITLE_SCOPED, title, bad_ranges) {
         return (
@@ -655,11 +635,9 @@ pub fn multipass_rip(
     opts: &MultipassOpts,
     sink: &dyn Sink,
 ) -> crate::Result<MultipassResult> {
-    // Every recovery primitive below sleeps through damage cooldowns, and a
-    // sleeping pass emits no progress ticks — so the progress callback's
-    // `should_cancel` return value cannot be consulted while it waits. Run the
-    // whole multipass under one halt token so Stop is honoured mid-cooldown in
-    // the sweep AND in every patch pass. See `with_cancel_watcher`.
+    // Every recovery primitive sleeps through damage cooldowns, emitting no
+    // progress ticks, so `should_cancel` can't be polled while waiting. Run the
+    // whole multipass under one halt token so Stop works mid-cooldown too.
     crate::run::with_cancel_watcher(sink, |halt| {
         multipass_rip_inner(disc, reader, iso_path, job, opts, sink, halt)
     })
@@ -677,15 +655,9 @@ fn multipass_rip_inner(
 ) -> crate::Result<MultipassResult> {
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
 
-    // Multipass implies raw — but the test is the RESOLVED PLAN, not the
-    // entry point. `max_passes: 0` selects the single-pass branch below, which
-    // is an ordinary decrypting `copy` dispatch and must stay allowed;
-    // refusing on `!job.raw` here would have broken it. Only a real
-    // sweep-plus-patch plan is a whole-disc image recovery that cannot
-    // decrypt.
-    //
-    // Enforced here as well as in `preflight` because preflight is advisory by
-    // contract (callable without executing) and a front-end may skip it.
+    // Multipass implies raw — gated on the RESOLVED PLAN, not the entry point:
+    // `max_passes: 0` takes the single-pass (decrypting) branch and must stay
+    // allowed. Enforced here too since `preflight` is advisory and skippable.
     if plan.multipass && !job.raw {
         return Err(crate::run::multipass_requires_raw());
     }
@@ -713,44 +685,21 @@ fn multipass_rip_inner(
             key_fetch: None,
         };
         let cr = crate::recovery::copy(disc, reader, iso_path, &copy_opts)?;
-        // Same reasoning as the halted branch: a single-pass run that came
-        // back with unreadable bytes is not Clean just because there was only
-        // one pass. Clean is a claim about the DISC, not about the plan.
-        //
-        // WHY `bytes_pending` is the right second term HERE, given
-        // `bad_sector_count`'s doc forbids the aggregate: on every route that
-        // reaches this line un-halted, the pending bytes contain no `NonTried`.
-        // `recovery::copy` routes ANY mapfile with `bytes_nontried > 0` to a
-        // resume sweep before it can return, and its terminal plain-copy branch
-        // is reached only with `nontried == 0` — so a completed single pass has
-        // attempted the whole disc and its pending bytes are retryable damage
-        // (sweep's skipped `NonTrimmed` blocks), which is exactly what the
-        // score wants. The interrupted route, where `NonTried` genuinely
-        // dominates, takes `interrupted_severity` below instead.
+        // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
+        // here (unlike the aggregate `bad_sector_count` forbids) because every
+        // un-halted route here has `nontried == 0`, so pending is retryable damage.
         let bad_sectors = bad_sector_count(cr.bytes_unreadable, cr.bytes_pending);
         return Ok(MultipassResult {
             unreadable_bytes: cr.bytes_unreadable,
             pending_bytes: cr.bytes_pending,
             good_bytes: cr.bytes_good,
-            // Single-pass never runs the end-of-recovery gate that measures
-            // main-title loss. A flat 0.0 therefore asserted a measurement
-            // that never happened — indistinguishable, to any consumer, from
-            // "this damaged disc lost no playback", against a non-zero
-            // unreadable count. NaN is this crate's existing and only marker
-            // for "could not be quantified" (see the Err-branch fail-safe
-            // below, and this field's own doc).
-            //
-            // A disc with NO bad sectors is the one case that needs no
-            // measurement: nothing was lost because nothing was unreadable.
-            // Reporting NaN there would mark a perfect rip as unquantified.
+            // Single-pass never runs the end-of-recovery loss gate, so a flat
+            // 0.0 would falsely claim "no playback lost" beside real damage.
+            // NaN marks it unquantified — except zero bad sectors, genuinely 0.0.
             main_lost_ms: if bad_sectors == 0 { 0.0 } else { f64::NAN },
-            // Severity still comes from the SECTOR count, which single-pass
-            // does know. Passing the NaN here instead would escalate every
-            // damaged single-pass rip to Serious, because `classify_damage`
-            // treats an unquantifiable loss as fail-safe — right for the
-            // abort gate, wrong here, since single-pass has no abort gate
-            // (`aborted_for_loss: false`). The 0.0 below is "no time-based
-            // escalation", not a claim that nothing was lost.
+            // Severity comes from the SECTOR count, which single-pass knows.
+            // NaN would wrongly escalate to Serious via `classify_damage`'s
+            // fail-safe (right for the abort gate; single-pass has none).
             severity: if cr.halted {
                 interrupted_severity(cr.bytes_unreadable, cr.bytes_pending)
             } else {
@@ -800,17 +749,9 @@ fn multipass_rip_inner(
                 break;
             }
 
-            // Loop-top convergence gate: the muxable scope is already clean
-            // in the mapfile — skip remaining passes and proceed to mux.
-            //
-            // `None` = the mapfile could not be read, so the scope is
-            // UNMEASURED. It used to fall back to the in-flight counters, which
-            // silently turned a failed read of the rip's only damage record
-            // into a measurement: on a run whose carried counters are both zero
-            // the fallback is 0, `patch_pass_decision(0, None)` answers
-            // `Converged`, and the loop announces "muxable scope 100%
-            // recovered" and skips every remaining pass on the strength of a
-            // load that failed. Unmeasured must never converge.
+            // Loop-top convergence gate: skip remaining passes if the mapfile
+            // shows the muxable scope already clean. `None` (mapfile unreadable)
+            // must never be conflated with 0 — that used to fake "Converged".
             let mux_scope_bad = match Mapfile::load(&mapfile_path) {
                 Ok(map) => {
                     let bad = map.ranges_with(&bad_sector_statuses());
@@ -853,12 +794,9 @@ fn multipass_rip_inner(
                 halted = true;
                 break;
             }
-            // A transport fault is NOT an exhausted pass. The bridge died
-            // mid-range, so everything it had not reached is still retryable —
-            // and falling through to the loop's exhaustion gate would end the
-            // recovery, promote those ranges to permanently Unreadable, and
-            // make a later re-run skip them entirely. Return partial, like a
-            // cancel, and say which of the two it was.
+            // A transport fault is NOT an exhausted pass: unreached ranges are
+            // still retryable, and falling through would promote them to
+            // permanently Unreadable, so a re-run would skip them forever.
             if exit == PassExit::Wedged {
                 sink.log(
                     Level::Warn,
@@ -886,10 +824,9 @@ fn multipass_rip_inner(
                     last_pending
                 ),
             );
-            // Loop-bottom exhaustion gate, evaluated against the SAME
-            // pre-pass `mux_scope_bad` the top-of-loop check used (see
-            // `patch_pass_decision`'s doc): a pass that recovered nothing
-            // won't be helped by another pass with the same drive state.
+            // Loop-bottom exhaustion gate, evaluated against the SAME pre-pass
+            // `mux_scope_bad` the top-of-loop check used: a pass that recovered
+            // nothing won't be helped by another pass with the same drive state.
             if patch_pass_decision_measured(mux_scope_bad, Some(recovered))
                 == PatchDecision::NoProgress
             {
@@ -903,16 +840,9 @@ fn multipass_rip_inner(
     }
 
     if halted {
-        // Severity comes from the damage actually recorded so far. Hard-coding
-        // Clean here made a cancelled rip that had already found 300 MB of
-        // unreadable sectors render a "Clean" badge next to a non-zero
-        // unreadable count — the result contradicted itself, and Clean is the
-        // reading that gets believed.
-        //
-        // main_lost_ms stays 0.0 and is NOT a damage claim: main-title loss is
-        // only computable from the mapfile at end-of-recovery, which an
-        // interrupted run never reaches. `halted: true` is the flag that says
-        // this result is partial.
+        // Severity comes from damage actually recorded — hard-coding Clean here
+        // made a cancelled rip with 300 MB unreadable show a "Clean" badge.
+        // main_lost_ms stays 0.0 (uncomputable mid-recovery); `halted` marks it partial.
         return Ok(MultipassResult {
             unreadable_bytes: last_unreadable,
             pending_bytes: last_pending,
@@ -928,19 +858,14 @@ fn multipass_rip_inner(
     }
 
     // ── End-of-recovery promotion + abort-on-loss gate. ──
-    // `bad_sectors` is carried out of the match rather than derived after it:
-    // the two branches score from different evidence. The Ok branch has the
-    // mapfile's own damage/un-attempted split (`end_of_recovery_bad_sectors`);
-    // the Err branch has only in-flight counters that cannot be split.
+    // `bad_sectors` is carried out of the match, not derived after: the Ok
+    // branch has the mapfile split; the Err branch has only unsplittable counters.
     let (main_lost_ms, main_lost_bytes, good_bytes, unreadable_bytes, pending_bytes, bad_sectors) =
         match Mapfile::load(&mapfile_path) {
             Ok(mut map) => {
-                // Promotion is what MAKES the loss visible: the abort gate a
-                // few lines down reads Unreadable ranges only, so a range that
-                // fails to promote out of NonTrimmed is not counted as lost —
-                // it silently drops out of the very decision it should be
-                // driving. Logging and carrying on therefore turns a write
-                // error into a rip delivered as good.
+                // Promotion MAKES the loss visible: the abort gate reads only
+                // Unreadable ranges, so a range that fails to promote out of
+                // NonTrimmed silently drops out — a write error ships as a good rip.
                 let mut promotion_intact = true;
                 let (promote_from, promote_to) = end_of_recovery_promotion();
                 for (pos, size) in map.ranges_with(promote_from) {
@@ -962,16 +887,9 @@ fn multipass_rip_inner(
                 let stats = map.stats();
                 let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
                 let lost_bytes = abort_lost_bytes(opts.is_iso_output, main_title, &bad_ranges);
-                // Same fail-safe the unreadable-mapfile branch below uses: if
-                // the damage record is incomplete, the loss is unquantifiable,
-                // and NaN makes `loss_aborts` fire regardless of threshold
-                // rather than delivering a possibly-lossy rip as perfect.
-                // NOTE the asymmetry, it is deliberate: `lost_bytes` above is
-                // the GATE's count (whole-disc for an ISO deliverable) and
-                // feeds `loss_aborts`, while `end_of_recovery_lost_ms` scopes
-                // its own bytes to the main title. Handing the gate's count to
-                // the millisecond conversion is what reported off-title damage
-                // as main-title playback loss.
+                // Fail-safe: an incomplete damage record makes loss NaN, so
+                // `loss_aborts` fires regardless of threshold. Deliberately
+                // asymmetric: `lost_bytes` is whole-disc; the ms below stays title-scoped.
                 let (lost_ms, unquantifiable) =
                     end_of_recovery_lost_ms(promotion_intact, main_title, &bad_ranges);
                 if let Some(why) = unquantifiable {
@@ -988,20 +906,15 @@ fn multipass_rip_inner(
             }
             Err(_) => {
                 // Fail-safe (mirrors autorip): the mapfile — the rip's only
-                // damage record — could not be read at the abort-decision
-                // point. Report the loss as unquantifiable (NaN) so
-                // `loss_aborts` fires regardless of threshold, rather than
-                // silently delivering a possibly-lossy rip as perfect.
+                // damage record — couldn't be read at the abort-decision point.
+                // NaN makes `loss_aborts` fire instead of shipping this as a perfect rip.
                 sink.log(
                     Level::Error,
                     "multipass_rip: mapfile could not be loaded to verify loss — forcing abort",
                 );
-                // No `MapStats` to split, so the score keeps the whole
-                // in-flight aggregate — deliberately, because this is the
-                // fail-safe path and it must over-report rather than
-                // under-report. (It cannot lean on the NaN to escalate either:
-                // `classify_damage` answers Clean for zero bad sectors BEFORE
-                // it looks at `lost_ms`.)
+                // No `MapStats` to split, so the score keeps the whole in-flight
+                // aggregate deliberately — this fail-safe path must over-report,
+                // not under-report (NaN can't escalate a zero-sector Clean verdict).
                 (
                     f64::NAN,
                     0,
@@ -1056,10 +969,9 @@ mod tests {
     fn every_multipass_result_field_is_documented() {
         let src = include_str!("multipass.rs");
         let guide = include_str!("../USING_THE_ENGINE.md");
-        // The struct body: from its declaration to the closing brace in
-        // column 0. `MultipassResult` has no `impl` block to terminate on
-        // (unlike `Reason`), and no field type or doc line inside it
-        // contains a brace, so the first `\n}` is the end.
+        // The struct body: declaration to the closing brace in column 0.
+        // `MultipassResult` has no `impl` block to terminate on (unlike
+        // `Reason`), and no field/doc line inside contains a brace, so `\n}` is the end.
         let body = src
             .split_once("pub struct MultipassResult {")
             .expect("the file declares MultipassResult")
@@ -1090,10 +1002,9 @@ mod tests {
         }
 
         for field in fields {
-            // `mp.<field>` — the notation the guide's own example
-            // establishes (`let mp: MultipassResult = multipass_rip(...)`).
-            // Matching the bare word would let "completed" (an unrelated
-            // sink method in §1) pass for `complete`.
+            // `mp.<field>` — the notation the guide's own example establishes.
+            // Matching the bare word would let "completed" (an unrelated sink
+            // method in §1) pass for `complete`.
             assert!(
                 guide.contains(&format!("mp.{field}")),
                 "MultipassResult field {field:?} is public but not listed in \
@@ -1178,10 +1089,9 @@ mod tests {
             "an unquantifiable loss must abort even under a 30s tolerance"
         );
 
-        // The scope hole: a title with NO EXTENTS cannot be scoped, so
-        // `bytes_bad_in_title` answers 0 — indistinguishable from "clean".
-        // With a perfectly good bitrate, this is the case a naive
-        // `lost_bytes == 0 -> 0.0` guard would wave through.
+        // The scope hole: a title with NO EXTENTS can't be scoped, so
+        // `bytes_bad_in_title` answers 0 — indistinguishable from "clean". A
+        // naive `lost_bytes == 0 -> 0.0` guard would wave this through.
         let mut no_extents = libfreemkv::DiscTitle::empty();
         no_extents.size_bytes = 1_000_000;
         no_extents.duration_secs = 100.0;
@@ -1244,11 +1154,9 @@ mod tests {
             "extents-less scoping still answers 0; the guard is what catches it"
         );
 
-        // Now the GATE'S OWN decision function — not the predicate in
-        // isolation. An earlier version of this test asserted only
-        // `loss_is_unscopable(..)`, and it passed with the guard deleted from
-        // the gate, because the bug was never in the predicate: it was that
-        // the gate did not consult one. Call what the gate calls.
+        // Now the GATE'S OWN decision function, not the predicate in isolation.
+        // An earlier version asserted only `loss_is_unscopable(..)` and stayed
+        // green with the guard deleted — the bug was the gate not consulting it.
         let (lost_ms, why) =
             end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage);
         assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
@@ -1462,9 +1370,8 @@ mod tests {
     }
 
     // ── Multipass strategy decisions — relocated from autorip's char_* tests.
-    //    autorip keeps its own characterization coverage exercising these same
-    //    fns through its call path; these are the engine's own unit coverage
-    //    now that it owns the implementation. ──
+    //    autorip keeps its own characterization coverage via its call path;
+    //    these are the engine's own coverage now that it owns the implementation. ──
 
     #[test]
     fn plan_passes_single_vs_multipass() {
@@ -1569,19 +1476,15 @@ mod tests {
             u8::MAX,
             "total_passes wrapped: in release this silently becomes 1"
         );
-        // (No `total_passes >= patch_passes` check here: both operands were
-        // just pinned to the same literal `u8::MAX`, so it could only ever read
-        // `255 >= 255`. An assertion that cannot fail is noise in a test whose
-        // subject is an arithmetic overflow.)
-        // The ordinary case is unchanged.
+        // (No `total_passes >= patch_passes` check: both operands are pinned
+        // to `u8::MAX`, so it could only read `255 >= 255` — an assertion
+        // that can't fail is noise for a test about overflow.) Ordinary case unchanged.
         assert_eq!(plan_passes(5).total_passes, 7);
     }
 
     // ── A cancelled or wedged pass has not MEASURED the disc ──────────────
-    //
-    // `bytes_pending` counts NonTried — the un-attempted remainder ahead of
-    // the sweep head — so folding it into the damage score made an early
-    // interruption look like catastrophic damage.
+    // `bytes_pending` counts NonTried — the un-attempted remainder ahead of the
+    // sweep head — folding it into the damage score made an interruption look catastrophic.
 
     /// A rip cancelled seconds into a 66 GB disc has found nothing bad. It
     /// must not be scored as though the whole disc were unreadable.
@@ -1695,10 +1598,9 @@ mod tests {
                         sense: if self.sweep_done {
                             None
                         } else {
-                            // RECOVERED (marginal), which the sweep marks
-                            // NonTrimmed for Pass N without the 30 s
-                            // damage-zone cooldown a hard error would earn —
-                            // the pass this test is about is the patch one.
+                            // RECOVERED (marginal): the sweep marks NonTrimmed
+                            // without the 30s damage-zone cooldown a hard error
+                            // would earn — the pass this test is about is the patch one.
                             Some(libfreemkv::scsi::ScsiSense {
                                 sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
                                 asc: 0x17,
@@ -1803,10 +1705,8 @@ mod tests {
         assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096).is_nan());
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // multipass_rip — the composed strategy LOOP, exercised headlessly
+    // ── multipass_rip — the composed strategy LOOP, exercised headlessly ──
     // against synthetic `SectorSource`s (hard rule #2: no live drive).
-    // ─────────────────────────────────────────────────────────────────────
 
     /// Every test double in this module must honour the contract it is
     /// standing in for: `SectorSource::read_sectors` returns the number of
@@ -1962,10 +1862,8 @@ mod tests {
         let total = sectors as u64 * 2048;
 
         // The reachable damaged-single-pass state is the RESUME one: a plain
-        // copy aborts at the first read error, so damage only comes back as a
-        // RESULT when a prior run already attempted the whole disc. That is
-        // exactly what a user hits re-running after a failed rip. Build that
-        // mapfile: fully attempted, some sectors permanently Unreadable.
+        // copy aborts at the first read error, so damage only returns as a
+        // RESULT after a prior run attempted the whole disc — build that mapfile.
         let mapfile_path = disc.mapfile_for(&iso);
         let _ = std::fs::remove_file(&mapfile_path);
         let mut mf =
@@ -2014,23 +1912,9 @@ mod tests {
             r.unreadable_bytes,
             r.pending_bytes,
         );
-        // Severity still comes from the sector count, which single-pass DOES
-        // know. It must not have been escalated to Serious merely because the
-        // loss is unquantified — that rule belongs to the abort gate, which
-        // single-pass never runs.
-        //
-        // The expected badge is spelled out, not recomputed. This used to
-        // assert against
-        // `classify_damage(bad_sector_count(r.unreadable_bytes, r.pending_bytes), 0.0)`
-        // — the same two functions the producer calls, on the same inputs — so
-        // both sides moved together and it pinned nothing but self-agreement:
-        // dropping the byte→sector division inside `bad_sector_count` (which
-        // turns this disc's badge from Cosmetic into Serious) left it green.
-        // The fixture records 8 sectors' worth of damage (8 * 2048 = 16384
-        // bytes) and
-        // nothing pending, and the tiers are ">= 500 sectors → Serious,
-        // >= 51 → Moderate", so the honest badge is Cosmetic — and Cosmetic is
-        // also what a NaN could never produce (a NaN fails safe to Serious).
+        // Severity comes from the sector count, not escalated merely because
+        // loss is unquantified (that's the abort gate's rule, unused here).
+        // The badge is spelled out, not recomputed via the producer's own fns.
         assert_eq!(
             r.severity,
             crate::DamageSeverity::Cosmetic,
@@ -2130,9 +2014,8 @@ mod tests {
     #[test]
     fn multipass_rip_recoverable_bad_sector_converges_after_a_patch_pass() {
         // One sector fails Pass 1's touch, then reads clean from Pass 2 on:
-        // the patch pass recovers it, the muxable scope goes to 0 bad bytes,
-        // and the NEXT loop-top check (Converged) stops the loop early —
-        // well under the 5-patch-pass cap.
+        // the patch pass recovers it, muxable scope hits 0 bad bytes, and the
+        // NEXT loop-top check (Converged) stops early, well under the 5-pass cap.
         let (dir, iso) = scratch_iso("recoverable");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
@@ -2176,11 +2059,9 @@ mod tests {
 
     #[test]
     fn multipass_rip_permanent_loss_past_tolerance_aborts() {
-        // A sector that NEVER heals: Pass 1 marks it NonTrimmed, the one
-        // patch pass recovers nothing (NoProgress -> stop retrying early),
-        // end-of-recovery promotion turns it Unreadable, and — with a
-        // whole-disc (ISO) scope and a zero-tolerance threshold — the
-        // abort-on-loss gate fires.
+        // A sector that NEVER heals: Pass 1 marks it NonTrimmed, the patch
+        // pass recovers nothing (NoProgress -> stop early), promotion turns it
+        // Unreadable, and — whole-disc ISO scope + zero tolerance — the gate fires.
         let (dir, iso) = scratch_iso("permanent-loss");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
@@ -2212,23 +2093,17 @@ mod tests {
         )
         .expect("a permanently-bad sector is a reported result, not an Err");
 
-        // NoProgress stops the retry loop before the 5-pass cap is reached:
-        // the first patch pass still recovers the bad sector's readable ECC-
-        // block neighbours (real progress), so NoProgress fires one pass
-        // later than the target sector itself heals — pin "stopped early",
-        // not the exact pass count that depends on the ECC block size.
+        // NoProgress stops the retry loop before the 5-pass cap: the first
+        // patch pass still recovers the bad sector's readable ECC-block
+        // neighbours, so pin "stopped early", not an exact ECC-dependent count.
         assert!(
             result.passes > 1 && result.passes < 1 + opts.max_passes,
             "expected the retry loop to exhaust progress before the pass cap, got {} passes",
             result.passes
         );
-        // And the exact count, because the loose range above is what let the
-        // loop-bottom `== PatchDecision::NoProgress` be mutated to `!=` with
-        // the suite still green: `!=` breaks out after the FIRST patch pass
-        // (which does make ECC-neighbour progress, so the decision is
-        // `Continue`), giving 2 passes — still inside the range. Pass 1 heals
-        // the neighbours, pass 2 recovers nothing and is the one that must
-        // stop the loop.
+        // The exact count matters: a loose range let `== NoProgress` be
+        // mutated to `!=` and stay green (breaking after the first, progress-
+        // making pass). Pass 1 heals ECC neighbours; pass 2 must stop the loop.
         assert_eq!(
             result.passes, 3,
             "1 sweep + 2 patch passes: the loop must stop on the pass that \
@@ -2250,12 +2125,9 @@ mod tests {
 
     #[test]
     fn multipass_rip_respects_max_passes_bound_even_with_ongoing_progress() {
-        // Two bad sectors: one heals on the very next touch (so the patch
-        // pass DOES recover bytes — NoProgress never fires), the other never
-        // heals (so the muxable scope never reaches 0 — Converged never
-        // fires either). With max_passes == 1, only ONE patch pass is
-        // allowed to run; the `for` loop must stop there purely because the
-        // pass budget is exhausted, not because of either strategy gate.
+        // Two bad sectors: one heals next touch (progress, so NoProgress never
+        // fires); the other never heals (scope never hits 0, so Converged never
+        // fires). With max_passes == 1 the loop must stop purely on budget.
         let (dir, iso) = scratch_iso("max-passes-bound");
         let sectors = 200_000u32;
         let disc = test_disc(sectors, vec![]);
@@ -2308,13 +2180,9 @@ mod tests {
 
     #[test]
     fn multipass_rip_scope_bad_bytes_wiring_drives_convergence_by_output_kind() {
-        // A permanently-bad sector OUTSIDE the muxed title's extents. For an
-        // MKV/M2TS deliverable (is_iso_output=false) that byte is out of
-        // scope: the loop-top `scope_bad_bytes` check sees 0 bad bytes in
-        // scope and converges immediately, without ever calling
-        // `recovery::patch`. For an ISO deliverable (is_iso_output=true) the
-        // SAME byte counts (whole-disc scope): the loop grinds a patch pass,
-        // makes no progress, and the promoted loss aborts.
+        // A permanently-bad sector OUTSIDE the muxed title's extents. MKV/M2TS
+        // scope sees 0 bad bytes and converges immediately, without calling
+        // `recovery::patch`; ISO's whole-disc scope grinds a pass, then aborts.
         let title = test_title(0, 2_000); // extents [0, 2000)
         let bad_lba = 50_000; // outside the title's extents
         let sectors = 200_000u32;
@@ -2382,15 +2250,9 @@ mod tests {
                 &crate::sink::NoopSink,
             )
             .expect("whole-disc-scoped loss is still a reported result");
-            // Pinned exactly, for the reason the permanent-loss test above
-            // spells out: the loose `passes > 1 && passes < 1 + max_passes`
-            // range this used to carry let the loop-bottom
-            // `== PatchDecision::NoProgress` be mutated to `!=` — which breaks
-            // out after the FIRST patch pass (2 passes, still inside the
-            // range) — with the suite green. Pass 1 sweeps, patch pass 1 heals
-            // the bad sector's readable ECC-block neighbours (real progress),
-            // patch pass 2 recovers nothing and is the pass that must stop the
-            // loop.
+            // Pinned exactly, as above: a loose `passes > 1 && < 1 + max_passes`
+            // range let `== NoProgress` mutate to `!=` and stay green (breaking
+            // after the first, progress-making pass). Pass 2 must stop the loop.
             assert_eq!(
                 result.passes, 3,
                 "whole-disc scope must see the bad byte and keep patching until \
@@ -2538,15 +2400,9 @@ mod tests {
         );
     }
 
-    // ─────────────────────────────────────────────────────────────────────
-    // The three fail-safes inside `multipass_rip_inner` that no black-box
-    // fixture reached: the failed end-of-recovery promotion, the unreadable
-    // mapfile at the abort-decision point, and the mid-loop cancel.
-    //
-    // All three need the world to change WHILE the loop is running, which is
-    // what `HookSink` is for: the loop's own log lines are the only
-    // deterministic clock a caller has inside a `multipass_rip` call.
-    // ─────────────────────────────────────────────────────────────────────
+    // ── Three `multipass_rip_inner` fail-safes no black-box fixture reached:
+    // failed promotion, unreadable mapfile at the abort point, mid-loop cancel.
+    // All need the world to change mid-loop — `HookSink` uses log lines as that clock. ──
 
     /// A `Sink` that records every line the loop logs and, the first time a
     /// line contains `trigger`, runs `action` (and optionally starts
@@ -3000,15 +2856,9 @@ mod tests {
             result.unreadable_bytes,
             result.pending_bytes
         );
-        // The expectation is the literal tier, not a re-run of a formula.
-        // It used to be `classify_damage(bad_sector_count(unreadable,
-        // pending), 0.0)` — which is NOT what the halted exit computes (that
-        // is `interrupted_severity`, and it deliberately does not fold pending
-        // in). The two agree only because this fixture ends with a single
-        // pending sector; the test therefore pinned the formula the code was
-        // changed to stop using, and reverting production to it would have
-        // stayed green. `a_cancel_with_a_wide_pending_region_is_not_scored_
-        // from_it` is the fixture where the two disagree.
+        // Expects the literal tier, not a re-run of the old formula
+        // (`classify_damage(bad_sector_count(unreadable, pending), 0.0)`),
+        // which `interrupted_severity` deliberately avoids — see the wide-pending test.
         assert_eq!(
             result.unreadable_bytes, 0,
             "fixture: nothing was CONFIRMED lost, so the tier below is the \

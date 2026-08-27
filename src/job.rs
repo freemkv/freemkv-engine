@@ -1,7 +1,7 @@
 //! What to rip, and how — the front-end's request to the engine.
 //!
 //! A [`Job`] is pure data: a front-end builds one from CLI args, a web POST, or
-//! GUI selections, hands it to [`crate::preflight`] to check it, then to
+//! GUI selections, hands it to [`crate::preflight()`] to check it, then to
 //! [`crate::run`] to execute it. It carries no I/O handles and no callbacks —
 //! those arrive separately as the [`crate::Sink`].
 //!
@@ -116,8 +116,9 @@ pub enum StreamFilter {
 }
 
 impl Job {
-    /// A minimal single-pass job: main movie, decrypt on, no loss tolerance
-    /// knob (single-pass ignores it).
+    /// A minimal single-pass job: main movie, decrypt on. The loss-tolerance
+    /// knob lives on `MultipassOpts` (passed to `multipass_rip`), not on
+    /// `Job` — a single-pass job has none to set.
     pub fn new(source: impl Into<String>, dest: impl Into<String>) -> Self {
         Job {
             source: source.into(),

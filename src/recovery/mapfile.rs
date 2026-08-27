@@ -314,20 +314,9 @@ impl Mapfile {
                 if let Some(v) = rest.strip_prefix("Rescue Logfile. Created by ") {
                     version = v.to_string();
                 }
-                // The two identity headers are NOT best-effort. Dropping a
-                // malformed one loads a mapfile that CARRIES a disc identity as
-                // one carrying NONE, and `check_mapfile_identity` returns
-                // `Ok(())` for none (legacy files, unencrypted discs) — so a
-                // corrupted `# freemkv-uk:` / `# freemkv-vid:` line downgrades
-                // the resume guard to the exact pre-guard behaviour it was
-                // written to stop: disc A's Finished ranges trusted for disc B,
-                // and an ISO spliced from two physical discs that passes every
-                // completeness check.
-                //
-                // ABSENT is fine and stays fine (that is the ddrescue-import and
-                // legacy case). PRESENT-BUT-UNPARSEABLE is corruption, and the
-                // only safe reading of corruption in the file that decides
-                // whether this is even the right disc is to refuse the file.
+                // The two identity headers are not best-effort: dropping a malformed
+                // one downgrades to "no identity", trusted by the resume guard and
+                // letting disc A's ranges apply to disc B. Absent is fine; unparseable is refused.
                 if let Some(hex) = rest.strip_prefix("freemkv-vid:") {
                     let Some(parsed) = parse_vid_hex(hex.trim()) else {
                         let e: io::Error =
@@ -352,13 +341,9 @@ impl Mapfile {
             // skip over it.
             if !saw_current_line {
                 saw_current_line = true;
-                // Discriminate by ddrescue's actual line shape, not by a
-                // `0x`-prefix heuristic (which dropped a valid first data line
-                // whose size field happened to lack `0x`). A *current* line's
-                // 2nd field is a single status char (`?*/-+`); a *data* line's
-                // 2nd field is the hex size, with the status char in the 3rd.
-                // So: single-char-and-valid-status 2nd field ⇒ current line
-                // (skip); anything else ⇒ fall through to entry parse.
+                // Discriminate by ddrescue's line shape, not a `0x`-prefix heuristic
+                // (that dropped a data line whose size lacked `0x`). A current line's
+                // 2nd field is a single status char; a data line's is the hex size.
                 let fields: Vec<&str> = t.split_whitespace().collect();
                 let is_current_line = fields
                     .get(1)
@@ -379,31 +364,18 @@ impl Mapfile {
             // Entry: `pos size statuschar`
             let fields: Vec<&str> = t.split_whitespace().collect();
             if fields.len() < 3 {
-                // A short data line is DROPPED COVERAGE, not noise. Every other
-                // consumer reads this file as a gapless partition of
-                // `[0, total_size)`; skipping a line silently deletes its range
-                // from the partition, and skipping the LAST one also shortens
-                // `total_size` — which is derived from the final entry's end.
-                // The rip then reports the smaller extent as its whole disc.
-                //
-                // Rejecting is also the SAFE downgrade at every in-crate caller:
-                // `sweep`'s corrupt-mapfile branch and `copy`'s coverage check
-                // both fall back to a fresh full sweep, and `patch` refuses by
-                // design. Consistent with every other malformed shape here
-                // (`hex`, `status_char`, `zero_size`, `overlap`), which all
-                // reject rather than skip.
+                // A short data line is dropped coverage, not noise: skipping it deletes
+                // its range from the gapless [0, total_size) partition, and skipping
+                // the last one shrinks total_size itself. Reject rather than skip.
                 let e: io::Error =
                     libfreemkv::error::Error::MapfileInvalid { kind: "short_line" }.into();
                 return Err(e);
             }
             let pos = parse_hex(fields[0])?;
             let size = parse_hex(fields[1])?;
-            // Reject an entry whose pos+size overflows u64 up front. The
-            // downstream overlap/coalesce/next_with code adds pos+size
-            // freely; a crafted/corrupt line like
-            // `0xfffffffffffffff0 0x20 +` would otherwise panic (debug)
-            // or wrap to a tiny range (release), corrupting stats and
-            // resume logic.
+            // Reject pos+size overflow up front: downstream overlap/coalesce/next_with
+            // code adds pos+size freely, and a crafted line would otherwise panic
+            // (debug) or wrap to a tiny range (release), corrupting stats/resume.
             if pos.checked_add(size).is_none() {
                 let e: io::Error =
                     libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
@@ -433,26 +405,9 @@ impl Mapfile {
             entries.push(MapEntry { pos, size, status });
         }
         entries.sort_by_key(|e| e.pos);
-        // Reject overlapping ranges, then COALESCE-FILL any internal gaps
-        // with synthetic NonTried entries. A well-formed ddrescue mapfile
-        // is a *gap-free* disjoint partition of [0, total_size).
-        //
-        // Overlaps (from a corrupt/hand-edited file) would make
-        // compute_stats double-count, so bytes_good / bytes_unreadable /
-        // bytes_pending could exceed bytes_total and inflate resume /
-        // abort-on-loss decisions and >100% progress — hard-reject those.
-        //
-        // GAPS are a subtler hazard: total_size is derived from the last
-        // entry's end, so a holed mapfile passes the caller's
-        // `covers_disc = (total_size == disc_size)` check and copy() would
-        // report complete=true even though the hole was never read. Rather
-        // than hard-reject (which would strand existing partial mapfiles),
-        // we fill every gap — leading, internal, and any between entries —
-        // with a NonTried entry so the gap is visible to the resume
-        // sweep's NonTried region list and actually gets read. (A trailing
-        // gap up to the disc size is filled by the caller's full-sweep
-        // path when total_size < disc_size; here we only have the mapfile's
-        // own extent to reason about.)
+        // Reject overlapping ranges (would make compute_stats double-count and
+        // inflate resume decisions), then coalesce-fill internal gaps as NonTried
+        // so a holed mapfile can't pass as falsely "complete", without stranding partials.
         let mut filled: Vec<MapEntry> = Vec::with_capacity(entries.len() + 1);
         let mut cursor: u64 = 0;
         for e in entries {
@@ -477,12 +432,9 @@ impl Mapfile {
             .last()
             .map(|e| e.pos.saturating_add(e.size))
             .unwrap_or(0);
-        // Enforce the keys-XOR-vid invariant that set_unit_keys()
-        // guarantees: a corrupt/hand-edited file carrying both comment
-        // types would otherwise load with vid=Some AND non-empty
-        // unit_keys, violating the invariant downstream code relies on.
-        // Unit keys win, matching the setter (it clears vid when keys
-        // are present).
+        // Enforce the keys-XOR-vid invariant set_unit_keys() guarantees: a
+        // hand-edited file with both comment types would otherwise load with
+        // both set. Unit keys win here, matching the setter.
         if !unit_keys.is_empty() {
             vid = None;
         }
@@ -505,13 +457,9 @@ impl Mapfile {
     pub fn open_or_create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         match Self::load(path) {
             Ok(mf) => {
-                // load() derives total_size from the last entry's
-                // pos+size; if that disagrees with the caller's
-                // expected disc size (different disc, edited/partial
-                // file, trimmed trailing region) the downstream
-                // resume/progress math keys off the wrong basis. Surface
-                // it so an operator can spot a mismatched mapfile rather
-                // than failing the resume outright.
+                // load() derives total_size from the last entry's pos+size; if that
+                // disagrees with the caller's expected disc size, downstream resume
+                // math keys off the wrong basis. Warn rather than fail the resume.
                 if mf.total_size != total_size {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -533,15 +481,15 @@ impl Mapfile {
 
     /// Mark a byte range as having the given status. Splits any overlapping
     /// existing entries, merges with adjacent same-status entries, and flushes
-    /// to disk.
+    /// to disk once `FLUSH_INTERVAL` has elapsed since the last persist (see
+    /// `flush()`/`Drop` for guaranteed durability).
     pub fn record(&mut self, pos: u64, size: u64, status: SectorStatus) -> io::Result<()> {
         if size == 0 {
             return Ok(());
         }
-        // Mirror load()'s overflow contract: reject a range that would
-        // wrap u64 rather than storing a saturated entry narrower than
-        // its size, which load() would then reject on the next resume
-        // (making the mapfile unreadable).
+        // Mirror load()'s overflow contract: reject a range that would wrap u64
+        // rather than storing a saturated entry, which load() would then reject
+        // on the next resume (making the mapfile unreadable).
         let Some(end) = pos.checked_add(size) else {
             let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
             return Err(e);
@@ -587,10 +535,9 @@ impl Mapfile {
             merged.push(e);
         }
 
-        // Recompute stats from merged entries. record() is already O(n) due to
-        // drain-and-rebuild, so this is a constant-factor overhead. The critical
-        // win is that stats() is now O(1) — called millions of times in the hot
-        // path during sweep/patch, it just returns the cached value.
+        // Recompute stats from merged entries; record() is already O(n) so this is
+        // constant-factor overhead. The win is stats() becomes O(1), important
+        // since it's called millions of times in the sweep/patch hot path.
         self.stats = Self::compute_stats(&merged, self.total_size);
         self.entries = merged;
         self.dirty = true;
@@ -736,12 +683,9 @@ impl Mapfile {
     }
 
     fn write_to_disk(&self) -> io::Result<()> {
-        // DISOWNED: this mapfile's owner was abandoned and someone else is
-        // the record of this path now. Checked here rather than in each of
-        // `flush` / `record` / `Drop` because this is the single place the
-        // file is committed, so one check covers all three. Reported as
-        // success: not writing IS the correct outcome, and there is no
-        // caller left to handle an error anyway.
+        // DISOWNED: owner was abandoned; someone else records this path now. Checked
+        // here (the single commit point) so one check covers flush/record/Drop.
+        // Reported as success: not writing is correct, and no caller remains.
         if self.disowned.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -754,22 +698,16 @@ impl Mapfile {
             PathBuf::from(s)
         };
         // Any `?` between creating the tmp and the final rename used to leave a
-        // partially-written `<path>.tmp` behind forever — one per failure, in
-        // the output directory, for the lifetime of a long-running service.
-        // Written as a closure so a single cleanup covers every early return.
+        // partially-written `<path>.tmp` behind forever. Written as a closure so
+        // a single cleanup covers every early return.
         let write_tmp = |tmp: &std::path::Path| -> io::Result<()> {
             {
                 let file = std::fs::File::create(tmp)?;
                 let mut w = std::io::BufWriter::new(file);
                 writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
-                // VID comment lives in the header block. ddrescue treats any
-                // `#`-prefixed line as a comment, so this round-trips through
-                // our `load()` without affecting the `pos size status` data
-                // parser. 16 bytes → 32 lowercase hex chars.
-                // KEYS XOR VID: a keyed disc persists its unit keys (the final
-                // answer — deferred-mux decrypts directly); an unresolved disc
-                // persists only the VID (the retry marker, so a future mux can
-                // re-ask the key service). Never both.
+                // VID/key comments live in the header (`#`-prefixed, round-trips via load()).
+                // KEYS XOR VID: a keyed disc persists unit keys (final answer, for
+                // deferred-mux); an unresolved disc persists only the VID (retry marker).
                 use std::fmt::Write as _;
                 if !self.unit_keys.is_empty() {
                     for (cps, key) in &self.unit_keys {
@@ -799,10 +737,9 @@ impl Mapfile {
                     )?;
                 }
                 w.flush()?;
-                // fsync the tmp file before the rename so the bytes are durable on
-                // disk (notably on NFS, where a rename can otherwise reach the
-                // server before the data does and leave a truncated mapfile after
-                // a crash). Recover the File from the BufWriter to call sync_all.
+                // fsync the tmp file before the rename so bytes are durable (notably on
+                // NFS, where a rename can reach the server before the data does).
+                // Recover the File from the BufWriter to call sync_all.
                 let file = w.into_inner().map_err(|e| e.into_error())?;
                 file.sync_all()?;
             }
@@ -815,14 +752,9 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // Re-check at the COMMIT POINT. The entry check above can be minutes
-        // stale by now: writing and fsyncing the tmp is exactly the step that
-        // hangs on the mount this whole mechanism exists for, and the owner
-        // may have been abandoned during it. Checking again immediately
-        // before the rename narrows the window in which a disowned writer can
-        // still commit to the gap between this load and the rename syscall.
-        // (It narrows it; it cannot close it — there is no atomic
-        // check-and-rename. Two processes would need a real lock.)
+        // Re-check at the commit point: the entry check above can be stale, since
+        // writing/fsyncing the tmp hangs on the mount this mechanism exists for.
+        // Narrows (not closes) the race; true fix needs an atomic check-and-rename.
         if self.disowned.load(Ordering::Acquire) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(());
@@ -831,14 +763,9 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // fsync the parent directory so the rename itself is durable. Syncing
-        // the tmp file's bytes (above) is not enough: after the rename the new
-        // dirent for the final mapfile name lives only in the directory's
-        // page cache, so a crash / power loss in the rename-commit window can
-        // lose it and leave resume reading a stale or absent mapfile even
-        // though the data was synced. On NFS — the case the tmp-fsync guards —
-        // this window is the wide one. Best-effort: a dir that can't be
-        // opened/synced (some filesystems, Windows) is not a write failure.
+        // fsync the parent directory so the rename itself is durable — syncing the
+        // tmp file's bytes alone isn't enough, since the new dirent lives only in the
+        // page cache until synced. Best-effort: unsupported dirs aren't a failure.
         if let Some(parent) = self.path.parent() {
             libfreemkv::io::fsync::dir(parent);
         }
@@ -1046,12 +973,9 @@ mod tests {
         let counts = fragmenting_multipass(&mut mf);
         assert_canonical(&mf);
         let _ = std::fs::remove_file(&p);
-        // Literals, not recomputed from the code under test:
-        //  pass 1 — [+ | * | + | * | + | * | +]                        = 7
-        //  pass 2 — 3 regions x 64 sectors alternating +/*, 64 runs each,
-        //           the leading + of each region merging into the bulk:
-        //           1 + 3*64 = 193
-        //  pass 3 — everything Finished, one run                       = 1
+        // Literals, not recomputed from the code under test: pass 1 alternates
+        // +/*/+/*/+/*/+ = 7 runs; pass 2 is 3 regions x 64 alternating sectors with
+        // the leading + merging into the bulk = 1 + 3*64 = 193; pass 3 collapses to 1.
         assert_eq!(counts, vec![7, 193, 1]);
         assert!(
             counts[2] < counts[1],
@@ -1213,13 +1137,9 @@ mod tests {
         mf.flush().unwrap();
         let loaded = Mapfile::load(&p).unwrap();
         assert_eq!(loaded.entries(), mf.entries());
-        // The entry list was the ONLY thing compared here, and it is the one
-        // part of the state that is written verbatim. `total_size` and the
-        // stats are SUPPLIED on create and RE-DERIVED on load, so a writer
-        // that dropped the trailing NonTried extent — or a reader that
-        // mis-derived the total — round-tripped "correctly" against entries
-        // alone while every consumer of `stats()` silently lost that coverage.
-        // Literals, so neither side is asked to confirm itself.
+        // The entry list is the one part of state written verbatim; total_size and
+        // stats are supplied on create and re-derived on load, so a writer that
+        // dropped the trailing extent could round-trip "correctly" on entries alone.
         assert_eq!(
             loaded.total_size(),
             1000,
@@ -1237,10 +1157,9 @@ mod tests {
 
     #[test]
     fn write_to_disk_fsyncs_and_leaves_no_tmp() {
-        // Regression: write_to_disk must recover the File from the BufWriter
-        // and sync_all() it before rename (NFS durability). The .tmp file
-        // must not survive a successful write, and the renamed mapfile must
-        // load back identically.
+        // Regression: write_to_disk must recover the File and sync_all() it before
+        // rename (NFS durability). The .tmp file must not survive a successful
+        // write, and the renamed mapfile must load back identically.
         let p = tmpfile("write_to_disk_fsyncs");
         let _ = std::fs::remove_file(&p);
         let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
@@ -1267,12 +1186,9 @@ mod tests {
 
     #[test]
     fn write_to_disk_fsyncs_parent_dir() {
-        // Regression: after rename(2), write_to_disk must fsync the parent
-        // directory so the new dirent is durable (not page-cache-only). We
-        // can't observe a power-loss window in a unit test, but we exercise
-        // the parent-fsync branch against a real subdirectory and confirm the
-        // best-effort dir-sync neither errors the write nor corrupts the
-        // round-trip. A missing/unsyncable dir must not fail the write.
+        // Regression: after rename(2), write_to_disk must fsync the parent dir so
+        // the new dirent is durable. Can't observe power loss in a unit test, but
+        // exercise the fsync branch and confirm it neither errors nor corrupts.
         let dir = tmpfile("write_to_disk_fsyncs_parent_dir");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1508,10 +1424,9 @@ mod tests {
         assert_eq!(loaded_novid.vid(), None);
         assert_eq!(loaded_novid.entries(), loaded.entries());
 
-        // A malformed VID comment FAILS the load. Treating it as absent
-        // silently downgrades "this mapfile names a disc" to "this mapfile
-        // names no disc", which `check_mapfile_identity` accepts — see
-        // `load_rejects_a_malformed_vid_header`.
+        // A malformed VID comment fails the load; treating it as absent silently
+        // downgrades "names a disc" to "names no disc" (accepted by
+        // check_mapfile_identity) — see load_rejects_a_malformed_vid_header.
         let mut bad = text.replace("00112233445566778899aabbccddeeff", "zzzz");
         let pbad = tmpfile("vid_round_trips_bad");
         let _ = std::fs::remove_file(&pbad);
@@ -1629,10 +1544,9 @@ mod tests {
         );
         // total_size unchanged (last entry end), but the hole is now pending.
         assert_eq!(mf.total_size(), 0x300);
-        // EXACTLY the hole, not "at least" it. The fixture's only non-Finished
-        // bytes are the filled gap [0x100,0x200), so `>=` was satisfied by any
-        // over-count too: doubling the NonTried contribution in `compute_stats`
-        // left this assertion green while six other mapfile tests went red.
+        // EXACTLY the hole, not "at least" it: doubling the NonTried contribution
+        // in compute_stats left this assertion green (satisfied by `>=`) while
+        // six other mapfile tests went red.
         assert_eq!(
             mf.stats().bytes_pending,
             0x100,
@@ -1696,12 +1610,9 @@ mod tests {
             assert_eq!(st.to_char(), ch, "{st:?} must map to '{ch}'");
             assert_eq!(SectorStatus::from_char(ch), Some(st));
         }
-        // Any char outside the alphabet is rejected. Every entry here must be
-        // genuinely OUTSIDE it: this list used to end in
-        // `'?'.to_ascii_uppercase()`, which is just `'?'` — a VALID status char
-        // — and the loop skipped it through a `if "?*/-+".contains(bad)` guard,
-        // so that element asserted nothing the `pairs` loop above had not
-        // already covered. The guard went with it.
+        // Any char outside the alphabet is rejected. This list used to end in
+        // `'?'.to_ascii_uppercase()` (just `'?'`, a valid status char), asserting
+        // nothing the `pairs` loop above hadn't already covered.
         for bad in ['x', ' ', '0', '#', '!'] {
             assert_eq!(
                 SectorStatus::from_char(bad),
