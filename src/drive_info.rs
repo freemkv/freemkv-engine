@@ -98,20 +98,9 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let rb_f1 = session.read_buffer(0x02, 0xF1, 48); // Pioneer
     let rb_mode6 = session.read_buffer(0x06, 0x00, 32); // MTK
 
-    // Renesas signature: RB 0xF1 bytes [16..19] == "SAT".
-    //
-    // Diagnostic before/after experiment (drive-info --share). The open model is:
-    // READ (open?) -> knock -> READ (open now?). To characterize what each vendor
-    // window means, we run the FULL sequence unconditionally: read BOTH windows
-    // (0xB0 @0x04 and @0x500000) BEFORE, issue the payload-less knock
-    // (WRITE_BUFFER 0x41 @0xA5AAAA), then read BOTH windows AFTER. Diffing
-    // before-vs-after status AND content disambiguates an always-mapped status
-    // window from an access-gated data window, and shows whether the raw read
-    // returns meaningful drive state (not just GOOD status).
-    //
-    // NOTE: the *runtime* unlocker (`freemkv-unlock::renesis`) is CONDITIONAL — it
-    // reads first and only knocks if that read fails. This capture is deliberately
-    // unconditional because its purpose is to characterize the drive, not rip it.
+    // Renesas "SAT" signature (RB 0xF1 [16..19]). --share reads both vendor
+    // windows + the 0xF4 window before and after a payload-less knock (WB 0x41
+    // @0xA5AAAA); the before/after diff characterizes what the knock unlocks.
     let (mut rb_b0_04, mut rb_b0_500000) = (None, None);
     let (mut wb_41, mut rb_b0_04_postknock, mut rb_b0_500000_postknock) = (None, None, None);
     let mut rb_f4 = None;
