@@ -15,6 +15,7 @@ exclude = ["CLAUDE.md"]
 publish = false
 
 [dependencies]
+anyhow = "1"
 libfreemkv = "1.6"
 freemkv-keysources = "1.6"
 serde = { version = "1", features = ["derive"] }

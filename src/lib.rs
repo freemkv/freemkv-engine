@@ -44,6 +44,7 @@
 // single-threaded process-wide). `forbid`, not `deny`, so it can't be re-allowed.
 #![forbid(unsafe_code)]
 
+pub mod drive_info;
 mod extract;
 mod job;
 mod keys;
@@ -71,6 +72,7 @@ mod sink;
 mod speed;
 mod streams;
 
+pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
 pub use extract::extract_tree;
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
