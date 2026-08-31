@@ -1,0 +1,273 @@
+//! Drive data capture — read hardware information via SCSI.
+
+use anyhow::Result;
+use libfreemkv::Drive;
+
+/// Raw data captured from a drive's SCSI responses.
+#[derive(Debug, Clone)]
+pub struct DriveCapture {
+    /// Raw INQUIRY response (96 bytes)
+    pub inquiry: Vec<u8>,
+    /// Raw GET_CONFIG 010C response
+    pub gc_010c: Vec<u8>,
+    /// GET_CONFIG feature responses: (feature_code, feature_name, data)
+    pub features: Vec<CapturedFeature>,
+    /// REPORT_KEY RPC state
+    pub rpc_state: Option<Vec<u8>>,
+    /// MODE SENSE page 2A (capabilities)
+    pub mode_2a: Option<Vec<u8>>,
+    /// READ_BUFFER 0xF1 (Pioneer vendor data)
+    pub rb_f1: Option<Vec<u8>>,
+    /// READ_BUFFER mode 6 (MTK vendor data)
+    pub rb_mode6: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x04 — low vendor window, captured BEFORE the knock
+    /// (Renesas signature only). GOOD status = already readable.
+    pub rb_b0_04: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x500000 — high vendor "state" window, captured BEFORE
+    /// the knock (Renesas signature only).
+    pub rb_b0_500000: Option<Vec<u8>>,
+    /// WRITE_BUFFER 0x41 @0xA5AAAA — the payload-less vendor "knock". Issued
+    /// UNCONDITIONALLY here as the before/after diagnostic — NOT gated on the open
+    /// read failing — so its effect on both windows can be observed. `Some(empty)`
+    /// on GOOD status.
+    pub wb_41: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x04 re-read AFTER the knock. Diff against `rb_b0_04`.
+    pub rb_b0_04_postknock: Option<Vec<u8>>,
+    /// READ_BUFFER 0xB0 @0x500000 re-read AFTER the knock. Diff against
+    /// `rb_b0_500000`: if this window only turns GOOD (or changes content) after
+    /// the knock, it is the access-gated data window the knock unlocks; if it was
+    /// already GOOD before, the knock is a status/bank op instead.
+    pub rb_b0_500000_postknock: Option<Vec<u8>>,
+    /// READ_BUFFER 0xF4 (256 B) — the Pioneer firmware/drive-flags vendor read
+    /// (Renesas signature only). Content unvalidated; may be empty or refused
+    /// depending on drive state.
+    pub rb_f4: Option<Vec<u8>>,
+}
+
+/// A single GET CONFIGURATION feature response from the drive.
+#[derive(Debug, Clone)]
+pub struct CapturedFeature {
+    /// MMC-6 GET CONFIGURATION feature code (e.g. `0x010D` = AACS).
+    pub code: u16,
+    /// Static human-readable label from the internal `FEATURES` table —
+    /// not a device-reported string.
+    pub name: &'static str,
+    /// Raw feature-descriptor payload bytes, with the 8-byte GET
+    /// CONFIGURATION header stripped (i.e. `buf[8..]`). Unlike
+    /// [`DriveCapture::gc_010c`], which retains the full header.
+    pub data: Vec<u8>,
+}
+
+/// Feature codes to capture.
+const FEATURES: &[(u16, &str)] = &[
+    (0x0000, "Profile List"),
+    (0x0001, "Core"),
+    (0x0003, "Removable Medium"),
+    (0x0010, "Random Readable"),
+    (0x001D, "Multi-Read"),
+    (0x001E, "CD Read"),
+    (0x001F, "DVD Read"),
+    (0x0040, "BD Read"),
+    (0x0041, "BD Write"),
+    (0x0100, "Power Management"),
+    (0x0102, "Embedded Changer"),
+    (0x0107, "Real Time Streaming"),
+    (0x0108, "Serial Number"),
+    (0x010C, "Firmware Information"),
+    (0x010D, "AACS"),
+];
+
+/// Capture all available drive data via SCSI commands.
+/// Returns raw responses — no formatting, no zipping, no presentation.
+pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
+    let id = &session.drive_id;
+
+    // Already have INQUIRY from drive open
+    let inquiry = id.raw_inquiry.clone();
+    let gc_010c = id.raw_gc_010c.clone();
+
+    // Capture GET_CONFIG features using Drive's query methods
+    let mut features = Vec::new();
+    for &(code, name) in FEATURES {
+        if let Some(data) = session.get_config_feature(code) {
+            features.push(CapturedFeature { code, name, data });
+        }
+    }
+
+    // Vendor-specific READ_BUFFER queries
+    let rb_f1 = session.read_buffer(0x02, 0xF1, 48); // Pioneer
+    let rb_mode6 = session.read_buffer(0x06, 0x00, 32); // MTK
+
+    // Renesas signature: RB 0xF1 bytes [16..19] == "SAT".
+    //
+    // Diagnostic before/after experiment (drive-info --share). The open model is:
+    // READ (open?) -> knock -> READ (open now?). To characterize what each vendor
+    // window means, we run the FULL sequence unconditionally: read BOTH windows
+    // (0xB0 @0x04 and @0x500000) BEFORE, issue the payload-less knock
+    // (WRITE_BUFFER 0x41 @0xA5AAAA), then read BOTH windows AFTER. Diffing
+    // before-vs-after status AND content disambiguates an always-mapped status
+    // window from an access-gated data window, and shows whether the raw read
+    // returns meaningful drive state (not just GOOD status).
+    //
+    // NOTE: the *runtime* unlocker (`freemkv-unlock::renesis`) is CONDITIONAL — it
+    // reads first and only knocks if that read fails. This capture is deliberately
+    // unconditional because its purpose is to characterize the drive, not rip it.
+    let (mut rb_b0_04, mut rb_b0_500000) = (None, None);
+    let (mut wb_41, mut rb_b0_04_postknock, mut rb_b0_500000_postknock) = (None, None, None);
+    let mut rb_f4 = None;
+    if rb_f1
+        .as_ref()
+        .is_some_and(|f| f.len() >= 19 && &f[16..19] == b"SAT")
+    {
+        use libfreemkv::scsi::{DataDirection as D, build_read_buffer};
+        let read_04 = build_read_buffer(0x02, 0xB0, 0x04, 164);
+        let read_500000 = build_read_buffer(0x02, 0xB0, 0x500000, 164);
+        let read_f4 = build_read_buffer(0x02, 0xF4, 0x00, 256);
+        let knock = [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0];
+
+        // BEFORE: both windows + the F4 firmware window.
+        rb_b0_04 = raw(session, &read_04, D::FromDevice, 164);
+        rb_b0_500000 = raw(session, &read_500000, D::FromDevice, 164);
+        rb_f4 = raw(session, &read_f4, D::FromDevice, 256);
+        // KNOCK: the universal enable (payload-less write). `Some(empty)` = GOOD.
+        wb_41 = raw(session, &knock, D::None, 0);
+        // AFTER: re-read both windows to observe the knock's effect.
+        rb_b0_04_postknock = raw(session, &read_04, D::FromDevice, 164);
+        rb_b0_500000_postknock = raw(session, &read_500000, D::FromDevice, 164);
+    }
+
+    // Standard queries
+    let rpc_state = session.report_key_rpc_state();
+    let mode_2a = session.mode_sense_page(0x2A);
+
+    Ok(DriveCapture {
+        inquiry,
+        gc_010c,
+        features,
+        rpc_state,
+        mode_2a,
+        rb_f1,
+        rb_mode6,
+        rb_b0_04,
+        rb_b0_500000,
+        wb_41,
+        rb_b0_04_postknock,
+        rb_b0_500000_postknock,
+        rb_f4,
+    })
+}
+
+/// Run a raw CDB; `Some(data)` on GOOD status (empty for a write), else `None`.
+fn raw(
+    session: &mut Drive,
+    cdb: &[u8],
+    dir: libfreemkv::scsi::DataDirection,
+    len: usize,
+) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let r = session.scsi_execute(cdb, dir, &mut buf, 5_000).ok()?;
+    (r.status == 0).then(|| buf[..r.bytes_transferred.min(buf.len())].to_vec())
+}
+
+/// Mask a string for privacy (letters->A, digits->0).
+pub fn mask_string(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphabetic() {
+                'A'
+            } else if c.is_ascii_digit() {
+                '0'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// Mask bytes for privacy.
+pub fn mask_bytes(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .map(|&b| {
+            if b.is_ascii_alphabetic() {
+                b'A'
+            } else if b.is_ascii_digit() {
+                b'0'
+            } else {
+                b
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Privacy-masking + capture-orchestration tests.
+    //!
+    //! `mask_string` / `mask_bytes` redact identifying characters before
+    //! a drive capture leaves the machine: every ASCII letter → 'A',
+    //! every ASCII digit → '0', everything else (punctuation, spaces,
+    //! control bytes, non-ASCII) is preserved verbatim so structural
+    //! framing (offsets, separators) survives for diffing.
+    use super::*;
+
+    #[test]
+    fn mask_string_letters_become_a_digits_become_zero() {
+        // Mixed case letters all collapse to 'A'; digits to '0'.
+        assert_eq!(mask_string("HL-DT-ST"), "AA-AA-AA");
+        assert_eq!(mask_string("BU40N"), "AA00A");
+    }
+
+    #[test]
+    fn mask_string_preserves_non_alnum_punctuation_and_space() {
+        // Separators and spaces must be preserved so the masked output
+        // keeps the same shape as the original (the whole point of a
+        // structure-preserving redaction).
+        assert_eq!(mask_string("1.04"), "0.00");
+        assert_eq!(mask_string("a b-c.d_e"), "A A-A.A_A");
+    }
+
+    #[test]
+    fn mask_string_preserves_non_ascii_chars() {
+        // is_ascii_alphabetic/is_ascii_digit are false for non-ASCII, so multibyte
+        // chars pass through unchanged (no mojibake, no panic): ASCII letters → 'A',
+        // digits → '0', 'é' preserved.
+        assert_eq!(mask_string("café9"), "AAAé0");
+    }
+
+    #[test]
+    fn mask_bytes_matches_string_masking_for_ascii() {
+        // mask_bytes is the byte-wise analogue: letters→b'A', digits→b'0'.
+        assert_eq!(mask_bytes(b"HL-DT-ST"), b"AA-AA-AA".to_vec());
+        assert_eq!(mask_bytes(b"1.04"), b"0.00".to_vec());
+    }
+
+    #[test]
+    fn mask_bytes_preserves_non_alnum_and_high_bytes() {
+        // Control bytes (0x00), high bytes (0xFF), and punctuation are
+        // not ASCII alnum and must survive verbatim — INQUIRY payloads
+        // are space-padded binary and the framing must be diffable.
+        let input = [0x00u8, b'A', 0x20, b'7', 0xFF, b'-'];
+        assert_eq!(mask_bytes(&input), vec![0x00, b'A', 0x20, b'0', 0xFF, b'-']);
+    }
+
+    #[test]
+    fn feature_table_has_no_duplicate_codes() {
+        // capture_drive_data iterates FEATURES once per code; a duplicate
+        // code would silently capture the same feature twice (and bloat
+        // the report). Each MMC-6 feature code must be unique.
+        let mut seen = std::collections::HashSet::new();
+        for &(code, _name) in FEATURES {
+            assert!(seen.insert(code), "duplicate feature code {code:#06x}");
+        }
+    }
+
+    #[test]
+    fn feature_table_includes_aacs_010d() {
+        // AACS (0x010D) is the feature that gates UHD decryption capture;
+        // it must be in the table or AACS drives capture incompletely.
+        assert!(
+            FEATURES.iter().any(|&(c, _)| c == 0x010D),
+            "AACS feature 0x010D must be captured"
+        );
+    }
+}
