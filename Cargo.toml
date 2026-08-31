@@ -2,7 +2,7 @@
 name = "freemkv-engine"
 version = "1.6.13"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.88"
 license = "MIT"
 description = "freemkv rip engine — disc→MKV orchestration over libfreemkv, shared by every front-end (CLI, autorip, desktop UI)"
 repository = "https://github.com/freemkv/freemkv-engine"
@@ -41,3 +41,6 @@ codegen-units = 1
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.12" }
 freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.12" }
+
+[lints.clippy]
+uninlined_format_args = "allow"
