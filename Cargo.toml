@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-engine"
-version = "1.6.13"
+version = "1.6.14"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -39,8 +39,8 @@ codegen-units = 1
 # the CI resolution path; the release script rewrites the tags on bump. Local
 # dev overrides it with a path patch via the gitignored .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.12" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.12" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.14" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.14" }
 
 [lints.clippy]
 uninlined_format_args = "allow"
