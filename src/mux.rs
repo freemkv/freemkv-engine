@@ -1,18 +1,13 @@
 //! ISO/disc → MKV muxing and the multi-title rip loop.
 //!
-//! This is the orchestration that lived in the CLI's `run()` and autorip's
-//! `rip_disc`: resolve which titles to rip, mux each through
-//! `libfreemkv::mux_stream`, and decide when a failure is fatal vs skippable.
-//! It carries three behaviours that were wrong or duplicated in the consumers
-//! (user feedback 2026-07-28):
+//! Resolves which titles to rip, muxes each through `libfreemkv::mux_stream`,
+//! and decides when a failure is fatal vs skippable. Three load-bearing
+//! behaviours: fail-fast on a disc-level key failure (every title would fail
+//! identically), cancel is a full stop (not a per-title cancel), and a
+//! main-title default (via [`Selection`]) so an obfuscated disc doesn't rip
+//! everything by accident.
 //!
-//! 1. **Fail-fast on a disc-level key failure.** If the disc needs decryption
-//!    and no key resolved (and not `raw`), EVERY title will fail — so we refuse
-//!    once, up front, instead of printing a "no key" error for all N titles.
-//! 2. **Cancel is a full stop.** One halt breaks the whole title loop; it does
-//!    NOT cancel each remaining title individually and carry on.
-//! 3. **Main-title default** (via [`Selection`]) so an obfuscated disc with 50+
-//!    similar-length playlists doesn't rip everything by accident.
+//! See docs/mux.md — module history and the 2026-07-28 rationale.
 
 use crate::job::Selection;
 use crate::sink::{Level, Sink};
@@ -178,20 +173,9 @@ pub enum RipOutcome {
     NoKey,
     /// A title the user wanted (the feature, or an explicit `-t`) failed hard.
     ///
-    /// Without a cause this variant named only WHICH title died and never WHY,
-    /// so a front-end could not tell a full disk from a permission denial from
-    /// a malformed source — it had a title index and a log line, and the log
-    /// line is prose, not something it can branch on.
-    ///
-    /// The cause needs BOTH fields because libfreemkv reports it two ways.
-    /// `From<Error> for io::Error` stringifies a typed error as `E<code>: …`,
-    /// but it deliberately passes an `Error::IoError` straight through
-    /// unwrapped so the original `ErrorKind` and OS errno survive instead of
-    /// being flattened. So a genuine I/O failure — the full disk — has NO
-    /// `E<code>` prefix to parse and arrives as `code: None` with the truth in
-    /// `kind`, while a typed failure like a malformed stub arrives as
-    /// `code: Some(_)` with `kind` merely `Other`. Carrying one field would
-    /// have blinded the front-end to exactly one half of the failures.
+    /// Carries both `code` and `kind` because libfreemkv reports a failure's
+    /// cause two different ways depending on its origin — see docs/mux.md for
+    /// why one field alone would blind a front-end to half the failures.
     Failed {
         title_index: usize,
         /// libfreemkv's numeric code, when the error carried one.
@@ -205,25 +189,14 @@ pub enum RipOutcome {
 }
 
 /// Drive the multi-title rip loop. `mux_one(idx) -> io::Result<()>` muxes a
-/// single title; injecting it keeps the loop's control flow (fail-fast, skip,
-/// halt-break) unit-testable without a real ISO. Production passes
-/// [`mux_title`] (or the consumer's own single-title mux).
+/// single title; injecting it keeps the loop's control flow unit-testable
+/// without a real ISO. Production passes [`mux_title`] (or the consumer's
+/// own single-title mux). Self-contained — no `Disc` needed.
 ///
-/// Self-contained — no `Disc` needed. The three behaviours (user feedback
-/// 2026-07-28):
-/// 1. **Fail-fast on a disc-level key failure**: the FIRST title that fails
-///    with a whole-disc key error (`is_disc_level_no_key`) stops the whole rip
-///    — every remaining title would fail identically. No 54× error spew.
-/// 2. **Cancel is a full stop**: `should_cancel()` between titles, OR a halt
-///    error from inside a title's mux, returns [`RipOutcome::Halted`] and does
-///    NOT continue to the next title.
-/// 3. Skippable stubs (empty/uncrackable non-feature titles) are skipped in a
-///    multi-title, non-explicit rip; fatal on the feature / explicit `-t` /
-///    single-title.
-///
-/// `explicit_selection` is `true` when the user named specific titles (so a
-/// stub there is what they asked for → fatal). For an all-titles rip pass
-/// `false`.
+/// Fails fast on a disc-level key error, treats cancel as a full stop, and
+/// skips skippable stubs only on a non-feature title in a multi-title,
+/// non-explicit rip (fatal otherwise). `explicit_selection` is `true` when
+/// the user named specific titles. See docs/mux.md for the full rationale.
 pub fn run_titles<F>(
     indices: &[usize],
     explicit_selection: bool,
@@ -361,14 +334,9 @@ pub fn mux_title_session(
     mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
 }
 
-/// Shared scaffolding behind [`mux_title`] and [`mux_title_session`]: drives
-/// `libfreemkv::mux_stream` for an already-built [`libfreemkv::MuxInput`],
-/// bridging the two libfreemkv seams onto the Sink:
-/// - `MuxEvents` write-progress → `Sink::progress` (via a channel + a scoped
-///   watcher thread, because `mux_stream` takes an `Arc<dyn MuxEvents + 'static>`
-///   that cannot borrow the `&dyn Sink` directly).
-/// - `Sink::should_cancel()` → the `Halt` token the mux polls (the watcher sets
-///   it), so a UI Cancel / Ctrl-C stops the pump exactly as today.
+// Shared scaffolding behind `mux_title` and `mux_title_session`: drives
+// `mux_stream` for an already-built `MuxInput`, bridging progress and cancel
+// onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
 fn mux_with_input(
     input: libfreemkv::MuxInput<'_>,
     source_label: &str,
@@ -389,23 +357,9 @@ fn mux_with_input(
     })
 }
 
-/// The Sink↔libfreemkv bridge every mux runs inside, lifted out of
-/// [`mux_with_input`] so it can be tested without a disc.
-///
-/// [`mux_with_input`] itself cannot be: everything it adds on top of this is a
-/// call into `libfreemkv::mux_stream`, which needs real media. But the two
-/// things that go WRONG here are not about media at all — a cancel that never
-/// reaches the muxer (the user presses Stop and watches the rip run to
-/// completion anyway), and a watcher that is never told to exit (the scope
-/// joins a thread that loops forever, so the mux hangs instead of returning).
-/// Both are exercisable against a closure standing in for the mux, so they are.
-///
-/// Runs `f` with:
-/// - a [`libfreemkv::Halt`] mirroring `sink.should_cancel()` — asked ONCE
-///   before `f` starts and then polled every 100 ms by a scoped watcher;
-/// - a `'static` [`libfreemkv::MuxEvents`] handle (`mux_stream` takes it as an
-///   `Arc`, so it cannot borrow the `&dyn Sink`) whose write-progress is
-///   forwarded to [`Sink::progress`] by that same watcher.
+// The Sink↔libfreemkv bridge every mux runs inside, lifted out of
+// `mux_with_input` so it's testable against a closure without real media.
+// See docs/mux.md for why it's split out and what it's guarding against.
 fn with_mux_watcher<T>(
     sink: &dyn Sink,
     f: impl FnOnce(&libfreemkv::Halt, Arc<dyn libfreemkv::MuxEvents>) -> T,
@@ -483,15 +437,9 @@ fn with_mux_watcher<T>(
     })
 }
 
-/// The `KeySpec` a drive bring-up opens with.
-///
-/// Lifted out of [`open_scan_resolve`]'s struct literal because that function
-/// opens a real drive and so cannot be unit-tested at all — which left the one
-/// field that matters in it unverified. `credentials` carries the host
-/// certificate(s) for the SCSI AACS handshake and is forwarded to
-/// `ScanOptions::credentials` at scan time; it is the ONLY input to that
-/// handshake. Dropped, every caller silently authenticates as no-one and a
-/// locked drive refuses the disc regardless of what the shell passed in.
+// Lifted out of `open_scan_resolve`'s struct literal so the one field that
+// matters (`credentials`, the sole input to the SCSI AACS handshake) is
+// unit-testable — dropped, every caller silently authenticates as no-one.
 fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemkv::KeySpec {
     libfreemkv::KeySpec {
         credentials,
@@ -501,16 +449,13 @@ fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemk
 
 /// Open a live optical drive and get it ready to rip: open the session, lock
 /// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
-/// session (its `disc()` is populated and its drive is still owned, ready to be
-/// staged for a `MuxInput::Session` mux) plus the resolution trace.
+/// session (its `disc()` is populated and its drive is still owned, ready to
+/// be staged for a `MuxInput::Session` mux) plus the resolution trace.
 ///
-/// This is the ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and
-/// the desktop GUI's disc:// path — neither reimplements it. Presentation
-/// (rendering the trace, per-step error messages, preflight gates) stays in each
-/// shell; the key-source `factory` and `credentials` are supplied by the caller,
-/// so a shell can log key attempts (the CLI) or stay quiet (the GUI) without
-/// this core knowing. `disc_to_iso`'s image copy uses a different lower-level
-/// `Drive` API and is intentionally not covered here.
+/// The ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and the
+/// desktop GUI's disc:// path; `factory` and `credentials` are supplied by
+/// the caller so a shell can log key attempts or stay quiet. `disc_to_iso`
+/// uses a different, lower-level `Drive` API and isn't covered here.
 pub fn open_scan_resolve(
     target: libfreemkv::DeviceTarget,
     credentials: Option<libfreemkv::DriveCredentials>,
@@ -607,14 +552,8 @@ mod tests {
         assert_eq!(resolve_selection(&d, &Selection::Longest), vec![3]);
     }
 
-    /// Ties go to the FIRST title, not the last.
-    ///
-    /// Playlist obfuscation is the reason `Longest` exists, and it works by
-    /// authoring decoy playlists with the SAME runtime as the feature — so a
-    /// tie is the normal case on exactly the discs this selection is for, and
-    /// the real playlist is conventionally the lowest index.
-    /// `Iterator::max_by` returns the LAST of equal maxima, which picks a
-    /// decoy, rips it, and reports success.
+    // Ties go to the FIRST title, not the last (`max_by` would pick the LAST
+    // of equal maxima, i.e. a decoy). See docs/mux.md for why.
     #[test]
     fn selection_longest_breaks_a_tie_towards_the_first_title() {
         let mut d = disc(5, false, false);
@@ -630,13 +569,9 @@ mod tests {
         );
     }
 
-    /// A title with no duration at all must not win, and must not crash the
-    /// comparison — `partial_cmp` on a NaN is `None`.
-    /// A non-finite duration must never win, INCLUDING when it is the first
-    /// title. Rejecting NaN only inside the comparison looks correct and is
-    /// not: `t > NaN` is false for every `t`, so a NaN that reaches the
-    /// accumulator first is never displaced. A disc whose first playlist has
-    /// an unparseable runtime would rip that playlist every time.
+    // A non-finite duration must never win, INCLUDING as the first title
+    // (`t > NaN` is false for every `t`, so a leading NaN is never
+    // displaced). See docs/mux.md.
     #[test]
     fn selection_longest_ignores_a_leading_title_with_no_measurable_duration() {
         let mut d = disc(3, false, false); // 60, 120, 180
@@ -684,13 +619,8 @@ mod tests {
         );
     }
 
-    /// The range filter is `i < n`, and `n` itself is out of range.
-    ///
-    /// Every other out-of-range case in this suite uses an index comfortably
-    /// past the end (9 against 2), so `<` and `<=` agree and the boundary was
-    /// never pinned. `<=` admits `disc.titles[n]`, which is the classic
-    /// off-by-one that either panics on the index or hands the muxer a title
-    /// the disc does not have.
+    // The range filter is `i < n`, and `n` itself is out of range — pins the
+    // boundary that `<` vs `<=` off-by-one bugs hide behind. See docs/mux.md.
     #[test]
     fn selection_explicit_index_equal_to_the_title_count_is_out_of_range() {
         let d = disc(3, false, false); // valid indices are 0, 1, 2
@@ -706,15 +636,9 @@ mod tests {
         );
     }
 
-    /// A lone selected title is NOT a multi-title rip.
-    ///
-    /// `multi_title = indices.len() > 1` is the flag `decide_title` consults
-    /// to decide whether a non-feature stub may be silently skipped. Widened
-    /// to `>=`, a single selected non-feature title whose mux comes back as a
-    /// skippable stub is swallowed: the rip returns `Ok { titles_written: 0 }`
-    /// — a success that wrote no file — instead of reporting the failure. The
-    /// existing single-title stub test passes `explicit_selection: true`,
-    /// which is fatal by a different clause and so hides this one.
+    // A lone selected title is NOT a multi-title rip: `multi_title =
+    // indices.len() > 1` guards against silently swallowing a single-title
+    // stub as a "successful" empty rip. See docs/mux.md.
     #[test]
     fn a_single_non_explicit_title_stub_is_fatal_not_skipped() {
         let d = disc(4, false, false); // durations 60..240 → longest is index 3
@@ -777,14 +701,9 @@ mod tests {
         }
     }
 
-    /// The mux must not start work it has ALREADY been told to stop.
-    ///
-    /// A watcher alone makes cancellation a race the work can win: on a short
-    /// title the mux can finish before the watcher thread is first scheduled.
-    /// Only asking before the work begins closes that window. The sink here
-    /// answers `true` exactly ONCE — that one answer is the pre-check — and
-    /// `false` to every later poll, so nothing but the pre-check can be what
-    /// cancelled the token.
+    // The mux must not start work it has ALREADY been told to stop; the sink
+    // here answers `true` exactly ONCE (the pre-check), `false` after, so
+    // only the pre-check can cancel the token. See docs/mux.md.
     #[test]
     fn an_already_cancelled_sink_halts_the_mux_before_it_starts() {
         struct CancelledOnce {
@@ -806,12 +725,9 @@ mod tests {
         );
     }
 
-    /// A Stop pressed once the mux is under way must reach the muxer.
-    ///
-    /// The sink only starts cancelling AFTER the mux has begun, so the
-    /// pre-check cannot be what sets the token — the watcher's poll is the
-    /// only path left. Without it a user's Stop is swallowed and the mux runs
-    /// to completion.
+    // A Stop pressed once the mux is under way must reach the muxer via the
+    // watcher's poll, not the pre-check (the sink only starts cancelling
+    // AFTER the mux begins). See docs/mux.md.
     #[test]
     fn a_cancel_during_the_mux_reaches_the_halt_token() {
         struct CancelOnceStarted {
@@ -836,12 +752,8 @@ mod tests {
         );
     }
 
-    /// Write-progress from the muxer must arrive at the sink as a `mux` tick.
-    ///
-    /// `mux_stream` reports through an `Arc<dyn MuxEvents>` that cannot borrow
-    /// the `&dyn Sink`, so the bridge is a channel plus the watcher drain. If
-    /// that drain is broken the rip shows no movement at all for its whole
-    /// duration.
+    // Write-progress from the muxer must arrive at the sink as a `mux` tick
+    // via the channel + watcher drain bridge. See docs/mux.md.
     #[test]
     fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
         let sink = RecordingSink::default();
@@ -859,14 +771,9 @@ mod tests {
         assert_eq!(p.bytes_total, 8192);
     }
 
-    /// A panic inside the mux must still release the watcher.
-    ///
-    /// `mux_stream` runs on damaged and malformed media, so a panic there is in
-    /// scope. `thread::scope` joins the watcher before it resumes the unwind —
-    /// if `done` is only stored after the call returns, an unwind skips it and
-    /// the watcher loops forever: the rip HANGS instead of failing, and no
-    /// error ever reaches the front-end. Bounded here, because the failure
-    /// mode is a hang.
+    // A panic inside the mux must still release the watcher, or an unwind
+    // skips storing `done` and the watcher loops forever — a hang, not a
+    // failure. Bounded here for that reason. See docs/mux.md.
     #[test]
     fn a_panicking_mux_still_releases_the_watcher() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -947,18 +854,9 @@ mod tests {
         );
     }
 
-    /// A rip that writes NO title must say so, whatever emptied it.
-    ///
-    /// `Ok { titles_written: 0 }` is success, exit 0, no file — and it is
-    /// reachable two ways: an empty `indices` (a caller that skipped
-    /// `preflight`, the shape that shipped once already: preflight said Ready,
-    /// `resolve_selection` said `[]`, the rip "succeeded" and wrote nothing),
-    /// and a selection whose every title turned out to be a skippable stub. In
-    /// both, every other arm of this loop reports through the Sink and this one
-    /// returned silently, so nothing anywhere told the user why the disc
-    /// produced no output. The outcome stays `Ok` — the count is the machine-
-    /// readable half of the answer and changing the variant would break every
-    /// front-end's `match` — but it must not be SILENT.
+    // A rip that writes NO title must say so, whatever emptied it (empty
+    // `indices`, or every title a skippable stub) — the outcome stays `Ok`
+    // but must not be SILENT. See docs/mux.md.
     #[test]
     fn a_rip_that_writes_nothing_says_so_rather_than_returning_a_silent_ok() {
         #[derive(Default)]
@@ -1014,17 +912,9 @@ mod tests {
         assert_eq!(outcome, RipOutcome::Ok { titles_written: 2 });
     }
 
-    /// The cause on `Failed` must actually discriminate — the assertions above
-    /// derive it from the same fixture they compare against, so on their own
-    /// they would still pass if every failure reported nothing.
-    ///
-    /// Three failures, three distinguishable causes, and each one legible
-    /// through the field that carries its meaning:
-    ///   - a malformed stub is typed, so it has a code and a bland kind;
-    ///   - a full disk is a passthrough OS error, so it has NO code and the
-    ///     kind is the whole story — this is the case a code-only field would
-    ///     have reported as an anonymous failure;
-    ///   - the two are not confusable.
+    // The cause on `Failed` must actually discriminate: three failures, three
+    // distinguishable causes, each legible through the field that carries
+    // its meaning (typed vs passthrough OS error). See docs/mux.md.
     #[test]
     fn the_failure_cause_says_which_failure_it_was() {
         let d = disc(3, false, false);
@@ -1142,11 +1032,9 @@ mod tests {
         assert_eq!(outcome, RipOutcome::Halted);
     }
 
-    /// A repeated `-t` index must produce ONE entry. Muxing the same title
-    /// twice counts it twice in `titles_written` while a front-end naming
-    /// files from `title_index` writes a single file — a success count that
-    /// does not match the disk — and flips `multi_title` on what is really a
-    /// single-title rip.
+    // A repeated `-t` index must produce ONE entry, or `titles_written`
+    // over-counts against the disk and `multi_title` misfires. See
+    // docs/mux.md.
     #[test]
     fn duplicate_title_indices_are_deduped_preserving_first_seen_order() {
         let d = disc(4, false, true);

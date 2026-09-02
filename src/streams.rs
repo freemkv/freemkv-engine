@@ -7,24 +7,18 @@ use crate::job::{StreamChoice, StreamFilter};
 use isolang::Language;
 use libfreemkv::{PidFilter, StreamSelection};
 
+// "German subtitles, and forced only if in English" is a single coherent
+// request a single language list can't express — forced subs answer to what
+// the viewer is *watching* in, not what full subs answer to.
 /// A subtitle policy whose FORCED-subtitle language set is independent of its
 /// normal-subtitle language set.
 ///
-/// Forced subtitles are a different editorial object from full subtitles: they
-/// translate on-screen signs and foreign dialogue for a viewer who is listening
-/// in the dub, so the language you want them in is the language you are
-/// *watching* in — not the language you want full subtitles in. "German
-/// subtitles, and forced only if in English" is a single coherent request that a
-/// single language list cannot express, which is why this splits in two.
-///
 /// The `forced` side is matched against subtitle streams whose `forced` flag is
-/// set (libfreemkv decides forcedness — including its PGS forced probe — and
-/// this only reads the flag); the `normal` side against the rest. The resolved
+/// set (libfreemkv decides forcedness, including its PGS forced probe; this
+/// only reads the flag); the `normal` side against the rest. The resolved
 /// selection is the UNION of the two: neither side can remove what the other
-/// kept, and either may be [`StreamFilter::None`].
-///
-/// A plain [`StreamFilter`] converts into the both-sides-the-same case, which is
-/// exactly the pre-forced behavior — see [`From`] below.
+/// kept, and either may be [`StreamFilter::None`]. A plain [`StreamFilter`]
+/// converts into the both-sides-the-same case — see [`From`] below.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SubtitleFilter {
     /// Applied to subtitle streams that are NOT flagged forced.
@@ -42,10 +36,9 @@ impl SubtitleFilter {
     }
 }
 
-/// One filter applied to BOTH sides — i.e. forcedness is ignored, which is what
-/// a caller that has only ever had a single subtitle list means. `All` still
-/// keeps every subtitle, `None` still keeps none, and `Langs(["de"])` still
-/// keeps every German subtitle whether or not it is forced.
+// One filter applied to BOTH sides: forcedness is ignored, matching what a
+// caller with only a single subtitle list means (`Langs(["de"])` keeps every
+// German subtitle whether or not it is forced).
 impl From<StreamFilter> for SubtitleFilter {
     fn from(f: StreamFilter) -> Self {
         SubtitleFilter::split(f.clone(), f)
@@ -95,16 +88,11 @@ impl StreamChoice {
     /// i.e. the whole rip will ship without that track class, however many
     /// titles it writes.
     ///
-    /// [`unmatched`](StreamChoice::unmatched) answers for ONE title, which is
-    /// the wrong question for a multi-title job: a language present on the
-    /// second title is not a miss just because the first lacks it. This is the
-    /// question preflight has to ask, and until it did, a `-a jpn` rip of a
-    /// disc with no Japanese audio resolved to zero audio PIDs, muxed a
-    /// video-only file and exited 0.
-    ///
-    /// A class NO selected title carries at all is not reported: there was
-    /// never a track to keep, so nothing was lost. Keys are returned in the
-    /// fixed order audio, subtitle, subtitle_forced.
+    /// Unlike [`unmatched`](StreamChoice::unmatched), which answers for ONE
+    /// title, a language present on the second title is not a miss just
+    /// because the first lacks it. A class NO selected title carries at all is
+    /// not reported: there was never a track to keep, so nothing was lost.
+    /// Keys are returned in the fixed order audio, subtitle, subtitle_forced.
     pub fn unmatched_everywhere<'a>(
         &self,
         titles: impl IntoIterator<Item = &'a libfreemkv::DiscTitle>,
@@ -129,6 +117,8 @@ impl StreamChoice {
                 }
             }
         }
+        // Before this existed, `-a jpn` on a disc lacking Japanese audio
+        // resolved to zero PIDs per-title, muxing a video-only file at exit 0.
         classes
             .iter()
             .enumerate()
@@ -216,10 +206,9 @@ fn check_class(
     ClassVerdict::Matched
 }
 
-/// The raw language tags of every stream of `class` on `title` (order preserved,
-/// not yet deduped). Empty tags are RETAINED — see `unmatched_for_class`: an
-/// untagged stream still counts as a stream of the class, and dropping it here
-/// makes "no tracks" indistinguishable from "no *tagged* tracks".
+// Raw language tags of every stream of `class` on `title` (order preserved,
+// not deduped). Empty tags are RETAINED: an untagged stream still counts as a
+// stream of the class, so "no tracks" stays distinguishable from "no tagged".
 fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<String> {
     match class {
         StreamClass::Audio => title.audio_streams().map(|a| a.language.clone()).collect(),
@@ -297,10 +286,9 @@ impl StreamClass {
     }
 }
 
-/// A [`StreamFilter`] with its language tags already resolved to identities —
-/// every tag is validated ONCE, before any stream is looked at, so a typo is
-/// reported as [`StreamSelError::UnknownLanguage`] whether or not the disc
-/// happens to carry a stream that would have matched.
+// A StreamFilter with its language tags already resolved to identities: every
+// tag is validated ONCE, before any stream is looked at, so a typo is reported
+// as UnknownLanguage whether or not the disc has a stream that would match.
 enum Wanted {
     All,
     None,
@@ -356,12 +344,9 @@ fn resolve_audio(
     ))
 }
 
-/// Subtitle PIDs = (non-forced streams matching `sel.normal`) ∪ (forced streams
-/// matching `sel.forced`), in stream order. Each stream is classified by the
-/// `forced` flag libfreemkv already put on it (its PGS forced probe feeds that
-/// flag; forcedness is never re-derived here) and is therefore offered to
-/// exactly one side — the two sides never contend for the same stream, and the
-/// union is duplicate-free by construction.
+// Subtitle PIDs = (non-forced streams matching sel.normal) ∪ (forced streams
+// matching sel.forced). Each stream is classified by the `forced` flag
+// libfreemkv already set (never re-derived), so the two sides never contend.
 fn resolve_subtitles(
     title: &libfreemkv::DiscTitle,
     sel: &SubtitleFilter,
@@ -441,21 +426,9 @@ mod tests {
         AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, Stream, SubtitleStream,
     };
 
-    /// ISO 639-2's complete set of languages whose bibliographic (/B) code
-    /// differs from its terminologic (/T) code, transcribed from the standard's
-    /// own code table: `(639-2/B, 639-2/T, 639-1)`.
-    ///
-    /// This is an INDEPENDENT statement of the standard, not a restatement of
-    /// `bib_to_terminologic`. That distinction is the whole point: the previous
-    /// test asserted `normalize_lang(bib) == from_639_3(bib_to_terminologic(bib))`,
-    /// which routes both sides through the very table under test, so a row could
-    /// be wrong and still agree with itself — `"ger" => "fra"` (i.e. `-a ger`
-    /// silently selecting the French track) passed the whole suite. The 639-1
-    /// column is the oracle: it reaches `isolang` by a path that does not touch
-    /// this crate's table at all.
-    ///
-    /// All 20 pairs are listed, so a row DELETED from the production table is
-    /// caught as well as a row rewritten.
+    // ISO 639-2's complete set of languages whose bibliographic (/B) code
+    // differs from its terminologic (/T) code: `(639-2/B, 639-2/T, 639-1)`.
+    // See docs/streams-tests.md#bib_term_iso1 — why 639-1 is the oracle.
     const BIB_TERM_ISO1: [(&str, &str, &str); 20] = [
         ("alb", "sqi", "sq"), // Albanian
         ("arm", "hye", "hy"), // Armenian
@@ -487,21 +460,9 @@ mod tests {
         "mao", "may", "per", "rum", "slo", "tib", "wel",
     ];
 
-    /// Discs label tracks with bibliographic codes (`ger`, `fre`, `chi`) as
-    /// often as terminologic ones, so `-a ger` has to reach a German track.
-    /// Only `fre` was covered: every other arm could be deleted and the suite
-    /// stayed green, which is a track the user asked for silently not matching.
-    ///
-    /// `isolang` is the oracle rather than a restated mapping — the property is
-    /// that a bibliographic tag and the /T form the table sends it to name the
-    /// SAME language.
-    /// A forced language the disc does not carry must be REPORTED.
-    ///
-    /// The two subtitle sides are chosen independently, so a hit on the full
-    /// side says nothing about the forced one. Before this, asking for forced
-    /// Japanese on a disc with none finished at exit 0 as though the request
-    /// had been honoured — that half of it silently dropped, which is the
-    /// whole failure this check exists to prevent.
+    // A forced language the disc lacks must be REPORTED: the two subtitle
+    // sides are chosen independently, so a hit on the full side says nothing
+    // about the forced one. See docs/streams-tests.md#a_forced_language_the_disc_lacks_is_reported_on_its_own_side.
     #[test]
     fn a_forced_language_the_disc_lacks_is_reported_on_its_own_side() {
         let t = forced_title(); // deu/eng full, eng/deu forced
@@ -573,10 +534,9 @@ mod tests {
         }
     }
 
-    /// The production table must cover the standard's set exactly: every /B
-    /// code in it, and no invented rows. A missing row is a language request
-    /// that silently matches nothing; an extra row is a code the standard does
-    /// not define as bibliographic.
+    // The production table must cover the standard's set exactly: every /B
+    // code in it, no invented rows. A missing row silently matches nothing;
+    // an extra row is a code the standard doesn't define as bibliographic.
     #[test]
     fn the_bibliographic_table_covers_exactly_the_standard_set() {
         for (bib, term, _) in BIB_TERM_ISO1 {
@@ -598,10 +558,9 @@ mod tests {
         }
     }
 
-    /// Each arm has to be load-bearing. `normalize_lang` tries `from_639_3`
-    /// BEFORE the table, so an entry `isolang` already resolves on its own is
-    /// unreachable — and a table with dead rows in it is a table nobody can
-    /// tell is still correct.
+    // Each arm has to be load-bearing. `normalize_lang` tries `from_639_3`
+    // BEFORE the table, so an entry `isolang` already resolves on its own is
+    // unreachable — a table with dead rows is one nobody can tell is correct.
     #[test]
     fn no_bibliographic_arm_is_dead() {
         for bib in BIB_CODES {
@@ -820,16 +779,9 @@ mod tests {
         assert!(u.is_empty(), "got {u:?}");
     }
 
-    /// A class whose streams exist but carry NO language tag is a MISS, not an
-    /// absent class.
-    ///
-    /// Regression: `class_languages` used to filter empty tags out, so a title
-    /// with untagged audio looked identical to a title with no audio — the
-    /// unmatched check returned early, nothing was reported, and `resolve`
-    /// produced `Only([])`, i.e. keep nothing. `-a eng` on such a disc therefore
-    /// wrote a video-only file and exited 0, which is precisely the silent
-    /// track-loss the fail-loud work was meant to end. DVDs authored with zero
-    /// language bytes reach this (libfreemkv emits `language: ""`).
+    // A class whose streams exist but carry NO language tag is a MISS, not an
+    // absent class (untagged audio must not look like no audio at all).
+    // See docs/streams-tests.md#untagged-class-regression.
     #[test]
     fn unmatched_flags_a_class_whose_streams_are_all_untagged() {
         let mut t = libfreemkv::DiscTitle::empty();
@@ -849,11 +801,9 @@ mod tests {
         );
     }
 
-    /// `StreamChoice::resolve` is the method every front-end calls; the free
-    /// function underneath it is what every test above calls. That left the
-    /// one-line delegation replaceable with `Ok(Default::default())` — an
-    /// empty selection, which for a `PidFilter::Only(vec![])` audio choice is
-    /// a plausible-looking answer that silently drops every track.
+    // Guards the one-line delegation from `StreamChoice::resolve` to the free
+    // function every other test calls directly, so it can't silently become
+    // `Ok(Default::default())`. See docs/streams-tests.md#resolve_delegates_to_resolve_stream_selection.
     #[test]
     fn resolve_delegates_to_resolve_stream_selection() {
         let t = title();
@@ -896,13 +846,9 @@ mod tests {
         t
     }
 
-    /// The request this split exists for, verbatim: "German & Spanish audio,
-    /// only German subtitles, and forced only if in English."
-    ///
-    /// Audio is a SET — both German and Spanish are kept, not the first match.
-    /// Subtitles are a UNION of two INDEPENDENT sets: the German full subtitle
-    /// AND the English forced one, together. Anything that folds the two sides
-    /// into one language list can satisfy at most one half of this.
+    // The request this split exists for, verbatim: "German & Spanish audio,
+    // only German subtitles, and forced only if in English."
+    // See docs/streams-tests.md#german_spanish_audio_german_subs_forced_english.
     #[test]
     fn german_spanish_audio_german_subs_forced_english() {
         let sel = resolve_stream_selection_forced(
@@ -1014,10 +960,8 @@ mod tests {
         );
     }
 
-    /// A caller that has only one subtitle list keeps today's behavior exactly:
-    /// the `From` conversion applies it to both sides, so forcedness is ignored
-    /// — `All` is still the library's `All`, `None` still empty, and a language
-    /// still matches forced and full subtitles alike.
+    // A caller with only one subtitle list keeps today's behavior exactly: the
+    // `From` conversion applies it to both sides, so forcedness is ignored.
     #[test]
     fn a_plain_filter_converts_to_a_forced_agnostic_split() {
         let t = forced_title();

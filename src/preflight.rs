@@ -43,15 +43,15 @@ pub struct Reason {
     /// Stable reason key. The complete set this crate emits — a front-end that
     /// maps only part of it renders a blocked Start with no explanation:
     ///
-    /// * `"no-titles"` — the scan found no titles at all.
-    /// * `"empty-selection"` — the selection resolves to no title.
-    /// * `"title-out-of-range"` — an explicit index past the last title;
-    ///   `detail` carries the offending index.
-    /// * `"multipass-requires-raw"` — `RipMode::Multi` without `job.raw`.
-    /// * `"language-unmatched"` — a language-filtered stream class the job asks
-    ///   for is carried by no selected title; `detail` carries the class key
-    ///   (`audio`, `subtitle`, `subtitle_forced`).
-    /// * `"encrypted-no-key"` — an encrypted disc, not raw, with no usable key.
+    /// ```text
+    /// "no-titles"              the scan found no titles at all
+    /// "empty-selection"        the selection resolves to no title
+    /// "title-out-of-range"     an index past the last title (detail = index)
+    /// "multipass-requires-raw" RipMode::Multi without job.raw
+    /// "language-unmatched"     a language-filtered class no selected title
+    ///                          carries (detail = audio|subtitle|subtitle_forced)
+    /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
+    /// ```
     pub key: String,
     /// Optional machine detail for the message (e.g. the offending index).
     pub detail: Option<String>,
@@ -75,16 +75,12 @@ impl Reason {
 /// Validate `job` against the already-scanned `disc`. Pure and side-effect
 /// free — safe to call on every UI selection change.
 ///
-/// Checks, cheapest first:
-/// 1. The disc has at least one title.
-/// 2. The selection resolves to a non-empty set of in-range title indices.
-/// 3. Every language-filtered stream class the job asks for is carried by at
-///    least one selected title (so a rip cannot silently ship a file without
-///    the audio or subtitle track the user asked for).
-/// 4. If the disc is encrypted and the job is NOT `raw`, a usable key exists
-///    (so a decrypting rip cannot silently write ciphertext — the same class
-///    of guard `Disc::ensure_decryptable` enforces at execution time, surfaced
-///    here earlier as data).
+/// Checks, cheapest first: the disc has titles; the selection resolves to a
+/// non-empty set of in-range indices; every language-filtered stream class
+/// the job asks for is carried by a selected title; and, if the disc is
+/// encrypted and the job is not `raw`, a usable key exists. See
+/// docs/preflight.md ("`preflight` — why each check exists") for the
+/// rationale behind each gate.
 pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     let mut reasons = Vec::new();
 
@@ -158,14 +154,9 @@ mod tests {
     use super::*;
     use crate::job::RipMode;
 
-    /// Multipass implies raw, and the engine must be the place that knows it.
-    ///
-    /// `decrypt` and `multipass` were independent fields with no relationship
-    /// encoded anywhere: not in the CLI, which passes them as separate
-    /// booleans, and not in the engine, whose three recovery call sites all
-    /// set `decrypt: !job.raw` whatever the mode. Every front-end — including
-    /// a GUI that does not exist yet — could therefore construct a rip the
-    /// product does not support, and nothing would say so.
+    // Multipass implies raw, and the engine must be the place that knows it.
+    // See docs/preflight.md ("Test: `a_decrypting_multipass_job_is_blocked`")
+    // for why `decrypt`/`multipass` needed this test.
     #[test]
     fn a_decrypting_multipass_job_is_blocked() {
         let disc = disc_with(2, false, false);
@@ -205,18 +196,9 @@ mod tests {
         );
     }
 
-    /// Every reason key this module can emit must be documented where a
-    /// front-end will look for it.
-    ///
-    /// `Reason.key` is a contract with a UI that renders nothing but the key:
-    /// a key the guide does not list is a blocked Start button with no
-    /// message. The set was presented as four for as long as there have been
-    /// five — `multipass-requires-raw` was emitted but listed nowhere, and it
-    /// is the key `USING_THE_ENGINE.md`'s own §1 example triggers.
-    ///
-    /// Derived from the SOURCE, not from a hand-kept list here, so adding a
-    /// sixth key without documenting it fails this test rather than quietly
-    /// repeating the same omission.
+    // Every reason key this module can emit must be documented where a
+    // front-end will look for it. See docs/preflight.md
+    // ("Test: `every_emitted_reason_key_is_documented`") for the incident.
     #[test]
     fn every_emitted_reason_key_is_documented() {
         let src = include_str!("preflight.rs");
@@ -349,13 +331,9 @@ mod tests {
         assert_eq!(preflight(&d, &j), Preflight::Ready);
     }
 
-    /// `is_ready` is the accessor a front-end greys out Start on.
-    ///
-    /// Every test in this module that touches it asserts the BLOCKED
-    /// direction, so a constant `false` was indistinguishable — and a
-    /// permanently greyed-out Start with no reason shown is a UI nobody can
-    /// use. Assert both directions against the same accessor, and against
-    /// `reasons()`, which has to agree with it.
+    // `is_ready` is the accessor a front-end greys out Start on; assert both
+    // directions against it, and against `reasons()`. See docs/preflight.md
+    // ("Test: `is_ready_agrees_with_the_variant_in_both_directions`").
     #[test]
     fn is_ready_agrees_with_the_variant_in_both_directions() {
         let ready = preflight(
@@ -403,21 +381,9 @@ mod tests {
         assert_eq!(r.detail.as_deref(), Some("5"));
     }
 
-    /// `Ready` has to mean the rip will actually rip something.
-    ///
-    /// The selection→indices policy lives in `mux::resolve_selection`, and
-    /// preflight carried a SECOND copy of the "does it resolve to anything?"
-    /// question — an assumption, written as a comment, that MainMovie / All /
-    /// Longest always yield at least one title on a disc that has titles. That
-    /// stopped being true when `resolve_selection` was hardened: `Longest` now
-    /// drops non-finite durations BEFORE folding (a NaN reaching the
-    /// accumulator first was never displaced and won outright), so a disc whose
-    /// every playlist has an unparseable runtime resolves to NO title.
-    ///
-    /// The two copies then disagreed on exactly that input: preflight said
-    /// `Ready`, `resolve_selection` said `[]`, and `run_titles([])` returns
-    /// `Ok { titles_written: 0 }` — a rip that reports success, exits 0, and
-    /// writes nothing. Preflight now asks the owner instead of assuming.
+    // `Ready` has to mean the rip will actually rip something. See
+    // docs/preflight.md ("Test:
+    // `ready_implies_the_selection_resolves_to_at_least_one_title`").
     #[test]
     fn ready_implies_the_selection_resolves_to_at_least_one_title() {
         let mut d = disc_with(3, false, false);
@@ -511,12 +477,9 @@ mod tests {
         ))
     }
 
-    /// `-a jpn` on a disc with no Japanese audio must be REFUSED, not run.
-    ///
-    /// `StreamChoice::unmatched` computes exactly this and had no caller
-    /// anywhere in the crate: the resolved selection simply kept no audio PIDs,
-    /// the mux wrote a video-only file, and the run exited 0. The user asked for
-    /// a track, got a file without one, and nothing said so.
+    // `-a jpn` on a disc with no Japanese audio must be REFUSED, not run.
+    // See docs/preflight.md ("Test:
+    // `a_language_no_selected_title_carries_is_refused`").
     #[test]
     fn a_language_no_selected_title_carries_is_refused() {
         let d = disc_with_titles(vec![title_with_audio(&["eng", "deu"])]);

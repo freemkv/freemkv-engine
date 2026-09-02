@@ -1,29 +1,12 @@
 //! Pass-N (`freemkv_engine::patch`) read-error handler — A/B golden fixture.
 //!
-//! WHAT THIS PINS, in today's code: the end-to-end behaviour of
-//! `freemkv_engine::patch` over eight canonical damage profiles against a
-//! synthetic `ScriptedSectorReader`. Each profile asserts the exact observable
-//! outcome — final mapfile byte counts, plus an upper bound on the number of
-//! reads — so any change to the Pass-N failure path either preserves the
-//! goldens or fails loudly. They are the evidence that a refactor did not move
-//! shipped recovery behaviour.
-//!
-//! WHERE THAT BEHAVIOUR LIVES: `recovery::read_error::handle_read_error` is the
-//! Pass-1 (sweep) error policy and is the sweep loop's only production caller.
-//! Pass N does not route through it: its recovery is the chain of
-//! time-bounded handlers in `recovery/section_recover.rs`, driven per bad
-//! section by `recovery/patch.rs`. The Pass-N damage threshold is
-//! `read_error::PATCH_DAMAGE_THRESHOLD_PCT` (6, against the sweep's 12).
-//!
-//! HISTORY (2026-05-13, v0.20.8), because the golden VALUES below date from
-//! it: this file began as the A/B fixture for unifying Pass N onto
-//! `handle_read_error`, when Pass N had its own inline `handle_read_failure`
-//! in `recovery/patch.rs` producing a `FailureAction`, its own damage window,
-//! and its own `compute_damage_skip` with a size-aware `range_remaining/4` cap
-//! and a `MAX_SKIPS_PER_RANGE` bound. NONE of those five names exists in `src/`
-//! any more — the per-section handler chain replaced that loop wholesale — so
-//! do not go looking for them. What survived the replacement, unchanged, is the
-//! observable contract this file asserts.
+//! Pins the end-to-end behaviour of `freemkv_engine::patch` over eight
+//! canonical damage profiles against a synthetic `ScriptedSectorReader`:
+//! final mapfile byte counts plus an upper bound on read count, so any
+//! change to the Pass-N failure path preserves the goldens or fails loudly.
+//! Pass N's recovery is the handler chain in `recovery/section_recover.rs`
+//! driven by `recovery/patch.rs` — NOT `read_error::handle_read_error`.
+//! See docs/passn-handler-ab.md for the full split and golden-value history.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::{Mapfile, SectorStatus};
@@ -38,26 +21,18 @@ use std::sync::{Arc, Mutex};
 
 const SECTOR_SIZE: usize = 2048;
 
-/// Per-attempt result the script can emit. `Ok` returns a deterministic
-/// per-sector byte pattern (LBA mod 256 in each sector). `Err` returns
-/// the SCSI sense triple supplied — the patch failure path inspects
-/// `scsi_sense().sense_key` to classify (MEDIUM, NOT_READY,
-/// HARDWARE, ILLEGAL_REQUEST, ABORTED_COMMAND).
+// Per-attempt result the script can emit. `Ok` returns a deterministic
+// per-sector byte pattern (LBA mod 256). `Err` returns the SCSI sense
+// triple; the patch failure path classifies on `sense_key`.
 #[derive(Debug, Clone, Copy)]
 enum ScriptStep {
     Ok,
     Err { sense_key: u8, asc: u8, ascq: u8 },
 }
 
-/// A scripted reader. For each (lba, count) read attempt, picks the
-/// step at `attempt_idx[lba]`, advances the index. If no script entry
-/// exists for an LBA, defaults to `Ok` so we don't need to script
-/// every sector of large ranges.
-///
-/// "Batch fails if ANY sector in the batch is bad" — matches real
-/// drive behavior (`pass_n_size_aware_skip.rs` uses the same model).
-/// For batched reads we synthesize an Err with the FIRST scripted
-/// failure in the batch.
+// Scripted reader: per (lba, count) attempt, picks `attempt_idx[lba]`'s
+// step and advances it (missing entries default `Ok`). Batch fails if
+// ANY sector is bad, synthesizing an Err with the FIRST scripted failure.
 struct ScriptedSectorReader {
     capacity: u32,
     /// Per-LBA script of (step, then next step on retry, …). When
@@ -728,32 +703,9 @@ fn profile_08_batch_fail_singles_ok() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Sense-family error paths in `patch`, driven directly rather than via
-// `run_profile`/`copy`. Invariant: a pass never promotes to Unreadable or drops bytes.
-
-/// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
-/// range) patch pass with the given failure step and return the final map
-/// stats. 256-sector synthetic disc; everything outside the range is Finished.
-///
-/// TODO(coverage gap): these HARDWARE_ERROR / ILLEGAL_REQUEST cases assert only
-/// the persistent-sense RECOVERY CONTRACT (never Unreadable, byte conservation,
-/// dead sector stays pending) — they do NOT exercise the patch WEDGE-EXIT path.
-/// A single dead sector in one range structurally cannot reach either exit:
-/// `WEDGE_ABORT_THRESHOLD=16` needs 16 CONSECUTIVE wedge-family senses within a
-/// range, and the `wedged_threshold=50` exit additionally needs `range_idx > 0`
-/// (a prior range already processed). A real wedge-exit fixture (a first
-/// throwaway range, then a second range of >=16 sectors that ALL always-fail
-/// with HARDWARE_ERROR, in reverse mode) is a separate, larger synthetic build;
-/// left out here rather than bent into this shared single-sector helper.
-///
-/// This comment used to end "no test anywhere asserts
-/// `PatchOutcome::wedged_exit == true`", and that is NO LONGER TRUE — do not
-/// act on it. `multipass::tests::a_wedged_result_is_distinguishable_from_a_
-/// cancelled_one` (in `src/multipass.rs`) drives a real `multipass_rip` whose
-/// patch pass meets a transport failure and asserts `result.wedged`, reaching
-/// the `PassExit::Wedged` arm end to end. The gap left here is this HELPER's,
-/// not the crate's, and the wedge arm is live code with a live test behind it.
+// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
+// range) patch pass; returns final map stats (256-sector synthetic disc).
+// Coverage + the sense-family invariant history: docs/passn-handler-ab.md.
 fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats {
     let capacity_sectors: u32 = 256;
     let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);

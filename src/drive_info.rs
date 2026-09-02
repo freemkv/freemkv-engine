@@ -158,34 +158,28 @@ fn raw(
     (r.status == 0).then(|| buf[..r.bytes_transferred.min(buf.len())].to_vec())
 }
 
-/// Mask a string for privacy (letters->A, digits->0).
-pub fn mask_string(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if c.is_ascii_alphabetic() {
-                'A'
-            } else if c.is_ascii_digit() {
-                '0'
-            } else {
-                c
-            }
-        })
-        .collect()
+/// The one masking policy both `mask_string` and `mask_bytes` apply, so a
+/// future change (e.g. also masking punctuation) can't drift between them.
+/// ASCII letter -> 'A', ASCII digit -> '0', everything else unchanged.
+fn mask_char(c: char) -> char {
+    if c.is_ascii_alphabetic() {
+        'A'
+    } else if c.is_ascii_digit() {
+        '0'
+    } else {
+        c
+    }
 }
 
-/// Mask bytes for privacy.
+/// Mask a string for privacy (letters->A, digits->0).
+pub fn mask_string(s: &str) -> String {
+    s.chars().map(mask_char).collect()
+}
+
+/// Mask bytes for privacy. A byte round-trips through `char` (Latin-1), so the
+/// ASCII classification — the only thing `mask_char` acts on — is identical.
 pub fn mask_bytes(data: &[u8]) -> Vec<u8> {
-    data.iter()
-        .map(|&b| {
-            if b.is_ascii_alphabetic() {
-                b'A'
-            } else if b.is_ascii_digit() {
-                b'0'
-            } else {
-                b
-            }
-        })
-        .collect()
+    data.iter().map(|&b| mask_char(b as char) as u8).collect()
 }
 
 #[cfg(test)]

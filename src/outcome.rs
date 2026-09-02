@@ -20,14 +20,10 @@ pub enum DamageSeverity {
     /// 500 or more sectors, OR 30 s or more lost — or a loss that could not be
     /// quantified at all (`lost_ms` NaN), which fails safe to this tier because
     /// the abort-on-loss gate is refusing the same rip. Significant damage;
-    /// consider a rescan or a different drive.
-    ///
-    /// The boundaries are stated here as they are IMPLEMENTED
-    /// ([`crate::classify_damage`] is the owner): the ranges used to read
-    /// "51–500" and "500+", which claimed both tiers for exactly 500 sectors.
-    /// The code answers `Serious` there, and a front-end that rendered its
-    /// badge from this doc rather than from the function disagreed with the
-    /// engine on the boundary case.
+    /// consider a rescan or a different drive. Boundaries are owned by
+    /// [`crate::classify_damage`], not restated here: they used to read
+    /// "51–500"/"500+" (ambiguous at exactly 500), which disagreed with the
+    /// code's actual answer for that case.
     Serious,
 }
 

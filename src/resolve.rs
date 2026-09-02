@@ -5,26 +5,20 @@
 //! without scraping a log. [`resolve_keys`] reads the scanned [`libfreemkv::Disc`]'s
 //! already-resolved AACS/CSS state and returns it as a [`KeyStatus`].
 //!
-//! The actual key *derivation* happens in libfreemkv during `Disc::scan` /
-//! `DiscSession::resolve_keys` (that's the mechanics — a lib primitive). This
-//! function only reports the resulting state; it performs no I/O and no
-//! derivation.
+//! Key *derivation* happens in libfreemkv (`Disc::scan` / `DiscSession::resolve_keys`);
+//! this module only reports the resulting state, with no I/O or derivation of its own.
 
 use crate::outcome::KeyStatus;
 
 /// Report the key-resolution state of an already-scanned disc, as data.
 ///
-/// - Unencrypted disc → resolved (nothing to decrypt), summary `"unencrypted"`.
+/// - Unencrypted disc → resolved, summary `"unencrypted"`.
 /// - AACS with real key material (unit keys or a VUK) → resolved, origin
-///   carried, summary keyed to the origin (`"resolved-keydb"`,
-///   `"resolved-external"`, `"resolved-derived"`). AACS state present but with
-///   no key material (a VID-only placeholder scan) is treated as unresolved.
+///   carried, summary `"resolved-keydb"` / `"resolved-external"` /
+///   `"resolved-derived"`. AACS with no key material (VID-only scan) is unresolved.
 /// - CSS with a recovered key → resolved, summary `"resolved-css"`.
-/// - Encrypted but no key → unresolved, summary `"no-key"` (or the more
-///   specific `"no-keydb"` when the library flagged a missing keydb, or
-///   `"key-service-unavailable"` / `"key-service-unauthorized"` /
-///   `"key-service-rate-limited"` when a key SOURCE failed to answer at all —
-///   which is not the same claim as "no key exists").
+/// - Encrypted, no key → unresolved, summary `"no-key"` / `"no-keydb"` / a
+///   `"key-service-*"` variant (source failed, not proof of "no key").
 pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     if !disc.encrypted {
         return KeyStatus {
@@ -89,20 +83,9 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     KeyStatus::unresolved(summary)
 }
 
-/// The decrypt gate the EXECUTORS use — [`libfreemkv::Disc::ensure_decryptable`]
-/// plus this crate's own [`resolve_keys`] judgement.
-///
-/// The library gate only errors when it has an AACS or CSS state to judge. A
-/// disc that reports `encrypted` but resolved NEITHER — which `Disc::scan`
-/// produces when the volume carries `/AACS` but the VID probe failed, leaving
-/// `aacs: None, aacs_error: Some(..)` — therefore passed it, the decrypt
-/// wrapper degraded to a pass-through, and the copy finished at
-/// `complete: true`, exit 0, having written an unplayable ciphertext image.
-///
-/// `preflight` already blocks that disc, via `resolve_keys`. The two predicates
-/// disagreed, and only the one NOT on the execution path was strict. Sharing
-/// the judgement here means "can this disc be decrypted" has a single answer
-/// whether it is asked before the rip or during it.
+// The decrypt gate the executors use, layered on the library gate.
+// See docs/resolve.md — closes the `aacs_error`-with-no-`aacs` gap the
+// library gate alone lets a disc pass through unresolved.
 pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
     disc.ensure_decryptable(raw)?;
     if disc.encrypted && !raw && !resolve_keys(disc).resolved {
@@ -136,21 +119,9 @@ pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> c
 mod tests {
     use super::*;
 
-    /// Every `KeyStatus::summary` value this module can emit must be documented
-    /// where a front-end will look for it.
-    ///
-    /// `summary` is a contract with a UI that renders nothing but the key:
-    /// an undocumented value is an unlocalised string in front of the user, on
-    /// the strip whose whole job is to explain why a disc will not decrypt. The
-    /// set was presented as seven for as long as there have been ten — the
-    /// three `key-service-*` values (a key SOURCE could not answer, which is
-    /// NOT the claim "this disc has no key") were emitted and listed nowhere.
-    ///
-    /// Derived from the SOURCE — the body of `resolve_keys` itself — not from a
-    /// hand-kept list here, so adding an eleventh summary without documenting
-    /// it fails this test rather than quietly repeating the same omission.
-    /// Mirrors `preflight.rs`'s `every_emitted_reason_key_is_documented` and
-    /// `multipass.rs`'s `every_multipass_result_field_is_documented`.
+    // Every `KeyStatus::summary` value this module can emit must be
+    // documented where a front-end will look for it, checked from the
+    // SOURCE so an undocumented addition fails loudly. See docs/resolve.md.
     #[test]
     fn every_emitted_key_summary_is_documented() {
         let src = include_str!("resolve.rs");
@@ -248,6 +219,31 @@ mod tests {
         let ks = resolve_keys(&disc(false));
         assert!(ks.resolved);
         assert_eq!(ks.summary, "unencrypted");
+    }
+
+    #[test]
+    fn strict_gate_passes_an_unencrypted_disc() {
+        assert!(ensure_decryptable_strict(&disc(false), false).is_ok());
+    }
+
+    #[test]
+    fn strict_gate_passes_a_resolved_encrypted_disc() {
+        let mut d = disc(true);
+        d.aacs = Some(aacs(libfreemkv::KeyOrigin::KeyDb));
+        assert!(ensure_decryptable_strict(&d, false).is_ok());
+    }
+
+    #[test]
+    fn strict_gate_surfaces_a_key_source_failure() {
+        // aacs: None + aacs_error: Some — the gap the strict gate exists to
+        // close. Deleting its body lets this encrypted-but-unresolved disc pass
+        // as decryptable; the gate must instead surface the key-service failure.
+        let mut d = disc(true);
+        d.aacs_error = Some(libfreemkv::Error::KeyServiceUnavailable);
+        assert!(matches!(
+            ensure_decryptable_strict(&d, false),
+            Err(libfreemkv::Error::KeyServiceUnavailable)
+        ));
     }
 
     #[test]
