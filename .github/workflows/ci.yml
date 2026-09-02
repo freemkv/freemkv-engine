@@ -35,9 +35,11 @@ on:
 # libfreemkv path-deps ../freemkv-unlock, which resolves to the workspace root
 # under this layout — hence the fourth checkout.
 #
-# `--locked` is deliberately absent: Cargo.lock is gitignored here (library
-# convention), so there is nothing to lock against. The lock that has to hold is
-# the one release.sh regenerates in each consuming binary.
+# `--locked` is deliberately absent: Cargo.lock is now committed (issue #15) and
+# the `deny` job audits the resolved graph, but CI's sibling path-patch layout
+# resolves the freemkv crates as path packages, which `--locked` can't satisfy —
+# the same reason the binary crates omit it. The lock that has to hold is the one
+# release.sh regenerates in each consuming binary.
 
 jobs:
   # ── Single source of truth for the MSRV ─────────────────────────────────────
@@ -177,6 +179,47 @@ jobs:
           workspaces: freemkv-engine
       - run: cargo test --tests
         working-directory: freemkv-engine
+
+  # cargo-deny — gates the RESOLVED dependency graph (RUSTSEC advisories, a
+  # permissive licence allow-list, and source/ban hygiene). Mirrors the `test`
+  # job's sibling checkout + .cargo/config.toml patch layout so `cargo metadata`
+  # resolves the path-patched siblings exactly like the real build.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: freemkv-engine
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/libfreemkv
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: libfreemkv
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-keysources
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-keysources
+      - uses: actions/checkout@v7
+        with:
+          repository: freemkv/freemkv-unlock
+          ref: "${{ github.ref_name == 'qa' && 'qa' || 'dev' }}"
+          path: freemkv-unlock
+      - name: Resolve siblings from their dev tips
+        shell: bash
+        working-directory: freemkv-engine
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<'EOF'
+          [patch.crates-io]
+          libfreemkv = { path = "../libfreemkv" }
+          freemkv-keysources = { path = "../freemkv-keysources" }
+          EOF
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+          manifest-path: freemkv-engine/Cargo.toml
 
   # The release profile is a DIFFERENT program. `[profile.release]` sets lto and
   # codegen-units but not debug-assertions, so every debug_assert! in the
@@ -405,8 +448,8 @@ jobs:
   # here does not block a push or a release). Mirrors the `test` job's sibling
   # checkout + .cargo/config.toml patch layout so llvm-cov builds this branch's
   # tip against the sibling dev tips, exactly like the real test build; `--locked`
-  # is deliberately absent for the same reason as everywhere else (Cargo.lock is
-  # gitignored). Uploads tokenless to Codecov and never fails CI on upload error.
+  # is deliberately absent for the same reason as everywhere else (the path-patch
+  # layout can't satisfy it). Uploads tokenless to Codecov and never fails CI on upload error.
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest
