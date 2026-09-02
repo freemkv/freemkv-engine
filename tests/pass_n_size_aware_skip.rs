@@ -1,29 +1,13 @@
 //! Pass N (`freemkv_engine::patch`) size-aware-skip targeted tests.
 //!
-//! The user's failure mode (2026-05-07): "what if we have a 100 sector zone
-//! and its really 2 25 sector zones and we keep jumping over the good in
-//! the middle." Today's pre-fix patch escalates skip-distance based on
-//! `consecutive_skips_without_recovery` with hardcoded 32 → 4096 sector
-//! caps. A 100-sector bad range whose actual layout is 25 bad + 50 good +
-//! 25 bad would have the patch skip 32-4096 sectors after a couple of
-//! failures, leaping over the entire range AND the good middle.
+//! Contract under test: a 100-sector bad range whose middle 50 sectors
+//! are readable must come back with that middle recovered, not leapt
+//! over, regardless of which internal mechanism does the recovering.
 //!
-//! The fix AT THE TIME: cap each skip at `range_remaining/4`.
-//!
-//! HISTORY, so nobody goes looking for that cap: `range_remaining`,
-//! `compute_damage_skip` and `MAX_SKIPS_PER_RANGE` do not exist in `src/` any
-//! more. The per-section handler chain in `recovery/section_recover.rs`
-//! (driven per bad range by `recovery/patch.rs`) replaced that loop wholesale,
-//! and it is what recovers the good middle of a bad range today — by walking
-//! the range from several angles under a time budget, not by bounding a skip
-//! distance. The same note is on `tests/passn_handler_ab.rs`, the sibling
-//! fixture from the same rework.
-//!
-//! What survived, and what these tests still pin, is the OBSERVABLE contract:
-//! a 100-sector bad range whose middle 50 sectors are readable must come back
-//! with that middle recovered, not leapt over. That assertion is independent of
-//! which mechanism does it, which is why the file kept its value when the
-//! mechanism it was named for was deleted.
+//! See docs/pass-n-size-aware-skip.md for the original bug report, the
+//! now-deleted `range_remaining/4` skip-cap fix, and why this file kept
+//! its value after that mechanism was replaced by the handler chain in
+//! `recovery/section_recover.rs`.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::PatchOptions;
@@ -171,12 +155,9 @@ fn prep_iso_and_mapfile(
     }
 }
 
-/// THE critical test. A 100-sector "bad" range hides 50 good sectors in
-/// the middle (LBAs 125-174). The pre-fix patch loop would skip-escalate at
-/// 32+ sectors and leap over the whole range, good middle included. The
-/// recovered middle below is the contract; the `range_remaining/4` cap that
-/// first delivered it is long gone (see this file's header) and the handler
-/// chain delivers it now.
+// THE critical test: a 100-sector "bad" range hides 50 good sectors in
+// the middle (LBAs 125-174); the recovered middle is the contract.
+// See docs/pass-n-size-aware-skip.md for why.
 #[test]
 fn patch_recovers_good_middle_of_a_bad_range() {
     let capacity_sectors: u32 = 1024;
@@ -257,13 +238,9 @@ fn patch_recovers_good_middle_of_a_bad_range() {
     );
 }
 
-/// Regression: `PatchOptions::block_sectors == Some(0)` must not
-/// busy-spin. `block_sectors` is a public `Option<u16>` field; a zero
-/// value would compute a zero-length read every iteration, never
-/// advance `block_end`, and burn a CPU core until the per-range
-/// watchdog fired (up to 30 min on a large range). The entry-point
-/// `.max(1)` clamp turns Some(0) into a single-sector batch so the
-/// range recovers and the call returns promptly.
+// Regression: `PatchOptions::block_sectors == Some(0)` must not busy-spin.
+// Without the entry-point `.max(1)` clamp, a zero-length read would never
+// advance `block_end` and would burn a CPU core until the per-range watchdog fired.
 #[test]
 fn patch_block_sectors_zero_does_not_busy_spin() {
     let capacity_sectors: u32 = 256;
@@ -433,21 +410,9 @@ fn patch_recovers_multiple_good_middles() {
     );
 }
 
-/// 0.18 Pass N pipeline split: exercises the new producer/consumer
-/// path end-to-end on a synthetic patterned reader. Bad range layout
-/// is small (5 bad LBAs surrounded by good middle) so the producer
-/// emits a mix of `Recovered` and `NonTrimmed` items and the consumer
-/// thread must apply both kinds. Verifies:
-///
-/// - `bytes_good` advances (good sectors flow producer→consumer→file
-///   →mapfile with the data preserved).
-/// - The recovered LBAs end up Finished; the bad LBAs end up NonTrimmed
-///   (NOT Unreadable — promotion to Unreadable is the orchestrator's job
-///   after the final pass).
-/// - Bytes written at the recovered offsets match what the producer
-///   read from the patterned source (proves the channel hand-off
-///   didn't drop or reorder buffers, and the consumer's seek+write
-///   landed at the right offsets).
+// 0.18 Pass N pipeline split: exercises the producer/consumer path
+// end-to-end, verifying bytes_good, Finished/NonTrimmed status, and
+// byte-exact writes. See docs/pass-n-size-aware-skip.md for detail.
 #[test]
 fn patch_pipeline_split_recovers_and_records_correctly() {
     let capacity_sectors: u32 = 512;

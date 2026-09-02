@@ -1,14 +1,9 @@
 //! # freemkv-engine
 //!
-//! The freemkv **rip engine**: freemkv's recovery STRATEGY (sweep, patch, the
-//! retry-decision state machine, mapfile bookkeeping, damage-severity
-//! judgment) plus the rip ORCHESTRATION shared by every front-end. It sits
-//! *above* [`libfreemkv`]'s public API — composing `DiscSession`, `scan_iso`,
-//! `resolve_keys_for`, and `mux_stream` — and *below* the front-ends (CLI,
-//! autorip, desktop UI), each of which is a thin shell that supplies a
-//! [`Sink`] and a [`Job`].
-//!
-//! ## Layering
+//! The freemkv **rip engine**: recovery STRATEGY (sweep/patch/retry/mapfile/
+//! damage-severity) plus rip ORCHESTRATION shared by every front-end, sitting
+//! above [`libfreemkv`]'s API and below the front-ends (each a thin shell
+//! supplying a [`Sink`] and a [`Job`]).
 //!
 //! ```text
 //! libfreemkv     ← library: SCSI, parse, decrypt, mux highway, the raw read
@@ -22,26 +17,13 @@
 //!    └── freemkv-gui ← desktop front-end (future)
 //! ```
 //!
-//! The boundary rationale — why sweep/patch/mapfile/damage-classification are
-//! strategy, not primitives, and what's a small deliberate `pub` promotion in
-//! the lib vs a physical relocation here — is captured in the project's
-//! internal design notes.
-//!
-//! ## Two hard rules the API enforces
-//!
-//! 1. **Nothing prints.** Every diagnostic flows through the [`Sink`]; the
-//!    engine never writes to stdout/stderr. A GUI has no other way to surface
-//!    it.
-//! 2. **Preflight is callable without executing.** [`preflight()`] answers "can
-//!    this job run, and if not why" as *data*, so a UI can keep a Start button
-//!    honest on every selection change — without side effects.
+//! Crate-boundary rationale: docs/lib-layering.md. Two hard rules: (1)
+//! nothing prints — diagnostics flow through the [`Sink`]; (2)
+//! [`preflight()`] answers "can this job run, and if not why" as *data*.
 
-// The engine is app-layer, so (unlike libfreemkv) it may carry English text in
-// diagnostics. Front-ends localize via the message + code carried on events.
-
-// No reason for this crate to use `unsafe`; a prior test helper's SAFETY note
-// justified the wrong condition for `std::env::set_var` (env access must be
-// single-threaded process-wide). `forbid`, not `deny`, so it can't be re-allowed.
+// App-layer (unlike libfreemkv): may carry English diagnostic text;
+// front-ends localize via the message + code carried on events.
+// See docs/lib-unsafe-forbid.md — why `forbid`, not `deny`, on unsafe_code.
 #![forbid(unsafe_code)]
 
 pub mod drive_info;

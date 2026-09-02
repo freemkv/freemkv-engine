@@ -17,10 +17,8 @@
 //!
 //! Status chars: `?` non-tried · `*` non-trimmed · `/` non-scraped · `-` unreadable · `+` finished.
 //!
-//! The mapfile is flushed to disk at most once per `FLUSH_INTERVAL`
-//! during `record()` calls, plus on explicit `flush()` and on `Drop`.
-//! This bounds atomic-rename RPC rate on networked staging (e.g. NFS)
-//! where per-record persists otherwise serialize the rip pipeline.
+//! Persisted to disk in time-batched intervals; see [`FLUSH_INTERVAL`] and
+//! [`Mapfile`] for the flush policy.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -28,12 +26,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Minimum interval between mapfile persists. `record()` updates in-memory
-/// state every call but only writes to disk when this interval has elapsed
-/// since the last persist (or when `flush()` is called explicitly, or on
-/// `Drop`). Bounds RPC rate on NFS staging where atomic-rename per record
-/// otherwise dominates throughput. On crash the worst-case progress loss
-/// is one interval's worth of records.
+// Minimum interval between mapfile persists (else on `flush()`/`Drop`).
+// Bounds atomic-rename RPC rate on NFS staging; worst-case crash loss is
+// one interval's worth of records.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Mapfile path for a regular output file: appends `.mapfile` to the output
@@ -176,22 +171,9 @@ pub struct MapStats {
     pub main_lost_ms: f64,
 }
 
-/// Revokes a [`Mapfile`]'s right to write its path — the owner's way of
-/// saying "whatever you still hold is no longer the record of that file".
-///
-/// Obtainable ONLY from a live `Mapfile` ([`Mapfile::disown_handle`]), so it
-/// cannot be conjured for a pipeline that owns no mapfile.
-///
-/// Why it exists: a consumer thread that is wedged inside a write on a hung
-/// mount is ABANDONED (detached, not killed) by
-/// [`super::finish_bounded`] and the pass returns. The caller is then free to
-/// resume the rip against the same mapfile path. When the abandoned thread's
-/// write finally returns it still owns a `Mapfile` — a snapshot from before
-/// the abandonment — and both `record()`'s interval flush and `Mapfile`'s
-/// `Drop` flush would then rewrite the WHOLE file from that stale snapshot,
-/// silently reverting progress the resumed pass has already persisted (and
-/// racing the live writer over the shared `<path>.tmp` staging name).
-/// Disowning is what makes the abandoned writer harmless.
+// Revokes a `Mapfile`'s right to write its path, so an ABANDONED writer
+// thread (see `super::finish_bounded`) can't rewrite the file from a stale
+// snapshot after a resume. See docs/mapfile-disown.md for the full story.
 #[derive(Clone)]
 pub(crate) struct MapfileDisown(Arc<AtomicBool>);
 
@@ -212,24 +194,12 @@ impl MapfileDisown {
 pub struct Mapfile {
     path: PathBuf,
     /// The CANONICAL maximal-run partition of `[0, total_size)`: contiguous,
-    /// gapless, and (after any `record()`) with no two adjacent entries sharing
-    /// a status. There is deliberately no cap, and none is needed — that
-    /// invariant IS the bound. The length is exactly the number of status runs
-    /// the disc's damage actually has, so:
-    ///
-    /// * it does not grow with the number of passes, or with the number of
-    ///   `record()` calls. A record that repeats or extends an existing run
-    ///   leaves the partition untouched.
-    /// * it is not a ratchet. Recovering the damage between two same-status
-    ///   runs merges all three, so fragmentation FALLS as a rip succeeds — in
-    ///   the pathological interleave (`fragmentation_peaks_then_collapses…`)
-    ///   the count goes 7 → 193 → 1.
-    /// * the only thing that grows it is genuinely finer interleaving of
-    ///   statuses, bounded by `2 * (interleaved damaged sectors) + 1`.
-    ///
-    /// Measured ceiling on real media: archived mapfiles for a genuinely
-    /// damaged UHD disc hold 19 entries, unchanged between passes. `record()`
-    /// is O(entries), so that is a handful of comparisons per sector.
+    /// gapless, and (after any `record()`) with no two adjacent entries
+    /// sharing a status. Deliberately uncapped — that invariant IS the
+    /// bound, and the length is exactly the number of status runs the
+    /// disc's damage actually has (it shrinks as damage is recovered, not
+    /// just grows). `record()` is O(entries). See
+    /// docs/mapfile-entries-invariant.md for the full argument.
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
@@ -246,12 +216,9 @@ pub struct Mapfile {
     /// `# freemkv-vid:` comment header so it survives to deferred-mux /
     /// resume without altering the ISO payload or breaking ddrescue
     /// data-line parsing. `None` for unencrypted / non-AACS discs.
-    ///
-    /// MUTUALLY EXCLUSIVE with `unit_keys`: a disc whose keys were resolved
-    /// persists the keys (`unit_keys`) and NOT the VID — the keys are the final
-    /// answer, so deferred-mux/resume decrypts directly with no key service. A
-    /// disc that did NOT resolve persists only the VID, the retry-able "still
-    /// need a key" marker (a future mux can re-ask the key service with it).
+    /// MUTUALLY EXCLUSIVE with `unit_keys`: set only when the disc did NOT
+    /// resolve its keys, as the retry-able "still need a key" marker; a
+    /// resolved disc persists `unit_keys` instead (see below).
     vid: Option<[u8; 16]>,
     /// Decrypted AACS unit keys `(CPS unit, key)`, persisted as `# freemkv-uk:`
     /// comment headers when the disc was successfully keyed. Mutually exclusive
@@ -610,18 +577,14 @@ impl Mapfile {
     }
 
     /// Total image size in bytes, FIXED at construction: the size handed to
-    /// [`Mapfile::create`], or the end byte of the last entry [`Mapfile::load`]
-    /// parsed.
+    /// [`Mapfile::create`], or the end byte of the last entry [`Mapfile::load`] parsed.
     ///
     /// It is NOT recomputed. [`Mapfile::record`] never touches it and never
     /// bounds a range against it, so this is "the coverage this mapfile was
-    /// opened for", not "the end of the last entry as it stands now" — the two
-    /// coincide only because every in-crate producer stays inside the coverage
-    /// (`recovery::copy` forces a fresh, correctly-sized mapfile on ANY
-    /// mapfile/disc size mismatch rather than recording past the old one). The
-    /// distinction matters because `stats().bytes_total` is this value: were a
-    /// caller to record past it, the ratio a front-end renders would exceed
-    /// 100% rather than the total growing to meet it.
+    /// opened for", not "the end of the last entry as it stands now". It is
+    /// also `stats().bytes_total`, so a caller recording past it would show
+    /// a front-end ratio over 100%. See docs/mapfile-total-size.md for why
+    /// the two values coincide in practice.
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -774,21 +737,17 @@ impl Mapfile {
 }
 
 impl Drop for Mapfile {
-    /// Best-effort flush on drop so a sweep / patch that returns early
-    /// (or unwinds) doesn't lose its in-memory state. Errors here are
-    /// swallowed because Drop has no way to surface them; explicit
-    /// `flush()` on the success path gives callers proper error handling.
+    // Best-effort flush on drop so an early-return/unwind doesn't lose
+    // in-memory state. Errors are swallowed (Drop can't surface them);
+    // explicit `flush()` on the success path handles errors properly.
     fn drop(&mut self) {
         let _ = self.flush();
     }
 }
 
-/// Parse a 32-char lowercase/uppercase hex string into a 16-byte VID.
-/// Returns `None` on any malformation (wrong length, non-hex). `load()`
-/// turns that `None` into a hard `MapfileInvalid{kind:"vid"}`: a header
-/// that is PRESENT but unparseable is corruption in the disc-identity
-/// record, and loading it as "no identity" is what re-opens the
-/// cross-disc resume splice (see `check_mapfile_identity`).
+// Parse a 32-char hex VID string. `None` on malformation, which `load()`
+// turns into a hard `MapfileInvalid{kind:"vid"}` rather than "no identity" —
+// else corruption here would re-open the cross-disc resume splice.
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
     // byte-based so a multi-byte `# freemkv-vid:` comment rejects, never panics).
@@ -819,21 +778,9 @@ fn parse_hex(s: &str) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    /// This crate's `mapfile_path_for` must agree with libfreemkv's
-    /// `Disc::mapfile_for` for any ordinary output path.
-    ///
-    /// The rule genuinely exists twice: libfreemkv needs it to back
-    /// `Disc::mapfile_for`, and it cannot call into this crate (the dependency
-    /// runs the other way). So the duplication is structural, not an oversight —
-    /// but two copies of a naming rule are exactly how a rip ends up writing its
-    /// mapfile to one path and looking for it at another, which reads downstream
-    /// as "no mapfile" and silently restarts a recovered disc from sector 0.
-    /// This pins them together so a change to either side fails here.
-    ///
-    /// `/dev/null` is deliberately NOT compared: `Disc::mapfile_for`
-    /// special-cases benchmark output to a temp-dir path derived from the disc
-    /// title, which is a `Disc`-dependent rule this plain-path helper does not
-    /// and should not reproduce.
+    // Pins this crate's `mapfile_path_for` to libfreemkv's `Disc::mapfile_for`
+    // (duplicated by necessity — libfreemkv can't depend back on this crate).
+    // See docs/mapfile-path-duplication.md for why and what's excluded.
     #[test]
     fn agrees_with_libfreemkv_disc_mapfile_for() {
         let disc = libfreemkv::Disc {
@@ -883,10 +830,9 @@ mod tests {
         dir.join(name)
     }
 
-    /// Runs a three-pass patch-shaped workload over `mf` and returns the entry
-    /// count after each pass. Pass 2 is the worst case for `record()`'s
-    /// coalescing: alternate sectors inside each damaged region come back, so
-    /// every recovered sector is its own run bracketed by two unrecovered ones.
+    // Three-pass patch-shaped workload; returns the entry count after each
+    // pass. Pass 2 is the worst case for `record()`'s coalescing: alternate
+    // sectors come back, so every recovered sector is its own bracketed run.
     fn fragmenting_multipass(mf: &mut Mapfile) -> Vec<usize> {
         const SEC: u64 = 2048;
         let mut counts = Vec::new();
@@ -922,12 +868,9 @@ mod tests {
         counts
     }
 
-    /// `record()` leaves `entries` as the CANONICAL maximal-run partition of
-    /// `[0, total_size)`: contiguous, gapless, and with no two adjacent entries
-    /// sharing a status. That invariant — not any cap — is what bounds the list:
-    /// its length is exactly the number of status runs the disc's damage
-    /// actually has, so it can only grow when the damage itself interleaves
-    /// more finely, and it SHRINKS again as recovery merges runs back together.
+    // `record()` leaves `entries` as the CANONICAL maximal-run partition of
+    // `[0, total_size)` (contiguous, gapless, no two adjacent entries sharing
+    // a status). See docs/mapfile-entries-invariant.md for why that bounds it.
     fn assert_canonical(mf: &Mapfile) {
         let es = mf.entries();
         assert!(!es.is_empty());
@@ -953,18 +896,8 @@ mod tests {
         );
     }
 
-    /// The `Mapfile.entries` bound, measured rather than asserted from a doc.
-    ///
-    /// A patch pass that recovers alternate sectors inside a damaged region is
-    /// the worst case coalescing can face — it is the ONLY thing that defeats
-    /// the merge, since a record that repeats or extends an existing run never
-    /// adds an entry. Even so the list is not a ratchet: pass 3 recovers the
-    /// interleaved remainder and 193 entries collapse back to 1.
-    ///
-    /// So fragmentation tracks the damage topology, not the pass count, and it
-    /// is bounded by `2 * (interleaved damaged sectors) + 1`. Archived mapfiles
-    /// from real damaged UHD media hold 19 entries and do not grow between
-    /// passes (see `real_shaped_mapfile_round_trips`).
+    // The `Mapfile.entries` bound, measured rather than asserted from a doc.
+    // See docs/mapfile-fragmentation-bound.md for the full argument.
     #[test]
     fn fragmentation_peaks_then_collapses_as_damage_is_recovered() {
         let p = tmpfile("fragmentation_peaks_then_collapses");
@@ -1006,11 +939,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// The mapfile is a persisted, ddrescue-compatible artifact that outlives
-    /// the build that wrote it. This pins the on-disk format against a literal
-    /// copy of a mapfile written by an older release (v0.14.0) for genuinely
-    /// damaged UHD media: it must load, its 19 entries must be understood
-    /// exactly, and re-writing it must reproduce the same bytes.
+    // Pins the on-disk format against a literal mapfile written by an older
+    // release (v0.14.0) for damaged UHD media: it must load, its 19 entries
+    // must be understood exactly, and re-writing it must reproduce the bytes.
     #[test]
     fn real_shaped_mapfile_round_trips() {
         const ARCHIVED: &str = "\
@@ -1509,12 +1440,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Regression: a mapfile with an INTERNAL hole (a byte range no entry
-    /// covers) must load with the hole filled as NonTried, so the hole is
-    /// visible to resume (counted as pending, not silently "complete").
-    /// Without the fill, total_size (= last entry's end) would still equal
-    /// the disc size and copy()'s `covers_disc && bad_bytes == 0` check
-    /// would report a holed rip as complete.
+    // Regression: an INTERNAL hole (byte range no entry covers) must load
+    // filled as NonTried so it's visible to resume, else total_size still
+    // equals the disc size and copy()'s complete-check misreports a hole.
     #[test]
     fn load_fills_internal_gap_as_nontried() {
         let p = tmpfile("load_fills_internal_gap");
@@ -1592,11 +1520,8 @@ mod tests {
     }
 
     // ── status char round-trip (ddrescue alphabet ?*/-+) ──────────
-
-    /// Every SectorStatus must round-trip through to_char/from_char, and
-    /// the chars must be the exact ddrescue alphabet (header doc: `?` `*`
-    /// `/` `-` `+`). A swapped mapping would silently misclassify resume
-    /// state (e.g. a good sector read back as unreadable).
+    // Every SectorStatus must round-trip to_char/from_char with the exact
+    // alphabet — a swapped mapping would silently misclassify resume state.
     #[test]
     fn status_char_round_trip_is_ddrescue_alphabet() {
         let pairs = [
@@ -1818,11 +1743,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// Regression (finding 4): a leading DATA line whose size field has NO
-    /// `0x` prefix (ddrescue/`parse_hex` both accept bare hex) must still be
-    /// parsed as an entry, not misclassified as the current-status line and
-    /// dropped. The shape-based discriminator keys off the 2nd field being a
-    /// single status char (current line) vs. a multi-char hex size (data line).
+    // Regression: a leading DATA line with NO `0x` size prefix must still
+    // parse as an entry, not get misclassified as the current-status line
+    // and dropped (discriminator keys off field shape, not the prefix).
     #[test]
     fn load_treats_leading_data_line_without_0x_prefix_as_entry() {
         let p = tmpfile("load_leading_entry_no_0x");
@@ -1881,18 +1804,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// A truncated data line is REFUSED, not skipped.
-    ///
-    /// `fields.len() < 3` used to `continue`, which deletes that line's range
-    /// from a partition every consumer reads as gapless — and when the short
-    /// line is the LAST one it also shrinks `total_size`, since that is derived
-    /// from the final entry's end. Here the truncated line is the tail of the
-    /// disc: skipping it reports a 0x2800-byte disc that is 100% good, erasing
-    /// 0x800 bytes of coverage from every consumer.
-    ///
-    /// The expectation is a literal, not a value re-derived from the parser:
-    /// the skip answer is `total_size == 0x2800`, and that is what must not
-    /// happen.
+    // A truncated data line is REFUSED, not skipped (skipping would shrink
+    // total_size and hide missing coverage). See docs/mapfile-truncated-line.md.
     #[test]
     fn load_rejects_a_data_line_with_too_few_fields() {
         let p = tmpfile("load_shortline");
@@ -1938,13 +1851,9 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// A malformed `# freemkv-vid:` header must FAIL the load.
-    ///
-    /// Dropping it silently turns a mapfile that CARRIES a disc identity into
-    /// one that carries NONE — and `check_mapfile_identity` answers `Ok(())`
-    /// for none (legacy files, unencrypted discs). That is the cross-disc
-    /// resume splice the identity guard exists to stop, reachable by
-    /// corrupting one hex digit into a `z`.
+    // A malformed `# freemkv-vid:` header must FAIL the load, not drop
+    // silently — that would turn "carries an identity" into "carries none",
+    // which reopens the cross-disc resume splice the identity guard stops.
     #[test]
     fn load_rejects_a_malformed_vid_header() {
         let p = tmpfile("load_bad_vid");
@@ -2093,11 +2002,8 @@ mod tests {
     }
 
     // ── write_to_disk format ──────────────────────────────────────
-
-    /// write_to_disk emits each entry as `0x{pos:09x}  0x{size:09x}  {char}`
-    /// and a load() recovers identical entries (the canonical resume path).
-    /// Also verifies the fixed header block (Created by / Current pos /
-    /// column header) is present so external ddrescue tools parse it.
+    // Entries round-trip through load() with the fixed header block
+    // (Created by / Current pos / column header) intact for external tools.
     #[test]
     fn write_to_disk_format_round_trips_and_has_headers() {
         let p = tmpfile("write_format");
@@ -2223,10 +2129,9 @@ mod tests {
 mod status_set_tests {
     use super::*;
 
-    /// The two sets differ by exactly `NonTried`, and neither may ever contain
-    /// `Finished`. Both used to be hand-written arrays scattered across five
-    /// call sites in three files — in two different orders — so this pins the
-    /// relationship that the comments used to assert individually.
+    // The two sets differ by exactly `NonTried`, and neither may ever contain
+    // `Finished`. Both used to be hand-written arrays scattered across five
+    // call sites in three files — in different orders — this pins the relation.
     #[test]
     fn damage_set_is_the_bad_set_without_the_unread_remainder() {
         let bad = bad_sector_statuses();
@@ -2259,18 +2164,9 @@ mod status_set_tests {
     }
 }
 
-/// Load a mapfile, distinguishing "there isn't one" from "there is one and it
-/// is unreadable".
-///
-/// Three call sites classified this themselves and reached three different
-/// fail-safes: `progress_snapshot_from_mapfile` collapsed both cases into
-/// `None` via `.ok()?`, so a corrupt sidecar rendered as "no data yet" instead
-/// of surfacing that the damage record is unreadable;
-/// `bytes_bad_in_title_from_mapfile` correctly reports the whole title bad;
-/// and `multipass_rip` forces an abort. The CLASSIFICATION is shared here so
-/// corruption is never silently indistinguishable from absence — the fail-safe
-/// VALUE stays per-caller, because "assume clean", "assume all bad" and "abort"
-/// are genuinely different correct answers for those three questions.
+// Loads a mapfile, distinguishing "there isn't one" from "there is one and
+// it is unreadable" — shared CLASSIFICATION, per-caller fail-safe VALUE.
+// See docs/mapfile-load-if-present.md for the three call sites' rationale.
 pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfile>> {
     match Mapfile::load(path) {
         Ok(m) => Ok(Some(m)),
@@ -2291,13 +2187,9 @@ pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfi
 mod write_to_disk_cleanup_tests {
     use super::*;
 
-    /// A failed write must not leave `<path>.tmp` behind.
-    ///
-    /// Every `?` between `File::create(&tmp)` and the final `rename` used to
-    /// return with the partially-written tmp still on disk — one orphan per
-    /// failure, in the output directory, for the lifetime of a long-running
-    /// service. Reachable case: the tmp writes fine and the rename fails,
-    /// which is what a directory sitting on the destination name produces.
+    // A failed write must not leave `<path>.tmp` behind: every `?` between
+    // `File::create(&tmp)` and the final `rename` used to orphan the tmp file.
+    // Reachable via a directory sitting on the destination name (rename fails).
     #[test]
     fn a_failed_write_does_not_orphan_the_tmp_file() {
         let dir = std::env::temp_dir().join(format!("fmkv-tmpclean-{}", std::process::id()));
@@ -2362,28 +2254,9 @@ mod load_if_present_tests {
     }
 }
 
-/// Does this mapfile describe the disc currently in the drive?
-///
-/// Resume used to be gated on ONE fact: `map.total_size() == disc.capacity_bytes`.
-/// Two different discs authored at the same size — box-set reprints, or the
-/// same title pressed twice — satisfy that, so a mapfile left by disc A was
-/// trusted for disc B: A's `Finished` ranges were never re-read, and the output
-/// ISO silently spliced sectors from two physical discs while passing every
-/// completeness check.
-///
-/// The mapfile already persists a disc identity; nothing ever read it back.
-/// `Mapfile::vid()` had no caller outside this module's own tests.
-///
-/// Identity is keys-XOR-vid, matching how the mapfile stores it (`set_unit_keys`
-/// clears the VID — keys are the final answer, a VID is the "still unresolved"
-/// marker). Checking only the VID would have been nearly inert: a normally
-/// ripped AACS disc resolves unit keys, so it stores keys and NO vid, which is
-/// precisely the box-set case above.
-///
-/// A mapfile carrying neither is `Ok` — legacy files, unencrypted discs and CSS
-/// DVDs record no AACS identity, and refusing them would strand every existing
-/// in-flight rip. That residual gap is real and deliberate: this closes the
-/// AACS case, not the unencrypted one, which would need a new identity header.
+// Does this mapfile describe the disc currently in the drive? Identity is
+// keys-XOR-vid (matching how the mapfile stores it); carrying neither is
+// `Ok` (legacy/unencrypted). See docs/mapfile-check-identity.md for why.
 pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> io::Result<()> {
     let mismatch = || -> io::Error {
         libfreemkv::error::Error::MapfileInvalid {
@@ -2434,11 +2307,9 @@ pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> 
 mod check_mapfile_identity_tests {
     use super::*;
 
-    /// Every field `check_mapfile_identity` never reads gets a neutral value:
-    /// `Disc` and `AacsState` carry many fields this check doesn't consult
-    /// (region, css, format, ...), so a minimal fixture keeps each test's
-    /// intent legible — only `aacs` (and inside it, `unit_keys`/`volume_id`)
-    /// varies per case.
+    // Every field `check_mapfile_identity` never reads gets a neutral value,
+    // so a minimal fixture keeps each test's intent legible — only `aacs`
+    // (and inside it, `unit_keys`/`volume_id`) varies per case.
     fn disc_with_aacs(aacs: Option<libfreemkv::disc::AacsState>) -> libfreemkv::Disc {
         libfreemkv::Disc {
             volume_id: String::new(),
@@ -2494,10 +2365,9 @@ mod check_mapfile_identity_tests {
         dir.join(name)
     }
 
-    /// Neither the mapfile nor the disc carries an AACS identity: legacy
-    /// mapfiles, unencrypted discs, CSS DVDs. Deliberately permissive — see
-    /// the doc on `check_mapfile_identity` for why this residual gap is not
-    /// this check's job to close.
+    // Neither the mapfile nor the disc carries an AACS identity (legacy
+    // mapfiles, unencrypted discs, CSS DVDs). Deliberately permissive; see
+    // docs/mapfile-check-identity.md.
     #[test]
     fn neither_identity_present_is_ok() {
         let p = tmpfile2("neither");
