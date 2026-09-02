@@ -17,9 +17,25 @@ pins and `Cargo.toml`'s `rust-version`). It is
 
 ```toml
 [dependencies]
-freemkv-engine = "1.6"   # + the same [patch.crates-io] git-tag redirect the
-                         # other crates use; local dev path-patches it.
+freemkv-engine = "1.6"
+
+# REQUIRED. freemkv-engine, libfreemkv, freemkv-keysources and freemkv-i18n are
+# NOT published on crates.io — they are consumed by git tag. This block must live
+# in YOUR OWN workspace-root manifest: Cargo only honours [patch] in the root of
+# the crate being built, so the patch table committed in a dependency's Cargo.toml
+# redirects nothing for you. Keep all four tags on the SAME version.
+[patch.crates-io]
+libfreemkv         = { git = "https://github.com/freemkv/libfreemkv",         tag = "v1.6.14" }
+freemkv-engine     = { git = "https://github.com/freemkv/freemkv-engine",     tag = "v1.6.14" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.14" }
+freemkv-i18n       = { git = "https://github.com/freemkv/freemkv-i18n",       tag = "v1.6.14" }
 ```
+
+> **Heads-up on the `libfreemkv` name:** an old `libfreemkv` **1.1.0** still sits
+> on crates.io. It is unmaintained and unrelated to current releases. Without the
+> `[patch.crates-io]` above, `libfreemkv = "1.6"` fails to resolve and
+> `libfreemkv = "1"` silently pulls that abandoned 1.1.0. The patch block is what
+> makes the git-tag source authoritative — do not omit it.
 
 ---
 
