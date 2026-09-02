@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.6.15] — 2026-09-02
+
+### Changed
+
+- Version aligned to 1.6.15 for the unified release. Internal CI/lint hardening (stable-clippy MSRV split, cargo-deny dependency-audit gate, audience-based comment-guard).
+
+### Docs
+
+- Corrected USING_THE_ENGINE.md: the MSRV is 1.88 (single-sourced from `Cargo.toml`, resolved by CI rather than pinned), and the dependency snippet reflects the git-tag patch layout.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed
