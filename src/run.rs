@@ -6,20 +6,16 @@
 //! first consumer of the relocated recovery module, and the piece a front-end
 //! composes with `mux_stream` to get disc→MKV.
 //!
-//! The ISO→MKV mux stage is driven by the front-end (or a later engine `run()`
-//! surface) via `libfreemkv::mux_stream`; keeping the recovery and mux stages
-//! separately callable mirrors how the CLI and autorip already stage a rip
-//! (recover to an ISO intermediate, then mux from it) and keeps each stage
-//! unit-testable in isolation.
+//! The ISO→MKV mux stage is driven by the front-end via `libfreemkv::mux_stream`,
+//! kept separately callable to mirror how the CLI and autorip already stage a rip.
 
 use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
-/// The error both recovery entry points return for a decrypting multipass job.
-///
-/// One constructor so the two call sites cannot describe the same refusal two
-/// different ways — the duplication-that-drifts shape this crate keeps finding.
+// The error both recovery entry points return for a decrypting multipass job.
+// One constructor so the two call sites can't describe the same refusal two
+// different ways.
 pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
     libfreemkv::Error::IoError {
         source: std::io::Error::new(
@@ -30,17 +26,9 @@ pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
     }
 }
 
-/// Sets a watcher's `done` flag on EVERY exit path, including a panic unwind.
-///
-/// A plain `done.store(true)` after the watched call is skipped by an unwind,
-/// and `std::thread::scope` joins its threads BEFORE propagating a panic — so
-/// the watcher keeps looping on a flag nobody will ever set, the join never
-/// finishes, and a panic becomes a permanent hang. For a service holding a
-/// drive open that is strictly worse than the crash it replaces.
-///
-/// Every scoped watcher in this crate must hold one of these rather than
-/// storing the flag by hand. Two hand-rolled copies of that pattern existed
-/// and both had the bug; this type is the single place the rule lives.
+// Sets `done` on every exit path, including a panic unwind, since a plain
+// `store(true)` placed after the call is skipped by an unwind and the join
+// would hang forever. See docs/run.md — SignalDone.
 pub(crate) struct SignalDone<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
 
 impl Drop for SignalDone<'_> {
@@ -49,20 +37,9 @@ impl Drop for SignalDone<'_> {
     }
 }
 
-/// Run `f` with a halt token that mirrors `sink.should_cancel()`.
-///
-/// Cancellation needs BOTH channels, not just the progress callback.
-/// [`libfreemkv::progress::Progress::report`] returns `!should_cancel()`, which stops the
-/// library — but only on a tick, and a damaged disc produces no ticks while it
-/// is sitting in a cooldown (`ReadAction::Retry { pause_secs }`: 3 s on a NOT
-/// READY retry, 30 s on zone entry). With no halt token the user's Stop went
-/// unheard for the whole pause, so the button looked broken exactly when the
-/// rip was going badly and someone most wanted to abort it.
-///
-/// `sleep_secs_or_halt` polls the token every 100 ms, so wiring one bounds Stop
-/// latency at ~100 ms regardless of pause length. The watcher is the same
-/// `should_cancel` → halt bridge `mux_with_input` and `extract_tree` already
-/// use, and the scope joins it before returning.
+// Wires a halt token, not just the progress callback, so Stop is honoured
+// even during a retry cooldown when no progress tick fires. See docs/run.md
+// — with_cancel_watcher.
 pub(crate) fn with_cancel_watcher<T>(
     sink: &dyn Sink,
     f: impl FnOnce(&std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
@@ -97,16 +74,9 @@ pub(crate) fn with_cancel_watcher<T>(
     })
 }
 
-/// Bridges libfreemkv's low-level [`libfreemkv::progress::Progress`] callback
-/// onto the engine [`Sink`]. Recovery calls `report(&PassProgress) -> bool`
-/// frequently; this translates each tick to a [`Progress`] and forwards it,
-/// returning `!sink.should_cancel()` so the library's cooperative-cancellation
-/// bool (`false` = stop) is driven by the front-end's Cancel/Ctrl-C exactly as
-/// it is today.
-///
-/// `pub(crate)` so [`crate::multipass::multipass_rip`] can reuse the exact same
-/// bridge — one speed/ETA derivation, shared by every caller that drives a
-/// recovery primitive directly.
+// Bridges libfreemkv's `Progress::report` callback onto the engine `Sink`,
+// translating each tick and honouring `should_cancel()`. `pub(crate)` so
+// `crate::multipass::multipass_rip` reuses the same speed/ETA derivation.
 pub(crate) struct ProgressBridge<'a> {
     sink: &'a dyn Sink,
     // The engine's ONE speed/ETA derivation. `report` takes `&self`, and the
@@ -116,11 +86,8 @@ pub(crate) struct ProgressBridge<'a> {
 }
 
 impl<'a> ProgressBridge<'a> {
-    /// Build a fresh bridge (fresh speed/ETA estimator) for one recovery
-    /// primitive call (`sweep`, `patch`, or `copy`). Each primitive call gets
-    /// its own estimator — matching `recover_to_iso`'s one-bridge-per-call
-    /// convention — so a new pass's speed reading doesn't inherit the
-    /// previous pass's smoothing state.
+    // A fresh estimator per primitive call (`sweep`/`patch`/`copy`), so a new
+    // pass's speed reading doesn't inherit the previous pass's smoothing state.
     pub(crate) fn new(sink: &'a dyn Sink) -> Self {
         ProgressBridge {
             sink,
@@ -172,13 +139,11 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
 ///
 /// `reader` is the sector source (a live drive session's reader, or an ISO for
 /// re-recovery). `disc` is the already-scanned disc. The [`RipMode`] on `job`
-/// selects single-pass (`recovery::copy` with `multipass = false`, aborts on
-/// first read error) vs multipass (sweep + patch dispatch). Decryption is on
-/// unless `job.raw`.
+/// selects single-pass (`recovery::copy`, aborts on first read error) vs
+/// multipass (sweep + patch dispatch). Decryption is on unless `job.raw`.
 ///
 /// Returns the library's [`CopyResult`] (byte accounting + completion flags);
-/// the caller maps it into an [`crate::Outcome`] once the mux stage has also
-/// run, or inspects it directly for the ISO-only case.
+/// the caller maps it into an [`crate::Outcome`] once the mux stage has run.
 pub fn recover_to_iso(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
@@ -331,19 +296,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The WATCHER, not the check-before-starting.
-    ///
-    /// `with_cancel_watcher` does two things: it asks once before the work
-    /// begins, and it polls on a thread while the work runs. The existing
-    /// `cancel_via_sink_halts_recovery` uses a sink that is cancelled from the
-    /// very first call, so the entry check alone satisfies it — and the
-    /// mutation run duly deleted the `!` from the watcher's loop condition
-    /// (`while !done` -> `while done`, so the loop body never runs) with the
-    /// suite still green. A cancel arriving AFTER start would then be missed
-    /// entirely.
-    ///
-    /// This sink stays uncancelled for the first few polls, so only a live
-    /// watcher can set the halt flag.
+    // Exercises the WATCHER, not the check-before-starting: a sink that stays
+    // uncancelled for the first few polls, so only a live watcher (not the
+    // entry check) can set the halt flag. See docs/run.md — the watcher test.
     #[test]
     fn a_cancel_raised_after_the_work_starts_is_still_observed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -409,14 +364,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `sectors_bad` must count DAMAGE, not un-swept territory.
-    ///
-    /// The bridge used to derive it from `bytes_pending_total`, which folds in
-    /// NonTried — the part of the disc Pass 1 has not reached yet. On the
-    /// first progress tick of a flawless disc that reports essentially the
-    /// whole disc as bad sectors, and the number then falls as the sweep
-    /// advances. An operator watching a damage counter start at twelve million
-    /// and count down has no way to tell a pristine disc from a failing one.
+    // `sectors_bad` must count DAMAGE, not un-swept territory: deriving it from
+    // `bytes_pending_total` made a flawless disc report ~12M bad sectors on the
+    // first tick. See docs/run.md — sectors_bad tests.
     #[test]
     fn a_clean_disc_reports_no_bad_sectors_while_the_sweep_is_still_running() {
         use libfreemkv::progress::Progress as _;
@@ -460,13 +410,9 @@ mod tests {
         );
     }
 
-    /// ...and it must COUNT the damage once there is some.
-    ///
-    /// The companion test above uses an all-zero `PassProgress`, where
-    /// `/ 2048`, `% 2048` and `* 2048` all agree on `0` — so the conversion
-    /// itself was exercised with the one input that can never distinguish it.
-    /// The number this produces is the bad-sector count an operator reads off
-    /// the progress line while deciding whether to stop a failing rip.
+    // ...and it must COUNT the damage once there is some: the companion test
+    // uses an all-zero `PassProgress`, where `/`, `%` and `*` by 2048 all agree
+    // on `0`. See docs/run.md — sectors_bad tests.
     #[test]
     fn sectors_bad_converts_bad_bytes_into_a_sector_count() {
         use libfreemkv::progress::Progress as _;
@@ -509,17 +455,9 @@ mod tests {
         );
     }
 
-    /// A panic inside the watched call must PROPAGATE, not hang.
-    ///
-    /// `with_cancel_watcher` sets `done` after `f` returns. On a panic the
-    /// unwind skips that store, and `thread::scope` joins its threads before
-    /// propagating — so the watcher, still looping on `done`, is joined
-    /// forever and the panic becomes a permanent hang. A ripping service that
-    /// would have crashed and restarted instead sits there holding the drive.
-    ///
-    /// The failure mode is a deadlock, so this cannot simply call and assert:
-    /// a regression would hang the whole test binary rather than fail it. The
-    /// call runs on its own thread and the assertion is on a receive timeout.
+    // A panic inside the watched call must PROPAGATE, not hang the join. The
+    // failure mode is a deadlock, so this runs the call on its own thread and
+    // asserts via a receive timeout. See docs/run.md — the panic test.
     #[test]
     fn a_panic_inside_the_watched_call_propagates_instead_of_hanging() {
         struct NeverCancel;
@@ -547,20 +485,9 @@ mod tests {
         }
     }
 
-    /// Stop must be honoured DURING a damage cooldown, not after it.
-    ///
-    /// The recovery cooldowns (`ReadAction::Retry { pause_secs }`) are 3 s for a
-    /// NOT READY retry and 30 s on zone entry. Cancellation reaches the library
-    /// two ways: the progress callback's return value, which is only consulted
-    /// when a tick happens, and the halt token, which `sleep_secs_or_halt`
-    /// polls every 100 ms. A damaged disc produces no ticks while it is
-    /// sleeping, so with no halt token wired the user's Stop sat unheard for the
-    /// full pause — up to 30 s of a button that looks broken.
-    ///
-    /// This reader fails every read with the BU40N bad-sector signature
-    /// (NOT READY / 0x04 / 0x3E), so the first batch enters a cooldown
-    /// immediately. The assertion is wall-clock: with the halt token wired the
-    /// call returns in well under one pause.
+    // Stop must be honoured DURING a damage cooldown (3-30 s pauses that
+    // produce no progress ticks), not only after it. Reader fails with the
+    // NOT READY signature; assertion is wall-clock. See docs/run.md — cooldown test.
     #[test]
     fn cancel_is_honoured_during_a_damage_cooldown() {
         struct NotReadyReader {

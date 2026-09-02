@@ -1,20 +1,14 @@
 //! Single source of truth for what to do when a sector read fails.
 //!
 //! Pass 1 (`recovery::sweep_internal`, this crate) calls into
-//! `handle_read_error` after every failed `read_sectors` — the ONE production
-//! call site. The handler classifies the error, updates the in-flight context
-//! (counters, damage window, retry budgets), and returns a `ReadAction` the
-//! caller dispatches on.
+//! `handle_read_error` after every failed `read_sectors` — the ONE
+//! production call site. The handler classifies the error, updates the
+//! in-flight context (counters, damage window, retry budgets), and
+//! returns a `ReadAction` the caller dispatches on.
 //!
-//! Pass N does not route here: its recovery is the time-bounded handler chain
-//! in `section_recover.rs`, driven by `patch.rs`. (`ReadCtx::for_patch` and the
-//! Pass-N constants below are the relocated Pass-N tuning, exercised by this
-//! module's own tests; the named `handle_read_failure` in `disc/patch.rs` that
-//! this doc used to point at belongs to a module layout that no longer exists —
-//! there is no `src/disc/` in this crate, and no function of that name.)
+//! Pass N does not route here — see docs/read-error.md.
 //!
 //! Adding a new error class = add one arm in `handle_read_error`.
-//! Adding new logging on errors = one place.
 
 use libfreemkv::error::Error;
 use libfreemkv::scsi;
@@ -110,16 +104,10 @@ pub struct ReadCtx {
     pub in_damage_zone: bool,
     /// Count of long-streak pause escalations taken this pass — the
     /// `consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD`
-    /// branch of the pause selection.
-    ///
-    /// The escalation currently resolves to the same number of seconds as
-    /// the ordinary inter-error pause (see
-    /// `CONSECUTIVE_FAIL_LONG_PAUSE_SECS`), so it has NO effect a caller
-    /// could observe from the returned `ReadAction` — deleting the branch
-    /// outright changed nothing any test could see. Counting it makes the
-    /// policy observable in its own right: the pass summary can say how
-    /// often the drive was in a long failure streak, and the branch cannot
-    /// be removed without a test noticing.
+    /// branch of the pause selection. Reported in the pass summary so an
+    /// operator can see how often the drive was in a long failure streak.
+    /// See docs/read-error.md for why the branch is kept even though it
+    /// currently resolves to the same pause duration as the ordinary case.
     pub long_pause_escalations: u64,
     /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
     /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
@@ -130,22 +118,14 @@ pub struct ReadCtx {
 }
 
 impl ReadCtx {
-    /// Initial context for a Pass 1 sweep. The job is "fast and
-    /// accurate, get the most data in the shortest time" — Pass N
-    /// is the one that grinds on the bad ranges. So a failed batch
-    /// becomes SkipBlock (whole 32-sector blocks marked NonTrimmed
-    /// for Pass N to revisit), and
-    /// the damage-jump fast-path triggers after just 1 consecutive
-    /// outer-batch failure — the user's wedge-prevention principle
-    /// (2026-05-11): once the drive returns ANY recoverable error,
-    /// retrying the same LBA quickly is what triggers the firmware
-    /// fast-fail transition. On the damage-jump and marginal paths Pass 1
-    /// jumps immediately rather than grinding the same LBA. Transient errors
-    /// (NOT_READY, bridge degradation) are still retried a small bounded
-    /// number of times (`NOT_READY_MAX_RETRIES` / `BRIDGE_DEGRADATION_MAX_RETRIES`)
-    /// in both passes before falling through to the skip path.
-    /// Pass N owns the heavy retries — it gets per-sector timeouts that don't
-    /// hammer the firmware the same way.
+    /// Initial context for a Pass 1 sweep: `batch` sectors per read. Tuned
+    /// for "fast and accurate" — a failed batch becomes `SkipBlock`
+    /// (NonTrimmed, left for Pass N to revisit), and the damage-jump
+    /// fast path triggers after just 1 consecutive outer-batch failure so
+    /// Pass 1 jumps immediately rather than grinding the same LBA.
+    /// Transient errors still get a small bounded number of retries
+    /// (`NOT_READY_MAX_RETRIES` / `BRIDGE_DEGRADATION_MAX_RETRIES`).
+    /// See docs/read-error.md for the wedge-prevention rationale.
     pub fn for_sweep(batch: u16) -> Self {
         Self {
             batch,
@@ -174,23 +154,12 @@ impl ReadCtx {
         }
     }
 
-    /// Initial context for a Pass 2-N patch. Pass N's whole reason to
-    /// exist is to recover sectors Pass 1 skipped, so the fast-jump
-    /// threshold is loose: we don't bail too early on a range that
-    /// has scattered good sectors mixed in.
-    ///
-    /// No production caller: Pass N's read effort is owned by the
-    /// handler chain in `section_recover.rs`, which does its own read
-    /// sizing and its own error classification and never routes
-    /// through [`handle_read_error`]. This constructor is kept as the
-    /// Pass-N half of this module's tuning table — `for_sweep`'s
-    /// values only mean anything next to it, and the wedge and
-    /// zone-entry branches below still read `patch_pass`.
-    ///
-    /// `damage_threshold_pct = 6` is looser than Pass 1 (12%): Pass N triggers
-    /// the damage-skip at half Pass 1 density because the patch loop exists to chip
-    /// away at bad ranges, so being more eager to skip clustered bad sectors
-    /// converges faster on the recoverable good sectors inside a range.
+    /// Initial context for a Pass 2-N patch: `batch` sectors per read.
+    /// The fast-jump threshold is loose (window-based jump only) since
+    /// Pass N exists to recover scattered sectors Pass 1 skipped, and
+    /// `damage_threshold_pct` uses [`PATCH_DAMAGE_THRESHOLD_PCT`] (6%,
+    /// tighter than Pass 1's 12%) to converge faster on bad sub-zones.
+    /// No production caller — see docs/read-error.md.
     pub fn for_patch(batch: u16) -> Self {
         Self {
             batch,
@@ -307,48 +276,15 @@ pub enum ReadAction {
     AbortPass,
 }
 
-// Pause budget constants. Tuned from 2026-05-07 BU40N traces showing
-// bridge wedges 524 ms after a 5.4-second internal ECC retry. The
-// post-failure pauses give the drive — and the bridge — time to settle.
-/// Pause between a failed read and the next read attempt — applied
-/// by Pass 1 sweep via `handle_read_error`. (Pass N used to carry a separate
-/// `POST_FAILURE_PAUSE_SECS` in the old `disc/patch.rs`; neither the constant
-/// nor that module exists any more — see the reframe below, and
-/// `section_recover.rs` for the pauses Pass N applies today.)
-///
-/// 2026-05-11 reframe: a failed read is a failed read, regardless of
-/// which pass is running. The prior split (1s for Pass N, 5s for Pass
-/// 1 via `PASS_1_FAIL_PAUSE_SECS`) was solving an imaginary cost
-/// problem — real damaged-disc cases mark <50 MB NonTrimmed, and the
-/// extra 5s/error is single-digit minutes per pass, not hours. The
-/// cost of NOT pausing — a drive wedge that aborts the entire
-/// multi-pass recovery — is much worse.
-///
-/// The wedge avoidance principle: error → drive ECC retry (5-10s
-/// internal) → return → cooldown pause → next read. Same shape
-/// everywhere reads can fail.
+// Pause budget constants: give the drive and bridge time to settle
+// after a failed read. Applied by Pass 1 sweep; Pass N's pauses live
+// in section_recover.rs today. See docs/read-error.md for tuning history.
 const FAIL_PAUSE_SECS: u64 = 5;
-/// Long cooldown applied when a damage zone is first entered (the
-/// FIRST read failure after a clean run, before the drive has had a
-/// chance to cycle in retries that push it toward fast-fail).
-///
-/// Empirical: a 2026-05-11 wedge incident showed 7 medium
-/// errors in 6.5 seconds (~1s per attempt + ~1s pause) push the
-/// BU40N's firmware into IllegalRequest fast-fail mode permanently.
-/// Once there, only physical eject + reload clears it. Giving the
-/// drive 30s of breathing room after the FIRST error in a zone —
-/// before we start adding more error counts in the firmware's
-/// internal window — prevents the transition.
-///
-/// Cost on clean discs: zero (first-error path doesn't trigger).
-/// Cost on damaged discs: ~30s × N damage zones; on a 5-zone disc
-/// that's 2.5 min extra. Trade for never wedging the drive.
+// Long cooldown on the FIRST failure after a clean run, before retries
+// can push the drive toward firmware fast-fail. See docs/read-error.md.
 pub(crate) const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
-/// Cooldown when a long streak of failures suggests the drive is
-/// stuck in a damage zone and needs MORE breathing room than the
-/// standard inter-error pause. Same value as `FAIL_PAUSE_SECS`
-/// because empirically 5s is enough; kept as a separate name so the
-/// escalation policy is explicit at the call site.
+// Cooldown for a long failure streak; same value as FAIL_PAUSE_SECS,
+// kept as a separate name so the escalation is explicit at call sites.
 const CONSECUTIVE_FAIL_LONG_PAUSE_SECS: u64 = 5;
 const CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD: u64 = 10;
 const POST_JUMP_EXTRA_PAUSE_SECS: u64 = 2;
@@ -357,14 +293,9 @@ const NOT_READY_MAX_RETRIES: u32 = 3;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 15;
 const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
 
-/// Base of the damage-jump distance formula: `jump_sectors =
-/// JUMP_BASE_SECTORS × batch × jump_multiplier`. Bumped 2026-05-10
-/// from 256 → 1024 (4×) so the first damage-jump at batch=32 covers
-/// 64 MB instead of 16 MB. Empirically the BU40N's damage clusters
-/// are 100+ MB wide; 16 MB jumps landed inside the cluster and the
-/// re-read added to the firmware wedge counter. 64 MB → 128 MB
-/// (after one doubling) clears almost any single-cluster damage in
-/// 2 jumps.
+// Base of the damage-jump formula: jump_sectors = JUMP_BASE_SECTORS *
+// batch * jump_multiplier. Sized so the first jump clears a whole
+// damage cluster in ~2 doublings. See docs/read-error.md for the tuning history.
 const JUMP_BASE_SECTORS: u64 = 1024;
 
 // Firmware-wedge skip policy: a damaged drive's firmware can latch into
@@ -374,37 +305,24 @@ const JUMP_BASE_SECTORS: u64 = 1024;
 /// One-gigabyte jump (1024 MiB) on each wedge. Big enough to clear
 /// almost any single-cluster damage zone we've seen.
 const WEDGE_JUMP_SECTORS: u64 = 524_288;
-/// Cooldown pause after each wedge. A wedged drive needs a
-/// significant cool-down to leave fast-fail; 30 s strikes a balance
-/// between giving the drive a chance to recover and not stalling the
-/// rip if the drive is permanently stuck.
+// Cooldown after each wedge; long enough to give the drive a chance
+// to leave fast-fail without stalling forever on a stuck drive.
 const WEDGE_PAUSE_SECS: u64 = 30;
-/// Bail after this many consecutive wedges with no good read in
-/// between. At 1 GB jumps this lets us scan ~16 GB worth of fully
-/// wedged area before giving up — generous enough to clear most
-/// physical-damage clusters, bounded enough to not loop forever on
-/// a permanently bricked drive.
+// Bail after this many consecutive wedges with no good read between
+// them — generous enough for real damage clusters, bounded enough to
+// not loop forever on a permanently bricked drive.
 const WEDGE_ABORT_THRESHOLD: u64 = 16;
 
-/// Pass-N wedge-skip distance. Pass N's batch=1 reads target
-/// specific NonTrimmed sectors from Pass 1, so a big 1 GB skip
-/// would blow past the current NonTrimmed range and abandon many
-/// sectors that might still recover. Use a smaller skip just to
-/// move past the bricked LBA + a small buffer — the outer patch
-/// loop's next iteration picks up the next sector in the same or
-/// next range.
+// Pass-N wedge-skip distance: small, unlike WEDGE_JUMP_SECTORS, because
+// Pass N targets specific NonTrimmed sectors and a 1 GB skip would blow
+// past the current range and abandon recoverable sectors.
 const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 
 /// Single source of truth for the Pass-N damage-window threshold.
-/// [`ReadCtx::for_patch`] reads this constant for the Pass-N damage-skip
-/// threshold.
-///
-/// 6% means: with a 16-entry sliding window, the damage-skip fires
-/// once 1 out of 16 recent reads has failed. Pass 1 uses a 12%
-/// threshold via `damage_threshold_pct` on `for_sweep`; Pass N is
-/// twice as eager because patch's whole job is to converge on the
-/// bad sub-zones inside a NonTrimmed range — a faster trigger
-/// produces tighter convergence in fewer iterations.
+/// [`ReadCtx::for_patch`] reads this for the damage-skip threshold: with
+/// a 16-entry sliding window, 6% fires once 1/16 recent reads failed.
+/// Twice as eager as Pass 1's 12% (`damage_threshold_pct` on
+/// `for_sweep`), since patch's job is to converge on bad sub-zones.
 pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 
 /// THE single error-handling entry point. Updates `ctx`, returns the
@@ -740,13 +658,9 @@ mod tests {
         assert_eq!(ctx.zones_entered, 1, "hard error registers the zone entry");
     }
 
-    /// A NOT_READY retry must not consume the zone-entry transition either.
-    ///
-    /// The zone entry is what buys the drive the 30 s cooldown, and the whole
-    /// point of that constant is the firmware fast-fail wedge. The BU40N's
-    /// documented bad-sector signature IS a NOT_READY, so on the discs this
-    /// matters most for, the first error spent the transition on a 3 s retry
-    /// and the genuine hard error that followed got the ordinary 5 s pause.
+    // A NOT_READY retry must not consume the zone-entry transition either:
+    // that transition buys the drive its 30s wedge-avoidance cooldown, and
+    // a NOT_READY retry shouldn't spend it before the real hard error does.
     #[test]
     fn a_not_ready_retry_does_not_consume_the_zone_entry() {
         let mut ctx = ReadCtx::for_sweep(32);
@@ -1115,19 +1029,9 @@ mod tests {
         }
     }
 
-    /// The WINDOW trigger, isolated from the fast-entry trigger.
-    ///
-    /// This test used to build its ctx with `for_sweep`, which sets
-    /// `fast_jump_threshold = 1` — so the very first error jumped via the
-    /// fast path and the loop broke on iteration 0. `damage_window_max` and
-    /// `damage_threshold_pct` were never consulted: replacing the whole
-    /// `window_trigger` expression with `false` left this test (and all 36
-    /// others in this module) green. The one test named for the damage window
-    /// was pinning the path that bypasses it.
-    ///
-    /// Disable the fast path the way Pass N does (`u64::MAX`) so only the
-    /// window can fire, then pin BOTH sides: no jump while the window is
-    /// short, a jump on the read that fills it.
+    // The WINDOW trigger, isolated from the fast-entry trigger: disable the
+    // fast path (`u64::MAX`, as Pass N does) so only the window can fire,
+    // then pin both no-jump-while-short and jump-on-fill. See docs/read-error.md.
     #[test]
     fn damage_window_fills_then_jumps() {
         let mut ctx = ReadCtx::for_sweep(1);
@@ -1156,10 +1060,9 @@ mod tests {
         );
     }
 
-    /// The window threshold is a real comparison, not a formality: a threshold
-    /// no density can reach must never jump, however long the failure run.
-    /// Without this, `bad_pct >= ctx.damage_threshold_pct` could be inverted
-    /// or dropped and only the test above would notice the direction.
+    // The threshold is a real comparison, not a formality: an unreachable
+    // threshold must never jump, so an inverted/dropped comparison in the
+    // impl doesn't only get caught by the test above.
     #[test]
     fn an_unreachable_damage_threshold_never_jumps() {
         let mut ctx = ReadCtx::for_sweep(1);
@@ -1381,10 +1284,9 @@ mod tests {
         );
     }
 
-    /// The documented BU40N bad-sector signature: NOT_READY
-    /// (sense_key=2, ASC=0x04, ASCQ=0x3E) delivered as a CHECK CONDITION
-    /// (status 0x02). This is the case the old comment on the bridge
-    /// branch wrongly claimed `is_bridge_degradation` matched.
+    // The documented BU40N bad-sector signature: NOT_READY (sense_key=2,
+    // ASC=0x04, ASCQ=0x3E) as a CHECK CONDITION (status 0x02) — NOT the
+    // case `is_bridge_degradation` matches, despite an old comment's claim.
     fn not_ready_04_3e_err() -> Error {
         Error::DiscRead {
             sector: 100,
@@ -1462,15 +1364,9 @@ mod tests {
         );
     }
 
-    /// The FIRST damage-jump distance, which the base constant alone decides.
-    ///
-    /// Nothing pinned it: the only test that looked at a jump distance
-    /// compared it against the same `JUMP_BASE_SECTORS` expression the
-    /// handler evaluates, so doubling the base (64 MB → 128 MB first jump —
-    /// exactly the 2026-05-10 retune, in reverse) passed the whole suite.
-    /// The distance is the amount of disc a Pass 1 sweep writes off as
-    /// NonTrimmed on the first error in a zone, so it is a data-loss-shaped
-    /// number and belongs in a literal.
+    // The FIRST damage-jump distance, pinned as a literal (not the same
+    // JUMP_BASE_SECTORS expression the handler evaluates) since it's the
+    // amount of disc Pass 1 writes off as NonTrimmed on a zone's first error.
     #[test]
     fn the_first_damage_jump_clears_exactly_64_mib() {
         let mut ctx = ReadCtx::for_sweep(32);
@@ -1500,15 +1396,9 @@ mod tests {
         }
     }
 
-    /// The long-streak pause escalation, which nothing could see.
-    ///
-    /// `CONSECUTIVE_FAIL_LONG_PAUSE_SECS` is deliberately the same 5 s as
-    /// `FAIL_PAUSE_SECS`, so the branch returns a value indistinguishable
-    /// from the ordinary path and deleting it outright left all 38 tests
-    /// green. `ReadCtx::long_pause_escalations` now records that the branch
-    /// was taken, which makes both the branch and its threshold pinnable —
-    /// and gives the end-of-pass summary an honest count of how long the
-    /// drive spent in a sustained failure streak.
+    // The long-streak pause escalation: its pause equals the ordinary one,
+    // so `ReadCtx::long_pause_escalations` is what makes the branch and its
+    // threshold observable/pinnable at all. See docs/read-error.md.
     #[test]
     fn the_long_streak_escalation_fires_at_its_threshold() {
         let mut ctx = ReadCtx::for_patch(1);
