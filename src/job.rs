@@ -5,12 +5,7 @@
 //! [`crate::run`] to execute it. It carries no I/O handles and no callbacks —
 //! those arrive separately as the [`crate::Sink`].
 //!
-//! "Pure data" is about I/O, not about module position: the request shape
-//! reaches into [`crate::streams`] for [`SubtitleFilter`], which is itself
-//! plain data. It lives there because that is where the filter is APPLIED and
-//! where its language-matching rules are documented, and duplicating it here
-//! to keep the import graph one-directional would give the two copies a way to
-//! disagree about what a filter means.
+//! See docs/job.md — why `SubtitleFilter` is imported from `crate::streams`.
 
 use crate::streams::SubtitleFilter;
 
@@ -74,13 +69,8 @@ pub struct StreamChoice {
     /// Subtitle streams to keep, as two independent sides: full subtitles and
     /// forced ones. Default keeps everything on both sides.
     ///
-    /// This is a [`SubtitleFilter`] rather than a plain [`StreamFilter`] because
-    /// "German subtitles, forced only if English" is one coherent request that a
-    /// single language list cannot express — the forced side is a different
-    /// editorial object. A caller that only has one list assigns it directly
-    /// (`subtitles: my_filter.into()`); the [`From`] impl applies it to BOTH
-    /// sides, which is exactly the pre-forced meaning. It is one field, not two,
-    /// so the two sides cannot drift out of sync or be partially updated.
+    /// See docs/job.md — why this is one [`SubtitleFilter`] field rather than
+    /// two plain [`StreamFilter`] fields.
     pub subtitles: SubtitleFilter,
 }
 
@@ -207,11 +197,9 @@ mod tests {
         assert_eq!(j.selection, Selection::Titles(vec![0, 2, 5]));
     }
 
-    /// `is_all` is the "skip the stream filter entirely" shortcut, so it has
-    /// to mean BOTH classes keep everything. A version that answers true for a
-    /// half-filtered choice makes callers skip a filter the user asked for and
-    /// ship every track; one that answers false costs only a redundant
-    /// resolve. Untested until now, in either direction.
+    // `is_all` is the "skip the stream filter entirely" shortcut, so it must
+    // mean BOTH classes keep everything — answering true for a half-filtered
+    // choice would ship a track the user asked to exclude.
     #[test]
     fn is_all_requires_both_classes_to_keep_everything() {
         let all = StreamChoice {
@@ -248,12 +236,9 @@ mod tests {
         );
     }
 
-    /// The default has to keep EVERYTHING on every side, spelled out per side
-    /// rather than only through `is_all()` — `is_all` and the default are the
-    /// two halves of "an unconfigured job is byte-identical to no selection at
-    /// all", and checking one through the other lets a default that quietly
-    /// dropped forced subtitles agree with an `is_all` that quietly ignored
-    /// them.
+    // The default must keep EVERYTHING, spelled out per side rather than only
+    // through `is_all()` — checking one through the other alone would let a
+    // default that quietly dropped forced subtitles agree with a broken `is_all`.
     #[test]
     fn default_keeps_every_side() {
         let d = StreamChoice::default();
@@ -268,11 +253,9 @@ mod tests {
         );
     }
 
-    /// The bug the forced side creates the moment it exists: `is_all()` that
-    /// only looks at the normal side answers TRUE for "every full subtitle, no
-    /// forced ones". Callers use `is_all()` to SKIP resolving entirely, so that
-    /// answer ships exactly the forced subtitles the user excluded — silently,
-    /// at exit 0.
+    // The bug the forced side creates: `is_all()` looking only at the normal
+    // side would answer TRUE for "every full subtitle, no forced ones", so
+    // callers skip resolving and ship exactly the forced subtitles excluded.
     #[test]
     fn is_all_is_false_when_only_the_forced_side_is_narrowed() {
         let no_forced = StreamChoice {
@@ -305,10 +288,9 @@ mod tests {
         assert!(!no_full.is_all(), "full subtitles are excluded");
     }
 
-    /// A caller that has only ever had ONE subtitle list must keep today's
-    /// meaning exactly: the list applies to full and forced subtitles alike.
-    /// If `From` ever set only one side, `-s eng` would start dropping the
-    /// English forced subtitle it used to keep.
+    // A caller with only ONE subtitle list must keep today's meaning exactly:
+    // the list applies to full and forced subtitles alike, so `-s eng` never
+    // starts dropping the English forced subtitle it used to keep.
     #[test]
     fn a_plain_subtitle_list_applies_to_both_sides() {
         for f in [
@@ -386,11 +368,9 @@ mod tests {
         t
     }
 
-    /// End-to-end through the type a front-end actually holds: a `StreamChoice`
-    /// carrying a split must reach the forced-aware resolver, so the two sides
-    /// select independently. If `resolve` collapsed the choice back to one list
-    /// (either side), this asks for German full subtitles and English forced
-    /// ones and would get both German PIDs or both English ones instead.
+    // End-to-end through the type a front-end actually holds: a `StreamChoice`
+    // split must reach the forced-aware resolver. If `resolve` collapsed the
+    // choice back to one list, this would get both German or both English PIDs.
     #[test]
     fn resolve_routes_the_two_subtitle_sides_independently() {
         let choice = StreamChoice {

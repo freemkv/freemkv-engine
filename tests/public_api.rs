@@ -2,13 +2,11 @@
 //!
 //! A `pub` type inside a private module that is not re-exported can be bound by
 //! inference but can never be written in a signature, a struct field, or a
-//! turbofish. `RipMode` was the sharp case: `Job.mode` and `Job::with_mode` are
-//! the documented way to ask for a multipass rip, and no consumer could name a
-//! variant to pass, so `RipMode::Multi` was unreachable through the public API.
+//! turbofish. `RipMode` was the sharp case: `RipMode::Multi` was unreachable
+//! through the public API before its re-export.
 //!
-//! These are compile-time assertions. If an export is dropped this file stops
-//! compiling, which is the point — a doc test or a runtime check could not
-//! catch it.
+//! These are compile-time assertions — if an export is dropped this file stops
+//! compiling, which a doc test or a runtime check could not catch.
 
 /// The multipass mode selector, and the builder that takes it.
 #[test]
@@ -49,12 +47,9 @@ fn documented_free_functions_are_callable() {
         freemkv_engine::resolve_stream_selection;
 }
 
-/// Forced subtitles are selectable INDEPENDENTLY of normal ones — a user can
-/// ask for German subtitles plus forced English. The split type and the
-/// resolver that takes it must both be nameable, or a front-end can never
-/// construct the request. `SubtitleFilter` lives in a private module, so
-/// without its re-export it is bindable by inference and unwritable in a
-/// signature — the exact failure this file exists to catch.
+// Forced subtitles are selectable independently of normal ones. `SubtitleFilter`
+// lives in a private module, so without its re-export it would be bindable by
+// inference but unwritable in a signature — the failure this file exists to catch.
 #[test]
 fn forced_subtitle_selection_is_nameable_and_constructible() {
     use freemkv_engine::SubtitleFilter;

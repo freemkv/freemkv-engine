@@ -1,19 +1,12 @@
-//! The forced-subtitle selection a real user asked for, exercised through the
-//! PUBLIC API rather than through crate internals.
+//! Exercises forced-subtitle stream selection through the PUBLIC API rather
+//! than through crate internals: audio as an independent language set, a
+//! forced-subtitle language set independent of the non-forced one, and the
+//! legacy single-list path unchanged.
 //!
-//! Their words: "German & Spanish audio, only German subtitles, and forced only
-//! if in English." Three things have to hold at once for that sentence to be
-//! expressible, and each has failed in some earlier design:
-//!
-//!   * audio is a SET (German AND Spanish both kept), not a first-match chain;
-//!   * the forced language set is INDEPENDENT of the non-forced one, so
-//!     "German subtitles + forced English" is not a contradiction;
-//!   * a plain single list still means what it always did, so `-a eng` and
-//!     `-a none` are unaffected.
-//!
-//! The unit tests in `streams.rs` cover the matcher. This file covers the part
-//! a front-end actually touches: that the types are nameable, constructible and
-//! wired to the same behaviour from outside the crate.
+//! See docs/stream-selection-forced.md for the user request that motivated
+//! this coverage and why each case matters. The unit tests in `streams.rs`
+//! cover the matcher; this file covers that the types are nameable,
+//! constructible and wired to the same behaviour from outside the crate.
 
 use freemkv_engine::{
     PidFilter, StreamFilter, SubtitleFilter, resolve_stream_selection,
@@ -141,10 +134,9 @@ fn each_side_selects_only_its_own_forcedness() {
     );
 }
 
-/// The legacy path must be untouched: one list still applies to both sides, so
-/// an existing caller (and the CLI's `-a`/`--subtitles`) behaves exactly as
-/// before. A regression here is silent — a user's saved selection quietly
-/// starts meaning something narrower.
+// The legacy path must be untouched: one list still applies to both sides
+// (existing callers and the CLI's `-a`/`--subtitles` behave as before). A
+// regression here is silent — a saved selection quietly narrows.
 #[test]
 fn a_single_list_still_means_both_forced_and_not() {
     let t = multilingual_title();

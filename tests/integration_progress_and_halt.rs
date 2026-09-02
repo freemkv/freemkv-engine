@@ -52,15 +52,8 @@ impl SectorSource for ZeroSectorReader {
     }
 }
 
-/// Zero-filling reader that raises the halt flag ITSELF on its Nth read and
-/// counts every read the sweep issues, so a halt test can assert on a count
-/// instead of a stopwatch.
-///
-/// The interesting number is `reads_total - halt_after_reads`: how many more
-/// batches the sweep read after the flag went up. The sweep polls `halt` at the
-/// top of every batch iteration, immediately before the read, so a correct
-/// build issues exactly ZERO further reads — no wall-clock budget involved, and
-/// no dependence on how fast the machine happens to be.
+// See docs/halting-zero-sector-reader.md — self-halting reader used to
+// assert on a read count instead of a stopwatch.
 struct HaltingZeroSectorReader {
     capacity: u32,
     halt: Arc<AtomicBool>,
@@ -855,18 +848,9 @@ fn test_patch_progress_locates_damage_against_the_main_title() {
     );
 }
 
-// Section 10 ("Damage time calculation") used to be an empty heading — the
-// formula lives in libfreemkv, not here, and 9b above already pins the value
-// end to end. A heading promising coverage that doesn't exist was removed.
-
-// ── 11. A live progress tick never counts zero-filled damage as "good" ─────
-// The sweep cursor also advances on damage paths (SkipBlock, JumpAhead, gaps),
-// so feeding it straight to bytes_good_total would render data loss as success.
-
-/// Fails every read with RECOVERED ERROR (a marginal read the sweep distrusts):
-/// each batch becomes a plain `SkipBlock` — zero-filled, marked NonTrimmed —
-/// with the ordinary 5 s pause and no 30 s damage-zone cooldown, so the whole
-/// disc is damage and the test stays short.
+// Test 11 — a live progress tick never counts zero-filled damage as "good":
+// fail every read with RECOVERED ERROR so each batch is a plain zero-filled
+// SkipBlock; the advancing sweep must not fold that into bytes_good_total.
 struct MarginalSectorReader {
     capacity: u32,
 }

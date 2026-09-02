@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.7.0] — 2026-09-02
+
+### Changed
+
+- Version aligned to 1.7.0 for the unified release. Internal CI/lint hardening (stable-clippy MSRV split, cargo-deny dependency-audit gate, audience-based comment-guard).
+- Internal: de-duplicated the drive-info privacy-masking policy into one `mask_char` shared by `mask_string`/`mask_bytes`, and added coverage for the strict decrypt gate (a key-source failure surfaces rather than passing as decryptable). No API change.
+
+### Docs
+
+- Corrected USING_THE_ENGINE.md: the MSRV is 1.88 (single-sourced from `Cargo.toml`, resolved by CI rather than pinned), and the dependency snippet reflects the git-tag patch layout.
+
 ## [1.6.14] — 2026-08-31
 
 ### Changed
