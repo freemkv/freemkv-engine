@@ -41,9 +41,17 @@ impl Preflight {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Reason {
     /// Stable reason key. The complete set this crate emits — a front-end that
-    /// maps only part of it renders a blocked Start with no explanation.
-    /// See docs/preflight.md ("`Reason.key` — the full key set") for the
-    /// full list of keys and what `detail` carries for each.
+    /// maps only part of it renders a blocked Start with no explanation:
+    ///
+    /// ```text
+    /// "no-titles"              the scan found no titles at all
+    /// "empty-selection"        the selection resolves to no title
+    /// "title-out-of-range"     an index past the last title (detail = index)
+    /// "multipass-requires-raw" RipMode::Multi without job.raw
+    /// "language-unmatched"     a language-filtered class no selected title
+    ///                          carries (detail = audio|subtitle|subtitle_forced)
+    /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
+    /// ```
     pub key: String,
     /// Optional machine detail for the message (e.g. the offending index).
     pub detail: Option<String>,
