@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-engine"
-version = "1.7.0"
+version = "1.7.0-rc5"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -16,8 +16,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-libfreemkv = "1.6"
-freemkv-keysources = "1.6"
+libfreemkv = "1.7.0-rc5"
+freemkv-keysources = "1.7.0-rc5"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 # Language-tag normalization for stream selection (name / 639-1 / 639-2/3 →
@@ -39,8 +39,8 @@ codegen-units = 1
 # the CI resolution path; the release script rewrites the tags on bump. Local
 # dev overrides it with a path patch via the gitignored .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.6.14" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.14" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.7.0-rc5" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.7.0-rc5" }
 
 [lints.clippy]
 uninlined_format_args = "allow"
