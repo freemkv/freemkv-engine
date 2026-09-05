@@ -19,7 +19,7 @@ use crate::sink::{Level, Sink};
 const MILLIS_PER_SEC: f64 = 1000.0;
 
 /// Bytes in one optical sector — the unit damage is scored in.
-const SECTOR_BYTES: u64 = 2048;
+pub(crate) const SECTOR_BYTES: u64 = 2048;
 
 /// Does the residual loss exceed the tolerance and therefore abort the rip?
 ///
@@ -1603,6 +1603,34 @@ mod tests {
         }
     }
 
+    /// A clean `SectorSource` that stamps each sector with its own LBA (u32 LE
+    /// in the first 4 bytes), so a read-back of the output ISO can prove the
+    /// orchestration loop wrote the right bytes at the right offset.
+    struct PatternReader {
+        capacity: u32,
+    }
+    impl libfreemkv::SectorSource for PatternReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let n = ((count as usize) * 2048).min(buf.len());
+            for (i, chunk) in buf[..n].chunks_mut(2048).enumerate() {
+                chunk.fill(0);
+                if chunk.len() >= 4 {
+                    chunk[..4].copy_from_slice(&(lba + i as u32).to_le_bytes());
+                }
+            }
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
     /// A minimal unencrypted `sectors`-sized disc with the given titles (may
     /// be empty — several tests don't need a title at all).
     fn test_disc(sectors: u32, titles: Vec<libfreemkv::DiscTitle>) -> libfreemkv::Disc {
@@ -1795,6 +1823,56 @@ mod tests {
         assert_eq!(result.main_lost_ms, 0.0);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multipass_rip_writes_each_sector_to_its_own_lba() {
+        // Counters can't tell right-bytes-at-right-LBA from zeros-at-wrong-LBA.
+        // Stamp each sector with its LBA, then read the output ISO back: a
+        // wrong-offset or stale cursor in the loop would mismatch the stamp.
+        let (dir, iso) = scratch_iso("lba-pattern");
+        let sectors = 256u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = PatternReader { capacity: sectors };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("clean patterned multipass recovery should succeed");
+        assert_eq!(result.good_bytes, sectors as u64 * 2048);
+        assert!(result.complete);
+
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(&iso).unwrap();
+        let mut mismatches = Vec::new();
+        for &lba in &[0u32, 1, 100, 200, 255] {
+            f.seek(SeekFrom::Start(lba as u64 * 2048)).unwrap();
+            let mut sector = [0u8; 2048];
+            f.read_exact(&mut sector).unwrap();
+            let stamp = u32::from_le_bytes(sector[..4].try_into().unwrap());
+            if stamp != lba {
+                mismatches.push((lba, stamp));
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            mismatches.is_empty(),
+            "each LBA's stamp must land at byte LBA*2048; (expected, got) \
+             mismatches = {mismatches:?}"
+        );
     }
 
     #[test]

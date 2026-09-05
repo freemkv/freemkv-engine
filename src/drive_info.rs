@@ -4,7 +4,7 @@ use anyhow::Result;
 use libfreemkv::Drive;
 
 /// Raw data captured from a drive's SCSI responses.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DriveCapture {
     /// Raw INQUIRY response (96 bytes)
     pub inquiry: Vec<u8>,
@@ -45,7 +45,7 @@ pub struct DriveCapture {
 }
 
 /// A single GET CONFIGURATION feature response from the drive.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CapturedFeature {
     /// MMC-6 GET CONFIGURATION feature code (e.g. `0x010D` = AACS).
     pub code: u16,
@@ -56,6 +56,40 @@ pub struct CapturedFeature {
     /// CONFIGURATION header stripped (i.e. `buf[8..]`). Unlike
     /// [`DriveCapture::gc_010c`], which retains the full header.
     pub data: Vec<u8>,
+}
+
+// Hand-written so `{:?}` can't leak unredacted identifying bytes (e.g. the
+// INQUIRY serial, or the Serial Number feature). Every raw field is run through
+// `mask_bytes` — the same policy the `--share` report applies.
+impl std::fmt::Debug for DriveCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mo = |o: &Option<Vec<u8>>| o.as_deref().map(mask_bytes);
+        f.debug_struct("DriveCapture")
+            .field("inquiry", &mask_bytes(&self.inquiry))
+            .field("gc_010c", &mask_bytes(&self.gc_010c))
+            .field("features", &self.features)
+            .field("rpc_state", &mo(&self.rpc_state))
+            .field("mode_2a", &mo(&self.mode_2a))
+            .field("rb_f1", &mo(&self.rb_f1))
+            .field("rb_mode6", &mo(&self.rb_mode6))
+            .field("rb_b0_04", &mo(&self.rb_b0_04))
+            .field("rb_b0_500000", &mo(&self.rb_b0_500000))
+            .field("wb_41", &mo(&self.wb_41))
+            .field("rb_b0_04_postknock", &mo(&self.rb_b0_04_postknock))
+            .field("rb_b0_500000_postknock", &mo(&self.rb_b0_500000_postknock))
+            .field("rb_f4", &mo(&self.rb_f4))
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for CapturedFeature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CapturedFeature")
+            .field("code", &self.code)
+            .field("name", &self.name)
+            .field("data", &mask_bytes(&self.data))
+            .finish()
+    }
 }
 
 /// Feature codes to capture.
