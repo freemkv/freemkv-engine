@@ -123,7 +123,7 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
             sectors_bad: p
                 .bytes_unreadable_total
                 .saturating_add(p.bytes_retryable_total)
-                / 2048,
+                / crate::multipass::SECTOR_BYTES,
             speed_bps,
             eta_secs,
         };
