@@ -245,6 +245,18 @@ pub fn patch_pass_decision_measured(
     }
 }
 
+/// Loop-top convergence gate for the patch retry loop, guarding the fail-open
+/// the bare [`patch_pass_decision_measured`] can't see: `Converged` fires on
+/// `scope_bad == 0`, but an EMPTY mapfile (Pass 1 read ZERO bytes) ALSO has
+/// zero bad bytes. "Nothing bad recorded" is not "everything good", so require
+/// the recovery actually read something (`bytes_good > 0`) first: a complete
+/// Pass 1 still converges and skips redundant passes; an empty mapfile (or a
+/// `None`/unreadable one, which measured never converges) falls through to run
+/// the pass. Mirrors autorip's `pre_pass_converged` over its copy of the loop.
+pub fn pre_pass_converged(mux_scope_bad: Option<u64>, bytes_good: u64) -> bool {
+    bytes_good > 0 && patch_pass_decision_measured(mux_scope_bad, None) == PatchDecision::Converged
+}
+
 /// The end-of-recovery promotion: after the final patch pass, bytes still in a
 /// "maybe" state across every pass are promoted to `Unreadable` (confirmed
 /// lost) BEFORE the abort/loss gate reads them. Returns the `(from, to)`
@@ -611,8 +623,8 @@ fn multipass_rip_inner(
             }
 
             // Loop-top convergence gate: skip remaining passes if the mapfile
-            // shows the muxable scope already clean. `None` (mapfile unreadable)
-            // must never be conflated with 0 — that used to fake "Converged".
+            // shows the muxable scope already clean. `None` (unreadable) and an
+            // EMPTY mapfile both fake "Converged" — `pre_pass_converged` guards.
             let mux_scope_bad = match Mapfile::load(&mapfile_path) {
                 Ok(map) => {
                     let bad = map.ranges_with(&bad_sector_statuses());
@@ -628,7 +640,7 @@ fn multipass_rip_inner(
                     None
                 }
             };
-            if patch_pass_decision_measured(mux_scope_bad, None) == PatchDecision::Converged {
+            if pre_pass_converged(mux_scope_bad, last_good) {
                 sink.log(
                     Level::Info,
                     "multipass_rip: muxable scope 100% recovered — skipping remaining patch passes",
@@ -2253,6 +2265,36 @@ mod tests {
             patch_pass_decision_measured(Some(4096), Some(1_000_000)),
             PatchDecision::Continue,
         );
+    }
+
+    // FAIL-OPEN GUARD: an empty mapfile (Pass 1 read nothing) is `Some(0)` bad
+    // bytes with zero good — measured reads it as Converged and fakes "100%".
+    // The loop-top gate adds `last_good > 0`. See docs/multipass.md.
+    #[test]
+    fn char_pre_pass_converged_requires_real_coverage() {
+        // Empty mapfile: 0 good, Some(0) bad. Bare decision says Converged, but
+        // the guarded gate must NOT — nothing was ripped, so run the pass.
+        assert_eq!(
+            patch_pass_decision_measured(Some(0), None),
+            PatchDecision::Converged,
+        );
+        assert!(
+            !pre_pass_converged(Some(0), 0),
+            "empty mapfile (0 good, 0 bad) must NOT be treated as converged"
+        );
+        // Genuinely-complete scope: good spans the scope, zero bad → converged,
+        // so redundant patch passes are still skipped.
+        assert!(
+            pre_pass_converged(Some(0), 4096),
+            "complete scope (good>0, bad==0) must still converge"
+        );
+        // Scope still bad → never converged regardless of good coverage.
+        assert!(!pre_pass_converged(Some(2048), 4096));
+        assert!(!pre_pass_converged(Some(2048), 0));
+        // Unreadable mapfile (`None`) never converges, good bytes or not — the
+        // measured gate already refuses `None`, and the guard preserves that.
+        assert!(!pre_pass_converged(None, 4096));
+        assert!(!pre_pass_converged(None, 0));
     }
 
     // ── Three `multipass_rip_inner` fail-safes no black-box fixture reached

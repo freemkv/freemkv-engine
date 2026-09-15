@@ -52,6 +52,11 @@ pub fn copy(
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // A zero-capacity disc (READ CAPACITY failed during scan, swallowed to 0)
+    // would drive every resume/complete decision below off `capacity_bytes == 0`
+    // and, on a fresh sweep, write a 0-byte ISO reported as done. Reject it here,
+    // before any dispatch, as `Error::EmptyImage`.
+    disc.image_read_sectors()?;
     // Mapfile-driven resume dispatch, shared by plain and `--multipass` copies: an
     // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
@@ -731,7 +736,10 @@ pub fn sweep(
     // disc with no usable key would write ciphertext at exit 0. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
 
-    let total_bytes = disc.capacity_sectors as u64 * 2048;
+    // A zero-capacity disc would size the read domain at 0 and write a 0-byte
+    // ISO reported as complete; `image_read_sectors` turns it into an
+    // `Error::EmptyImage` before the output is created.
+    let total_bytes = disc.image_read_sectors()? as u64 * 2048;
     // Decrypt-aware read: `opts.decrypt` decrypts each unit in place (plaintext ISO);
     // otherwise pure pass-through (keys = `None`). Bad sectors are found by physical
     // read success, not decrypt structure — proven at mux time, not capture time.
