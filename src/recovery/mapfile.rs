@@ -2343,7 +2343,6 @@ mod check_mapfile_identity_tests {
             key_source: libfreemkv::disc::KeyOrigin::ExternalUk,
             vuk: None,
             unit_keys,
-            read_data_key: None,
             volume_id,
             uk_ro: Vec::new(),
             mkb: Vec::new(),

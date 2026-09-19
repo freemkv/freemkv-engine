@@ -122,7 +122,6 @@ fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
         key_source: KeyOrigin::DeviceKey,
         vuk: None,
         unit_keys,
-        read_data_key: None,
         volume_id: [0u8; 16],
         uk_ro: Vec::new(),
         mkb: Vec::new(),
