@@ -183,11 +183,15 @@ mod tests {
                     who: "keydb".to_string(),
                     path: vec![KeyNode::NoEntry],
                     outcome: KeyOutcome::NoKey,
+                    matched_entry: None,
+                    store_entries: None,
                 },
                 KeyStep {
                     who: "online".to_string(),
                     path: vec![KeyNode::MatchedDisc, KeyNode::FoundUnitKeys],
                     outcome: KeyOutcome::Resolved,
+                    matched_entry: None,
+                    store_entries: None,
                 },
             ],
         };
@@ -204,6 +208,8 @@ mod tests {
                 who: "keydb".to_string(),
                 path: vec![KeyNode::NoEntry],
                 outcome: KeyOutcome::NoKey,
+                matched_entry: None,
+                store_entries: None,
             }],
         };
         assert_eq!(won_source(&trace), None);
