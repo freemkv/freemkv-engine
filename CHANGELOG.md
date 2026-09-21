@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.7.4]
+
+### Changed
+
+- Aligned to libfreemkv 1.7.4 `KeyStep` (new `matched_entry` / `store_entries` fields).
+
+### Maintenance
+
+- CI moved to the central reusable workflows.
+
 ## [1.7.3] — 2026-09-19
 
 ### Changed
