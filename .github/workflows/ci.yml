@@ -22,7 +22,7 @@ concurrency:
 # the LAST RELEASE of both. For this crate that is not theoretical: the 1.6.0
 # recovery layer MOVED here out of libfreemkv, so the dev tip imports symbols the
 # last tag does not export. No arrangement of tags could fix it — the tag that
-# satisfies this branch does not exist until release.sh creates it.
+# satisfies this branch does not exist until release-orchestrate.yml creates it.
 #
 # The shared `checkout-siblings` composite (freemkv/.github) reproduces the
 # developer's local layout: every repo is cloned into a subdirectory of
@@ -196,9 +196,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
@@ -230,9 +229,8 @@ jobs:
     # to agree is what a release candidate is for.
     #
     # `if` SKIPS the job (it does not queue). A queued job would be far worse
-    # than a slow one: release.sh's CI gate refuses while any run for the
-    # commit is still in progress, so a never-scheduled job blocks releases
-    # silently -- see the note on real-media in qa.yml.
+    # than a slow one: a never-scheduled job leaves the run pending forever, so
+    # the branch's required checks never report complete.
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
