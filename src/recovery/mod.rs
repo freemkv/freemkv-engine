@@ -52,10 +52,9 @@ pub fn copy(
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
-    // A zero-capacity disc (READ CAPACITY failed during scan, swallowed to 0)
-    // would drive every resume/complete decision below off `capacity_bytes == 0`
-    // and, on a fresh sweep, write a 0-byte ISO reported as done. Reject it here,
-    // before any dispatch, as `Error::EmptyImage`.
+    // A zero-capacity disc (READ CAPACITY failed during scan, swallowed to 0) drives
+    // every resume/complete decision below off `capacity_bytes == 0` and writes a
+    // 0-byte ISO reported as done. Reject it here, before dispatch, as `Error::EmptyImage`.
     disc.image_read_sectors()?;
     // Mapfile-driven resume dispatch, shared by plain and `--multipass` copies: an
     // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
