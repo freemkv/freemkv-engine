@@ -1,7 +1,6 @@
 # Changelog
 
-## [1.7.4]
-
+## [1.7.4] — UNRELEASED
 ### Changed
 
 - Aligned to libfreemkv 1.7.4 `KeyStep` (new `matched_entry` / `store_entries` fields).
