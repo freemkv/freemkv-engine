@@ -1,18 +1,18 @@
 name: doc-links
 
-# Fails on broken intra-doc links in `///`/`//!` doc comments (e.g. a `[Type]`
-# link to a renamed/removed item). Catches doc drift that `cargo build` misses.
-
+# Thin caller → the canonical reusable doc-links gate in freemkv/.github.
+# freemkv-engine patches libfreemkv + freemkv-keysources from git tags, so the
+# reusable gate checks them out as siblings (plus freemkv-unlock, which
+# libfreemkv path-deps) and resolves the toolchain from rust-version.
 on: [push, pull_request]
-
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   doc-links:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.98.0
-      - uses: Swatinem/rust-cache@v2
-      - name: cargo doc (deny broken intra-doc links)
-        env:
-          RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links"
-        run: cargo doc --no-deps --document-private-items --lib --bins
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork
+    uses: freemkv/.github/.github/workflows/guard-doclinks.yml@v1
+    with:
+      self: freemkv-engine
+      checkout: libfreemkv freemkv-keysources freemkv-unlock
+      patch: libfreemkv freemkv-keysources

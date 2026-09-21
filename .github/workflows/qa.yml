@@ -10,7 +10,8 @@ name: qa
 # that a commit is production worth: everything expensive that can run without
 # physical media. `main` only ever receives a qa that went green here.
 #
-# Sibling repos are checked out at `qa`, NOT `dev`. A qa run that resolved its
+# Sibling repos are checked out at `qa`, NOT `dev`: the shared checkout-siblings
+# composite resolves qa->qa from this branch. A qa run that resolved its
 # dependencies from dev tips would be validating a combination that is not the
 # one being released, which is the exact failure this branch exists to prevent.
 #
@@ -23,6 +24,11 @@ on:
     branches: [qa]
   workflow_dispatch:
 
+# Rapid dev pushes supersede their own in-progress runs instead of stacking.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
   # the MSRV read `needs.resolve-msrv.outputs.v` from Cargo.toml's rust-version;
@@ -32,7 +38,7 @@ jobs:
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -56,7 +62,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - name: Stamp the next rc
@@ -85,34 +91,14 @@ jobs:
         os: ['ubuntu-latest', 'macos-latest']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: freemkv-engine
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          EOF
+          self: freemkv-engine
+          checkout: libfreemkv freemkv-keysources freemkv-unlock
+          patch: libfreemkv freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -128,34 +114,14 @@ jobs:
   cross-lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: freemkv-engine
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          EOF
+          self: freemkv-engine
+          checkout: libfreemkv freemkv-keysources freemkv-unlock
+          patch: libfreemkv freemkv-keysources
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
       - uses: dtolnay/rust-toolchain@stable
@@ -176,34 +142,14 @@ jobs:
     needs: resolve-msrv
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v5
         with:
           path: freemkv-engine
-      - uses: actions/checkout@v7
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          repository: freemkv/libfreemkv
-          ref: qa
-          path: libfreemkv
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-keysources
-          ref: qa
-          path: freemkv-keysources
-      - uses: actions/checkout@v7
-        with:
-          repository: freemkv/freemkv-unlock
-          ref: qa
-          path: freemkv-unlock
-      - name: Resolve siblings from their qa tips
-        shell: bash
-        working-directory: freemkv-engine
-        run: |
-          mkdir -p .cargo
-          cat > .cargo/config.toml <<'EOF'
-          [patch.crates-io]
-          libfreemkv = { path = "../libfreemkv" }
-          freemkv-keysources = { path = "../freemkv-keysources" }
-          EOF
+          self: freemkv-engine
+          checkout: libfreemkv freemkv-keysources freemkv-unlock
+          patch: libfreemkv freemkv-keysources
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
