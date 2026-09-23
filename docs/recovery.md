@@ -328,6 +328,66 @@ than a fabricated sub-sector remainder. Every caller (`Linear`/`Jump`/
 here", so this stays safe: never a phantom read past the end, never a
 non-whole-sector length.
 
+The cap itself is `(u64::MAX / SECTOR) * SECTOR` and the arithmetic in it is
+load-bearing in both directions.
+`rounding_up_saturates_at_the_end_of_the_address_space` only proves the cap is
+not ABOVE the last sector boundary; it answers 0 whichever way the constant is
+mis-derived, because its range starts past every candidate cap.
+`the_end_cap_clamps_nothing_a_u64_can_actually_hold` covers the other
+direction: a mis-derived cap (`/ SECTOR + SECTOR`, or a second division) sits
+around 9 PB, and every range above it then comes back with length 0 — a real
+region silently reported as "nothing to do" instead of read.
+Both directions have to be pinned, since only their conjunction says "clamp
+exactly the unrepresentable and nothing else".
+
+## Equivalent mutants in `copy` / `sweep` (round-7 mutation run)
+
+Fifteen of `recovery/mod.rs`'s surviving mutants are not coverage gaps. They
+are recorded here — with the reason each one is unobservable — so the next
+mutation run doesn't spend a day re-deriving it. The two that ARE real gaps
+(`snap_to_sectors`' end cap) are covered above.
+
+**`copy`'s complete-check (`stats.bytes_nontried == 0`).** Inverting it is
+unobservable. `bytes_nontried` is a documented SUBSET of `bytes_pending` (see
+`MapStats`), so the preceding `bad_bytes == 0` — which is `bytes_pending +
+bytes_unreadable` — already implies it. The conjunct is belt-and-braces, and
+with it inverted the branch simply goes dead: control falls through to the
+multipass and plain-copy terminal returns further down, which build an
+identical `CopyResult` from the same `stats`. Only the `tracing` line differs.
+
+**`sweep`'s content gate (the `&&` on the `key_map` condition, the `!` on
+`can_gate`, and the `&&` on the `else if`).** The gate installed in that
+`else if` is INERT for every key state that can reach it. `key_map` is `None`
+exactly when the keys are CSS or `None`; libfreemkv's `decrypt_span` applies
+`css::descramble_region` to the whole buffer regardless of `content` (CSS
+self-gates on the pack start code plus the scramble flag), and
+`DecryptKeys::None` decrypts nothing at all. Only the AACS arms
+(`apply_aacs_map`, and the unit-alignment pre-check) read the ranges, and an
+AACS decrypting sweep always takes the `key_map` branch instead. The third
+mutant routes a CSS/clear disc through `resolve_content_key_map`, which
+returns an empty map without reading a sector for non-AACS keys and then
+decrypts through the same `decrypt_span` arms — same bytes, same reads. This
+is defence-in-depth that currently defends nothing; it is kept because the
+gate becomes load-bearing the moment CSS honours `content`.
+
+**The damage-jump's `gap_bytes > 0`.** Widened to `>= 0` it sends a
+zero-length `GapFill` at the end of a region. The sink's fill loop doesn't
+run, `Mapfile::record` returns early on `size == 0`, the seek is to where the
+writer already is (elided by `WritebackFile`), and `bytes_done` gains 0.
+
+**The iteration heartbeat (eight mutants).** The `read_ok_count` /
+`read_err_count` / `iter_count` increments, the `iter_count - last_log_iter >=
+100 || time_due` gate and each of its operands, and the `pos / 2048` that
+names an LBA all feed `tracing` fields and nothing else — not the result, not
+the ISO, not the mapfile. Killing them needs a subscriber-capture harness (and
+a `tracing-subscriber` dev-dependency) this crate deliberately doesn't carry;
+the tests would pin the wording and cadence of a debug line rather than a rip
+invariant.
+
+**`sleep_secs_or_halt`'s `start.elapsed() < total`.** `<=` differs only when
+`elapsed()` is EXACTLY `total` to the nanosecond, and even then costs one more
+iteration that sleeps `remaining = 0` and leaves.
+
 ## `a_raised_halt_still_delivers_when_the_channel_has_room`
 
 The other half of the halt contract, and the regression that routing every

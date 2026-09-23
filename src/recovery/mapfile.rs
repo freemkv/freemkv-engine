@@ -425,8 +425,8 @@ impl Mapfile {
         match Self::load(path) {
             Ok(mf) => {
                 // load() derives total_size from the last entry's pos+size; if that
-                // disagrees with the caller's expected disc size, downstream resume
-                // math keys off the wrong basis. Warn rather than fail the resume.
+                // disagrees with the caller's size, resume math keys off the wrong
+                // basis. Warn, don't fail — so `==` here is an equivalent mutant.
                 if mf.total_size != total_size {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -2063,6 +2063,37 @@ mod tests {
         assert_eq!(reopened.stats().bytes_good, 500);
         // Loaded total reflects the file, not the supplied arg.
         assert_eq!(reopened.total_size(), 1000);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// ONLY a missing file means "create a fresh one". A file that exists but
+    /// does not parse is a real error and must propagate: creating over it
+    /// silently DESTROYS the record of what was already read, and the rip
+    /// restarts from sector 0 reporting a clean resume.
+    #[test]
+    fn open_or_create_propagates_a_corrupt_file_instead_of_overwriting_it() {
+        let p = tmpfile("open_or_create_corrupt");
+        let _ = std::fs::remove_file(&p);
+        // Overlapping ranges — `load` rejects these (MapfileInvalid), which is
+        // NOT io::ErrorKind::NotFound.
+        let corrupt = "# Rescue Logfile. Created by test\n\
+             0x000000000  ?  1  0\n\
+             0x000000000  0x00000100    +\n\
+             0x000000080  0x00000100    -\n";
+        std::fs::write(&p, corrupt).unwrap();
+        let err = Mapfile::open_or_create(&p, 0x100, "test")
+            .err()
+            .expect("a corrupt mapfile is an error, not a reason to start over");
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "the file is present; only NotFound may route to create()"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            corrupt,
+            "the unparseable mapfile was overwritten — the prior rip's progress is gone"
+        );
         let _ = std::fs::remove_file(&p);
     }
 

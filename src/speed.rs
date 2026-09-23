@@ -33,6 +33,10 @@ const MAX_PLAUSIBLE_MBS: f64 = 1024.0;
 
 /// Compute the appropriate sliding-window size for the displayed speed given
 /// how long the pass has been running. See [`STATIC_PHASE_SECS`] for the curve.
+///
+/// Both `<` here are equivalent to `<=`: the curve is continuous at each
+/// breakpoint, so no test can pin them. See docs/speed.md ("Equivalent
+/// mutants").
 fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
     if elapsed_pass_secs < STATIC_PHASE_SECS {
         STATIC_WINDOW_SECS
@@ -178,7 +182,8 @@ impl SpeedEstimator {
         let eta_mbs = self.eta_speed_mbs(now, display_mbs);
         let speed_bps = (display_mbs * BYTES_PER_MIB) as u64;
         // 0.0001 MB/s (~0.1 KB/s) floor: any real forward motion yields an ETA,
-        // but a dead stall doesn't divide toward a multi-year number.
+        // but a dead stall doesn't divide toward a multi-year number. `>=` here
+        // is equivalent — see docs/speed.md ("Equivalent mutants").
         let eta_secs = if eta_mbs > 0.0001 && bytes_total > bytes_done {
             let rem_mb = (bytes_total - bytes_done) as f64 / BYTES_PER_MIB;
             Some((rem_mb / eta_mbs).round() as u64)
@@ -284,7 +289,9 @@ mod tests {
             "just past the boundary the window must be growing"
         );
 
-        // Growth is monotonic and lands exactly on MAX at the end.
+        // Growth is monotonic and lands exactly on MAX at the end — so the
+        // SECOND `<` -> `<=` mutant is equivalent for the same reason as the
+        // first (docs/speed.md, "Equivalent mutants").
         let end = STATIC_PHASE_SECS + GROWTH_PHASE_SECS;
         assert!(display_window_secs(end - 0.1) < MAX_WINDOW_SECS);
         assert_eq!(display_window_secs(end), MAX_WINDOW_SECS);
