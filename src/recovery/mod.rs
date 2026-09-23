@@ -14,6 +14,39 @@ use libfreemkv::sector::SectorSource;
 
 pub use patch::patch;
 
+/// Label the error that aborted a pass at `block_lba`.
+///
+/// Only a fault the MEDIUM or the TRANSPORT reported becomes
+/// [`Error::DiscRead`] (E6000, "the disc may be dirty or scratched — clean it
+/// and try again"), the one message that sends a user to a cloth.
+///
+/// Everything else keeps its own code. This used to relabel *every* error, so a
+/// decrypt refusal — which carries no SCSI status at all — was reported as
+/// `E6000: <block start LBA> 0x00`: a read fault the drive never signalled, at
+/// an LBA nothing was wrong with, on a disc that reads perfectly
+/// (freemkv/freemkv#55). A `DiscRead` with status `0x00` and no sense data is
+/// the signature of that bug and must not be constructible here again.
+fn classify_pass_abort(err: Error, block_lba: u32) -> Error {
+    match err {
+        // The drive answered with a status/sense, or the transport died under
+        // it: a genuine read fault, re-anchored to the block we were reading.
+        e @ (Error::ScsiError { .. }
+        | Error::DiscRead { .. }
+        | Error::IoError { .. }
+        | Error::DeviceNotFound { .. }) => {
+            let (status, sense) = extract_scsi_context(&e);
+            Error::DiscRead {
+                sector: block_lba as u64,
+                status: Some(status),
+                sense,
+            }
+        }
+        // A decrypt refusal, a halt, a contract violation: the cause IS the
+        // error. Surface it so the real code reaches the user and the logs.
+        other => other,
+    }
+}
+
 // A SHORT transfer is a FAILED read, never a partial success — see
 // docs/recovery.md ("require_full_read") for why a short `Ok(n)` must be
 // rejected rather than trusted.
@@ -749,8 +782,11 @@ pub fn sweep(
     };
     let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
     // AACS sweep: resolve a whole-disc key map up front (fail-loud on missing
-    // CPS-unit key) and decrypt via the map — clear sectors are in no range and
-    // pass through, so no separate gate is needed. CSS keeps its own content-gate.
+    // CPS-unit key) and decrypt via the map. The map alone is NOT a content gate:
+    // a unit in no mapped range is only *probably* clear, and `apply_aacs_map`
+    // refuses one that carries the AACS CPI bits as an un-keyable orphan clip.
+    // Clear UDF/BDMV bytes trip that ~3 times in 4 (`byte0 & 0xC0`), so the
+    // content extents go on too — see below.
     let key_map = if opts.decrypt && decrypt_is_aacs {
         let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
         Some(std::sync::Arc::new(disc.resolve_content_key_map(
@@ -769,8 +805,15 @@ pub fn sweep(
         let mut dec = DecryptingSectorSource::new(reader, keys);
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
-        } else if opts.decrypt && can_gate {
-            // CSS / clear decrypt: content-gate the self-descramble path.
+        }
+        // freemkv#55: a WHOLE-DISC reader walks the UDF filesystem and BDMV nav
+        // as well as the title extents, so it must say which sectors are content.
+        // This is NOT an else-arm of the key map: the AACS mapped path needs the
+        // gate more than the CSS one does, because without it a clear sector whose
+        // byte 0 happens to carry the CPI bits fails the whole read as an orphan
+        // encrypted unit. Left unset when the disc has no parsed titles — an EMPTY
+        // gate would pass every sector through and write a ciphertext ISO at exit 0.
+        if opts.decrypt && can_gate {
             dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
         }
         dec
@@ -1054,12 +1097,7 @@ pub fn sweep(
                     pos += block_bytes;
                 }
                 Err(err) if !opts.skip_on_error => {
-                    let (status, sense) = extract_scsi_context(&err);
-                    producer_err = Some(Error::DiscRead {
-                        sector: block_lba as u64,
-                        status: Some(status),
-                        sense,
-                    });
+                    producer_err = Some(classify_pass_abort(err, block_lba));
                     break 'outer;
                 }
                 Err(err) => {
@@ -1170,12 +1208,7 @@ pub fn sweep(
                             sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
                         }
                         read_error::ReadAction::AbortPass => {
-                            let (status, sense) = extract_scsi_context(&err);
-                            producer_err = Some(Error::DiscRead {
-                                sector: block_lba as u64,
-                                status: Some(status),
-                                sense,
-                            });
+                            producer_err = Some(classify_pass_abort(err, block_lba));
                             break 'outer;
                         }
                     }
