@@ -16,16 +16,11 @@ pub use patch::patch;
 
 /// Label the error that aborted a pass at `block_lba`.
 ///
-/// Only a fault the MEDIUM or the TRANSPORT reported becomes
-/// [`Error::DiscRead`] (E6000, "the disc may be dirty or scratched — clean it
-/// and try again"), the one message that sends a user to a cloth.
-///
-/// Everything else keeps its own code. This used to relabel *every* error, so a
-/// decrypt refusal — which carries no SCSI status at all — was reported as
-/// `E6000: <block start LBA> 0x00`: a read fault the drive never signalled, at
-/// an LBA nothing was wrong with, on a disc that reads perfectly
-/// (freemkv/freemkv#55). A `DiscRead` with status `0x00` and no sense data is
-/// the signature of that bug and must not be constructible here again.
+/// Only a MEDIUM/TRANSPORT fault becomes [`Error::DiscRead`] (E6000,
+/// "disc may be dirty — clean it"); every other error keeps its own code.
+/// This used to relabel *every* error, misreporting decrypt refusals as
+/// bogus `E6000 status 0x00` reads (freemkv/freemkv#55). A `DiscRead`
+/// with status `0x00` and no sense data is that bug's signature.
 fn classify_pass_abort(err: Error, block_lba: u32) -> Error {
     match err {
         // The drive answered with a status/sense, or the transport died under
@@ -784,12 +779,9 @@ pub fn sweep(
         libfreemkv::decrypt::DecryptKeys::None
     };
     let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
-    // AACS sweep: resolve a whole-disc key map up front (fail-loud on missing
-    // CPS-unit key) and decrypt via the map. The map alone is NOT a content gate:
-    // a unit in no mapped range is only *probably* clear, and `apply_aacs_map`
-    // refuses one that carries the AACS CPI bits as an un-keyable orphan clip.
-    // Clear UDF/BDMV bytes trip that ~3 times in 4 (`byte0 & 0xC0`), so the
-    // content extents go on too — see below.
+    // AACS sweep: resolve a whole-disc key map up front (fail-loud on
+    // missing CPS-unit key). The map alone is NOT a content gate — see
+    // the content_ranges block below for why, and docs/recovery.md.
     let key_map = if opts.decrypt && decrypt_is_aacs {
         let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
         Some(std::sync::Arc::new(disc.resolve_content_key_map(
@@ -812,13 +804,9 @@ pub fn sweep(
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
         }
-        // freemkv#55: a WHOLE-DISC reader walks the UDF filesystem and BDMV nav
-        // as well as the title extents, so it must say which sectors are content.
-        // This is NOT an else-arm of the key map: the AACS mapped path needs the
-        // gate more than the CSS one does, because without it a clear sector whose
-        // byte 0 happens to carry the CPI bits fails the whole read as an orphan
-        // encrypted unit. Left unset when the disc has no parsed titles — an EMPTY
-        // gate would pass every sector through and write a ciphertext ISO at exit 0.
+        // freemkv#55: whole-disc reader walks UDF + BDMV nav sectors that
+        // are clear — content gate needed so those don't trip AACS's
+        // orphan-unit refusal. See docs/recovery.md for the full rationale.
         if opts.decrypt && can_gate {
             dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
         }
