@@ -1313,7 +1313,10 @@ pub fn patch(
         let mut dec = DecryptingSectorSource::new(reader, keys);
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
-        } else if opts.decrypt && can_gate {
+        }
+        // freemkv#55: whole-disc reader → always declare the content extents, key
+        // map or not. See `recovery::sweep` for why the map is not a substitute.
+        if opts.decrypt && can_gate {
             dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
         }
         dec
