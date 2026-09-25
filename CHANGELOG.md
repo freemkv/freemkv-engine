@@ -2,9 +2,17 @@
 
 ## [1.7.6] — UNRELEASED
 
+### Fixed
+
+- Whole-disc decrypt (ISO → ISO) now declares its content extents, so the recovery pipeline classifies decrypt refusals as `E6000` instead of the misleading `status=0x00` label they surfaced as before (#55).
+
+### Maintenance
+
+- Killed 11 surviving mutants in the recovery/mux/resolve paths; the remaining 27 are documented as equivalent.
+
 ### Changed
 
-- Version aligned to 1.7.6 for the unified release. No functional changes to this crate; the release is driven by the freemkv 1.7.6 Linux desktop shell (GTK4 + libadwaita) and the rip-finished desktop notification (issue #56).
+- Version aligned to 1.7.6 for the unified release alongside the freemkv 1.7.6 Linux desktop shell (issue #56).
 
 ## [1.7.5] — 2026-09-23
 
