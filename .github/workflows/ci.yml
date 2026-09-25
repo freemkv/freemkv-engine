@@ -292,6 +292,15 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
+      # Since freemkv 1.7.6 the `freemkv` consumer's Linux target compiles a
+      # GTK4 + libadwaita desktop shell, so `cargo check` on it needs the
+      # pkg-config dev headers the `gtk4-sys`/`glib-sys` build.rs scripts
+      # probe. `autorip` is a CLI-only crate and doesn't need these — the
+      # install is cheap and covers both.
+      - name: Install GTK4 + libadwaita development headers (for freemkv)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev build-essential
       # The consumers (freemkv/autorip) track a higher MSRV than the engine —
       # the binaries always float to the highest supported Rust. Build them on
       # `stable` so this job satisfies that floor; the engine's own lower MSRV
