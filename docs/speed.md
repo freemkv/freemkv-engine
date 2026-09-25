@@ -95,3 +95,25 @@ run found unpinned:
 - `eta_leaves_warmup_exactly_at_the_boundary`: pins that at exactly
   `ETA_WARMUP_SECS` the running average is already in use, not the display
   fallback.
+
+## Equivalent mutants (round-7 mutation run)
+
+Three comparison mutants in this module survive and always will; they are
+recorded here so nobody spends a third round chasing them.
+
+- Both `<` in `display_window_secs` (`< STATIC_PHASE_SECS`, and
+  `< STATIC_PHASE_SECS + GROWTH_PHASE_SECS`) are `<=` in disguise, because the
+  curve is CONTINUOUS at each breakpoint. At `elapsed == 60` the growth arm's
+  term is `t = 0`, so it returns exactly `STATIC_WINDOW_SECS` — the same answer
+  the static arm gives. At `elapsed == 360` the term is
+  `t / GROWTH_PHASE_SECS == 1`, so the growth arm returns exactly
+  `MAX_WINDOW_SECS` — the same answer the flat arm gives. Continuity is the
+  design property worth having (a window that jumped at a breakpoint would make
+  the displayed speed jump with it), and `the_display_window_boundaries_are_exact`
+  pins it; the operators themselves are simply not observable.
+- `sample_at`'s ETA floor, `eta_mbs > 0.0001`, differs from `>=` only for an
+  `eta_mbs` that is bit-for-bit the f64 nearest `0.0001`. That value is
+  `bytes / 2^20 / elapsed` with an integer `bytes` and a `Duration`-quantised
+  `elapsed`; the reachable results step far more coarsely than the ~1e-20 gap
+  around `0.0001f64`, so no `(bytes, elapsed)` pair lands on it. A test would
+  have to construct the float directly, which is to say it would test nothing.

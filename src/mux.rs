@@ -804,6 +804,18 @@ mod tests {
         assert_eq!(human_bytes(55_460_235_264), "51.7 GB");
     }
 
+    /// Each threshold is a PRODUCT of 1024s, and the values BETWEEN two
+    /// thresholds are what prove it: `K * K * K` mis-read as `K + K * K`
+    /// (or `K * K` as `K + K`) still renders the exact boundary values above
+    /// correctly, and turns every mid-range size into "0.0 GB" / "0 MB".
+    #[test]
+    fn human_bytes_thresholds_are_products_of_1024_not_sums() {
+        // 2 MiB — above `K + K * K` (1 049 600) but far below a gigabyte.
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2 MB");
+        // 4 KiB — above `K + K` (2048) but far below a megabyte.
+        assert_eq!(human_bytes(4096), "4 KB");
+    }
+
     fn disc_no_key_err() -> std::io::Error {
         // E_NO_DISC_KEY — a disc-level key failure (keydb has no entry).
         libfreemkv::Error::NoDiscKey {

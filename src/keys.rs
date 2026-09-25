@@ -264,4 +264,85 @@ mod tests {
             "no AACS inputs means no resolution, and therefore no winning source"
         );
     }
+
+    /// ...and the other half: a disc the local keydb DOES hold a unit key for
+    /// resolves, the key is banked onto the disc, and the label of the source
+    /// that won comes back. Without this the whole verb is indistinguishable
+    /// from a body that always answers `None` — which reads as "no key found",
+    /// and sends the operator hunting for a keydb they already have.
+    #[test]
+    fn resolve_disc_keys_names_the_source_that_won_and_banks_the_key() {
+        struct NeverRead;
+        impl libfreemkv::SectorSource for NeverRead {
+            fn read_sectors(
+                &mut self,
+                _lba: u32,
+                _count: u16,
+                _buf: &mut [u8],
+                _recovery: bool,
+            ) -> libfreemkv::Result<usize> {
+                // No parsed titles: there is nothing to sample, so validation
+                // is skipped and the stored unit key is taken as terminal.
+                panic!("a title-less disc has no ciphertext to sample");
+            }
+            fn capacity_sectors(&self) -> u32 {
+                1
+            }
+        }
+
+        let disc_hash = "ab".repeat(20);
+        let unit_key = "5a".repeat(16);
+        let dir = tempfile::tempdir().unwrap();
+        let keydb = dir.path().join("keydb.cfg");
+        std::fs::write(
+            &keydb,
+            format!("0x{disc_hash} = TESTDISC | U | 1-0x{unit_key}\n"),
+        )
+        .unwrap();
+
+        let mut disc = libfreemkv::Disc {
+            volume_id: "TESTDISC".into(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 1,
+            capacity_bytes: 2048,
+            layers: 1,
+            titles: vec![],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: Some(libfreemkv::AacsState {
+                version: 1,
+                bus_encryption: false,
+                mkb_version: None,
+                disc_hash: disc_hash.clone(),
+                key_source: libfreemkv::KeyOrigin::ExternalUk,
+                vuk: None,
+                unit_keys: Vec::new(),
+                volume_id: [0u8; 16],
+                uk_ro: Vec::new(),
+                mkb: Vec::new(),
+            }),
+            css: None,
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        };
+        let p = KeyParams {
+            keydb_path: Some(keydb.to_string_lossy().into_owned()),
+            key_url: None,
+            key_auth: None,
+            online_only: false,
+        };
+
+        assert_eq!(
+            resolve_disc_keys(&mut disc, &mut NeverRead, &p),
+            Some("keydb".to_string()),
+            "the local keydb held the unit key; it must be named as the winner"
+        );
+        assert_eq!(
+            disc.aacs.as_ref().unwrap().unit_keys,
+            vec![(1u32, [0x5au8; 16])],
+            "the winning key must be banked onto the disc, not merely reported"
+        );
+    }
 }

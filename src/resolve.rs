@@ -245,6 +245,30 @@ mod tests {
         ));
     }
 
+    /// ...and each key-service failure keeps its OWN identity through the
+    /// gate. Collapsing any of these arms into the `_` fallthrough returns
+    /// `NoDiscKey` — "this disc has no key", the wrong operator action — when
+    /// what actually happened is "the key service refused/throttled us".
+    #[test]
+    fn strict_gate_surfaces_an_unauthorized_key_service_as_itself() {
+        let mut d = disc(true);
+        d.aacs_error = Some(libfreemkv::Error::KeyServiceUnauthorized);
+        assert!(matches!(
+            ensure_decryptable_strict(&d, false),
+            Err(libfreemkv::Error::KeyServiceUnauthorized)
+        ));
+    }
+
+    #[test]
+    fn strict_gate_surfaces_a_rate_limited_key_service_as_itself() {
+        let mut d = disc(true);
+        d.aacs_error = Some(libfreemkv::Error::KeyServiceRateLimited);
+        assert!(matches!(
+            ensure_decryptable_strict(&d, false),
+            Err(libfreemkv::Error::KeyServiceRateLimited)
+        ));
+    }
+
     #[test]
     fn aacs_keydb_reports_origin_and_summary() {
         let mut d = disc(true);

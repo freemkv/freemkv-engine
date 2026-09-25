@@ -113,6 +113,13 @@ const FEATURES: &[(u16, &str)] = &[
 
 /// Capture all available drive data via SCSI commands.
 /// Returns raw responses — no formatting, no zipping, no presentation.
+///
+/// This function and `raw` hold eight surviving mutants (the Renesas
+/// `SAT`-signature predicate; `raw`'s return). None is a coverage gap a test
+/// here could close: both need a `&mut Drive`, and libfreemkv exposes no way to
+/// build one without a real SCSI device (`from_transport_for_test` is
+/// `#[cfg(test)] pub(crate)` there). Testing them is a libfreemkv API change,
+/// not a test.
 pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let id = &session.drive_id;
 
@@ -265,6 +272,85 @@ mod tests {
         // are space-padded binary and the framing must be diffable.
         let input = [0x00u8, b'A', 0x20, b'7', 0xFF, b'-'];
         assert_eq!(mask_bytes(&input), vec![0x00, b'A', 0x20, b'0', 0xFF, b'-']);
+    }
+
+    fn capture_with(inquiry: &[u8], rb_f1: Option<Vec<u8>>) -> DriveCapture {
+        DriveCapture {
+            inquiry: inquiry.to_vec(),
+            gc_010c: b"FW1.04".to_vec(),
+            features: vec![CapturedFeature {
+                code: 0x0108,
+                name: "Serial Number",
+                data: b"KX7L2201".to_vec(),
+            }],
+            rpc_state: Some(vec![0x01]),
+            mode_2a: None,
+            rb_f1,
+            rb_mode6: None,
+            rb_b0_04: None,
+            rb_b0_500000: None,
+            wb_41: None,
+            rb_b0_04_postknock: None,
+            rb_b0_500000_postknock: None,
+            rb_f4: None,
+        }
+    }
+
+    /// The hand-written `Debug` exists ONLY to redact, and a body that writes
+    /// nothing defeats it exactly as thoroughly as one that prints the fields
+    /// raw. Assert both halves: the rendering happens, and every identifying
+    /// byte in it is masked. A `{:?}` of a capture reaches bug reports and
+    /// `--share`.
+    #[test]
+    fn drive_capture_debug_renders_and_masks_every_raw_field() {
+        let inquiry = b"HL-DT-ST";
+        let f1 = b"SERIAL7".to_vec();
+        let c = capture_with(inquiry, Some(f1.clone()));
+        let s = format!("{c:?}");
+
+        assert!(
+            s.contains("DriveCapture") && s.contains("inquiry") && s.contains("rb_f1"),
+            "the Debug body produced nothing usable: {s:?}"
+        );
+        // Each raw field appears in its MASKED form (byte-slice Debug, so the
+        // rendering is numeric) and never in its raw one.
+        for (label, raw) in [
+            ("inquiry", inquiry.to_vec()),
+            ("rb_f1", f1),
+            ("feature data", b"KX7L2201".to_vec()),
+        ] {
+            assert!(
+                s.contains(&format!("{:?}", mask_bytes(&raw))),
+                "{label} is not rendered masked: {s}"
+            );
+            assert!(
+                !s.contains(&format!("{raw:?}")),
+                "{label} leaked through DriveCapture's Debug unmasked: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_feature_debug_renders_and_masks_its_payload() {
+        let raw = b"KX7L2201".to_vec();
+        let f = CapturedFeature {
+            code: 0x0108,
+            name: "Serial Number",
+            data: raw.clone(),
+        };
+        let s = format!("{f:?}");
+        assert!(
+            s.contains("CapturedFeature") && s.contains("Serial Number"),
+            "the Debug body produced nothing usable: {s:?}"
+        );
+        assert!(
+            s.contains(&format!("{:?}", mask_bytes(&raw))),
+            "the payload is not rendered masked: {s}"
+        );
+        assert!(
+            !s.contains(&format!("{raw:?}")),
+            "the raw Serial Number feature payload leaked: {s}"
+        );
     }
 
     #[test]

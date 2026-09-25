@@ -136,6 +136,9 @@ pub fn copy(
             );
             return sweep_internal(disc, reader, path, opts, false);
         }
+        // `bytes_nontried == 0` is implied by `bad_bytes == 0` (subset), so
+        // inverting it is an equivalent mutant — don't chase it. See
+        // docs/recovery.md ("Equivalent mutants in `copy` / `sweep`").
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && iso_is_intact {
             // Every sector is Finished AND the image it describes is intact —
             // a prior copy completed. Re-issuing the command is a no-op
@@ -801,6 +804,9 @@ pub fn sweep(
     let content_ranges = disc.encrypted_content_ranges();
     let can_gate = !content_ranges.is_empty();
 
+    // The content gate below is INERT for every key state that reaches it (CSS
+    // self-descrambles regardless; `None` decrypts nothing), so all three
+    // conditions here carry equivalent mutants — docs/recovery.md.
     let mut reader = {
         let mut dec = DecryptingSectorSource::new(reader, keys);
         if let Some(map) = key_map {
@@ -1175,6 +1181,8 @@ pub fn sweep(
                                 .min(region_end);
                             let gap_start = pos + block_bytes;
                             let gap_bytes = jump_pos.saturating_sub(gap_start);
+                            // `>= 0` here is an equivalent mutant: a zero-length
+                            // GapFill is a no-op end to end (docs/recovery.md).
                             if gap_bytes > 0 {
                                 match send_bounded(
                                     &pipe,
@@ -1226,6 +1234,9 @@ pub fn sweep(
                 cached_snapshot = Some(snap);
             }
 
+            // Heartbeat: this gate, its counters and the LBA below are
+            // DIAGNOSTIC-ONLY, and carry eight mutants no test here can kill.
+            // See docs/recovery.md ("Equivalent mutants in `copy` / `sweep`").
             let time_due = last_log_time.elapsed() >= std::time::Duration::from_secs(5);
             if iter_count - last_log_iter >= 100 || time_due {
                 last_log_iter = iter_count;
@@ -1572,6 +1583,8 @@ pub(crate) fn sleep_secs_or_halt(
     let total = std::time::Duration::from_secs(secs);
     let slice = std::time::Duration::from_millis(100);
     let start = std::time::Instant::now();
+    // `<=` is an equivalent mutant (docs/recovery.md): it differs only at an
+    // exact-nanosecond match, and then only by one `remaining = 0` iteration.
     while start.elapsed() < total {
         if h.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -1686,6 +1699,29 @@ mod snap_tests {
             "returned length must be a whole number of sectors"
         );
         assert_eq!(len, 0, "the final sector here cannot be represented in u64");
+    }
+
+    /// The end cap is the LARGEST sector-aligned u64, and nothing below it may
+    /// be clamped. Mis-derive that constant (`/ SECTOR + SECTOR`, or a second
+    /// division) and the ceiling drops to ~9 PB, where every range above it
+    /// comes back length 0 — a real region silently "nothing to do" instead of
+    /// read. The `u64::MAX`-adjacent test above answers 0 either way and cannot
+    /// see it. See docs/recovery.md ("snap_to_sectors").
+    #[test]
+    fn the_end_cap_clamps_nothing_a_u64_can_actually_hold() {
+        // 1e16 is an exact multiple of 2048, ~9 PB past a mis-derived cap.
+        let pos = 10_000_000_000_000_000u64;
+        assert_eq!(
+            snap_to_sectors(pos, 2048),
+            (pos, 2048),
+            "an aligned range far below the last sector boundary was clamped"
+        );
+        // And the cap itself is the last whole sector, not one short of it.
+        let last_sector_start = (u64::MAX / 2048) * 2048 - 2048;
+        assert_eq!(
+            snap_to_sectors(last_sector_start, 2048),
+            (last_sector_start, 2048)
+        );
     }
 
     // The u128 overflow-proofing above must not change ordinary snapping —
