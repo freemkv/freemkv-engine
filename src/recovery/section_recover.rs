@@ -16,9 +16,8 @@ use libfreemkv::sector::SectorSource;
 
 /// One 2048-byte sector.
 pub(super) const SECTOR: u64 = 2048;
-/// Batch size a linear handler reads at once (sectors). A partially-dead batch
-/// falls back to single-sector reads, so this only trades throughput on clean
-/// spans against granularity on dead ones.
+/// Batch size a linear handler reads at once (sectors). A failed batch is left
+/// bad whole (no per-sector re-read); Bisect salvages readable islands in it.
 const BATCH_SECTORS: u64 = 32;
 
 /// `Jump` handler: after this many consecutive failed batches it jumps to the
