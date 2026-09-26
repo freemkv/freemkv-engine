@@ -292,11 +292,8 @@ jobs:
           freemkv-i18n = { path = "../freemkv-i18n" }
           EOF
           done
-      # Since freemkv 1.7.6 the `freemkv` consumer's Linux target compiles a
-      # GTK4 + libadwaita desktop shell, so `cargo check` on it needs the
-      # pkg-config dev headers the `gtk4-sys`/`glib-sys` build.rs scripts
-      # probe. `autorip` is a CLI-only crate and doesn't need these — the
-      # install is cheap and covers both.
+      # freemkv's app build (`--features gui`) compiles a GTK4 + libadwaita
+      # shell, so checking it needs these pkg-config dev headers.
       - name: Install GTK4 + libadwaita development headers (for freemkv)
         run: |
           sudo apt-get update
@@ -312,6 +309,8 @@ jobs:
             freemkv
             autorip
       - run: cargo check --all-targets
+        working-directory: freemkv
+      - run: cargo check --all-targets --features gui
         working-directory: freemkv
       - run: cargo check --all-targets
         working-directory: autorip
