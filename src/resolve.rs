@@ -84,8 +84,6 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
 }
 
 // The decrypt gate the executors use, layered on the library gate.
-// See docs/resolve.md — closes the `aacs_error`-with-no-`aacs` gap the
-// library gate alone lets a disc pass through unresolved.
 pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
     disc.ensure_decryptable(raw)?;
     if disc.encrypted && !raw && !resolve_keys(disc).resolved {
@@ -119,9 +117,9 @@ pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> c
 mod tests {
     use super::*;
 
-    // Every `KeyStatus::summary` value this module can emit must be
-    // documented where a front-end will look for it, checked from the
-    // SOURCE so an undocumented addition fails loudly. See docs/resolve.md.
+    // Every `KeyStatus::summary` value this module can emit must be documented where a
+    // front-end will look for it, checked from the SOURCE so an undocumented addition fails
+    // loudly.
     #[test]
     fn every_emitted_key_summary_is_documented() {
         let src = include_str!("resolve.rs");

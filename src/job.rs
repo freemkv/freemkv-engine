@@ -4,8 +4,6 @@
 //! GUI selections, hands it to [`crate::preflight()`] to check it, then to
 //! [`crate::run`] to execute it. It carries no I/O handles and no callbacks —
 //! those arrive separately as the [`crate::Sink`].
-//!
-//! See docs/job.md — why `SubtitleFilter` is imported from `crate::streams`.
 
 use crate::streams::SubtitleFilter;
 
@@ -68,9 +66,6 @@ pub struct StreamChoice {
     pub audio: StreamFilter,
     /// Subtitle streams to keep, as two independent sides: full subtitles and
     /// forced ones. Default keeps everything on both sides.
-    ///
-    /// See docs/job.md — why this is one [`SubtitleFilter`] field rather than
-    /// two plain [`StreamFilter`] fields.
     pub subtitles: SubtitleFilter,
 }
 

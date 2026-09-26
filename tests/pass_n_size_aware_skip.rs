@@ -3,11 +3,6 @@
 //! Contract under test: a 100-sector bad range whose middle 50 sectors
 //! are readable must come back with that middle recovered, not leapt
 //! over, regardless of which internal mechanism does the recovering.
-//!
-//! See docs/pass-n-size-aware-skip.md for the original bug report, the
-//! now-deleted `range_remaining/4` skip-cap fix, and why this file kept
-//! its value after that mechanism was replaced by the handler chain in
-//! `recovery/section_recover.rs`.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::PatchOptions;
@@ -155,9 +150,8 @@ fn prep_iso_and_mapfile(
     }
 }
 
-// THE critical test: a 100-sector "bad" range hides 50 good sectors in
-// the middle (LBAs 125-174); the recovered middle is the contract.
-// See docs/pass-n-size-aware-skip.md for why.
+// THE critical test: a 100-sector "bad" range hides 50 good sectors in the middle (LBAs
+// 125-174); the recovered middle is the contract.
 #[test]
 fn patch_recovers_good_middle_of_a_bad_range() {
     let capacity_sectors: u32 = 1024;
@@ -410,9 +404,8 @@ fn patch_recovers_multiple_good_middles() {
     );
 }
 
-// 0.18 Pass N pipeline split: exercises the producer/consumer path
-// end-to-end, verifying bytes_good, Finished/NonTrimmed status, and
-// byte-exact writes. See docs/pass-n-size-aware-skip.md for detail.
+// 0.18 Pass N pipeline split: exercises the producer/consumer path end-to-end, verifying
+// bytes_good, Finished/NonTrimmed status, and byte-exact writes.
 #[test]
 fn patch_pipeline_split_recovers_and_records_correctly() {
     let capacity_sectors: u32 = 512;

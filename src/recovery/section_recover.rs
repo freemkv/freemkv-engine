@@ -1,5 +1,4 @@
 //! Handler-chain recovery of a single bad section (Pass-N rework, #55).
-//! See docs/section-recover.md for the full design rationale.
 //!
 //! A coordinator runs a chain of time-bounded recovery *handlers* (read
 //! backwards, forwards, fast, slow, bisect...) over one section's still-bad
@@ -27,19 +26,16 @@ const BATCH_SECTORS: u64 = 32;
 /// resumes rather than reading every dead sector.
 const JUMP_AFTER_FAILS: u32 = 2;
 
-// Early-yield: after this many consecutive unproductive reads, a handler
-// hands the still-bad set to the next handler instead of grinding its whole
-// budget on a dead zone. See docs/section-recover.md.
+// Early-yield: after this many consecutive unproductive reads, a handler hands the still-bad
+// set to the next handler instead of grinding its whole budget on a dead zone.
 const UNPRODUCTIVE_YIELD: u32 = 4;
 
-// Wedge abort: after this many CONSECUTIVE wedge-family senses, `read_span`
-// escalates to `Transport` and the whole pass aborts rather than hammering
-// remaining sections. See docs/section-recover.md for the full rationale.
+// Wedge abort: after this many CONSECUTIVE wedge-family senses, `read_span` escalates to
+// `Transport` and the whole pass aborts rather than hammering remaining sections.
 const WEDGE_ABORT_STREAK: u32 = 16;
 
-// A wedge-family failure only counts toward WEDGE_ABORT_STREAK if it came
-// back faster than this, so slow genuine ECC recovery doesn't false-trip
-// the wedge abort. See docs/section-recover.md.
+// A wedge-family failure only counts toward WEDGE_ABORT_STREAK if it came back faster than
+// this, so slow genuine ECC recovery doesn't false-trip the wedge abort.
 const WEDGE_FASTFAIL_MS: u64 = 500;
 
 // DELIBERATE DIVERGENCE from read_error.rs's WEDGE_ABORT_THRESHOLD (also 16, no
@@ -450,9 +446,8 @@ impl SectionHandler for Linear {
     }
 }
 
-/// Bisect + expand: probe the middle of a bad sub-range, and on a good read
-/// expand outward until a read fails, recovering the readable island in
-/// large batches. Failing ends re-bisect. See docs/section-recover.md.
+/// Bisect + expand: probe the middle of a bad sub-range, and on a good read expand outward
+/// until a read fails, recovering the readable island in large batches. Failing ends re-bisect.
 pub(super) struct Bisect {
     pub params: ReadParams,
 }
@@ -585,9 +580,8 @@ impl SectionHandler for Bisect {
     }
 }
 
-/// Blow through a LARGE dead run fast: after [`JUMP_AFTER_FAILS`] failed
-/// batches, skip ahead to the middle of what remains (halving, no fixed
-/// cap), leaving the skipped span bad. See docs/section-recover.md.
+/// Blow through a LARGE dead run fast: after [`JUMP_AFTER_FAILS`] failed batches, skip ahead to
+/// the middle of what remains (halving, no fixed cap), leaving the skipped span bad.
 pub(super) struct Jump {
     pub params: ReadParams,
 }
@@ -651,9 +645,8 @@ impl SectionHandler for Jump {
     }
 }
 
-/// SpeedSweep: per residual sector, try Max→Min spindle speeds until one
-/// reads (speed resonance means the sweet spot isn't always the slowest).
-/// Single-sector. See docs/section-recover.md.
+/// SpeedSweep: per residual sector, try Max→Min spindle speeds until one reads (speed resonance
+/// means the sweet spot isn't always the slowest). Single-sector.
 pub(super) struct SpeedSweep {
     pub params: ReadParams,
 }
@@ -721,9 +714,8 @@ impl SectionHandler for SpeedSweep {
     }
 }
 
-/// CachePrime: read the good run immediately preceding a residual island to
-/// lock the drive's PLL/servo, then read the island while the channel is
-/// warm. See docs/section-recover.md.
+/// CachePrime: read the good run immediately preceding a residual island to lock the drive's
+/// PLL/servo, then read the island while the channel is warm.
 pub(super) struct CachePrime {
     pub params: ReadParams,
 }
@@ -798,9 +790,8 @@ fn prime_above_is_in_range(pos: u64, capacity_sectors: u32) -> bool {
     (pos / SECTOR) + 1 < capacity_sectors as u64
 }
 
-/// Oscillate: read each residual sector by ALTERNATING approach
-/// (forward-into vs reverse-into priming), since a sector's servo lock can
-/// differ by approach direction. See docs/section-recover.md.
+/// Oscillate: read each residual sector by ALTERNATING approach (forward-into vs reverse-into
+/// priming), since a sector's servo lock can differ by approach direction.
 pub(super) struct Oscillate {
     pub params: ReadParams,
 }
@@ -903,14 +894,12 @@ impl SectionHandler for Oscillate {
     }
 }
 
-// EWMA smoothing factor for the decayed recovery rate: higher = more
-// reactive (leadership flips sooner), lower = steadier. See
-// docs/section-recover.md.
+// EWMA smoothing factor for the decayed recovery rate: higher = more reactive (leadership flips
+// sooner), lower = steadier.
 const SCORE_EWMA_ALPHA: f64 = 0.5;
 
-/// Per-rip handler scorecard: decayed recovery rate ([`SCORE_EWMA_ALPHA`]
-/// EWMA of bytes/second) so the coordinator runs whoever is winning *now*
-/// first. Ephemeral. See docs/section-recover.md.
+/// Per-rip handler scorecard: decayed recovery rate ([`SCORE_EWMA_ALPHA`] EWMA of bytes/second)
+/// so the coordinator runs whoever is winning *now* first. Ephemeral.
 #[derive(Default)]
 pub(super) struct HandlerScoreboard {
     stats: std::collections::HashMap<String, ScoreStat>,
@@ -937,9 +926,8 @@ impl HandlerScoreboard {
         }
     }
 
-    // Record one attempt: `recovered` bytes over `elapsed`. A barren attempt
-    // decays the score DOWN, letting an exhausted early winner lose its
-    // lead. See docs/section-recover.md.
+    // Record one attempt: `recovered` bytes over `elapsed`. A barren attempt decays the score
+    // DOWN, letting an exhausted early winner lose its lead.
     fn record(&mut self, name: &str, recovered: u64, elapsed: std::time::Duration) {
         let e = self.stats.entry(name.to_string()).or_default();
         e.recovered = e.recovered.saturating_add(recovered);
@@ -1279,9 +1267,8 @@ mod tests {
         (pos / SECTOR) as u32
     }
 
-    // read_span must refuse an empty (count == 0) span as a FAILED read in
-    // EVERY build, not just debug (pins a real Good-path-with-no-read bug).
-    // See docs/section-recover.md.
+    // read_span must refuse an empty (count == 0) span as a FAILED read in EVERY build, not
+    // just debug (pins a real Good-path-with-no-read bug).
     #[test]
     fn read_span_refuses_an_empty_span_as_a_failed_read() {
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
@@ -1484,8 +1471,7 @@ mod tests {
         );
     }
 
-    // Pins Linear's DIRECTION axis, which nothing else exercised. See
-    // docs/section-recover.md.
+    // Pins Linear's DIRECTION axis, which nothing else exercised.
     #[test]
     fn linear_reverse_recovers_a_batch_forward_cannot_approach() {
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
@@ -1905,9 +1891,8 @@ mod tests {
         }
     }
 
-    // Drives Oscillate::recover with the halt flag flipping after the
-    // flip_after-th read, returns (outcome, total reads). See
-    // docs/section-recover.md.
+    // Drives Oscillate::recover with the halt flag flipping after the flip_after-th read,
+    // returns (outcome, total reads).
     fn oscillate_halt_after(flip_after: u64) -> (HandlerOutcome, u64) {
         let dead = [5u32];
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
@@ -1983,9 +1968,8 @@ mod tests {
         );
     }
 
-    // Drives SpeedSweep::recover with the halt flag flipping after the
-    // flip_after-th read, returns (outcome, total reads). See
-    // docs/section-recover.md.
+    // Drives SpeedSweep::recover with the halt flag flipping after the flip_after-th read,
+    // returns (outcome, total reads).
     fn speed_sweep_halt_after(flip_after: u64) -> (HandlerOutcome, u64) {
         let dead = [5u32];
         let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
@@ -2312,9 +2296,8 @@ mod tests {
         assert_eq!(sink.got.get(&(13 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 
-    // A sector already handed to the sink must never be left in the
-    // residual bad set (Oscillate's prime reads, not just its target
-    // reads). See docs/section-recover.md.
+    // A sector already handed to the sink must never be left in the residual bad set
+    // (Oscillate's prime reads, not just its target reads).
     #[test]
     fn oscillate_never_leaves_a_sector_it_recovered_in_the_bad_set() {
         let (h, disc) = Harness::build(&[1u32], None, Duration::from_secs(1));
@@ -2360,8 +2343,8 @@ mod tests {
         }
     }
 
-    // Oscillate must not prime from past the end of the disc (reverse-into
-    // reads the sector ABOVE the target). See docs/section-recover.md.
+    // Oscillate must not prime from past the end of the disc (reverse-into reads the sector
+    // ABOVE the target).
     #[test]
     fn oscillate_does_not_prime_past_the_end_of_the_disc() {
         const CAP: u32 = 20;
@@ -2395,7 +2378,7 @@ mod tests {
     }
 
     // Pins prime_above_is_in_range at its three boundaries (named for the
-    // helper — it is all this test drives). See docs/section-recover.md.
+    // helper — it is all this test drives).
     #[test]
     fn prime_above_is_in_range_treats_an_unknown_capacity_as_no_bound() {
         assert!(

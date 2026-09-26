@@ -2,11 +2,6 @@
 //! than through crate internals: audio as an independent language set, a
 //! forced-subtitle language set independent of the non-forced one, and the
 //! legacy single-list path unchanged.
-//!
-//! See docs/stream-selection-forced.md for the user request that motivated
-//! this coverage and why each case matters. The unit tests in `streams.rs`
-//! cover the matcher; this file covers that the types are nameable,
-//! constructible and wired to the same behaviour from outside the crate.
 
 use freemkv_engine::{
     PidFilter, StreamFilter, SubtitleFilter, resolve_stream_selection,

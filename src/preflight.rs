@@ -75,12 +75,9 @@ impl Reason {
 /// Validate `job` against the already-scanned `disc`. Pure and side-effect
 /// free — safe to call on every UI selection change.
 ///
-/// Checks, cheapest first: the disc has titles; the selection resolves to a
-/// non-empty set of in-range indices; every language-filtered stream class
-/// the job asks for is carried by a selected title; and, if the disc is
-/// encrypted and the job is not `raw`, a usable key exists. See
-/// docs/preflight.md ("`preflight` — why each check exists") for the
-/// rationale behind each gate.
+/// Checks, cheapest first: the disc has titles; the selection resolves to a non-empty set of
+/// in-range indices; every language-filtered stream class the job asks for is carried by a
+/// selected title; and, if the disc is encrypted and the job is not `raw`, a usable key exists.
 pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     let mut reasons = Vec::new();
 
@@ -155,8 +152,6 @@ mod tests {
     use crate::job::RipMode;
 
     // Multipass implies raw, and the engine must be the place that knows it.
-    // See docs/preflight.md ("Test: `a_decrypting_multipass_job_is_blocked`")
-    // for why `decrypt`/`multipass` needed this test.
     #[test]
     fn a_decrypting_multipass_job_is_blocked() {
         let disc = disc_with(2, false, false);
@@ -196,9 +191,8 @@ mod tests {
         );
     }
 
-    // Every reason key this module can emit must be documented where a
-    // front-end will look for it. See docs/preflight.md
-    // ("Test: `every_emitted_reason_key_is_documented`") for the incident.
+    // Every reason key this module can emit must be documented where a front-end will look for
+    // it.
     #[test]
     fn every_emitted_reason_key_is_documented() {
         let src = include_str!("preflight.rs");
@@ -330,9 +324,8 @@ mod tests {
         assert_eq!(preflight(&d, &j), Preflight::Ready);
     }
 
-    // `is_ready` is the accessor a front-end greys out Start on; assert both
-    // directions against it, and against `reasons()`. See docs/preflight.md
-    // ("Test: `is_ready_agrees_with_the_variant_in_both_directions`").
+    // `is_ready` is the accessor a front-end greys out Start on; assert both directions against
+    // it, and against `reasons()`.
     #[test]
     fn is_ready_agrees_with_the_variant_in_both_directions() {
         let ready = preflight(
@@ -380,9 +373,7 @@ mod tests {
         assert_eq!(r.detail.as_deref(), Some("5"));
     }
 
-    // `Ready` has to mean the rip will actually rip something. See
-    // docs/preflight.md ("Test:
-    // `ready_implies_the_selection_resolves_to_at_least_one_title`").
+    // `Ready` has to mean the rip will actually rip something.
     #[test]
     fn ready_implies_the_selection_resolves_to_at_least_one_title() {
         let mut d = disc_with(3, false, false);
@@ -477,8 +468,6 @@ mod tests {
     }
 
     // `-a jpn` on a disc with no Japanese audio must be REFUSED, not run.
-    // See docs/preflight.md ("Test:
-    // `a_language_no_selected_title_carries_is_refused`").
     #[test]
     fn a_language_no_selected_title_carries_is_refused() {
         let d = disc_with_titles(vec![title_with_audio(&["eng", "deu"])]);

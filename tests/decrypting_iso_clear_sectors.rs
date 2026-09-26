@@ -1,24 +1,6 @@
-//! Regression suite for freemkv/freemkv#55 — "Can't rip to a decrypted ISO".
-//!
-//! A whole-disc decrypting sweep (`disc:// → iso://`) walks EVERY sector,
-//! including the UDF filesystem / BDMV nav sectors that live outside every
-//! title extent and are always clear. Those sectors must pass through the
-//! decrypting reader untouched.
-//!
-//! Two things went wrong on the reporter's disc:
-//!
-//! 1. The sweep installed the AACS key map but NOT the encrypted-content
-//!    extent map, so a clear filesystem unit whose first byte happens to have
-//!    the AACS CPI bits set (`byte0 & 0xC0 != 0` — true for ~3 of every 4
-//!    arbitrary bytes) was judged an un-keyable "orphan encrypted unit" and
-//!    the whole read failed with `DecryptFailed`.
-//! 2. The sweep's producer relabelled EVERY read error as
-//!    `Error::DiscRead` (E6000, "the disc may be dirty or scratched"), so the
-//!    decrypt failure was reported as a media fault at the batch's start LBA.
-//!
-//! Together they produced `E6000 Could not read the disc at sector 480` on a
-//! disc that reads perfectly, and the identical error when decrypting an
-//! already-ripped encrypted ISO (no drive involved at all).
+//! Whole-disc decryption must leave filesystem/navigation sectors outside content extents
+//! unchanged, even when their leading bits resemble encrypted AACS units.
+//! Decrypt refusals must retain their classification through the sweep pipeline.
 
 use freemkv_engine::SweepOptions;
 use libfreemkv::disc::{AacsState, DiscRegion, KeyOrigin};

@@ -5,9 +5,6 @@
 //! [`libfreemkv::io::Sink`] primitive. This module is the sweep-specific
 //! `Sink` impl; the producer-side state machine stays with the producer —
 //! the free `sweep` fn in `recovery/mod.rs`.
-//!
-//! See docs/sweep-sink.md for the throughput rationale and the
-//! correctness invariants preserved by the split.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -223,9 +220,8 @@ mod tests {
         d
     }
 
-    // The zero-fill loop must write EXACTLY the skipped range — under-fill
-    // leaves stale bytes the mapfile now claims are NonTrimmed, over-fill
-    // clobbers good data past the gap. See docs/sweep-sink.md.
+    // The zero-fill loop must write EXACTLY the skipped range — under-fill leaves stale bytes
+    // the mapfile now claims are NonTrimmed, over-fill clobbers good data past the gap.
     #[test]
     fn a_skip_fill_writes_exactly_the_gap_and_records_exactly_the_gap() {
         let dir = scratch("skipfill");
@@ -329,9 +325,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // `close` must surface a failed `sync_all` when the output is a regular
-    // file — the last barrier before `copy` reports a finished rip.
-    // See docs/sweep-sink.md for why the failure is genuine, not injected.
+    // `close` must surface a failed `sync_all` when the output is a regular file — the last
+    // barrier before `copy` reports a finished rip.
     #[cfg(unix)]
     #[test]
     fn a_failed_sync_all_is_an_error_when_the_output_is_regular() {
@@ -354,9 +349,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ...and must NOT surface it when the output is not a regular file
-    // (/dev/null and pipes always fail `sync_all`). See docs/sweep-sink.md
-    // for why this also checks the rest of `close`'s job ran.
+    // ...and must NOT surface it when the output is not a regular file (/dev/null and pipes
+    // always fail `sync_all`).
     #[cfg(unix)]
     #[test]
     fn a_failed_sync_all_is_exempt_when_the_output_is_not_regular() {

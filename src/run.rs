@@ -26,9 +26,8 @@ pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
     }
 }
 
-// Sets `done` on every exit path, including a panic unwind, since a plain
-// `store(true)` placed after the call is skipped by an unwind and the join
-// would hang forever. See docs/run.md — SignalDone.
+// Sets `done` on every exit path, including a panic unwind, since a plain `store(true)` placed
+// after the call is skipped by an unwind and the join would hang forever.
 pub(crate) struct SignalDone<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
 
 impl Drop for SignalDone<'_> {
@@ -37,9 +36,8 @@ impl Drop for SignalDone<'_> {
     }
 }
 
-// Wires a halt token, not just the progress callback, so Stop is honoured
-// even during a retry cooldown when no progress tick fires. See docs/run.md
-// — with_cancel_watcher.
+// Wires a halt token, not just the progress callback, so Stop is honoured even during a retry
+// cooldown when no progress tick fires.
 pub(crate) fn with_cancel_watcher<T>(
     sink: &dyn Sink,
     f: impl FnOnce(&std::sync::Arc<std::sync::atomic::AtomicBool>) -> T,
@@ -296,9 +294,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // Exercises the WATCHER, not the check-before-starting: a sink that stays
-    // uncancelled for the first few polls, so only a live watcher (not the
-    // entry check) can set the halt flag. See docs/run.md — the watcher test.
+    // Exercises the WATCHER, not the check-before-starting: a sink that stays uncancelled for
+    // the first few polls, so only a live watcher (not the entry check) can set the halt flag.
     #[test]
     fn a_cancel_raised_after_the_work_starts_is_still_observed() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -365,8 +362,7 @@ mod tests {
     }
 
     // `sectors_bad` must count DAMAGE, not un-swept territory: deriving it from
-    // `bytes_pending_total` made a flawless disc report ~12M bad sectors on the
-    // first tick. See docs/run.md — sectors_bad tests.
+    // `bytes_pending_total` made a flawless disc report ~12M bad sectors on the first tick.
     #[test]
     fn a_clean_disc_reports_no_bad_sectors_while_the_sweep_is_still_running() {
         use libfreemkv::progress::Progress as _;
@@ -410,9 +406,8 @@ mod tests {
         );
     }
 
-    // ...and it must COUNT the damage once there is some: the companion test
-    // uses an all-zero `PassProgress`, where `/`, `%` and `*` by 2048 all agree
-    // on `0`. See docs/run.md — sectors_bad tests.
+    // ...and it must COUNT the damage once there is some: the companion test uses an all-zero
+    // `PassProgress`, where `/`, `%` and `*` by 2048 all agree on `0`.
     #[test]
     fn sectors_bad_converts_bad_bytes_into_a_sector_count() {
         use libfreemkv::progress::Progress as _;
@@ -455,9 +450,8 @@ mod tests {
         );
     }
 
-    // A panic inside the watched call must PROPAGATE, not hang the join. The
-    // failure mode is a deadlock, so this runs the call on its own thread and
-    // asserts via a receive timeout. See docs/run.md — the panic test.
+    // A panic inside the watched call must PROPAGATE, not hang the join. The failure mode is a
+    // deadlock, so this runs the call on its own thread and asserts via a receive timeout.
     #[test]
     fn a_panic_inside_the_watched_call_propagates_instead_of_hanging() {
         struct NeverCancel;
@@ -485,9 +479,9 @@ mod tests {
         }
     }
 
-    // Stop must be honoured DURING a damage cooldown (3-30 s pauses that
-    // produce no progress ticks), not only after it. Reader fails with the
-    // NOT READY signature; assertion is wall-clock. See docs/run.md — cooldown test.
+    // Stop must be honoured DURING a damage cooldown (3-30 s pauses that produce no progress
+    // ticks), not only after it. Reader fails with the NOT READY signature; assertion is
+    // wall-clock.
     #[test]
     fn cancel_is_honoured_during_a_damage_cooldown() {
         struct NotReadyReader {

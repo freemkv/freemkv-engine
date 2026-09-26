@@ -1,29 +1,12 @@
-//! # freemkv-engine
+//! Shared rip orchestration and recovery strategy for freemkv front-ends.
 //!
-//! The freemkv **rip engine**: recovery STRATEGY (sweep/patch/retry/mapfile/
-//! damage-severity) plus rip ORCHESTRATION shared by every front-end, sitting
-//! above [`libfreemkv`]'s API and below the front-ends (each a thin shell
-//! supplying a [`Sink`] and a [`Job`]).
-//!
-//! ```text
-//! libfreemkv     ← library: SCSI, parse, decrypt, mux highway, the raw read
-//!                  primitive (single-shot, no retries) + SCSI-fact
-//!                  translation (SenseFamily)
-//! freemkv-engine ← THIS crate: recovery STRATEGY (sweep/patch/mapfile/
-//!                  retry-decisions/damage-severity) + rip ORCHESTRATION
-//!                  (multipass, job model, preflight, Sink)
-//!    ├── freemkv   ← CLI front-end
-//!    ├── autorip   ← service front-end (polling/staging/resume/web)
-//!    └── freemkv-gui ← desktop front-end (future)
-//! ```
-//!
-//! Crate-boundary rationale: docs/lib-layering.md. Two hard rules: (1)
-//! nothing prints — diagnostics flow through the [`Sink`]; (2)
-//! [`preflight()`] answers "can this job run, and if not why" as *data*.
+//! [`libfreemkv`] provides drive access, parsing, decryption, muxing and single-shot
+//! reads. This crate owns sweep/patch retries, mapfiles, preflight and job execution.
+//! Front-ends supply a [`Job`] and [`Sink`]; diagnostics flow through the sink.
+//! [`preflight()`] reports whether a job can run as data, without printing.
 
-// App-layer (unlike libfreemkv): may carry English diagnostic text;
-// front-ends localize via the message + code carried on events.
-// See docs/lib-unsafe-forbid.md — why `forbid`, not `deny`, on unsafe_code.
+// App-layer (unlike libfreemkv): may carry English diagnostic text; front-ends localize via the
+// message + code carried on events.
 #![forbid(unsafe_code)]
 
 pub mod drive_info;

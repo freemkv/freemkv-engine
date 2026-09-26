@@ -171,9 +171,8 @@ pub struct MapStats {
     pub main_lost_ms: f64,
 }
 
-// Revokes a `Mapfile`'s right to write its path, so an ABANDONED writer
-// thread (see `super::finish_bounded`) can't rewrite the file from a stale
-// snapshot after a resume. See docs/mapfile-disown.md for the full story.
+// Revokes a `Mapfile`'s right to write its path, so an ABANDONED writer thread (see
+// `super::finish_bounded`) can't rewrite the file from a stale snapshot after a resume.
 #[derive(Clone)]
 pub(crate) struct MapfileDisown(Arc<AtomicBool>);
 
@@ -193,13 +192,11 @@ impl MapfileDisown {
 /// interval of records — the file's payload bytes are unaffected.
 pub struct Mapfile {
     path: PathBuf,
-    /// The CANONICAL maximal-run partition of `[0, total_size)`: contiguous,
-    /// gapless, and (after any `record()`) with no two adjacent entries
-    /// sharing a status. Deliberately uncapped — that invariant IS the
-    /// bound, and the length is exactly the number of status runs the
-    /// disc's damage actually has (it shrinks as damage is recovered, not
-    /// just grows). `record()` is O(entries). See
-    /// docs/mapfile-entries-invariant.md for the full argument.
+    /// The CANONICAL maximal-run partition of `[0, total_size)`: contiguous, gapless, and
+    /// (after any `record()`) with no two adjacent entries sharing a status. Deliberately
+    /// uncapped — that invariant IS the bound, and the length is exactly the number of status
+    /// runs the disc's damage actually has (it shrinks as damage is recovered, not just grows).
+    /// `record()` is O(entries).
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
@@ -579,12 +576,10 @@ impl Mapfile {
     /// Total image size in bytes, FIXED at construction: the size handed to
     /// [`Mapfile::create`], or the end byte of the last entry [`Mapfile::load`] parsed.
     ///
-    /// It is NOT recomputed. [`Mapfile::record`] never touches it and never
-    /// bounds a range against it, so this is "the coverage this mapfile was
-    /// opened for", not "the end of the last entry as it stands now". It is
-    /// also `stats().bytes_total`, so a caller recording past it would show
-    /// a front-end ratio over 100%. See docs/mapfile-total-size.md for why
-    /// the two values coincide in practice.
+    /// It is NOT recomputed. [`Mapfile::record`] never touches it and never bounds a range
+    /// against it, so this is "the coverage this mapfile was opened for", not "the end of the
+    /// last entry as it stands now". It is also `stats().bytes_total`, so a caller recording
+    /// past it would show a front-end ratio over 100%.
     pub fn total_size(&self) -> u64 {
         self.total_size
     }
@@ -778,9 +773,8 @@ fn parse_hex(s: &str) -> io::Result<u64> {
 mod tests {
     use super::*;
 
-    // Pins this crate's `mapfile_path_for` to libfreemkv's `Disc::mapfile_for`
-    // (duplicated by necessity — libfreemkv can't depend back on this crate).
-    // See docs/mapfile-path-duplication.md for why and what's excluded.
+    // Pins this crate's `mapfile_path_for` to libfreemkv's `Disc::mapfile_for` (duplicated by
+    // necessity — libfreemkv can't depend back on this crate).
     #[test]
     fn agrees_with_libfreemkv_disc_mapfile_for() {
         let disc = libfreemkv::Disc {
@@ -868,9 +862,8 @@ mod tests {
         counts
     }
 
-    // `record()` leaves `entries` as the CANONICAL maximal-run partition of
-    // `[0, total_size)` (contiguous, gapless, no two adjacent entries sharing
-    // a status). See docs/mapfile-entries-invariant.md for why that bounds it.
+    // `record()` leaves `entries` as the CANONICAL maximal-run partition of `[0, total_size)`
+    // (contiguous, gapless, no two adjacent entries sharing a status).
     fn assert_canonical(mf: &Mapfile) {
         let es = mf.entries();
         assert!(!es.is_empty());
@@ -897,7 +890,6 @@ mod tests {
     }
 
     // The `Mapfile.entries` bound, measured rather than asserted from a doc.
-    // See docs/mapfile-fragmentation-bound.md for the full argument.
     #[test]
     fn fragmentation_peaks_then_collapses_as_damage_is_recovered() {
         let p = tmpfile("fragmentation_peaks_then_collapses");
@@ -1804,8 +1796,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    // A truncated data line is REFUSED, not skipped (skipping would shrink
-    // total_size and hide missing coverage). See docs/mapfile-truncated-line.md.
+    // A truncated data line is REFUSED, not skipped (skipping would shrink total_size and hide
+    // missing coverage).
     #[test]
     fn load_rejects_a_data_line_with_too_few_fields() {
         let p = tmpfile("load_shortline");
@@ -2195,9 +2187,8 @@ mod status_set_tests {
     }
 }
 
-// Loads a mapfile, distinguishing "there isn't one" from "there is one and
-// it is unreadable" — shared CLASSIFICATION, per-caller fail-safe VALUE.
-// See docs/mapfile-load-if-present.md for the three call sites' rationale.
+// Loads a mapfile, distinguishing "there isn't one" from "there is one and it is unreadable" —
+// shared CLASSIFICATION, per-caller fail-safe VALUE.
 pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfile>> {
     match Mapfile::load(path) {
         Ok(m) => Ok(Some(m)),
@@ -2285,9 +2276,8 @@ mod load_if_present_tests {
     }
 }
 
-// Does this mapfile describe the disc currently in the drive? Identity is
-// keys-XOR-vid (matching how the mapfile stores it); carrying neither is
-// `Ok` (legacy/unencrypted). See docs/mapfile-check-identity.md for why.
+// Does this mapfile describe the disc currently in the drive? Identity is keys-XOR-vid
+// (matching how the mapfile stores it); carrying neither is `Ok` (legacy/unencrypted).
 pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> io::Result<()> {
     let mismatch = || -> io::Error {
         libfreemkv::error::Error::MapfileInvalid {
@@ -2395,9 +2385,8 @@ mod check_mapfile_identity_tests {
         dir.join(name)
     }
 
-    // Neither the mapfile nor the disc carries an AACS identity (legacy
-    // mapfiles, unencrypted discs, CSS DVDs). Deliberately permissive; see
-    // docs/mapfile-check-identity.md.
+    // Neither the mapfile nor the disc carries an AACS identity (legacy mapfiles, unencrypted
+    // discs, CSS DVDs). Deliberately permissive.
     #[test]
     fn neither_identity_present_is_ok() {
         let p = tmpfile2("neither");

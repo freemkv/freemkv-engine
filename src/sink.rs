@@ -17,7 +17,6 @@ pub enum Level {
     Error,
 }
 
-// See docs/sink-progress-eta.md — why ETA/speed are engine-computed, not per-front-end.
 /// A progress tick during a rip. DERIVED data — `speed_bps` and `eta_secs`
 /// are computed ONCE by the engine (one smoothing algorithm, one
 /// remaining-bytes/speed formula) and never re-derived per front-end.

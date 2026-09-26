@@ -6,8 +6,6 @@
 //! identically), cancel is a full stop (not a per-title cancel), and a
 //! main-title default (via [`Selection`]) so an obfuscated disc doesn't rip
 //! everything by accident.
-//!
-//! See docs/mux.md — module history and the 2026-07-28 rationale.
 
 use crate::job::Selection;
 use crate::sink::{Level, Sink};
@@ -173,9 +171,8 @@ pub enum RipOutcome {
     NoKey,
     /// A title the user wanted (the feature, or an explicit `-t`) failed hard.
     ///
-    /// Carries both `code` and `kind` because libfreemkv reports a failure's
-    /// cause two different ways depending on its origin — see docs/mux.md for
-    /// why one field alone would blind a front-end to half the failures.
+    /// Carries both `code` and `kind` because libfreemkv reports a failure's cause two
+    /// different ways depending on its origin.
     Failed {
         title_index: usize,
         /// libfreemkv's numeric code, when the error carried one.
@@ -193,10 +190,9 @@ pub enum RipOutcome {
 /// without a real ISO. Production passes [`mux_title`] (or the consumer's
 /// own single-title mux). Self-contained — no `Disc` needed.
 ///
-/// Fails fast on a disc-level key error, treats cancel as a full stop, and
-/// skips skippable stubs only on a non-feature title in a multi-title,
-/// non-explicit rip (fatal otherwise). `explicit_selection` is `true` when
-/// the user named specific titles. See docs/mux.md for the full rationale.
+/// Fails fast on a disc-level key error, treats cancel as a full stop, and skips skippable
+/// stubs only on a non-feature title in a multi-title, non-explicit rip (fatal otherwise).
+/// `explicit_selection` is `true` when the user named specific titles.
 pub fn run_titles<F>(
     indices: &[usize],
     explicit_selection: bool,
@@ -357,9 +353,8 @@ fn mux_with_input(
     })
 }
 
-// The Sink↔libfreemkv bridge every mux runs inside, lifted out of
-// `mux_with_input` so it's testable against a closure without real media.
-// See docs/mux.md for why it's split out and what it's guarding against.
+// The Sink↔libfreemkv bridge every mux runs inside, lifted out of `mux_with_input` so it's
+// testable against a closure without real media.
 fn with_mux_watcher<T>(
     sink: &dyn Sink,
     f: impl FnOnce(&libfreemkv::Halt, Arc<dyn libfreemkv::MuxEvents>) -> T,
@@ -551,8 +546,8 @@ mod tests {
         assert_eq!(resolve_selection(&d, &Selection::Longest), vec![3]);
     }
 
-    // Ties go to the FIRST title, not the last (`max_by` would pick the LAST
-    // of equal maxima, i.e. a decoy). See docs/mux.md for why.
+    // Ties go to the FIRST title, not the last (`max_by` would pick the LAST of equal maxima,
+    // i.e. a decoy).
     #[test]
     fn selection_longest_breaks_a_tie_towards_the_first_title() {
         let mut d = disc(5, false, false);
@@ -568,9 +563,8 @@ mod tests {
         );
     }
 
-    // A non-finite duration must never win, INCLUDING as the first title
-    // (`t > NaN` is false for every `t`, so a leading NaN is never
-    // displaced). See docs/mux.md.
+    // A non-finite duration must never win, INCLUDING as the first title (`t > NaN` is false
+    // for every `t`, so a leading NaN is never displaced).
     #[test]
     fn selection_longest_ignores_a_leading_title_with_no_measurable_duration() {
         let mut d = disc(3, false, false); // 60, 120, 180
@@ -618,8 +612,8 @@ mod tests {
         );
     }
 
-    // The range filter is `i < n`, and `n` itself is out of range — pins the
-    // boundary that `<` vs `<=` off-by-one bugs hide behind. See docs/mux.md.
+    // The range filter is `i < n`, and `n` itself is out of range — pins the boundary that `<`
+    // vs `<=` off-by-one bugs hide behind.
     #[test]
     fn selection_explicit_index_equal_to_the_title_count_is_out_of_range() {
         let d = disc(3, false, false); // valid indices are 0, 1, 2
@@ -635,9 +629,8 @@ mod tests {
         );
     }
 
-    // A lone selected title is NOT a multi-title rip: `multi_title =
-    // indices.len() > 1` guards against silently swallowing a single-title
-    // stub as a "successful" empty rip. See docs/mux.md.
+    // A lone selected title is NOT a multi-title rip: `multi_title = indices.len() > 1` guards
+    // against silently swallowing a single-title stub as a "successful" empty rip.
     #[test]
     fn a_single_non_explicit_title_stub_is_fatal_not_skipped() {
         let d = disc(4, false, false); // durations 60..240 → longest is index 3
@@ -700,9 +693,9 @@ mod tests {
         }
     }
 
-    // The mux must not start work it has ALREADY been told to stop; the sink
-    // here answers `true` exactly ONCE (the pre-check), `false` after, so
-    // only the pre-check can cancel the token. See docs/mux.md.
+    // The mux must not start work it has ALREADY been told to stop; the sink here answers
+    // `true` exactly ONCE (the pre-check), `false` after, so only the pre-check can cancel the
+    // token.
     #[test]
     fn an_already_cancelled_sink_halts_the_mux_before_it_starts() {
         struct CancelledOnce {
@@ -724,9 +717,8 @@ mod tests {
         );
     }
 
-    // A Stop pressed once the mux is under way must reach the muxer via the
-    // watcher's poll, not the pre-check (the sink only starts cancelling
-    // AFTER the mux begins). See docs/mux.md.
+    // A Stop pressed once the mux is under way must reach the muxer via the watcher's poll, not
+    // the pre-check (the sink only starts cancelling AFTER the mux begins).
     #[test]
     fn a_cancel_during_the_mux_reaches_the_halt_token() {
         struct CancelOnceStarted {
@@ -751,8 +743,8 @@ mod tests {
         );
     }
 
-    // Write-progress from the muxer must arrive at the sink as a `mux` tick
-    // via the channel + watcher drain bridge. See docs/mux.md.
+    // Write-progress from the muxer must arrive at the sink as a `mux` tick via the channel +
+    // watcher drain bridge.
     #[test]
     fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
         let sink = RecordingSink::default();
@@ -770,9 +762,8 @@ mod tests {
         assert_eq!(p.bytes_total, 8192);
     }
 
-    // A panic inside the mux must still release the watcher, or an unwind
-    // skips storing `done` and the watcher loops forever — a hang, not a
-    // failure. Bounded here for that reason. See docs/mux.md.
+    // A panic inside the mux must still release the watcher, or an unwind skips storing `done`
+    // and the watcher loops forever — a hang, not a failure. Bounded here for that reason.
     #[test]
     fn a_panicking_mux_still_releases_the_watcher() {
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -865,9 +856,8 @@ mod tests {
         );
     }
 
-    // A rip that writes NO title must say so, whatever emptied it (empty
-    // `indices`, or every title a skippable stub) — the outcome stays `Ok`
-    // but must not be SILENT. See docs/mux.md.
+    // A rip that writes NO title must say so, whatever emptied it (empty `indices`, or every
+    // title a skippable stub) — the outcome stays `Ok` but must not be SILENT.
     #[test]
     fn a_rip_that_writes_nothing_says_so_rather_than_returning_a_silent_ok() {
         #[derive(Default)]
@@ -923,9 +913,9 @@ mod tests {
         assert_eq!(outcome, RipOutcome::Ok { titles_written: 2 });
     }
 
-    // The cause on `Failed` must actually discriminate: three failures, three
-    // distinguishable causes, each legible through the field that carries
-    // its meaning (typed vs passthrough OS error). See docs/mux.md.
+    // The cause on `Failed` must actually discriminate: three failures, three distinguishable
+    // causes, each legible through the field that carries its meaning (typed vs passthrough OS
+    // error).
     #[test]
     fn the_failure_cause_says_which_failure_it_was() {
         let d = disc(3, false, false);
@@ -1043,9 +1033,8 @@ mod tests {
         assert_eq!(outcome, RipOutcome::Halted);
     }
 
-    // A repeated `-t` index must produce ONE entry, or `titles_written`
-    // over-counts against the disk and `multi_title` misfires. See
-    // docs/mux.md.
+    // A repeated `-t` index must produce ONE entry, or `titles_written` over-counts against the
+    // disk and `multi_title` misfires.
     #[test]
     fn duplicate_title_indices_are_deduped_preserving_first_seen_order() {
         let d = disc(4, false, true);

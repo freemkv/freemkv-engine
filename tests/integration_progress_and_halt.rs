@@ -52,8 +52,6 @@ impl SectorSource for ZeroSectorReader {
     }
 }
 
-// See docs/halting-zero-sector-reader.md — self-halting reader used to
-// assert on a read count instead of a stopwatch.
 struct HaltingZeroSectorReader {
     capacity: u32,
     halt: Arc<AtomicBool>,

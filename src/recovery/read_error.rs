@@ -6,7 +6,7 @@
 //! in-flight context (counters, damage window, retry budgets), and
 //! returns a `ReadAction` the caller dispatches on.
 //!
-//! Pass N does not route here — see docs/read-error.md.
+//! Pass N does not route here.
 //!
 //! Adding a new error class = add one arm in `handle_read_error`.
 
@@ -102,12 +102,9 @@ pub struct ReadCtx {
     /// good reads after the last error in the cluster." Used to count
     /// zone entries and to bound zone_reads accurately.
     pub in_damage_zone: bool,
-    /// Count of long-streak pause escalations taken this pass — the
-    /// `consecutive_failures >= CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD`
-    /// branch of the pause selection. Reported in the pass summary so an
-    /// operator can see how often the drive was in a long failure streak.
-    /// See docs/read-error.md for why the branch is kept even though it
-    /// currently resolves to the same pause duration as the ordinary case.
+    /// Count of long-streak pause escalations taken this pass — the `consecutive_failures >=
+    /// CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD` branch of the pause selection. Reported in the
+    /// pass summary so an operator can see how often the drive was in a long failure streak.
     pub long_pause_escalations: u64,
     /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
     /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
@@ -118,14 +115,12 @@ pub struct ReadCtx {
 }
 
 impl ReadCtx {
-    /// Initial context for a Pass 1 sweep: `batch` sectors per read. Tuned
-    /// for "fast and accurate" — a failed batch becomes `SkipBlock`
-    /// (NonTrimmed, left for Pass N to revisit), and the damage-jump
-    /// fast path triggers after just 1 consecutive outer-batch failure so
-    /// Pass 1 jumps immediately rather than grinding the same LBA.
-    /// Transient errors still get a small bounded number of retries
-    /// (`NOT_READY_MAX_RETRIES` / `BRIDGE_DEGRADATION_MAX_RETRIES`).
-    /// See docs/read-error.md for the wedge-prevention rationale.
+    /// Initial context for a Pass 1 sweep: `batch` sectors per read. Tuned for "fast and
+    /// accurate" — a failed batch becomes `SkipBlock` (NonTrimmed, left for Pass N to revisit),
+    /// and the damage-jump fast path triggers after just 1 consecutive outer-batch failure so
+    /// Pass 1 jumps immediately rather than grinding the same LBA. Transient errors still get a
+    /// small bounded number of retries (`NOT_READY_MAX_RETRIES` /
+    /// `BRIDGE_DEGRADATION_MAX_RETRIES`).
     pub fn for_sweep(batch: u16) -> Self {
         Self {
             batch,
@@ -154,12 +149,10 @@ impl ReadCtx {
         }
     }
 
-    /// Initial context for a Pass 2-N patch: `batch` sectors per read.
-    /// The fast-jump threshold is loose (window-based jump only) since
-    /// Pass N exists to recover scattered sectors Pass 1 skipped, and
-    /// `damage_threshold_pct` uses [`PATCH_DAMAGE_THRESHOLD_PCT`] (6%,
-    /// tighter than Pass 1's 12%) to converge faster on bad sub-zones.
-    /// No production caller — see docs/read-error.md.
+    /// Initial context for a Pass 2-N patch: `batch` sectors per read. The fast-jump threshold
+    /// is loose (window-based jump only) since Pass N exists to recover scattered sectors Pass
+    /// 1 skipped, and `damage_threshold_pct` uses [`PATCH_DAMAGE_THRESHOLD_PCT`] (6%, tighter
+    /// than Pass 1's 12%) to converge faster on bad sub-zones. No production caller.
     pub fn for_patch(batch: u16) -> Self {
         Self {
             batch,
@@ -276,12 +269,11 @@ pub enum ReadAction {
     AbortPass,
 }
 
-// Pause budget constants: give the drive and bridge time to settle
-// after a failed read. Applied by Pass 1 sweep; Pass N's pauses live
-// in section_recover.rs today. See docs/read-error.md for tuning history.
+// Pause budget constants: give the drive and bridge time to settle after a failed read. Applied
+// by Pass 1 sweep; Pass N's pauses live in section_recover.rs today.
 const FAIL_PAUSE_SECS: u64 = 5;
-// Long cooldown on the FIRST failure after a clean run, before retries
-// can push the drive toward firmware fast-fail. See docs/read-error.md.
+// Long cooldown on the FIRST failure after a clean run, before retries can push the drive
+// toward firmware fast-fail.
 pub(crate) const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
 // Cooldown for a long failure streak; same value as FAIL_PAUSE_SECS,
 // kept as a separate name so the escalation is explicit at call sites.
@@ -293,9 +285,8 @@ const NOT_READY_MAX_RETRIES: u32 = 3;
 const BRIDGE_DEGRADATION_PAUSE_SECS: u64 = 15;
 const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
 
-// Base of the damage-jump formula: jump_sectors = JUMP_BASE_SECTORS *
-// batch * jump_multiplier. Sized so the first jump clears a whole
-// damage cluster in ~2 doublings. See docs/read-error.md for the tuning history.
+// Base of the damage-jump formula: jump_sectors = JUMP_BASE_SECTORS * batch * jump_multiplier.
+// Sized so the first jump clears a whole damage cluster in ~2 doublings.
 const JUMP_BASE_SECTORS: u64 = 1024;
 
 // Firmware-wedge skip policy: a damaged drive's firmware can latch into
@@ -1029,9 +1020,9 @@ mod tests {
         }
     }
 
-    // The WINDOW trigger, isolated from the fast-entry trigger: disable the
-    // fast path (`u64::MAX`, as Pass N does) so only the window can fire,
-    // then pin both no-jump-while-short and jump-on-fill. See docs/read-error.md.
+    // The WINDOW trigger, isolated from the fast-entry trigger: disable the fast path
+    // (`u64::MAX`, as Pass N does) so only the window can fire, then pin both
+    // no-jump-while-short and jump-on-fill.
     #[test]
     fn damage_window_fills_then_jumps() {
         let mut ctx = ReadCtx::for_sweep(1);
@@ -1396,9 +1387,9 @@ mod tests {
         }
     }
 
-    // The long-streak pause escalation: its pause equals the ordinary one,
-    // so `ReadCtx::long_pause_escalations` is what makes the branch and its
-    // threshold observable/pinnable at all. See docs/read-error.md.
+    // The long-streak pause escalation: its pause equals the ordinary one, so
+    // `ReadCtx::long_pause_escalations` is what makes the branch and its threshold
+    // observable/pinnable at all.
     #[test]
     fn the_long_streak_escalation_fires_at_its_threshold() {
         let mut ctx = ReadCtx::for_patch(1);

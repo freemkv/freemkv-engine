@@ -1,12 +1,10 @@
 //! Pass-N (`freemkv_engine::patch`) read-error handler — A/B golden fixture.
 //!
-//! Pins the end-to-end behaviour of `freemkv_engine::patch` over eight
-//! canonical damage profiles against a synthetic `ScriptedSectorReader`:
-//! final mapfile byte counts plus an upper bound on read count, so any
-//! change to the Pass-N failure path preserves the goldens or fails loudly.
-//! Pass N's recovery is the handler chain in `recovery/section_recover.rs`
-//! driven by `recovery/patch.rs` — NOT `read_error::handle_read_error`.
-//! See docs/passn-handler-ab.md for the full split and golden-value history.
+//! Pins the end-to-end behaviour of `freemkv_engine::patch` over eight canonical damage
+//! profiles against a synthetic `ScriptedSectorReader`: final mapfile byte counts plus an upper
+//! bound on read count, so any change to the Pass-N failure path preserves the goldens or fails
+//! loudly. Pass N's recovery is the handler chain in `recovery/section_recover.rs` driven by
+//! `recovery/patch.rs` — NOT `read_error::handle_read_error`.
 
 use freemkv_engine::CopyOptions;
 use freemkv_engine::{Mapfile, SectorStatus};
@@ -703,9 +701,7 @@ fn profile_08_batch_fail_singles_ok() {
     );
 }
 
-// Run a single-always-bad-sector (LBA 130, inside a NonTrimmed [128,192)
-// range) patch pass; returns final map stats (256-sector synthetic disc).
-// Coverage + the sense-family invariant history: docs/passn-handler-ab.md.
+// Patch a 256-sector disc with one unreadable sector at LBA 130 and report final map stats.
 fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats {
     let capacity_sectors: u32 = 256;
     let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);

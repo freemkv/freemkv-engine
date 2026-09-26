@@ -6,8 +6,6 @@
 //! and decrypt, so the channel carries clean cleartext bytes. It runs over
 //! a depth-1 channel ([`libfreemkv::io::pipeline::WRITE_THROUGH_DEPTH`]) so
 //! back-pressure kicks in immediately.
-//!
-//! See `docs/patch-pipeline.md` for rationale and correctness invariants.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -80,26 +78,20 @@ pub(super) enum PatchItem {
     /// the range as `Unreadable`. No file write — the existing zero-fill
     /// from sweep is preserved in place.
     ///
-    /// Currently unused by `Disc::patch` itself; kept for the
-    /// orchestrator-side end-of-recovery promotion. See
-    /// `docs/patch-pipeline.md` ("PatchItem::Unreadable") for why.
+    /// Currently unused by `Disc::patch` itself; kept for the orchestrator-side end-of-recovery
+    /// promotion.
     #[allow(dead_code)]
     Unreadable { pos: u64, len: u64 },
 
-    /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH
-    /// the per-range skip-limit case (remaining bytes never tried) AND
-    /// individual sector failures (tried-but-failed within a pass).
-    /// Both stay "hopeful" — a later pass retries them; promotion to
-    /// true `Unreadable` is the orchestrator's job, applied once after
-    /// all retry passes complete. See `docs/patch-pipeline.md`
-    /// ("PatchItem::NonTrimmed") for why failures aren't marked
-    /// `Unreadable` immediately.
+    /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH the per-range skip-limit
+    /// case (remaining bytes never tried) AND individual sector failures (tried-but-failed
+    /// within a pass). Both stay "hopeful" — a later pass retries them; promotion to true
+    /// `Unreadable` is the orchestrator's job, applied once after all retry passes complete.
     NonTrimmed { pos: u64, len: u64 },
 }
 
-// Mapfile snapshot the sink republishes after every record so the producer
-// can drive stall / progress logic without holding the mapfile lock. Derived
-// figures over the DAMAGE set. See docs/patch-pipeline.md ("SharedPatchState").
+// Mapfile snapshot the sink republishes after every record so the producer can drive stall /
+// progress logic without holding the mapfile lock. Derived figures over the DAMAGE set.
 pub(super) struct SharedPatchState {
     pub stats: MapStats,
     /// Damage bytes intersecting the main title's extents, over the COMPLETE
@@ -336,9 +328,8 @@ pub(super) fn compute_initial_state(
     ))
 }
 
-// One recovery read of `[lba, lba+count)` into `buf[..count*2048]`. `recovery`
-// selects the SCSI timeout (60 s deep vs fast); `fua` forces the drive to
-// bypass readahead and re-fetch. See docs/patch-pipeline.md ("recovery_read").
+// One recovery read of `[lba, lba+count)` into `buf[..count*2048]`. `recovery` selects the SCSI
+// timeout (60 s deep vs fast); `fua` forces the drive to bypass readahead and re-fetch.
 pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     reader: &mut R,
     decrypt_is_aacs: bool,
@@ -393,9 +384,8 @@ pub(super) struct SubRanges {
     ranges: Vec<(u64, u64)>,
 }
 
-// Widen a mapfile byte-range outward to whole 2048-byte sectors: the single
-// ingress establishing the "all offsets are sector multiples" invariant.
-// See docs/patch-pipeline.md ("snap_to_sectors").
+// Widen a mapfile byte-range outward to whole 2048-byte sectors: the single ingress
+// establishing the "all offsets are sector multiples" invariant.
 fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
     super::snap_to_sectors(pos, len)
 }
@@ -645,9 +635,8 @@ struct PatchCtx<'a, 'o> {
     wedge_streak: u32,
 }
 
-// Build the handler chain for one breadth-first tier (0 fast scouts, 1
-// slow-deep, 2 marginal specialists). The scorecard re-orders WITHIN a tier;
-// see docs/patch-pipeline.md ("build_tier_handlers") for the full roster.
+// Build the handler chain for one breadth-first tier (0 fast scouts, 1 slow-deep, 2 marginal
+// specialists). The scorecard re-orders WITHIN a tier.
 fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
     match tier {
         // Tier 0 — fast scouts. Bisect leads by default (probing a range's
@@ -746,9 +735,8 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
     }
 }
 
-// The FLAT handler pool — every technique from all tiers in ONE chain
-// (data-driven bandit, no tier gate). Enabled by `FREEMKV_PATCH_FLAT`; see
-// docs/patch-pipeline.md ("build_flat_pool").
+// The FLAT handler pool — every technique from all tiers in ONE chain (data-driven bandit, no
+// tier gate). Enabled by `FREEMKV_PATCH_FLAT`
 fn build_flat_pool() -> Vec<Box<dyn SectionHandler>> {
     let mut pool = Vec::new();
     for tier in 0..PATCH_TIERS {
@@ -775,9 +763,8 @@ pub(super) fn pass_kind(initial_batch: u16, reverse: bool) -> libfreemkv::progre
     }
 }
 
-// The scheduler knobs, as pure functions of the raw env value: lets tests
-// pin parsing without WRITING to the process environment. See
-// docs/patch-pipeline.md ("flat_mode_from_value").
+// The scheduler knobs, as pure functions of the raw env value: lets tests pin parsing without
+// WRITING to the process environment.
 fn flat_mode_from_value(v: Option<&str>) -> bool {
     matches!(v, Some(v) if !v.is_empty() && v != "0")
 }
@@ -826,9 +813,8 @@ fn patch_flat_mode() -> bool {
     flat_mode_from_value(std::env::var("FREEMKV_PATCH_FLAT").ok().as_deref())
 }
 
-// The deadline `budget_secs` seconds from `now`, saturating instead of
-// panicking on an unbounded env-sourced value. See docs/patch-pipeline.md
-// ("handler_deadline").
+// The deadline `budget_secs` seconds from `now`, saturating instead of panicking on an
+// unbounded env-sourced value.
 fn handler_deadline(now: std::time::Instant, budget_secs: u64) -> std::time::Instant {
     let mut secs = budget_secs;
     loop {
@@ -1974,9 +1960,7 @@ mod tests {
         );
     }
 
-    // A reader that under-delivers must not have its buffer believed. See
-    // docs/patch-pipeline.md ("recovery_read_rejects_a_short_transfer") for
-    // the mutation this catches and why both branches are exercised.
+    // A reader that under-delivers must not have its buffer believed.
     #[test]
     fn recovery_read_rejects_a_short_transfer_on_both_branches() {
         /// Reports `Ok(full)` while filling only the FIRST sector.

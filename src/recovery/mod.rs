@@ -4,8 +4,6 @@
 //! Mirrors the original `disc/` module topology 1:1: `mapfile.rs`,
 //! `read_error.rs`, `section_recover.rs`, `patch.rs`, and the private
 //! `sweep.rs` producer/consumer plumbing are unchanged in logic.
-//!
-//! See docs/recovery.md for the full relocation-fidelity design note.
 
 use libfreemkv::disc::{bytes_bad_in_title, locate_ranges};
 use libfreemkv::error::{Error, Result};
@@ -42,9 +40,7 @@ fn classify_pass_abort(err: Error, block_lba: u32) -> Error {
     }
 }
 
-// A SHORT transfer is a FAILED read, never a partial success — see
-// docs/recovery.md ("require_full_read") for why a short `Ok(n)` must be
-// rejected rather than trusted.
+// A SHORT transfer is a FAILED read, never a partial success.
 fn require_full_read(result: Result<usize>, requested: usize, lba: u32) -> Result<usize> {
     match result {
         Ok(n) if n == requested => Ok(n),
@@ -131,9 +127,8 @@ pub fn copy(
             );
             return sweep_internal(disc, reader, path, opts, false);
         }
-        // `bytes_nontried == 0` is implied by `bad_bytes == 0` (subset), so
-        // inverting it is an equivalent mutant — don't chase it. See
-        // docs/recovery.md ("Equivalent mutants in `copy` / `sweep`").
+        // `bytes_nontried == 0` is implied by `bad_bytes == 0` (subset), so inverting it is an
+        // equivalent mutant — don't chase it.
         if covers_disc && bad_bytes == 0 && stats.bytes_nontried == 0 && iso_is_intact {
             // Every sector is Finished AND the image it describes is intact —
             // a prior copy completed. Re-issuing the command is a no-op
@@ -215,17 +210,15 @@ pub fn copy(
     sweep_internal(disc, reader, path, opts, false)
 }
 
-// What goes in the mapfile's `# Rescue Logfile. Created by …` header — must
-// name the crate that actually wrote the file. See docs/recovery.md
-// ("MAPFILE_CREATOR") for why.
+// What goes in the mapfile's `# Rescue Logfile. Created by …` header — must name the crate that
+// actually wrote the file.
 pub(crate) const MAPFILE_CREATOR: &str = concat!("freemkv-engine v", env!("CARGO_PKG_VERSION"));
 
 /// Sectors in one AACS aligned unit (6144 bytes = 3 sectors).
 const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16;
 
-// Round a sweep's batch size up to a whole number of AACS aligned units, so
-// no read handed to the decrypting reader straddles a unit boundary. See
-// docs/recovery.md ("aacs_aligned_batch") for the full failure mode.
+// Round a sweep's batch size up to a whole number of AACS aligned units, so no read handed to
+// the decrypting reader straddles a unit boundary.
 pub(crate) fn aacs_aligned_batch(batch: u16, decrypt_is_aacs: bool) -> u16 {
     if decrypt_is_aacs && !batch.is_multiple_of(UNIT_SECTORS) {
         return batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
@@ -233,9 +226,8 @@ pub(crate) fn aacs_aligned_batch(batch: u16, decrypt_is_aacs: bool) -> u16 {
     batch
 }
 
-// Anchor a region's read cursor DOWN to the nearest AACS unit boundary, since
-// a resume `NonTried` region can begin mid-unit. See docs/recovery.md
-// ("aacs_aligned_region_start"); sibling of `aacs_aligned_batch`.
+// Anchor a region's read cursor DOWN to the nearest AACS unit boundary, since a resume
+// `NonTried` region can begin mid-unit.
 pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) -> u64 {
     if !decrypt_is_aacs {
         return region_pos;
@@ -247,9 +239,8 @@ pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) 
     region_pos - (region_pos % unit)
 }
 
-// Widen the PHYSICAL read of a region's LAST block out to whole AACS units —
-// the third corner of the alignment invariant (siblings: `aacs_aligned_batch`,
-// `aacs_aligned_region_start`). See docs/recovery.md ("aacs_aligned_read_bytes").
+// Widen the PHYSICAL read of a region's LAST block out to whole AACS units — the third corner
+// of the alignment invariant (siblings: `aacs_aligned_batch`, `aacs_aligned_region_start`).
 pub(crate) fn aacs_aligned_read_bytes(
     pos: u64,
     block_bytes: u64,
@@ -277,8 +268,8 @@ mod sleep_secs_or_halt_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    // The pause must actually happen (a mutation run once replaced the whole
-    // function with `()` and the suite stayed green). See docs/recovery.md.
+    // The pause must actually happen (a mutation run once replaced the whole function with `()`
+    // and the suite stayed green).
     #[test]
     fn it_actually_sleeps_when_not_halted() {
         let halt = Arc::new(AtomicBool::new(false));
@@ -490,9 +481,8 @@ mod aacs_aligned_read_bytes_tests {
     }
 }
 
-// What the output image's length is, for a resume decision. `NotFound` is the
-// ONE error meaning "no file yet"; every other error must propagate rather
-// than be treated as zero — see docs/recovery.md ("IsoLen").
+// What the output image's length is, for a resume decision. `NotFound` is the ONE error meaning
+// "no file yet"; every other error must propagate rather than be treated as zero.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum IsoLen {
     /// The file is genuinely absent.
@@ -509,9 +499,9 @@ pub(crate) fn iso_len_from_metadata(m: std::io::Result<std::fs::Metadata>) -> Re
     }
 }
 
-// The image a mapfile describes, measured against the length it should be —
-// ONE definition shared by `copy`, `sweep` AND `patch` so the "is this image
-// trustworthy" check can't drift between call sites. See docs/recovery.md.
+// The image a mapfile describes, measured against the length it should be — ONE definition
+// shared by `copy`, `sweep` AND `patch` so the "is this image trustworthy" check can't drift
+// between call sites.
 pub(crate) struct ImageState {
     // Length on disk; a missing file reports 0 (self-heals the same as empty).
     pub(crate) len: u64,
@@ -532,8 +522,8 @@ impl ImageState {
     }
 }
 
-// Measure `path` against the length a mapfile expects of it. A stat failure
-// other than "not found" is an error, never silently 0 — see docs/recovery.md.
+// Measure `path` against the length a mapfile expects of it. A stat failure other than "not
+// found" is an error, never silently 0.
 pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageState> {
     let len = match iso_len_from_metadata(std::fs::metadata(path))? {
         IsoLen::Missing => 0,
@@ -542,9 +532,8 @@ pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageStat
     Ok(ImageState { len, want })
 }
 
-// Whether the output is a REGULAR FILE — governs sync_all-failure severity
-// and pre-sizing. A metadata error defaults to `true` (patch's prior
-// behavior); see docs/recovery.md ("output_is_regular").
+// Whether the output is a REGULAR FILE — governs sync_all-failure severity and pre-sizing. A
+// metadata error defaults to `true` (patch's prior behavior).
 pub(crate) fn output_is_regular(m: std::io::Result<std::fs::Metadata>) -> bool {
     m.map(|md| md.file_type().is_file()).unwrap_or(true)
 }
@@ -575,15 +564,14 @@ pub(crate) fn sweep_batch_sectors(
     }
 }
 
-// Deadline for ONE producer→consumer handoff on a recovery pipeline. Reuses
-// `JOIN_TIMEOUT_SECS` (600s, the same budget `finish_with_halt` gives the
-// consumer at join) rather than inventing a second number. See docs/recovery.md.
+// Deadline for ONE producer→consumer handoff on a recovery pipeline. Reuses `JOIN_TIMEOUT_SECS`
+// (600s, the same budget `finish_with_halt` gives the consumer at join) rather than inventing a
+// second number.
 const SEND_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS);
 
-// Why a send failed: Stop pressed vs. consumer died vs. consumer alive but
-// stalled past `SEND_DEADLINE`. `send_with_halt` collapses all three into
-// `Err(item)`; see docs/recovery.md ("SendStall") for why that must be split.
+// Why a send failed: Stop pressed vs. consumer died vs. consumer alive but stalled past
+// `SEND_DEADLINE`. `send_with_halt` collapses all three into `Err(item)`
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum SendStall {
     /// The halt token fired while the producer was waiting for a slot. Not an
@@ -611,9 +599,8 @@ impl SendStall {
     }
 }
 
-// Halt-aware, deadline-bounded replacement for `pipe.send(item)`. Fixes a
-// plain `Pipeline::send` blocking forever on a stalled-but-alive consumer.
-// See docs/recovery.md ("send_bounded").
+// Halt-aware, deadline-bounded replacement for `pipe.send(item)`. Fixes a plain
+// `Pipeline::send` blocking forever on a stalled-but-alive consumer.
 pub(crate) fn send_bounded<I: Send + 'static, R: Send + 'static>(
     pipe: &libfreemkv::io::pipeline::Pipeline<I, R>,
     item: I,
@@ -656,9 +643,8 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
     }
 }
 
-// Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive
-// consumer gets a grace spin, then is abandoned, instead of blocking `finish`
-// forever. See docs/recovery.md ("finish_bounded").
+// Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive consumer gets a
+// grace spin, then is abandoned, instead of blocking `finish` forever.
 pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
     pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
     halt: &libfreemkv::halt::Halt,
@@ -669,9 +655,8 @@ pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
     pipe.finish_with_halt(Some(halt))
 }
 
-// `finish_bounded` for a sink that owns the `Mapfile`: on failed teardown it
-// DISOWNS it, so an abandoned-but-running consumer can't clobber a resumed
-// pass's confirmed progress. See docs/recovery.md.
+// `finish_bounded` for a sink that owns the `Mapfile`: on failed teardown it DISOWNS it, so an
+// abandoned-but-running consumer can't clobber a resumed pass's confirmed progress.
 pub(crate) fn finish_bounded_disowning<I: Send + 'static, R: Send + 'static>(
     pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
     halt: &libfreemkv::halt::Halt,
@@ -779,9 +764,8 @@ pub fn sweep(
         libfreemkv::decrypt::DecryptKeys::None
     };
     let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
-    // AACS sweep: resolve a whole-disc key map up front (fail-loud on
-    // missing CPS-unit key). The map alone is NOT a content gate — see
-    // the content_ranges block below for why, and docs/recovery.md.
+    // AACS sweep: resolve a whole-disc key map up front (fail-loud on missing CPS-unit key).
+    // The map alone is NOT a content gate — see the content_ranges block below for why, and
     let key_map = if opts.decrypt && decrypt_is_aacs {
         let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
         Some(std::sync::Arc::new(disc.resolve_content_key_map(
@@ -796,17 +780,16 @@ pub fn sweep(
     let content_ranges = disc.encrypted_content_ranges();
     let can_gate = !content_ranges.is_empty();
 
-    // The content gate below is INERT for every key state that reaches it (CSS
-    // self-descrambles regardless; `None` decrypts nothing), so all three
-    // conditions here carry equivalent mutants — docs/recovery.md.
+    // The content gate below is INERT for every key state that reaches it (CSS self-descrambles
+    // regardless; `None` decrypts nothing), so all three conditions here carry equivalent
+    // mutants.
     let mut reader = {
         let mut dec = DecryptingSectorSource::new(reader, keys);
         if let Some(map) = key_map {
             dec = dec.with_key_map(map);
         }
-        // freemkv#55: whole-disc reader walks UDF + BDMV nav sectors that
-        // are clear — content gate needed so those don't trip AACS's
-        // orphan-unit refusal. See docs/recovery.md for the full rationale.
+        // freemkv#55: whole-disc reader walks UDF + BDMV nav sectors that are clear — content
+        // gate needed so those don't trip AACS's orphan-unit refusal.
         if opts.decrypt && can_gate {
             dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
         }
@@ -1169,8 +1152,8 @@ pub fn sweep(
                                 .min(region_end);
                             let gap_start = pos + block_bytes;
                             let gap_bytes = jump_pos.saturating_sub(gap_start);
-                            // `>= 0` here is an equivalent mutant: a zero-length
-                            // GapFill is a no-op end to end (docs/recovery.md).
+                            // `>= 0` here is an equivalent mutant: a zero-length GapFill is a
+                            // no-op end to end.
                             if gap_bytes > 0 {
                                 match send_bounded(
                                     &pipe,
@@ -1222,9 +1205,8 @@ pub fn sweep(
                 cached_snapshot = Some(snap);
             }
 
-            // Heartbeat: this gate, its counters and the LBA below are
-            // DIAGNOSTIC-ONLY, and carry eight mutants no test here can kill.
-            // See docs/recovery.md ("Equivalent mutants in `copy` / `sweep`").
+            // Heartbeat: this gate, its counters and the LBA below are DIAGNOSTIC-ONLY, and
+            // carry eight mutants no test here can kill.
             let time_due = last_log_time.elapsed() >= std::time::Duration::from_secs(5);
             if iter_count - last_log_iter >= 100 || time_due {
                 last_log_iter = iter_count;
@@ -1504,10 +1486,9 @@ impl<'a> PatchOptions<'a> {
     /// apart on a future tuning change.
     ///
     /// `block_sectors: Some(32)` no longer sizes any read — the handler chain
-    /// (`section_recover.rs`) owns read sizing/bisection now. It only survives
-    /// as the pass LABEL (>1 = Trim, 1 = Scrape). `full_recovery` is
-    /// diagnostics-only; `wedged_threshold` is reported, not enforced. See
-    /// `patch_preset_tests` and docs/recovery.md for detail.
+    /// (`section_recover.rs`) owns read sizing/bisection now. It only survives as the pass
+    /// LABEL (>1 = Trim, 1 = Scrape). `full_recovery` is diagnostics-only; `wedged_threshold`
+    /// is reported, not enforced.
     pub fn for_patch_pass(
         decrypt: bool,
         progress: Option<&'a dyn libfreemkv::progress::Progress>,
@@ -1539,9 +1520,8 @@ pub struct PatchOutcome {
     pub wedged_threshold: u64,
 }
 
-// Snap a mapfile byte-range out to whole sectors (start down, end up) — an
-// unaligned offset truncates the LBA and records corrupt bytes `Finished`.
-// See docs/recovery.md ("snap_to_sectors").
+// Snap a mapfile byte-range out to whole sectors (start down, end up) — an unaligned offset
+// truncates the LBA and records corrupt bytes `Finished`.
 pub(super) fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
     use section_recover::SECTOR;
     let start = pos - pos % SECTOR;
@@ -1571,8 +1551,8 @@ pub(crate) fn sleep_secs_or_halt(
     let total = std::time::Duration::from_secs(secs);
     let slice = std::time::Duration::from_millis(100);
     let start = std::time::Instant::now();
-    // `<=` is an equivalent mutant (docs/recovery.md): it differs only at an
-    // exact-nanosecond match, and then only by one `remaining = 0` iteration.
+    // `<=` is an equivalent mutant: it differs only at an exact-nanosecond match, and then only
+    // by one `remaining = 0` iteration.
     while start.elapsed() < total {
         if h.load(std::sync::atomic::Ordering::Relaxed) {
             return;
@@ -1689,12 +1669,11 @@ mod snap_tests {
         assert_eq!(len, 0, "the final sector here cannot be represented in u64");
     }
 
-    /// The end cap is the LARGEST sector-aligned u64, and nothing below it may
-    /// be clamped. Mis-derive that constant (`/ SECTOR + SECTOR`, or a second
-    /// division) and the ceiling drops to ~9 PB, where every range above it
-    /// comes back length 0 — a real region silently "nothing to do" instead of
-    /// read. The `u64::MAX`-adjacent test above answers 0 either way and cannot
-    /// see it. See docs/recovery.md ("snap_to_sectors").
+    /// The end cap is the LARGEST sector-aligned u64, and nothing below it may be clamped.
+    /// Mis-derive that constant (`/ SECTOR + SECTOR`, or a second division) and the ceiling
+    /// drops to ~9 PB, where every range above it comes back length 0 — a real region silently
+    /// "nothing to do" instead of read. The `u64::MAX`-adjacent test above answers 0 either way
+    /// and cannot see it.
     #[test]
     fn the_end_cap_clamps_nothing_a_u64_can_actually_hold() {
         // 1e16 is an exact multiple of 2048, ~9 PB past a mis-derived cap.
@@ -1967,8 +1946,8 @@ mod send_bounded_tests {
         drop(pipe);
     }
 
-    // The other half of the halt contract: a raised halt must not discard a
-    // free-slot handoff that would not have blocked. See docs/recovery.md.
+    // The other half of the halt contract: a raised halt must not discard a free-slot handoff
+    // that would not have blocked.
     #[test]
     fn a_raised_halt_still_delivers_when_the_channel_has_room() {
         /// Stalls inside `apply` on the FIRST item only. That reproduces the
@@ -2070,9 +2049,8 @@ mod send_bounded_tests {
     }
 }
 
-// The join-side half of the same guarantee `send_bounded_tests` pins: a Stop
-// that gets the producer out must not then block forever in `Pipeline::finish`
-// on the same stalled consumer. See docs/recovery.md ("finish_bounded_tests").
+// The join-side half of the same guarantee `send_bounded_tests` pins: a Stop that gets the
+// producer out must not then block forever in `Pipeline::finish` on the same stalled consumer.
 #[cfg(test)]
 mod finish_bounded_tests {
     use super::*;
@@ -2253,9 +2231,9 @@ mod finish_bounded_tests {
         }
     }
 
-    // A STOP MUST NOT COST THE NEXT PASS ITS RECORD: the abandoned consumer
-    // is detached, not killed, and its stale mapfile snapshot must never
-    // reach the path once a resumed pass owns it. See docs/recovery.md.
+    // A STOP MUST NOT COST THE NEXT PASS ITS RECORD: the abandoned consumer is detached, not
+    // killed, and its stale mapfile snapshot must never reach the path once a resumed pass owns
+    // it.
     #[test]
     fn an_abandoned_consumer_cannot_overwrite_a_resumed_passs_mapfile() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2512,9 +2490,8 @@ mod resume_decision_tests {
         Err(std::io::Error::from(kind))
     }
 
-    // NotFound is the only error meaning "no file yet"; every other error is
-    // UNKNOWN and must not be answered "missing" (see docs/recovery.md,
-    // "only_not_found_means_the_image_is_missing").
+    // NotFound is the only error meaning "no file yet"; every other error is UNKNOWN and must
+    // not be answered "missing".
     #[test]
     fn only_not_found_means_the_image_is_missing() {
         assert_eq!(
@@ -2676,9 +2653,7 @@ mod snapshot_tests {
     }
 }
 
-// The shipped Pass-N patch preset, pinned, so it's load-bearing rather than
-// dead literals. See docs/recovery.md ("patch_preset_tests") for what each
-// of the four values actually does.
+// The shipped Pass-N patch preset, pinned, so it's load-bearing rather than dead literals.
 #[cfg(test)]
 mod patch_preset_tests {
     use super::*;
@@ -2733,8 +2708,8 @@ mod patch_preset_tests {
         );
     }
 
-    // `wedged_threshold` is REPORTED, verbatim, in the outcome — it does not,
-    // by itself, make the pass look wedged. See docs/recovery.md.
+    // `wedged_threshold` is REPORTED, verbatim, in the outcome — it does not, by itself, make
+    // the pass look wedged.
     #[test]
     fn the_wedged_threshold_is_reported_not_enforced() {
         let o = PatchOptions::for_patch_pass(false, None, None, None);

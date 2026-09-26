@@ -1,24 +1,20 @@
 //! `extract_tree` — shared orchestration around `Disc::extract_tree`.
 //!
-//! Bridges a shell's cooperative-cancel `Sink` into the `Halt` token
-//! `Disc::extract_tree` polls, and hands back the per-file + aggregate
-//! [`libfreemkv::ExtractResult`] for the caller to render. Used by both the
-//! CLI's `dir://` destination and the desktop GUI's "decrypted folder"
-//! output. Nothing here prints, formats a locale string, or picks an exit
-//! code — those stay in the shell. See docs/extract.md for why this is
-//! shared code and its relation to `mux::mux_title`'s bridge.
+//! Bridges a shell's cooperative-cancel `Sink` into the `Halt` token `Disc::extract_tree`
+//! polls, and hands back the per-file + aggregate [`libfreemkv::ExtractResult`] for the caller
+//! to render. Used by both the CLI's `dir://` destination and the desktop GUI's "decrypted
+//! folder" output. Nothing here prints, formats a locale string, or picks an exit code — those
+//! stay in the shell.
 
 use crate::sink::Sink;
 use std::path::Path;
 
 /// Extract `disc`'s decrypted UDF file tree to `dest`.
 ///
-/// `reader` is consumed for content reads (see [`libfreemkv::Disc::extract_tree`]).
-/// `force` mirrors the CLI's `--force`: without it, a non-empty `dest` is
-/// refused. `sink`'s [`Sink::should_cancel`] is polled by a watcher thread
-/// that cancels a fresh [`libfreemkv::Halt`], stopping the extraction at
-/// the next file boundary. See docs/extract.md for the full cancellation
-/// and unwind-safety contract.
+/// `reader` is consumed for content reads (see [`libfreemkv::Disc::extract_tree`]). `force`
+/// mirrors the CLI's `--force`: without it, a non-empty `dest` is refused. `sink`'s
+/// [`Sink::should_cancel`] is polled by a watcher thread that cancels a fresh
+/// [`libfreemkv::Halt`], stopping the extraction at the next file boundary.
 pub fn extract_tree(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,

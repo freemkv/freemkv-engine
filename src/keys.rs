@@ -6,8 +6,7 @@
 //! keeps its own boundary-specific bits (online-only derivation, path
 //! search/expansion, English presentation) out of this module.
 //!
-//! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted
-//! here. See docs/keys.md for the full rationale.
+//! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted here.
 
 /// Already-resolved key configuration, boundary-normalized by the calling
 /// shell. See the module docs for what each field means and does NOT mean.
@@ -215,9 +214,8 @@ mod tests {
         assert_eq!(won_source(&trace), None);
     }
 
-    // An unencrypted disc resolves nothing and READS nothing; guards against
-    // a fabricated winning-source label (see docs/keys.md for why that
-    // would be a lie about provenance) and pins the read short-circuit.
+    // An unencrypted disc resolves nothing and READS nothing; guards against a fabricated
+    // winning-source label  and pins the read short-circuit.
     #[test]
     fn resolve_disc_keys_is_none_and_reads_nothing_for_an_unencrypted_disc() {
         struct NeverRead;

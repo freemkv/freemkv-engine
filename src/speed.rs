@@ -4,39 +4,36 @@
 //! one agreed value instead of re-deriving it from raw byte deltas. A
 //! front-end formats the numbers; it never computes them.
 //!
-//! [`SpeedEstimator::observe`] returns the **displayed** speed (smoothed
-//! sliding window); [`SpeedEstimator::eta_speed_mbs`] returns the stable
-//! **ETA** rate. [`SpeedEstimator::sample_at`] / [`SpeedEstimator::sample`]
-//! run both and return `(speed_bps, eta_secs)`. See docs/speed.md.
+//! [`SpeedEstimator::observe`] returns the **displayed** speed (smoothed sliding window);
+//! [`SpeedEstimator::eta_speed_mbs`] returns the stable **ETA** rate.
+//! [`SpeedEstimator::sample_at`] / [`SpeedEstimator::sample`] run both and return `(speed_bps,
+//! eta_secs)`.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
-// Display-window growth curve: flat 10s, then linear growth to 60s over
-// GROWTH_PHASE_SECS, then flat 60s. See docs/speed.md for the full schedule.
+// Display-window growth curve: flat 10s, then linear growth to 60s over GROWTH_PHASE_SECS, then
+// flat 60s.
 const STATIC_PHASE_SECS: f64 = 60.0;
 const STATIC_WINDOW_SECS: f64 = 10.0;
 const GROWTH_PHASE_SECS: f64 = 300.0;
 const MAX_WINDOW_SECS: f64 = 60.0;
 
-// Minimum elapsed time before the running average is trustworthy for ETA
-// (below this it's noisy: small denominator, first-sample artefacts). See
-// docs/speed.md.
+// Minimum elapsed time before the running average is trustworthy for ETA (below this it's
+// noisy: small denominator, first-sample artefacts).
 const ETA_WARMUP_SECS: f64 = 10.0;
 
-// Sanity cap on computed MB/s: real optical drives top out ~70-140 MB/s, so
-// >=1 GB/s is a measurement artefact (clock jitter, mapfile replay) to drop
-// rather than display. See docs/speed.md.
+// Sanity cap on computed MB/s: real optical drives top out ~70-140 MB/s, so >=1 GB/s is a
+// measurement artefact (clock jitter, mapfile replay) to drop rather than display.
 const MAX_PLAUSIBLE_MBS: f64 = 1024.0;
 
 /// Compute the appropriate sliding-window size for the displayed speed given
 /// how long the pass has been running. See [`STATIC_PHASE_SECS`] for the curve.
 ///
-/// Both `<` here are equivalent to `<=`: the curve is continuous at each
-/// breakpoint, so no test can pin them. See docs/speed.md ("Equivalent
-/// mutants").
+/// Both `<` here are equivalent to `<=`: the curve is continuous at each breakpoint, so no test
+/// can pin them.
 fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
     if elapsed_pass_secs < STATIC_PHASE_SECS {
         STATIC_WINDOW_SECS
@@ -181,9 +178,8 @@ impl SpeedEstimator {
         let display_mbs = self.observe(now, bytes_done);
         let eta_mbs = self.eta_speed_mbs(now, display_mbs);
         let speed_bps = (display_mbs * BYTES_PER_MIB) as u64;
-        // 0.0001 MB/s (~0.1 KB/s) floor: any real forward motion yields an ETA,
-        // but a dead stall doesn't divide toward a multi-year number. `>=` here
-        // is equivalent — see docs/speed.md ("Equivalent mutants").
+        // 0.0001 MB/s (~0.1 KB/s) floor: any real forward motion yields an ETA, but a dead
+        // stall doesn't divide toward a multi-year number. `>=` here is equivalent.
         let eta_secs = if eta_mbs > 0.0001 && bytes_total > bytes_done {
             let rem_mb = (bytes_total - bytes_done) as f64 / BYTES_PER_MIB;
             Some((rem_mb / eta_mbs).round() as u64)
@@ -289,9 +285,8 @@ mod tests {
             "just past the boundary the window must be growing"
         );
 
-        // Growth is monotonic and lands exactly on MAX at the end — so the
-        // SECOND `<` -> `<=` mutant is equivalent for the same reason as the
-        // first (docs/speed.md, "Equivalent mutants").
+        // Growth is monotonic and lands exactly on MAX at the end — so the SECOND `<` -> `<=`
+        // mutant is equivalent for the same reason as the first.
         let end = STATIC_PHASE_SECS + GROWTH_PHASE_SECS;
         assert!(display_window_secs(end - 0.1) < MAX_WINDOW_SECS);
         assert_eq!(display_window_secs(end), MAX_WINDOW_SECS);
@@ -516,9 +511,8 @@ mod tests {
         assert_eq!(speed, 0, "same instant → no rate");
     }
 
-    // `sample` is the real production entry point; this test targets its
-    // real-clock wrapper specifically. See docs/speed.md for why it avoids
-    // `thread::sleep` in favor of `wait_for_the_clock_to_tick`.
+    // `sample` is the real production entry point; this test targets its real-clock wrapper
+    // specifically.
     #[test]
     fn sample_derives_from_the_real_clock_not_a_constant() {
         // Spin until the monotonic clock reports a later instant than `from`.
@@ -562,8 +556,7 @@ mod tests {
 
     // ─── Boundary comparisons the round-6 mutation run left unpinned ────────
 
-    // A byte count that has not moved is NOT a new pass. See docs/speed.md
-    // for why `observe`'s `<` re-anchor guard must not widen to `<=`.
+    // A byte count that has not moved is NOT a new pass.
     #[test]
     fn a_flat_byte_count_does_not_re_anchor_the_pass_clock() {
         let mut s = SpeedEstimator::new();
@@ -582,9 +575,7 @@ mod tests {
         );
     }
 
-    // A sample sitting exactly ON the window cutoff stays in the window. See
-    // docs/speed.md for why this is the one pruning test where `<`/`<=`/`==`
-    // aren't indistinguishable by accident.
+    // A sample sitting exactly ON the window cutoff stays in the window.
     #[test]
     fn the_window_cutoff_is_inclusive_of_a_sample_on_the_boundary() {
         let mut s = SpeedEstimator::new();

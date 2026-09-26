@@ -426,9 +426,8 @@ mod tests {
         AudioChannels, AudioStream, Codec, LabelQualifier, SampleRate, Stream, SubtitleStream,
     };
 
-    // ISO 639-2's complete set of languages whose bibliographic (/B) code
-    // differs from its terminologic (/T) code: `(639-2/B, 639-2/T, 639-1)`.
-    // See docs/streams-tests.md#bib_term_iso1 — why 639-1 is the oracle.
+    // ISO 639-2's complete set of languages whose bibliographic (/B) code differs from its
+    // terminologic (/T) code: `(639-2/B, 639-2/T, 639-1)`.
     const BIB_TERM_ISO1: [(&str, &str, &str); 20] = [
         ("alb", "sqi", "sq"), // Albanian
         ("arm", "hye", "hy"), // Armenian
@@ -460,9 +459,8 @@ mod tests {
         "mao", "may", "per", "rum", "slo", "tib", "wel",
     ];
 
-    // A forced language the disc lacks must be REPORTED: the two subtitle
-    // sides are chosen independently, so a hit on the full side says nothing
-    // about the forced one. See docs/streams-tests.md#a_forced_language_the_disc_lacks_is_reported_on_its_own_side.
+    // A forced language the disc lacks must be REPORTED: the two subtitle sides are chosen
+    // independently, so a hit on the full side says nothing about the forced one.
     #[test]
     fn a_forced_language_the_disc_lacks_is_reported_on_its_own_side() {
         let t = forced_title(); // deu/eng full, eng/deu forced
@@ -779,9 +777,8 @@ mod tests {
         assert!(u.is_empty(), "got {u:?}");
     }
 
-    // A class whose streams exist but carry NO language tag is a MISS, not an
-    // absent class (untagged audio must not look like no audio at all).
-    // See docs/streams-tests.md#untagged-class-regression.
+    // A class whose streams exist but carry NO language tag is a MISS, not an absent class
+    // (untagged audio must not look like no audio at all).
     #[test]
     fn unmatched_flags_a_class_whose_streams_are_all_untagged() {
         let mut t = libfreemkv::DiscTitle::empty();
@@ -801,9 +798,8 @@ mod tests {
         );
     }
 
-    // Guards the one-line delegation from `StreamChoice::resolve` to the free
-    // function every other test calls directly, so it can't silently become
-    // `Ok(Default::default())`. See docs/streams-tests.md#resolve_delegates_to_resolve_stream_selection.
+    // Guards the one-line delegation from `StreamChoice::resolve` to the free function every
+    // other test calls directly, so it can't silently become `Ok(Default::default())`.
     #[test]
     fn resolve_delegates_to_resolve_stream_selection() {
         let t = title();
@@ -846,9 +842,8 @@ mod tests {
         t
     }
 
-    // The request this split exists for, verbatim: "German & Spanish audio,
-    // only German subtitles, and forced only if in English."
-    // See docs/streams-tests.md#german_spanish_audio_german_subs_forced_english.
+    // The request this split exists for, verbatim: "German & Spanish audio, only German
+    // subtitles, and forced only if in English.".
     #[test]
     fn german_spanish_audio_german_subs_forced_english() {
         let sel = resolve_stream_selection_forced(

@@ -95,9 +95,8 @@ fn make_test_disc(sectors: u32, name: &str) -> Disc {
     }
 }
 
-// A disc title unique to this process+call, so a stale mapfile left by a
-// killed prior run is never mistaken for this run's.
-// See docs/recovery-copy-dispatch.md — unique_title
+// A disc title unique to this process+call, so a stale mapfile left by a killed prior run is
+// never mistaken for this run's.
 #[cfg(unix)]
 fn unique_title(prefix: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -296,9 +295,8 @@ fn sweep_to_dev_null_real() {
     assert_eq!(result.bytes_total, sectors as u64 * 2048);
 }
 
-// End-to-end Pass-1 sweep asserting the RESULTING MAPFILE (good region
-// Finished, damage region + jump gap NonTrimmed, full coverage, no overlap).
-// See docs/recovery-copy-dispatch.md — sweep_marks_bad_region_nontrimmed_and_engages_damage_jump
+// End-to-end Pass-1 sweep asserting the RESULTING MAPFILE (good region Finished, damage region
+// + jump gap NonTrimmed, full coverage, no overlap).
 #[test]
 fn sweep_marks_bad_region_nontrimmed_and_engages_damage_jump() {
     let sectors: u32 = 1000;
@@ -467,9 +465,8 @@ fn sweep_resume_downgrades_on_size_mismatch() {
     );
 }
 
-// Resume against a mapfile with prior progress but a missing/zero-length ISO
-// must DOWNGRADE to a fresh full sweep (else Finished ranges go unread).
-// See docs/recovery-copy-dispatch.md — sweep_resume_downgrades_on_zero_iso_with_progress_mapfile
+// Resume against a mapfile with prior progress but a missing/zero-length ISO must DOWNGRADE to
+// a fresh full sweep (else Finished ranges go unread).
 #[test]
 fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
     let tmp = tempfile::tempdir().unwrap();
@@ -553,9 +550,8 @@ fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
     );
 }
 
-// A resume against a CORRUPT/unparseable mapfile must DOWNGRADE to a fresh
-// full sweep, not proceed with resume=true (which would silently skip ranges).
-// See docs/recovery-copy-dispatch.md — sweep_resume_downgrades_on_corrupt_mapfile
+// A resume against a CORRUPT/unparseable mapfile must DOWNGRADE to a fresh full sweep, not
+// proceed with resume=true (which would silently skip ranges).
 #[test]
 fn sweep_resume_downgrades_on_corrupt_mapfile() {
     let tmp = tempfile::tempdir().unwrap();
@@ -614,9 +610,8 @@ fn sweep_resume_downgrades_on_corrupt_mapfile() {
     );
 }
 
-// A fresh (non-resume) sweep MUST abort if the stale mapfile cannot be
-// removed, rather than inheriting its old Finished ranges (silent hole).
-// See docs/recovery-copy-dispatch.md — sweep_fresh_aborts_when_stale_mapfile_unremovable
+// A fresh (non-resume) sweep MUST abort if the stale mapfile cannot be removed, rather than
+// inheriting its old Finished ranges (silent hole).
 #[test]
 fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
     let tmp = tempfile::tempdir().unwrap();
@@ -693,9 +688,8 @@ fn sweep_dev_null_full_good() {
     assert_eq!(r.bytes_good, sectors as u64 * 2048);
 }
 
-// Finding #6: on resume, copy() must NOT abandon the un-swept NonTried tail
-// when retryable (NonTrimmed) bytes also remain; it must route to a resume
-// sweep first. See docs/recovery-copy-dispatch.md — resume_sweeps_nontried_tail_even_with_retryable_present
+// Finding #6: on resume, copy() must NOT abandon the un-swept NonTried tail when retryable
+// (NonTrimmed) bytes also remain; it must route to a resume sweep first.
 #[test]
 fn resume_sweeps_nontried_tail_even_with_retryable_present() {
     use std::collections::HashSet;
@@ -789,9 +783,8 @@ fn resume_sweeps_nontried_tail_even_with_retryable_present() {
     );
 }
 
-// Regression (rc.6): a PLAIN (non-`--multipass`) copy interrupted by Ctrl-C
-// must RESUME on re-issue, not restart from sector 0 (CLI promises this).
-// See docs/recovery-copy-dispatch.md — plain_copy_resumes_nontried_tail_after_interrupt
+// Regression (rc.6): a PLAIN (non-`--multipass`) copy interrupted by Ctrl-C must RESUME on
+// re-issue, not restart from sector 0 (CLI promises this).
 #[test]
 fn plain_copy_resumes_nontried_tail_after_interrupt() {
     use std::collections::HashSet;
@@ -1018,9 +1011,8 @@ fn patch_dev_null_direct() {
     assert_eq!(patched.bytes_total, sectors as u64 * 2048);
 }
 
-// Synthetic regression for the 0.18 SweepSink + Pipeline migration: ~100
-// batches of clean reads, all bytes land in the ISO, consumer stats match.
-// See docs/recovery-copy-dispatch.md — sweep_pipeline_full_good_100_batches
+// Synthetic regression for the 0.18 SweepSink + Pipeline migration: ~100 batches of clean
+// reads, all bytes land in the ISO, consumer stats match.
 #[test]
 fn sweep_pipeline_full_good_100_batches() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1125,9 +1117,8 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
     );
 }
 
-// `copy()`'s "already complete, don't re-read a finished ISO" shortcut must
-// verify the ISO is still THERE, not trust the mapfile alone (else deleting
-// the ISO still reports success). See docs/recovery-copy-dispatch.md — complete_mapfile_with_a_missing_iso_re_reads_instead_of_claiming_success
+// `copy()`'s "already complete, don't re-read a finished ISO" shortcut must verify the ISO is
+// still THERE, not trust the mapfile alone (else deleting the ISO still reports success).
 #[test]
 fn complete_mapfile_with_a_missing_iso_re_reads_instead_of_claiming_success() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1172,9 +1163,8 @@ fn complete_mapfile_with_a_missing_iso_re_reads_instead_of_claiming_success() {
     assert_eq!(r.bytes_good, disc_size);
 }
 
-// A resume against a SHORT (non-zero but truncated) ISO must re-read, not
-// leave a hole; the inconsistent-resume guard only ever tested zero length.
-// See docs/recovery-copy-dispatch.md — resume_against_a_truncated_iso_re_reads_instead_of_leaving_a_hole
+// A resume against a SHORT (non-zero but truncated) ISO must re-read, not leave a hole; the
+// inconsistent-resume guard only ever tested zero length.
 #[test]
 fn resume_against_a_truncated_iso_re_reads_instead_of_leaving_a_hole() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1478,9 +1468,8 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
     );
 }
 
-// A disc reporting itself encrypted but with NO resolved cipher state
-// (aacs: None, css: None) must be REFUSED, not written out as ciphertext.
-// See docs/recovery-copy-dispatch.md — encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext
+// A disc reporting itself encrypted but with NO resolved cipher state (aacs: None, css: None)
+// must be REFUSED, not written out as ciphertext.
 #[test]
 fn encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1511,9 +1500,8 @@ fn encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext() {
     assert_eq!(wrote, 0, "nothing may be written before the refusal");
 }
 
-// A mapfile left by a DIFFERENT disc of the same capacity must not be
-// resumed, or the ISO silently splices sectors from two physical discs.
-// See docs/recovery-copy-dispatch.md — mapfile_from_a_different_disc_is_refused
+// A mapfile left by a DIFFERENT disc of the same capacity must not be resumed, or the ISO
+// silently splices sectors from two physical discs.
 #[test]
 fn mapfile_from_a_different_disc_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1567,9 +1555,8 @@ fn mapfile_from_a_different_disc_is_refused() {
     );
 }
 
-// ── Survivors from the full-crate mutation run, killed here ────────────────
-// A PLAIN copy must ABORT on the first unreadable sector, not zero-fill and
-// carry on. See docs/recovery-copy-dispatch.md — a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso
+// ── Survivors from the full-crate mutation run, killed here ──────────────── A PLAIN copy must
+// ABORT on the first unreadable sector, not zero-fill and carry on.
 #[test]
 fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
     let sectors: u32 = 1000;
@@ -1609,9 +1596,9 @@ fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
     );
 }
 
-// A RESUME must not truncate the image it is resuming into (zeroing bytes
-// the mapfile still records Finished). Fills the recovered prefix with a
-// recognisable pattern so truncation is visible. See docs/recovery-copy-dispatch.md — a_resume_does_not_truncate_the_already_recovered_prefix
+// A RESUME must not truncate the image it is resuming into (zeroing bytes the mapfile still
+// records Finished). Fills the recovered prefix with a recognisable pattern so truncation is
+// visible.
 #[test]
 fn a_resume_does_not_truncate_the_already_recovered_prefix() {
     const SEC: u64 = libfreemkv::consts::SECTOR_BYTES_U64;
@@ -1811,9 +1798,8 @@ fn multipass_copy_opts() -> CopyOptions<'static> {
     }
 }
 
-// A FRESH sweep must truncate an image left over from a previous run, or
-// unreached regions keep the old disc's bytes underneath (handed to the
-// muxer as this disc's data). See docs/recovery-copy-dispatch.md — a_fresh_sweep_truncates_the_image_left_by_a_previous_run
+// A FRESH sweep must truncate an image left over from a previous run, or unreached regions keep
+// the old disc's bytes underneath (handed to the muxer as this disc's data).
 #[test]
 fn a_fresh_sweep_truncates_the_image_left_by_a_previous_run() {
     let sectors: u32 = 400;
@@ -1858,9 +1844,8 @@ fn a_fresh_sweep_truncates_the_image_left_by_a_previous_run() {
     );
 }
 
-// A resume into a zero-length image must still pre-size it, or a halt leaves
-// it short and the NEXT run's guard throws away the mapfile and re-rips.
-// See docs/recovery-copy-dispatch.md — a_resume_into_an_empty_image_pre_sizes_it_to_the_disc
+// A resume into a zero-length image must still pre-size it, or a halt leaves it short and the
+// NEXT run's guard throws away the mapfile and re-rips.
 #[test]
 fn a_resume_into_an_empty_image_pre_sizes_it_to_the_disc() {
     let sectors: u32 = 400;
@@ -1898,9 +1883,8 @@ fn a_resume_into_an_empty_image_pre_sizes_it_to_the_disc() {
     );
 }
 
-// A resume whose image was DELETED must self-heal into a fresh sweep; only
-// `NotFound` should be read as "no file yet" (unlike the zero-length-file
-// downgrade test, this one removes the ISO). See docs/recovery-copy-dispatch.md — a_resume_whose_image_was_deleted_starts_over_instead_of_erroring
+// A resume whose image was DELETED must self-heal into a fresh sweep; only `NotFound` should be
+// read as "no file yet" (unlike the zero-length-file downgrade test, this one removes the ISO).
 #[test]
 fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
     let sectors: u32 = 400;
@@ -1933,9 +1917,8 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
     assert_eq!(std::fs::metadata(&iso_path).unwrap().len(), total);
 }
 
-// KEYS XOR VID: the mapfile header carries one or the other, never both.
-// A keyed disc writes unit keys; an unresolved disc writes only the VID.
-// See docs/recovery-copy-dispatch.md — the_mapfile_header_carries_the_unit_keys_when_there_are_keys
+// KEYS XOR VID: the mapfile header carries one or the other, never both. A keyed disc writes
+// unit keys; an unresolved disc writes only the VID.
 #[test]
 fn the_mapfile_header_carries_the_unit_keys_when_there_are_keys() {
     let sectors: u32 = 64;
@@ -2032,9 +2015,8 @@ fn the_drive_retry_lever_is_the_inverse_of_skip_on_error() {
     }
 }
 
-// Damage slows the drive down, and 16 consecutive good batches restore
-// maximum speed; a mock reader ignores `set_speed`, so no other test noticed.
-// See docs/recovery-copy-dispatch.md — damage_drops_the_drive_speed_and_a_clean_run_restores_it
+// Damage slows the drive down, and 16 consecutive good batches restore maximum speed; a mock
+// reader ignores `set_speed`, so no other test noticed.
 #[test]
 fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
     // Damage early, then a long clean tail so the exit threshold (16
@@ -2092,9 +2074,8 @@ fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
     );
 }
 
-// A finished rip with an intact image is a no-op — no reads, no re-write.
-// Loosening the dispatch shortcut's conjunction would re-rip a done disc.
-// See docs/recovery-copy-dispatch.md — re_issuing_a_finished_copy_reads_nothing_and_rewrites_nothing
+// A finished rip with an intact image is a no-op — no reads, no re-write. Loosening the
+// dispatch shortcut's conjunction would re-rip a done disc.
 #[test]
 fn re_issuing_a_finished_copy_reads_nothing_and_rewrites_nothing() {
     let sectors: u32 = 200;
@@ -2132,9 +2113,9 @@ fn re_issuing_a_finished_copy_reads_nothing_and_rewrites_nothing() {
     );
 }
 
-// An all-Unreadable disc is terminal — it must not be patched again, or
-// `patch`'s `damage_sector_statuses()` (which INCLUDES Unreadable) re-reads
-// ranges the design considers permanently lost. See docs/recovery-copy-dispatch.md — a_disc_whose_damage_is_all_permanent_is_not_patched_again
+// An all-Unreadable disc is terminal — it must not be patched again, or `patch`'s
+// `damage_sector_statuses()` (which INCLUDES Unreadable) re-reads ranges the design considers
+// permanently lost.
 #[test]
 fn a_disc_whose_damage_is_all_permanent_is_not_patched_again() {
     let sectors: u32 = 200;
@@ -2170,9 +2151,8 @@ fn a_disc_whose_damage_is_all_permanent_is_not_patched_again() {
     assert!(!r.complete, "a lossy rip is never complete");
 }
 
-// Retryable bytes are not "no bad bytes", even when pending and unreadable
-// counts happen to be equal (`bad_bytes = pending + unreadable`, disjoint
-// counters). See docs/recovery-copy-dispatch.md — equal_pending_and_unreadable_counts_still_route_to_a_patch_pass
+// Retryable bytes are not "no bad bytes", even when pending and unreadable counts happen to be
+// equal (`bad_bytes = pending + unreadable`, disjoint counters).
 #[test]
 fn equal_pending_and_unreadable_counts_still_route_to_a_patch_pass() {
     let sectors: u32 = 200;
@@ -2222,9 +2202,8 @@ fn equal_pending_and_unreadable_counts_still_route_to_a_patch_pass() {
     );
 }
 
-// A fresh sweep over another disc's leftover mapfile drops it and starts
-// over, rather than running the identity check (which only applies on resume).
-// See docs/recovery-copy-dispatch.md — a_fresh_sweep_over_a_different_discs_mapfile_starts_over
+// A fresh sweep over another disc's leftover mapfile drops it and starts over, rather than
+// running the identity check (which only applies on resume).
 #[test]
 fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
     let sectors: u32 = 128;
@@ -2279,9 +2258,8 @@ fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
     assert_eq!(mf.stats().bytes_good, total);
 }
 
-// A DECRYPTING sweep must actually decrypt — no other test in this suite
-// ever ran one (all set `decrypt: false`), so the CSS descramble path at
-// the top of `sweep` was unexercised. See docs/recovery-copy-dispatch.md — a_decrypting_css_sweep_descrambles_the_scrambled_sectors
+// A DECRYPTING sweep must actually decrypt — no other test in this suite ever ran one (all set
+// `decrypt: false`), so the CSS descramble path at the top of `sweep` was unexercised.
 #[test]
 fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
     /// Deterministic per-sector content, before any descrambling.
@@ -2378,9 +2356,8 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
     );
 }
 
-// A reader that under-delivers must not have its buffer written to the ISO,
-// or the tail of the PREVIOUS block gets recorded `Finished` under the wrong
-// LBA. See docs/recovery-copy-dispatch.md — a_short_read_is_a_failed_read_and_never_reaches_the_image
+// A reader that under-delivers must not have its buffer written to the ISO, or the tail of the
+// PREVIOUS block gets recorded `Finished` under the wrong LBA.
 #[test]
 fn a_short_read_is_a_failed_read_and_never_reaches_the_image() {
     struct ShortAfterFirstBlock {
