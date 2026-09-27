@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- Whole-disc decrypt (ISO → ISO) now declares its content extents, so decrypt refusals keep their own `DecryptFailed` code instead of the misleading `E6000: <lba> 0x00` disc-read error they surfaced as before; `E6000` is reserved for genuine read faults (#55).
+- Whole-disc decrypt (ISO → ISO) now declares its content extents, so clear filesystem sectors pass through instead of failing the sweep; a decrypt refusal that does occur keeps its own `DecryptFailed` code instead of the misleading `E6000: <lba> 0x00` (#55).
 
 ### Maintenance
 
