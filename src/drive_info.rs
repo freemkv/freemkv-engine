@@ -114,12 +114,9 @@ const FEATURES: &[(u16, &str)] = &[
 /// Capture all available drive data via SCSI commands.
 /// Returns raw responses — no formatting, no zipping, no presentation.
 ///
-/// This function and `raw` hold eight surviving mutants (the Renesas
-/// `SAT`-signature predicate; `raw`'s return). None is a coverage gap a test
-/// here could close: both need a `&mut Drive`, and libfreemkv exposes no way to
-/// build one without a real SCSI device (`from_transport_for_test` is
-/// `#[cfg(test)] pub(crate)` there). Testing them is a libfreemkv API change,
-/// not a test.
+/// The Renesas signature check is the pure [`is_renesas_sat`] (unit-tested). This function
+/// and `raw` themselves need a `&mut Drive`, which libfreemkv cannot build without a real
+/// SCSI device, so their remaining mutants are untestable here.
 pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let id = &session.drive_id;
 
@@ -145,10 +142,7 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let (mut rb_b0_04, mut rb_b0_500000) = (None, None);
     let (mut wb_41, mut rb_b0_04_postknock, mut rb_b0_500000_postknock) = (None, None, None);
     let mut rb_f4 = None;
-    if rb_f1
-        .as_ref()
-        .is_some_and(|f| f.len() >= 19 && &f[16..19] == b"SAT")
-    {
+    if rb_f1.as_deref().is_some_and(is_renesas_sat) {
         use libfreemkv::scsi::{DataDirection as D, build_read_buffer};
         let read_04 = build_read_buffer(0x02, 0xB0, 0x04, 164);
         let read_500000 = build_read_buffer(0x02, 0xB0, 0x500000, 164);
@@ -185,6 +179,11 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
         rb_b0_500000_postknock,
         rb_f4,
     })
+}
+
+/// Renesas signature: `SAT` at bytes 16..19 of the READ_BUFFER 0xF1 response.
+fn is_renesas_sat(rb_f1: &[u8]) -> bool {
+    rb_f1.get(16..19) == Some(b"SAT".as_slice())
 }
 
 /// Run a raw CDB; `Some(data)` on GOOD status (empty for a write), else `None`.
@@ -274,60 +273,93 @@ mod tests {
         assert_eq!(mask_bytes(&input), vec![0x00, b'A', 0x20, b'0', 0xFF, b'-']);
     }
 
-    fn capture_with(inquiry: &[u8], rb_f1: Option<Vec<u8>>) -> DriveCapture {
+    /// Every byte field populated with distinct, identifying bytes (letters + digits).
+    fn full_capture() -> DriveCapture {
+        let id = |tag: &str| Some(format!("{tag}-SN42X").into_bytes());
         DriveCapture {
-            inquiry: inquiry.to_vec(),
+            inquiry: b"HL-DT-ST BD1".to_vec(),
             gc_010c: b"FW1.04".to_vec(),
             features: vec![CapturedFeature {
                 code: 0x0108,
                 name: "Serial Number",
                 data: b"KX7L2201".to_vec(),
             }],
-            rpc_state: Some(vec![0x01]),
-            mode_2a: None,
-            rb_f1,
-            rb_mode6: None,
-            rb_b0_04: None,
-            rb_b0_500000: None,
-            wb_41: None,
-            rb_b0_04_postknock: None,
-            rb_b0_500000_postknock: None,
-            rb_f4: None,
+            rpc_state: id("rpc"),
+            mode_2a: id("m2a"),
+            rb_f1: id("f1"),
+            rb_mode6: id("mode6"),
+            rb_b0_04: id("b004"),
+            rb_b0_500000: id("b0500k"),
+            wb_41: id("wb41"),
+            rb_b0_04_postknock: id("b004post"),
+            rb_b0_500000_postknock: id("b0500kpost"),
+            rb_f4: id("f4"),
         }
     }
 
-    /// The hand-written `Debug` exists ONLY to redact, and a body that writes
-    /// nothing defeats it exactly as thoroughly as one that prints the fields
-    /// raw. Assert both halves: the rendering happens, and every identifying
-    /// byte in it is masked. A `{:?}` of a capture reaches bug reports and
-    /// `--share`.
+    /// The hand-written `Debug` exists ONLY to redact. Every raw byte field must render
+    /// under its own name in masked form and never raw; `{:?}` reaches bug reports.
     #[test]
     fn drive_capture_debug_renders_and_masks_every_raw_field() {
-        let inquiry = b"HL-DT-ST";
-        let f1 = b"SERIAL7".to_vec();
-        let c = capture_with(inquiry, Some(f1.clone()));
+        let c = full_capture();
         let s = format!("{c:?}");
+        assert!(s.starts_with("DriveCapture"), "no usable Debug body: {s:?}");
 
-        assert!(
-            s.contains("DriveCapture") && s.contains("inquiry") && s.contains("rb_f1"),
-            "the Debug body produced nothing usable: {s:?}"
-        );
-        // Each raw field appears in its MASKED form (byte-slice Debug, so the
-        // rendering is numeric) and never in its raw one.
-        for (label, raw) in [
-            ("inquiry", inquiry.to_vec()),
-            ("rb_f1", f1),
-            ("feature data", b"KX7L2201".to_vec()),
+        let mut fields: Vec<(&str, Vec<u8>, bool)> = vec![
+            ("inquiry", c.inquiry.clone(), false),
+            ("gc_010c", c.gc_010c.clone(), false),
+            ("data", c.features[0].data.clone(), false),
+        ];
+        for (name, v) in [
+            ("rpc_state", &c.rpc_state),
+            ("mode_2a", &c.mode_2a),
+            ("rb_f1", &c.rb_f1),
+            ("rb_mode6", &c.rb_mode6),
+            ("rb_b0_04", &c.rb_b0_04),
+            ("rb_b0_500000", &c.rb_b0_500000),
+            ("wb_41", &c.wb_41),
+            ("rb_b0_04_postknock", &c.rb_b0_04_postknock),
+            ("rb_b0_500000_postknock", &c.rb_b0_500000_postknock),
+            ("rb_f4", &c.rb_f4),
         ] {
+            fields.push((name, v.clone().unwrap_or_default(), true));
+        }
+        for (name, raw, optional) in fields {
+            assert!(!raw.is_empty(), "{name} must be populated for this test");
+            let wrap = |b: &[u8]| {
+                if optional {
+                    format!("{name}: Some({b:?})")
+                } else {
+                    format!("{name}: {b:?}")
+                }
+            };
             assert!(
-                s.contains(&format!("{:?}", mask_bytes(&raw))),
-                "{label} is not rendered masked: {s}"
+                s.contains(&wrap(&mask_bytes(&raw))),
+                "{name} is not rendered masked: {s}"
             );
             assert!(
                 !s.contains(&format!("{raw:?}")),
-                "{label} leaked through DriveCapture's Debug unmasked: {s}"
+                "{name} leaked through DriveCapture's Debug unmasked: {s}"
             );
         }
+    }
+
+    #[test]
+    fn renesas_signature_needs_sat_at_bytes_16_to_19() {
+        let mut f = vec![0u8; 19];
+        f[16..19].copy_from_slice(b"SAT");
+        assert!(is_renesas_sat(&f), "exactly 19 bytes ending in SAT matches");
+        assert!(!is_renesas_sat(&f[..18]), "18 bytes is too short");
+        f.push(0);
+        assert!(is_renesas_sat(&f), "trailing bytes after SAT still match");
+        f[16..19].copy_from_slice(b"SAX");
+        assert!(!is_renesas_sat(&f), "wrong signature must not match");
+        f[15..18].copy_from_slice(b"SAT");
+        assert!(
+            !is_renesas_sat(&f),
+            "SAT at the wrong offset must not match"
+        );
+        assert!(!is_renesas_sat(&[]), "empty response must not match");
     }
 
     #[test]
