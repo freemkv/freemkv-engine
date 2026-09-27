@@ -127,8 +127,11 @@ impl SpeedEstimator {
         if self.samples.len() < 2 {
             return 0.0;
         }
-        let &(oldest_t, oldest_b) = self.samples.front().unwrap();
-        let &(newest_t, newest_b) = self.samples.back().unwrap();
+        let (Some(&(oldest_t, oldest_b)), Some(&(newest_t, newest_b))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
         let dt = newest_t.duration_since(oldest_t).as_secs_f64();
         if dt <= 0.0 {
             return 0.0;
