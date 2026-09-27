@@ -770,6 +770,117 @@ fn patch_internal(
     ))
 }
 
+/// The whole-disc (sweep / patch) reader: `decrypt` installs the disc's keys, and for
+/// AACS the resolved key map plus a content gate over EVERY `/BDMV/STREAM` file, so a
+/// unit no kept title plays is decrypted or fails loud — never shipped as ciphertext.
+/// Returns the reader and whether it decrypts AACS (reads must then be unit-aligned).
+pub(crate) fn whole_disc_decrypting_reader<'r>(
+    disc: &libfreemkv::Disc,
+    reader: &'r mut dyn SectorSource,
+    decrypt: bool,
+    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    key_fetch: Option<&libfreemkv::sector::KeyFetch>,
+) -> Result<(
+    libfreemkv::sector::DecryptingSectorSource<&'r mut dyn SectorSource>,
+    bool,
+)> {
+    use libfreemkv::decrypt::DecryptKeys;
+    let mut keys = if decrypt {
+        disc.decrypt_keys()
+    } else {
+        DecryptKeys::None
+    };
+    let is_aacs = matches!(keys, DecryptKeys::Aacs { .. });
+    // AACS: the whole-disc key map, resolved up front (fail-loud on a missing CPS-unit key).
+    let key_map = if is_aacs {
+        let halt = halt.cloned().map(libfreemkv::halt::Halt::from_arc);
+        Some(std::sync::Arc::new(disc.resolve_content_key_map(
+            reader,
+            &mut keys,
+            key_fetch,
+            halt.as_ref(),
+        )?))
+    } else {
+        None
+    };
+    // freemkv#55: the map alone is no gate — clear UDF/nav units outside it would trip
+    // the orphan refusal. Read the stream map BEFORE wrapping `reader`. Inert for CSS/None.
+    let content_ranges = if is_aacs {
+        whole_disc_content_ranges(disc, reader)
+    } else {
+        disc.encrypted_content_ranges()
+    };
+    let mut dec = libfreemkv::sector::DecryptingSectorSource::new(reader, keys);
+    if let Some(map) = key_map {
+        dec = dec.with_key_map(map);
+    }
+    if decrypt && !content_ranges.is_empty() {
+        dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
+    }
+    Ok((dec, is_aacs))
+}
+
+// Every /BDMV/STREAM file's extents unioned with the kept titles'. No BDMV tree (HD DVD)
+// or an unreadable UDF leaves the title extents alone — the gate never narrows below them.
+fn whole_disc_content_ranges(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+) -> Vec<(u32, u32)> {
+    let mut ranges = disc.encrypted_content_ranges();
+    match libfreemkv::Disc::stream_content_ranges(reader) {
+        Ok(stream) => ranges.extend(stream),
+        Err(e) => tracing::warn!(
+            target: "freemkv::scan",
+            code = e.code(),
+            "stream file extents unreadable; content gate falls back to title extents"
+        ),
+    }
+    merge_ranges(ranges)
+}
+
+// Sort + coalesce overlapping/adjacent `(start, count)` ranges (the content gate's
+// binary search needs them sorted and disjoint); empty ranges are dropped.
+fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    ranges.retain(|&(_, count)| count > 0);
+    ranges.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
+    for (start, count) in ranges {
+        let end = start as u64 + count as u64;
+        if let Some(last) = out.last_mut() {
+            let last_end = last.0 as u64 + last.1 as u64;
+            if start as u64 <= last_end {
+                let merged = last_end.max(end) - last.0 as u64;
+                last.1 = u32::try_from(merged).unwrap_or(u32::MAX);
+                continue;
+            }
+        }
+        out.push((start, count));
+    }
+    out
+}
+
+#[cfg(test)]
+mod merge_ranges_tests {
+    use super::merge_ranges;
+
+    #[test]
+    fn sorts_coalesces_overlap_and_adjacency_and_drops_empties() {
+        let got = merge_ranges(vec![(50, 10), (10, 5), (12, 10), (22, 3), (40, 0), (30, 1)]);
+        assert_eq!(got, vec![(10, 15), (30, 1), (50, 10)]);
+    }
+
+    #[test]
+    fn a_contained_range_does_not_shrink_its_container() {
+        assert_eq!(merge_ranges(vec![(0, 100), (10, 5)]), vec![(0, 100)]);
+    }
+
+    #[test]
+    fn saturates_at_the_u32_ceiling() {
+        let got = merge_ranges(vec![(0, u32::MAX), (u32::MAX - 1, u32::MAX)]);
+        assert_eq!(got, vec![(0, u32::MAX)]);
+    }
+}
+
 /// Pass 1 of a multipass rip: walk the disc forward, write every readable
 /// sector into `path`, and record the result in the sidecar mapfile. With
 /// `skip_on_error: true`, a bad sector zero-fills + marks `NonTrimmed` and
@@ -785,7 +896,7 @@ pub fn sweep(
     opts: &SweepOptions,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
-    use libfreemkv::sector::{DecryptingSectorSource, SectorSource};
+    use libfreemkv::sector::SectorSource;
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
     // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
@@ -798,45 +909,15 @@ pub fn sweep(
     // `Error::EmptyImage` before the output is created.
     let total_bytes = disc.image_read_sectors()? as u64 * 2048;
     // Decrypt-aware read: `opts.decrypt` decrypts each unit in place (plaintext ISO);
-    // otherwise pure pass-through (keys = `None`). Bad sectors are found by physical
-    // read success, not decrypt structure — proven at mux time, not capture time.
-    let mut keys = if opts.decrypt {
-        disc.decrypt_keys()
-    } else {
-        libfreemkv::decrypt::DecryptKeys::None
-    };
-    let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
-    // AACS sweep: resolve a whole-disc key map up front (fail-loud on missing CPS-unit key).
-    // The map alone is NOT a content gate — see the content_ranges block below for why, and
-    let key_map = if opts.decrypt && decrypt_is_aacs {
-        let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
-        Some(std::sync::Arc::new(disc.resolve_content_key_map(
-            reader,
-            &mut keys,
-            opts.key_fetch.as_ref(),
-            halt.as_ref(),
-        )?))
-    } else {
-        None
-    };
-    let content_ranges = disc.encrypted_content_ranges();
-    let can_gate = !content_ranges.is_empty();
-
-    // The content gate below is INERT for every key state that reaches it (CSS self-descrambles
-    // regardless; `None` decrypts nothing), so all three conditions here carry equivalent
-    // mutants.
-    let mut reader = {
-        let mut dec = DecryptingSectorSource::new(reader, keys);
-        if let Some(map) = key_map {
-            dec = dec.with_key_map(map);
-        }
-        // freemkv#55: whole-disc reader walks UDF + BDMV nav sectors that are clear — content
-        // gate needed so those don't trip AACS's orphan-unit refusal.
-        if opts.decrypt && can_gate {
-            dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
-        }
-        dec
-    };
+    // otherwise pure pass-through. Bad sectors are found by physical read success,
+    // not decrypt structure — proven at mux time, not capture time.
+    let (mut reader, decrypt_is_aacs) = whole_disc_decrypting_reader(
+        disc,
+        reader,
+        opts.decrypt,
+        opts.halt.as_ref(),
+        opts.key_fetch.as_ref(),
+    )?;
     let reader = &mut reader;
 
     // Mapfile: load if resuming, else wipe + recreate.

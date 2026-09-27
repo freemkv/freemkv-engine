@@ -736,7 +736,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
 }
 
 // The FLAT handler pool — every technique from all tiers in ONE chain (data-driven bandit, no
-// tier gate). Enabled by `FREEMKV_PATCH_FLAT`
+// tier gate). Enabled by `FREEMKV_PATCH_FLAT` (see `patch_flat_mode`).
 fn build_flat_pool() -> Vec<Box<dyn SectionHandler>> {
     let mut pool = Vec::new();
     for tier in 0..PATCH_TIERS {
@@ -1221,7 +1221,6 @@ pub fn patch(
     opts: &PatchOptions,
 ) -> Result<PatchOutcome> {
     use libfreemkv::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
-    use libfreemkv::sector::DecryptingSectorSource;
 
     // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
     // direct `patch` caller can't bypass it): a decrypting pass with no usable
@@ -1276,43 +1275,15 @@ pub fn patch(
     let bytes_good_before = initial_stats.bytes_good;
     let bytes_good_start = bytes_good_before;
 
-    // Decrypt-aware read, symmetric with `Disc::sweep`: `opts.decrypt` decrypts
-    // in place, non-decrypting (multipass `--raw`) copies ciphertext verbatim.
+    // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim).
     // Bad sectors are found by PHYSICAL read success, not decrypt structure.
-    let mut keys = if opts.decrypt {
-        disc.decrypt_keys()
-    } else {
-        libfreemkv::decrypt::DecryptKeys::None
-    };
-    let decrypt_is_aacs = matches!(keys, libfreemkv::decrypt::DecryptKeys::Aacs { .. });
-    // AACS decrypting patch: resolve the whole-disc key map up front and decrypt
-    // via the map (identical to `Disc::sweep`). CSS keeps the content-gated
-    // self-descramble path. (Multipass patch is `--raw`, so decrypt is a no-op.)
-    let key_map = if opts.decrypt && decrypt_is_aacs {
-        let halt = opts.halt.clone().map(libfreemkv::halt::Halt::from_arc);
-        Some(std::sync::Arc::new(disc.resolve_content_key_map(
-            reader,
-            &mut keys,
-            opts.key_fetch.as_ref(),
-            halt.as_ref(),
-        )?))
-    } else {
-        None
-    };
-    let content_ranges = disc.encrypted_content_ranges();
-    let can_gate = !content_ranges.is_empty();
-    let mut reader = {
-        let mut dec = DecryptingSectorSource::new(reader, keys);
-        if let Some(map) = key_map {
-            dec = dec.with_key_map(map);
-        }
-        // freemkv#55: whole-disc reader → always declare the content extents, key
-        // map or not. See `recovery::sweep` for why the map is not a substitute.
-        if opts.decrypt && can_gate {
-            dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
-        }
-        dec
-    };
+    let (mut reader, decrypt_is_aacs) = super::whole_disc_decrypting_reader(
+        disc,
+        reader,
+        opts.decrypt,
+        opts.halt.as_ref(),
+        opts.key_fetch.as_ref(),
+    )?;
     let reader = &mut reader;
 
     // Spawn the consumer: `WritebackFile`/`Mapfile` move into the sink; the shared
