@@ -770,9 +770,8 @@ fn patch_internal(
     ))
 }
 
-/// The whole-disc (sweep / patch) reader: `decrypt` installs the disc's keys, and for
-/// AACS the resolved key map plus a content gate over EVERY `/BDMV/STREAM` file, so a
-/// unit no kept title plays is decrypted or fails loud — never shipped as ciphertext.
+/// Whole-disc (sweep / patch) reader: AACS decrypts via the key map, gated on every
+/// `/BDMV/STREAM` file; a stream unit the map cannot key is refused before any output.
 /// Returns the reader and whether it decrypts AACS (reads must then be unit-aligned).
 pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
@@ -791,51 +790,133 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
         DecryptKeys::None
     };
     let is_aacs = matches!(keys, DecryptKeys::Aacs { .. });
-    // AACS: the whole-disc key map, resolved up front (fail-loud on a missing CPS-unit key).
-    let key_map = if is_aacs {
+    let mut key_map = None;
+    let mut content_ranges = disc.encrypted_content_ranges();
+    if is_aacs {
+        // The title-derived key map, resolved up front (fail-loud on a missing CPS-unit key).
         let halt = halt.cloned().map(libfreemkv::halt::Halt::from_arc);
-        Some(std::sync::Arc::new(disc.resolve_content_key_map(
-            reader,
-            &mut keys,
-            key_fetch,
-            halt.as_ref(),
-        )?))
-    } else {
-        None
-    };
-    // freemkv#55: the map alone is no gate — clear UDF/nav units outside it would trip
-    // the orphan refusal. Read the stream map BEFORE wrapping `reader`. Inert for CSS/None.
-    let content_ranges = if is_aacs {
-        whole_disc_content_ranges(disc, reader)
-    } else {
-        disc.encrypted_content_ranges()
-    };
+        let map = disc.resolve_content_key_map(reader, &mut keys, key_fetch, halt.as_ref())?;
+        // freemkv#55: the map alone is no gate (clear UDF/nav would trip the orphan
+        // refusal). Read the stream map BEFORE wrapping `reader`.
+        content_ranges = aacs_content_ranges(disc, reader)?;
+        key_map = Some(std::sync::Arc::new(key_non_title_streams(
+            disc,
+            &keys,
+            map,
+            &content_ranges,
+        )?));
+    }
     let mut dec = libfreemkv::sector::DecryptingSectorSource::new(reader, keys);
     if let Some(map) = key_map {
         dec = dec.with_key_map(map);
     }
+    // CSS self-descrambles and `None` decrypts nothing: the gate only matters for AACS.
     if decrypt && !content_ranges.is_empty() {
         dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
     }
     Ok((dec, is_aacs))
 }
 
-// Every /BDMV/STREAM file's extents unioned with the kept titles'. No BDMV tree (HD DVD)
-// or an unreadable UDF leaves the title extents alone — the gate never narrows below them.
-fn whole_disc_content_ranges(
+// AACS whole-disc content: on a BD tree every /BDMV/STREAM file plus the title extents
+// (an unreadable or empty stream map fails loud); off-BD (HD DVD) title extents only.
+fn aacs_content_ranges(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
-) -> Vec<(u32, u32)> {
-    let mut ranges = disc.encrypted_content_ranges();
-    match libfreemkv::Disc::stream_content_ranges(reader) {
-        Ok(stream) => ranges.extend(stream),
-        Err(e) => tracing::warn!(
-            target: "freemkv::scan",
-            code = e.code(),
-            "stream file extents unreadable; content gate falls back to title extents"
-        ),
+) -> Result<Vec<(u32, u32)>> {
+    use libfreemkv::DiscFormat;
+    let titles = disc.encrypted_content_ranges();
+    if !matches!(
+        disc.format,
+        DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts
+    ) {
+        return Ok(titles);
     }
-    merge_ranges(ranges)
+    let stream = libfreemkv::Disc::stream_content_ranges(reader)?;
+    if stream.is_empty() && !titles.is_empty() {
+        tracing::warn!(target: "freemkv::scan", "BD titles but no /BDMV/STREAM files");
+        return Err(Error::DecryptFailed);
+    }
+    Ok(merge_ranges(titles.into_iter().chain(stream).collect()))
+}
+
+// Extend the title-only `map` over content it leaves unkeyed (stream files no kept title
+// plays) with the disc's ONE CPS-unit key; anything else can't be keyed, so refuse now.
+fn key_non_title_streams(
+    disc: &libfreemkv::Disc,
+    keys: &libfreemkv::decrypt::DecryptKeys,
+    map: libfreemkv::decrypt::AacsKeyMap,
+    content: &[(u32, u32)],
+) -> Result<libfreemkv::decrypt::AacsKeyMap> {
+    use libfreemkv::decrypt::Phase;
+    let keyed: Vec<(u32, u32)> = map.ranges().iter().map(|&(s, e, _, _)| (s, e)).collect();
+    let orphans = subtract_ranges(content, &keyed);
+    if orphans.is_empty() {
+        return Ok(map);
+    }
+    let Some(slot) = single_cps_key_slot(disc, keys, &map) else {
+        tracing::warn!(
+            target: "freemkv::scan",
+            orphan_ranges = orphans.len(),
+            "stream files outside every title on a multi-CPS/FMTS disc; refusing"
+        );
+        return Err(Error::DecryptFailed);
+    };
+    let mut ranges = map.ranges().to_vec();
+    ranges.extend(orphans.into_iter().map(|(s, e)| (s, e, slot, Phase::All)));
+    Ok(libfreemkv::decrypt::AacsKeyMap::from_ranges_phased(ranges))
+}
+
+// The key-pool slot of the disc's only CPS unit, when provably single-CPS: Unit_Key_RO.inf
+// declares exactly one unit, the disc is not FMTS, and the map uses at most one key.
+fn single_cps_key_slot(
+    disc: &libfreemkv::Disc,
+    keys: &libfreemkv::decrypt::DecryptKeys,
+    map: &libfreemkv::decrypt::AacsKeyMap,
+) -> Option<usize> {
+    use libfreemkv::aacs::mkb::AacsVersion;
+    use libfreemkv::decrypt::{DecryptKeys, Phase};
+    let aacs = disc.aacs.as_ref()?;
+    if disc.format == libfreemkv::DiscFormat::Fmts || map.ranges().iter().any(|r| r.3 != Phase::All)
+    {
+        return None;
+    }
+    let version = if aacs.version >= 2 {
+        AacsVersion::V20
+    } else {
+        AacsVersion::V10
+    };
+    let ukf = libfreemkv::aacs::inf::parse_unit_key_ro(&aacs.uk_ro, version)?;
+    if ukf.encrypted_keys.len() != 1 {
+        return None;
+    }
+    match (map.key_indices(), keys) {
+        ([only], _) => Some(*only),
+        ([], DecryptKeys::Aacs { unit_keys, .. }) if unit_keys.len() == 1 => Some(0),
+        _ => None,
+    }
+}
+
+// `content` `(start, count)` ranges minus the sorted, disjoint `[start, end)` `keyed`
+// ranges, as `[start, end)` pieces.
+fn subtract_ranges(content: &[(u32, u32)], keyed: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &(start, count) in content {
+        let end = start.saturating_add(count);
+        let mut pos = start;
+        for &(ks, ke) in keyed {
+            if ke <= pos || ks >= end {
+                continue;
+            }
+            if ks > pos {
+                out.push((pos, ks));
+            }
+            pos = pos.max(ke);
+        }
+        if pos < end {
+            out.push((pos, end));
+        }
+    }
+    out
 }
 
 // Sort + coalesce overlapping/adjacent `(start, count)` ranges (the content gate's
@@ -861,7 +942,16 @@ fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
 
 #[cfg(test)]
 mod merge_ranges_tests {
-    use super::merge_ranges;
+    use super::{merge_ranges, subtract_ranges};
+
+    #[test]
+    fn subtract_leaves_only_the_unkeyed_pieces() {
+        // content [10,40) and [50,60); keyed [0,12), [20,25), [38,55).
+        let got = subtract_ranges(&[(10, 30), (50, 10)], &[(0, 12), (20, 25), (38, 55)]);
+        assert_eq!(got, vec![(12, 20), (25, 38), (55, 60)]);
+        assert_eq!(subtract_ranges(&[(10, 5)], &[(10, 15)]), Vec::new());
+        assert_eq!(subtract_ranges(&[(10, 5)], &[]), vec![(10, 15)]);
+    }
 
     #[test]
     fn sorts_coalesces_overlap_and_adjacency_and_drops_empties() {
