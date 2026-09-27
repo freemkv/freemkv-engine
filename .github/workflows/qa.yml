@@ -23,10 +23,14 @@ on:
     branches: [qa]
   workflow_dispatch:
 
-# Rapid dev pushes supersede their own in-progress runs instead of stacking.
+# A newer qa push (or dispatch on the same ref) supersedes an in-progress run.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Least privilege by default; only rc-tag is granted contents: write.
+permissions:
+  contents: read
 
 jobs:
   # Single source of truth for the MSRV — see ci.yml. Jobs that build/test AT
@@ -55,8 +59,11 @@ jobs:
   # Red on qa is a working gate, not an incident — it is the branch saying this
   # is not production worth yet. Fix on dev, get dev green, push qa again.
   #
-  # release.yml excludes v*-rc* so a candidate never publishes a release.
+  # No workflow in this repo triggers on tags, so an rc tag never publishes;
+  # releases are cut by freemkv/freemkv's release-orchestrate.yml. Only the qa
+  # branch is a candidate: a dispatch from any other ref must not stamp an rc.
   rc-tag:
+    if: github.ref_name == 'qa'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -108,10 +115,14 @@ jobs:
         working-directory: freemkv-engine
 
   # clippy's output is target-dependent: cfg-gated code only gets linted on
-  # the target it compiles for. Linting solely on the dev machine's host
-  # target is how a lint that CI rejects reaches a push.
+  # the target it compiles for. ci.yml lints Linux; this lints the native
+  # macOS and Windows targets (C build scripts rule out cross-clippy from Linux).
   cross-lint:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ['macos-latest', 'windows-latest']
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -129,8 +140,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: freemkv-engine
-      - run: rustup target add x86_64-unknown-linux-gnu
-      - run: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+      - run: cargo +stable clippy --all-targets -- -D warnings
         working-directory: freemkv-engine
 
   # Windows compiles the tests but does not run them, matching the policy

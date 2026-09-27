@@ -15,6 +15,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege: no job here writes to the repo (Codecov uses its own secret).
+permissions:
+  contents: read
+
 # WHY THE SIBLING CHECKOUTS — this is NOT a monorepo.
 #
 # The committed Cargo.toml resolves libfreemkv and freemkv-keysources from git
@@ -190,8 +194,8 @@ jobs:
     # dev is the FAST lane: this job still runs, but on the release-candidate
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
+    # covers macOS and Windows (release profile), and these debug-profile test
+    # builds (macOS arm64, Windows) run here on qa and main. A push
     # to dev is meant to be cheap and frequent; waiting on three runner pools
     # to agree is what a release candidate is for.
     #
@@ -223,8 +227,8 @@ jobs:
     # dev is the FAST lane: this job still runs, but on the release-candidate
     # branches rather than on every push to dev. Nothing is deleted and no
     # platform stops being checked before a release -- qa.yml independently
-    # covers macOS and Windows, and the jobs unique to this file (the Intel
-    # macOS build, the Windows release build) run here on qa and main. A push
+    # covers macOS and Windows (release profile), and these debug-profile test
+    # builds (macOS arm64, Windows) run here on qa and main. A push
     # to dev is meant to be cheap and frequent; waiting on three runner pools
     # to agree is what a release candidate is for.
     #
