@@ -183,7 +183,9 @@ pub fn scope_bad_bytes(
 
 /// [`scope_bad_bytes`] for the patch loop: `None` (unmeasured, never converges)
 /// when the loss is [`loss_is_unscopable`], whose scoped count reads a false 0.
-pub(crate) fn measured_scope_bad(
+/// With no extents, out-of-title (menu/trailer) damage then also earns passes:
+/// fail-safe, and bounded by the loop's no-progress stop.
+pub fn measured_scope_bad(
     is_iso: bool,
     bad_ranges: &[(u64, u64)],
     title: &libfreemkv::DiscTitle,
@@ -623,8 +625,8 @@ fn multipass_rip_inner(
             }
 
             // Loop-top convergence gate: skip remaining passes if the mapfile
-            // shows the muxable scope already clean. `None` (unreadable or
-            // unscopable) and an EMPTY mapfile both fake "Converged" — guarded.
+            // shows the muxable scope clean. `None` (unreadable/unscopable) never
+            // converges; an EMPTY mapfile's `Some(0)` is guarded by `bytes_good`.
             let mux_scope_bad = match Mapfile::load(&mapfile_path) {
                 Ok(map) => {
                     let bad = map.ranges_with(&bad_sector_statuses());
@@ -1931,8 +1933,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // MKV scope with no main-title extents: scoped bad bytes read 0 whatever the
-    // damage. That must not pass as "converged" and skip the pass that recovers it.
     #[test]
     fn measured_scope_bad_is_unmeasured_only_when_unscopable() {
         let empty = libfreemkv::DiscTitle::empty();
@@ -1948,6 +1948,8 @@ mod tests {
         assert_eq!(measured_scope_bad(false, &damage, &t), Some(4096));
     }
 
+    // MKV scope with no main-title extents: scoped bad bytes read 0 whatever the
+    // damage. That must not pass as "converged" and skip the pass that recovers it.
     #[test]
     fn multipass_rip_unscopable_mkv_loss_still_runs_patch_passes() {
         let (dir, iso) = scratch_iso("unscopable-mkv");
