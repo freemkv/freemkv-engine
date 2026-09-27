@@ -44,8 +44,9 @@ pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, wo
 pub use multipass::{
     MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
-    end_of_recovery_promotion, loss_aborts, multipass_rip, pass_exit, patch_made_progress,
-    patch_pass_decision, plan_passes, scope_bad_bytes, scope_converged, should_abort_for_loss,
+    end_of_recovery_promotion, loss_aborts, measured_scope_bad, multipass_rip, pass_exit,
+    patch_made_progress, patch_pass_decision, plan_passes, scope_bad_bytes, scope_converged,
+    should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,

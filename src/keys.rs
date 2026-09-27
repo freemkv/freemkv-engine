@@ -215,7 +215,7 @@ mod tests {
     }
 
     // An unencrypted disc resolves nothing and READS nothing; guards against a fabricated
-    // winning-source label  and pins the read short-circuit.
+    // winning-source label and pins the read short-circuit.
     #[test]
     fn resolve_disc_keys_is_none_and_reads_nothing_for_an_unencrypted_disc() {
         struct NeverRead;

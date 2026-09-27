@@ -181,6 +181,21 @@ pub fn scope_bad_bytes(
     abort_lost_bytes(is_iso, title, bad_ranges)
 }
 
+/// [`scope_bad_bytes`] for the patch loop: `None` (unmeasured, never converges)
+/// when the loss is [`loss_is_unscopable`], whose scoped count reads a false 0.
+/// With no extents, out-of-title (menu/trailer) damage then also earns passes:
+/// fail-safe, and bounded by the loop's no-progress stop.
+pub fn measured_scope_bad(
+    is_iso: bool,
+    bad_ranges: &[(u64, u64)],
+    title: &libfreemkv::DiscTitle,
+) -> Option<u64> {
+    if loss_is_unscopable(is_iso, title, bad_ranges) {
+        return None;
+    }
+    Some(scope_bad_bytes(is_iso, bad_ranges, title))
+}
+
 /// Loop-top convergence gate: the muxable scope is 100% recovered (nothing left
 /// to retry) exactly when its scope-aware bad-byte count is zero.
 pub fn scope_converged(mux_scope_bad: u64) -> bool {
@@ -610,12 +625,12 @@ fn multipass_rip_inner(
             }
 
             // Loop-top convergence gate: skip remaining passes if the mapfile
-            // shows the muxable scope already clean. `None` (unreadable) and an
-            // EMPTY mapfile both fake "Converged" — `pre_pass_converged` guards.
+            // shows the muxable scope clean. `None` (unreadable/unscopable) never
+            // converges; an EMPTY mapfile's `Some(0)` is guarded by `bytes_good`.
             let mux_scope_bad = match Mapfile::load(&mapfile_path) {
                 Ok(map) => {
                     let bad = map.ranges_with(&bad_sector_statuses());
-                    Some(scope_bad_bytes(opts.is_iso_output, &bad, main_title))
+                    measured_scope_bad(opts.is_iso_output, &bad, main_title)
                 }
                 Err(e) => {
                     sink.log(
@@ -1914,6 +1929,65 @@ mod tests {
         assert!(result.complete);
         assert!(!result.halted);
         assert!(!result.aborted_for_loss);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn measured_scope_bad_is_unmeasured_only_when_unscopable() {
+        let empty = libfreemkv::DiscTitle::empty();
+        let damage = [(0u64, 4096u64)];
+        assert_eq!(measured_scope_bad(false, &damage, &empty), None);
+        assert!(!pre_pass_converged(
+            measured_scope_bad(false, &damage, &empty),
+            4096
+        ));
+        assert_eq!(measured_scope_bad(false, &[], &empty), Some(0));
+        assert_eq!(measured_scope_bad(true, &damage, &empty), Some(4096));
+        let t = test_title(0, 2_000);
+        assert_eq!(measured_scope_bad(false, &damage, &t), Some(4096));
+    }
+
+    // MKV scope with no main-title extents: scoped bad bytes read 0 whatever the
+    // damage. That must not pass as "converged" and skip the pass that recovers it.
+    #[test]
+    fn multipass_rip_unscopable_mkv_loss_still_runs_patch_passes() {
+        let (dir, iso) = scratch_iso("unscopable-mkv");
+        let sectors = 4096u32;
+        let disc = test_disc(sectors, vec![]);
+        let mut reader = MultiSpotReader {
+            capacity: sectors,
+            spots: vec![Spot {
+                lba: 1000,
+                heal_after: 1,
+                attempts: 0,
+            }],
+        };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: false,
+        };
+
+        let result = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("recoverable damage must not fail the rip");
+
+        assert_eq!(
+            result.passes, 2,
+            "unscopable loss must still earn a patch pass"
+        );
+        assert_eq!(result.unreadable_bytes, 0, "the patch pass recovered it");
+        assert!(!result.aborted_for_loss, "nothing is lost once recovered");
+        assert!(result.complete);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

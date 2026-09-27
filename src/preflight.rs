@@ -77,7 +77,8 @@ impl Reason {
 ///
 /// Checks, cheapest first: the disc has titles; the selection resolves to a non-empty set of
 /// in-range indices; every language-filtered stream class the job asks for is carried by a
-/// selected title; and, if the disc is encrypted and the job is not `raw`, a usable key exists.
+/// selected title; a multipass job is `raw`; and, if the disc is encrypted and the job is not
+/// `raw`, a usable key exists.
 pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     let mut reasons = Vec::new();
 

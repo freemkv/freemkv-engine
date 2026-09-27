@@ -127,8 +127,11 @@ impl SpeedEstimator {
         if self.samples.len() < 2 {
             return 0.0;
         }
-        let &(oldest_t, oldest_b) = self.samples.front().unwrap();
-        let &(newest_t, newest_b) = self.samples.back().unwrap();
+        let (Some(&(oldest_t, oldest_b)), Some(&(newest_t, newest_b))) =
+            (self.samples.front(), self.samples.back())
+        else {
+            return 0.0;
+        };
         let dt = newest_t.duration_since(oldest_t).as_secs_f64();
         if dt <= 0.0 {
             return 0.0;
@@ -179,7 +182,7 @@ impl SpeedEstimator {
         let eta_mbs = self.eta_speed_mbs(now, display_mbs);
         let speed_bps = (display_mbs * BYTES_PER_MIB) as u64;
         // 0.0001 MB/s (~0.1 KB/s) floor: any real forward motion yields an ETA, but a dead
-        // stall doesn't divide toward a multi-year number. `>=` here is equivalent.
+        // stall doesn't divide toward a multi-year number. Strict: exactly the floor is a stall.
         let eta_secs = if eta_mbs > 0.0001 && bytes_total > bytes_done {
             let rem_mb = (bytes_total - bytes_done) as f64 / BYTES_PER_MIB;
             Some((rem_mb / eta_mbs).round() as u64)
@@ -616,6 +619,27 @@ mod tests {
         assert!(
             (eta - 70.0).abs() < 0.5,
             "700 MiB over 10 s is ~70 MB/s, got {eta}"
+        );
+    }
+
+    /// The ETA floor is strict: exactly 0.0001 MB/s (1 MiB over 10000 s) is a stall.
+    #[test]
+    fn eta_floor_is_exclusive_at_exactly_the_threshold() {
+        let mib = 1024 * 1024u64;
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(10_000);
+
+        let mut s = SpeedEstimator::new();
+        s.sample_at(t0, 0, 100 * mib);
+        let (_, eta) = s.sample_at(at, mib, 100 * mib);
+        assert_eq!(eta, None, "a rate exactly on the floor must yield no ETA");
+
+        let mut s = SpeedEstimator::new();
+        s.sample_at(t0, 0, 100 * mib);
+        let (_, eta) = s.sample_at(at, 2 * mib, 100 * mib);
+        assert!(
+            eta.is_some(),
+            "a rate just above the floor must yield an ETA"
         );
     }
 }
