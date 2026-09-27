@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- Whole-disc decrypt (ISO → ISO) now declares its content extents, so the recovery pipeline classifies decrypt refusals as `E6000` instead of the misleading `status=0x00` label they surfaced as before (#55).
+- Whole-disc decrypt (ISO → ISO) now declares its content extents, so decrypt refusals keep their own `DecryptFailed` code instead of the misleading `E6000: <lba> 0x00` disc-read error they surfaced as before; `E6000` is reserved for genuine read faults (#55).
 
 ### Maintenance
 

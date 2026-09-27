@@ -14,7 +14,8 @@ use std::path::Path;
 /// `reader` is consumed for content reads (see [`libfreemkv::Disc::extract_tree`]). `force`
 /// mirrors the CLI's `--force`: without it, a non-empty `dest` is refused. `sink`'s
 /// [`Sink::should_cancel`] is polled by a watcher thread that cancels a fresh
-/// [`libfreemkv::Halt`], stopping the extraction at the next file boundary.
+/// [`libfreemkv::Halt`]. Cancel can stop mid-file: the interrupted file stays
+/// `<name>.partial` (never renamed to its final name) and the result reports `halted`.
 pub fn extract_tree(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,

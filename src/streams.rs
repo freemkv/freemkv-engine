@@ -843,7 +843,7 @@ mod tests {
     }
 
     // The request this split exists for, verbatim: "German & Spanish audio, only German
-    // subtitles, and forced only if in English.".
+    // subtitles, and forced only if in English."
     #[test]
     fn german_spanish_audio_german_subs_forced_english() {
         let sel = resolve_stream_selection_forced(
