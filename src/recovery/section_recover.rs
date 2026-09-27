@@ -303,6 +303,13 @@ fn read_span(
         // Not disc damage: stop the chain now (as a transport fault would) and
         // hand the real error to the caller via `ctx.fatal`.
         Err(e) if !super::is_damage_candidate(&e) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "section_recover.fatal",
+                lba,
+                code = e.code(),
+                "non-read error during recovery; aborting the pass with it"
+            );
             ctx.fatal = Some(e);
             ReadHit::Transport
         }
@@ -1028,6 +1035,8 @@ pub(super) fn run_handlers(
             bad_bytes_after = after,
             recovered = before.saturating_sub(after),
             outcome = ?outcome,
+            // Set when `outcome` is TransportFault only because a non-read error ended it.
+            fatal_code = ctx.fatal.as_ref().map(|e| e.code()),
             "handler finished; remaining bad bytes carry to the next handler"
         );
         match outcome {
