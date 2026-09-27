@@ -171,8 +171,6 @@ pub(super) struct HandlerCtx<'a> {
     /// inline, so tests advance a fake clock deterministically.
     pub now: &'a dyn Fn() -> Instant,
     pub halt: Option<&'a AtomicBool>,
-    /// Widen mid-unit reads to the aligned AACS unit (see [`recovery_read`]).
-    pub decrypt_is_aacs: bool,
     /// Progress heartbeat. Handlers call [`HandlerCtx::progress`] frequently (it
     /// is internally throttled); this pushes a fresh progress snapshot to the
     /// caller's reporter DURING a handler, not just at range boundaries — so the
@@ -279,15 +277,7 @@ fn read_span(
     }
     let recovery = params.timeout.recovery();
     let read_started = (ctx.now)();
-    let hit = match recovery_read(
-        ctx.reader,
-        ctx.decrypt_is_aacs,
-        lba,
-        count,
-        buf,
-        recovery,
-        params.fua,
-    ) {
+    let hit = match recovery_read(ctx.reader, lba, count, buf, recovery, params.fua) {
         Ok(n) if n == bytes => {
             ctx.sink.recovered(pos, &buf[..bytes]);
             ReadHit::Good
@@ -1298,7 +1288,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1337,7 +1326,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1391,7 +1379,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1431,7 +1418,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1469,7 +1455,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1508,7 +1493,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1570,7 +1554,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1616,7 +1599,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1650,7 +1632,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1683,7 +1664,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1746,7 +1726,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1805,7 +1784,6 @@ mod tests {
                 sink: &mut sink,
                 now: &now,
                 halt: None,
-                decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
                 fatal: None,
@@ -1858,7 +1836,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -1942,7 +1919,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -2020,7 +1996,6 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
             fatal: None,
@@ -2097,7 +2072,6 @@ mod tests {
                 sink: &mut $sink,
                 now: &$now,
                 halt: None,
-                decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
                 fatal: None,

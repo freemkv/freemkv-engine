@@ -332,47 +332,21 @@ pub(super) fn compute_initial_state(
 // timeout (60 s deep vs fast); `fua` forces the drive to bypass readahead and re-fetch.
 pub(super) fn recovery_read<R: SectorSource + ?Sized>(
     reader: &mut R,
-    decrypt_is_aacs: bool,
     lba: u32,
     count: u16,
     buf: &mut [u8],
     recovery: bool,
     fua: bool,
 ) -> Result<usize> {
+    // AACS unit widening happens inside the whole-disc reader (per-file grid). The
+    // caller's buffer is reused, so a short transfer would leave the PREVIOUS span's
+    // stale bytes behind: `require_full_read` turns it into a failed read.
     let bytes = count as usize * 2048;
-    if decrypt_is_aacs && (!lba.is_multiple_of(3) || !count.is_multiple_of(3)) {
-        const U: u32 = 3;
-        let aligned_lba = lba - (lba % U);
-        let head = (lba - aligned_lba) as usize; // lead-in sectors
-        let span = head + count as usize;
-        let aligned_count = span + ((U as usize - span % U as usize) % U as usize);
-        let mut scratch = vec![0u8; aligned_count * 2048];
-        // `require_full_read` before the copy-back, not a bare `?`: `scratch` is
-        // freshly zeroed, so a short transfer would splice zeros into the
-        // sector and the caller would commit them as recovered.
-        super::require_full_read(
-            reader.read_sectors_fua(
-                aligned_lba,
-                aligned_count as u16,
-                &mut scratch,
-                recovery,
-                fua,
-            ),
-            aligned_count * 2048,
-            aligned_lba,
-        )?;
-        buf[..bytes].copy_from_slice(&scratch[head * 2048..head * 2048 + bytes]);
-        Ok(bytes)
-    } else {
-        // Unaligned branch hands the caller's reused buffer to the reader, so a
-        // short transfer would leave the PREVIOUS span's stale bytes behind —
-        // the exact silent-corruption shape the helper exists to stop.
-        super::require_full_read(
-            reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua),
-            bytes,
-            lba,
-        )
-    }
+    super::require_full_read(
+        reader.read_sectors_fua(lba, count, &mut buf[..bytes], recovery, fua),
+        bytes,
+        lba,
+    )
 }
 
 // The still-bad `[pos, len)` sub-ranges of one bad section (byte offsets,
@@ -623,7 +597,6 @@ struct PatchCtx<'a, 'o> {
     shared: &'a Mutex<SharedPatchState>,
     opts: &'a PatchOptions<'o>,
     total_bytes: u64,
-    decrypt_is_aacs: bool,
     state: PatchLoopState,
     /// Per-rip handler scorecard: grades handlers by recovery rate so the
     /// coordinator runs the winners first and lets duds fall back. Reset per
@@ -1022,7 +995,6 @@ impl PatchCtx<'_, '_> {
                 // external token (mirrored above) and the front-end's
                 // `should_cancel()` answer from the progress tick.
                 halt: Some(pass_cancel.as_ref()),
-                decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
                 unproductive: 0,
                 fatal: None,
@@ -1275,9 +1247,9 @@ pub fn patch(
     let bytes_good_before = initial_stats.bytes_good;
     let bytes_good_start = bytes_good_before;
 
-    // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim).
-    // Bad sectors are found by PHYSICAL read success, not decrypt structure.
-    let (mut reader, decrypt_is_aacs) = super::whole_disc_decrypting_reader(
+    // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim); AACS
+    // reads widen onto each file's unit grid. Bad sectors = PHYSICAL read failure.
+    let mut reader = super::whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
         opts.decrypt,
@@ -1352,7 +1324,6 @@ pub fn patch(
         shared: &shared,
         opts,
         total_bytes,
-        decrypt_is_aacs,
         state: PatchLoopState::new(bytes_good_before, initial_batch, work_total),
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
@@ -1896,50 +1867,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn recovery_read_widens_unaligned_aacs_window() {
-        // A mid-unit AACS read must widen to the enclosing 3-sector unit and copy
-        // back exactly the requested sector; each sector is filled with its own
-        // LBA's low byte so we can prove which window came back.
-        struct RecordReader {
-            saw_lba: u32,
-            saw_count: u16,
-        }
-        impl SectorSource for RecordReader {
-            fn read_sectors(
-                &mut self,
-                lba: u32,
-                count: u16,
-                buf: &mut [u8],
-                _recovery: bool,
-            ) -> Result<usize> {
-                self.saw_lba = lba;
-                self.saw_count = count;
-                for s in 0..count as usize {
-                    buf[s * 2048..(s + 1) * 2048].fill((lba as usize + s) as u8);
-                }
-                Ok(count as usize * 2048)
-            }
-        }
-        let mut rr = RecordReader {
-            saw_lba: 0,
-            saw_count: 0,
-        };
-        let mut buf = vec![0u8; 2048];
-        // Request lba=4 (4 % 3 == 1, mid-unit), count=1.
-        let n = recovery_read(&mut rr, true, 4, 1, &mut buf, true, false).unwrap();
-        assert_eq!(n, 2048);
-        assert_eq!(rr.saw_lba, 3, "widened down to the unit-aligned start");
-        assert_eq!(rr.saw_count, 3, "widened to a whole 3-sector unit");
-        assert_eq!(
-            buf[0], 4u8,
-            "copied back the requested sector (lba 4), not the unit head (lba 3)"
-        );
-    }
-
     // A reader that under-delivers must not have its buffer believed.
     #[test]
-    fn recovery_read_rejects_a_short_transfer_on_both_branches() {
+    fn recovery_read_rejects_a_short_transfer() {
         /// Reports `Ok(full)` while filling only the FIRST sector.
         struct ShortReader;
         impl SectorSource for ShortReader {
@@ -1955,9 +1885,9 @@ mod tests {
             }
         }
 
-        // Plain branch: 4 sectors requested, 1 delivered.
+        // 4 sectors requested, 1 delivered.
         let mut buf = vec![0xAAu8; 4 * 2048];
-        let err = recovery_read(&mut ShortReader, false, 9, 4, &mut buf, true, false)
+        let err = recovery_read(&mut ShortReader, 9, 4, &mut buf, true, false)
             .expect_err("a short transfer is a failed read, not a partial success");
         assert!(
             matches!(
@@ -1970,29 +1900,6 @@ mod tests {
             ),
             "classified exactly as Drive::read_one classifies a residual \
              underrun, got {err:?}"
-        );
-
-        // AACS branch: lba 4 is mid-unit, so the read widens to 3 sectors at
-        // lba 3 and goes through `scratch` instead.
-        let mut buf = vec![0xAAu8; 2048];
-        let err = recovery_read(&mut ShortReader, true, 4, 1, &mut buf, true, false)
-            .expect_err("the widened read is short too, and must not copy back");
-        assert!(
-            matches!(
-                err,
-                Error::DiscRead {
-                    sector: 3,
-                    status: None,
-                    sense: None
-                }
-            ),
-            "reported against the WIDENED lba the drive was actually asked \
-             for, got {err:?}"
-        );
-        assert_eq!(
-            buf,
-            vec![0xAAu8; 2048],
-            "nothing may be copied back into the caller's buffer on a failed read"
         );
     }
 

@@ -256,53 +256,6 @@ pub fn copy(
 // actually wrote the file.
 pub(crate) const MAPFILE_CREATOR: &str = concat!("freemkv-engine v", env!("CARGO_PKG_VERSION"));
 
-/// Sectors in one AACS aligned unit (6144 bytes = 3 sectors).
-const UNIT_SECTORS: u16 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u16;
-
-// Round a sweep's batch size up to a whole number of AACS aligned units, so no read handed to
-// the decrypting reader straddles a unit boundary.
-pub(crate) fn aacs_aligned_batch(batch: u16, decrypt_is_aacs: bool) -> u16 {
-    if decrypt_is_aacs && !batch.is_multiple_of(UNIT_SECTORS) {
-        return batch.saturating_add(UNIT_SECTORS - (batch % UNIT_SECTORS));
-    }
-    batch
-}
-
-// Anchor a region's read cursor DOWN to the nearest AACS unit boundary, since a resume
-// `NonTried` region can begin mid-unit.
-pub(crate) fn aacs_aligned_region_start(region_pos: u64, decrypt_is_aacs: bool) -> u64 {
-    if !decrypt_is_aacs {
-        return region_pos;
-    }
-    // Same source of truth as `aacs_aligned_batch`'s `UNIT_SECTORS`, expressed
-    // in bytes rather than sectors — deriving it twice from the raw constant is
-    // how the two halves of one invariant drift apart.
-    let unit = UNIT_SECTORS as u64 * 2048;
-    region_pos - (region_pos % unit)
-}
-
-// Widen the PHYSICAL read of a region's LAST block out to whole AACS units — the third corner
-// of the alignment invariant (siblings: `aacs_aligned_batch`, `aacs_aligned_region_start`).
-pub(crate) fn aacs_aligned_read_bytes(
-    pos: u64,
-    block_bytes: u64,
-    limit: u64,
-    decrypt_is_aacs: bool,
-) -> u64 {
-    if !decrypt_is_aacs {
-        return block_bytes;
-    }
-    let unit = UNIT_SECTORS as u64 * 2048;
-    let rem = block_bytes % unit;
-    if rem == 0 {
-        return block_bytes;
-    }
-    let widened = block_bytes.saturating_add(unit - rem);
-    // Never past the end of the image, and never NARROWER than what the caller
-    // asked for (which `min` alone would do if `limit` were behind `pos`).
-    widened.min(limit.saturating_sub(pos)).max(block_bytes)
-}
-
 #[cfg(test)]
 mod sleep_secs_or_halt_tests {
     use super::sleep_secs_or_halt;
@@ -374,60 +327,6 @@ mod sleep_secs_or_halt_tests {
 }
 
 #[cfg(test)]
-mod aacs_aligned_batch_tests {
-    use super::{UNIT_SECTORS, aacs_aligned_batch};
-
-    /// The case that actually happens: BD/UHD ecc_sectors() is 32.
-    #[test]
-    fn rounds_the_real_bd_batch_up_to_a_unit_boundary() {
-        assert_eq!(aacs_aligned_batch(32, true), 33);
-    }
-
-    /// Rounding UP, never down and never over a whole extra unit.
-    #[test]
-    fn result_is_the_next_multiple_of_a_unit() {
-        for batch in 1u16..=256 {
-            let aligned = aacs_aligned_batch(batch, true);
-            assert!(aligned >= batch, "{batch} rounded down to {aligned}");
-            assert!(
-                aligned.is_multiple_of(UNIT_SECTORS),
-                "{batch} → {aligned}, not a whole number of units"
-            );
-            assert!(
-                aligned - batch < UNIT_SECTORS,
-                "{batch} → {aligned} overshot by a whole unit or more"
-            );
-        }
-    }
-
-    /// Already aligned means untouched — a `+` in place of the `-` would push
-    /// an aligned batch off the boundary it is already on.
-    #[test]
-    fn an_aligned_batch_is_left_alone() {
-        for batch in [3u16, 33, 96, 300] {
-            assert_eq!(aacs_aligned_batch(batch, true), batch);
-        }
-    }
-
-    /// A non-AACS sweep has no unit geometry to respect; the batch is the
-    /// drive's ECC size and must not be altered.
-    #[test]
-    fn a_non_aacs_sweep_keeps_its_batch() {
-        for batch in [1u16, 32, 64, 65535] {
-            assert_eq!(aacs_aligned_batch(batch, false), batch);
-        }
-    }
-
-    /// Saturating, not wrapping: a batch near u16::MAX must not wrap to a tiny
-    /// read.
-    #[test]
-    fn near_max_saturates_instead_of_wrapping() {
-        let aligned = aacs_aligned_batch(u16::MAX - 1, true);
-        assert!(aligned >= u16::MAX - 1, "wrapped to {aligned}");
-    }
-}
-
-#[cfg(test)]
 mod mapfile_creator_tests {
     use super::MAPFILE_CREATOR;
 
@@ -452,74 +351,6 @@ mod mapfile_creator_tests {
             version.starts_with(|c: char| c.is_ascii_digit()),
             "version tail is {version:?}"
         );
-    }
-}
-
-#[cfg(test)]
-mod aacs_aligned_read_bytes_tests {
-    use super::aacs_aligned_read_bytes;
-
-    /// One AACS aligned unit, spelled as the literal the format defines
-    /// (3 sectors x 2048) rather than derived from the constant under test.
-    const UNIT: u64 = 6144;
-    /// A whole disc, far past every `pos` used below, so `limit` never binds.
-    const FAR: u64 = 1 << 40;
-
-    // The case the sweep loop actually produces: the last block of a region,
-    // which ends on a SECTOR boundary (`snap_to_sectors`), not a unit one, so
-    // `region_end - pos` can straddle a unit.
-    #[test]
-    fn the_last_block_of_a_region_is_widened_to_a_whole_unit() {
-        assert_eq!(aacs_aligned_read_bytes(0, 4096, FAR, true), UNIT);
-        assert_eq!(aacs_aligned_read_bytes(0, 2048, FAR, true), UNIT);
-        // 33 sectors (one aligned batch) + 1 sector → 12 units.
-        assert_eq!(aacs_aligned_read_bytes(0, 69_632, FAR, true), 73_728);
-    }
-
-    /// A block that is already a whole number of units is left exactly alone —
-    /// that is every block but the last one of a region.
-    #[test]
-    fn a_unit_aligned_block_is_untouched() {
-        for bytes in [UNIT, 2 * UNIT, 11 * UNIT, 67_584] {
-            assert_eq!(aacs_aligned_read_bytes(12_288, bytes, FAR, true), bytes);
-        }
-    }
-
-    /// A NON-decrypting sweep (`--raw`, the multipass path) has no unit
-    /// geometry to respect and must read exactly what it was asked for.
-    #[test]
-    fn a_non_aacs_sweep_reads_exactly_the_block() {
-        for bytes in [2048u64, 4096, 65_536, 69_632] {
-            assert_eq!(aacs_aligned_read_bytes(0, bytes, FAR, false), bytes);
-        }
-    }
-
-    /// Widening must never read past the end of the image. A disc whose
-    /// capacity is not a whole number of units keeps its partial tail unit.
-    #[test]
-    fn widening_stops_at_the_end_of_the_disc() {
-        // 100 sectors = 204800 bytes, which is not a multiple of 6144.
-        let capacity = 204_800u64;
-        // Final block: the last 2 sectors of the disc.
-        assert_eq!(
-            aacs_aligned_read_bytes(capacity - 4096, 4096, capacity, true),
-            4096,
-            "must not read past capacity to complete a unit"
-        );
-        // A block that CAN be completed inside the disc still is.
-        assert_eq!(
-            aacs_aligned_read_bytes(0, 4096, capacity, true),
-            UNIT,
-            "room to widen inside the image"
-        );
-    }
-
-    /// Never narrower than what was asked for, even if `limit` is behind
-    /// `pos` (a mapfile whose extent disagrees with the image length).
-    #[test]
-    fn never_returns_less_than_the_requested_block() {
-        assert_eq!(aacs_aligned_read_bytes(8192, 4096, 0, true), 4096);
-        assert_eq!(aacs_aligned_read_bytes(8192, 4096, 8192, true), 4096);
     }
 }
 
@@ -770,207 +601,6 @@ fn patch_internal(
     ))
 }
 
-/// Whole-disc (sweep / patch) reader: AACS decrypts via the key map, gated on every
-/// `/BDMV/STREAM` file; a stream unit the map cannot key is refused before any output.
-/// Returns the reader and whether it decrypts AACS (reads must then be unit-aligned).
-pub(crate) fn whole_disc_decrypting_reader<'r>(
-    disc: &libfreemkv::Disc,
-    reader: &'r mut dyn SectorSource,
-    decrypt: bool,
-    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    key_fetch: Option<&libfreemkv::sector::KeyFetch>,
-) -> Result<(
-    libfreemkv::sector::DecryptingSectorSource<&'r mut dyn SectorSource>,
-    bool,
-)> {
-    use libfreemkv::decrypt::DecryptKeys;
-    let mut keys = if decrypt {
-        disc.decrypt_keys()
-    } else {
-        DecryptKeys::None
-    };
-    let is_aacs = matches!(keys, DecryptKeys::Aacs { .. });
-    let mut key_map = None;
-    let mut content_ranges = disc.encrypted_content_ranges();
-    if is_aacs {
-        // The title-derived key map, resolved up front (fail-loud on a missing CPS-unit key).
-        let halt = halt.cloned().map(libfreemkv::halt::Halt::from_arc);
-        let map = disc.resolve_content_key_map(reader, &mut keys, key_fetch, halt.as_ref())?;
-        // freemkv#55: the map alone is no gate (clear UDF/nav would trip the orphan
-        // refusal). Read the stream map BEFORE wrapping `reader`.
-        content_ranges = aacs_content_ranges(disc, reader)?;
-        key_map = Some(std::sync::Arc::new(key_non_title_streams(
-            disc,
-            &keys,
-            map,
-            &content_ranges,
-        )?));
-    }
-    let mut dec = libfreemkv::sector::DecryptingSectorSource::new(reader, keys);
-    if let Some(map) = key_map {
-        dec = dec.with_key_map(map);
-    }
-    // CSS self-descrambles and `None` decrypts nothing: the gate only matters for AACS.
-    if decrypt && !content_ranges.is_empty() {
-        dec = dec.with_content_ranges(std::sync::Arc::from(content_ranges));
-    }
-    Ok((dec, is_aacs))
-}
-
-// AACS whole-disc content: on a BD tree every /BDMV/STREAM file plus the title extents
-// (an unreadable or empty stream map fails loud); off-BD (HD DVD) title extents only.
-fn aacs_content_ranges(
-    disc: &libfreemkv::Disc,
-    reader: &mut dyn SectorSource,
-) -> Result<Vec<(u32, u32)>> {
-    use libfreemkv::DiscFormat;
-    let titles = disc.encrypted_content_ranges();
-    if !matches!(
-        disc.format,
-        DiscFormat::BluRay | DiscFormat::Uhd | DiscFormat::Fmts
-    ) {
-        return Ok(titles);
-    }
-    let stream = libfreemkv::Disc::stream_content_ranges(reader)?;
-    if stream.is_empty() && !titles.is_empty() {
-        tracing::warn!(target: "freemkv::scan", "BD titles but no /BDMV/STREAM files");
-        return Err(Error::DecryptFailed);
-    }
-    Ok(merge_ranges(titles.into_iter().chain(stream).collect()))
-}
-
-// Extend the title-only `map` over content it leaves unkeyed (stream files no kept title
-// plays) with the disc's ONE CPS-unit key; anything else can't be keyed, so refuse now.
-fn key_non_title_streams(
-    disc: &libfreemkv::Disc,
-    keys: &libfreemkv::decrypt::DecryptKeys,
-    map: libfreemkv::decrypt::AacsKeyMap,
-    content: &[(u32, u32)],
-) -> Result<libfreemkv::decrypt::AacsKeyMap> {
-    use libfreemkv::decrypt::Phase;
-    let keyed: Vec<(u32, u32)> = map.ranges().iter().map(|&(s, e, _, _)| (s, e)).collect();
-    let orphans = subtract_ranges(content, &keyed);
-    if orphans.is_empty() {
-        return Ok(map);
-    }
-    let Some(slot) = single_cps_key_slot(disc, keys, &map) else {
-        tracing::warn!(
-            target: "freemkv::scan",
-            orphan_ranges = orphans.len(),
-            "stream files outside every title on a multi-CPS/FMTS disc; refusing"
-        );
-        return Err(Error::DecryptFailed);
-    };
-    let mut ranges = map.ranges().to_vec();
-    ranges.extend(orphans.into_iter().map(|(s, e)| (s, e, slot, Phase::All)));
-    Ok(libfreemkv::decrypt::AacsKeyMap::from_ranges_phased(ranges))
-}
-
-// The key-pool slot of the disc's only CPS unit, when provably single-CPS: Unit_Key_RO.inf
-// declares exactly one unit, the disc is not FMTS, and the map uses at most one key.
-fn single_cps_key_slot(
-    disc: &libfreemkv::Disc,
-    keys: &libfreemkv::decrypt::DecryptKeys,
-    map: &libfreemkv::decrypt::AacsKeyMap,
-) -> Option<usize> {
-    use libfreemkv::aacs::mkb::AacsVersion;
-    use libfreemkv::decrypt::{DecryptKeys, Phase};
-    let aacs = disc.aacs.as_ref()?;
-    if disc.format == libfreemkv::DiscFormat::Fmts || map.ranges().iter().any(|r| r.3 != Phase::All)
-    {
-        return None;
-    }
-    let version = if aacs.version >= 2 {
-        AacsVersion::V20
-    } else {
-        AacsVersion::V10
-    };
-    let ukf = libfreemkv::aacs::inf::parse_unit_key_ro(&aacs.uk_ro, version)?;
-    if ukf.encrypted_keys.len() != 1 {
-        return None;
-    }
-    match (map.key_indices(), keys) {
-        ([only], _) => Some(*only),
-        ([], DecryptKeys::Aacs { unit_keys, .. }) if unit_keys.len() == 1 => Some(0),
-        _ => None,
-    }
-}
-
-// `content` `(start, count)` ranges minus the sorted, disjoint `[start, end)` `keyed`
-// ranges, as `[start, end)` pieces.
-fn subtract_ranges(content: &[(u32, u32)], keyed: &[(u32, u32)]) -> Vec<(u32, u32)> {
-    let mut out = Vec::new();
-    for &(start, count) in content {
-        let end = start.saturating_add(count);
-        let mut pos = start;
-        for &(ks, ke) in keyed {
-            if ke <= pos || ks >= end {
-                continue;
-            }
-            if ks > pos {
-                out.push((pos, ks));
-            }
-            pos = pos.max(ke);
-        }
-        if pos < end {
-            out.push((pos, end));
-        }
-    }
-    out
-}
-
-// Sort + coalesce overlapping/adjacent `(start, count)` ranges (the content gate's
-// binary search needs them sorted and disjoint); empty ranges are dropped.
-fn merge_ranges(mut ranges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
-    ranges.retain(|&(_, count)| count > 0);
-    ranges.sort_unstable();
-    let mut out: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
-    for (start, count) in ranges {
-        let end = start as u64 + count as u64;
-        if let Some(last) = out.last_mut() {
-            let last_end = last.0 as u64 + last.1 as u64;
-            if start as u64 <= last_end {
-                let merged = last_end.max(end) - last.0 as u64;
-                last.1 = u32::try_from(merged).unwrap_or(u32::MAX);
-                continue;
-            }
-        }
-        out.push((start, count));
-    }
-    out
-}
-
-#[cfg(test)]
-mod merge_ranges_tests {
-    use super::{merge_ranges, subtract_ranges};
-
-    #[test]
-    fn subtract_leaves_only_the_unkeyed_pieces() {
-        // content [10,40) and [50,60); keyed [0,12), [20,25), [38,55).
-        let got = subtract_ranges(&[(10, 30), (50, 10)], &[(0, 12), (20, 25), (38, 55)]);
-        assert_eq!(got, vec![(12, 20), (25, 38), (55, 60)]);
-        assert_eq!(subtract_ranges(&[(10, 5)], &[(10, 15)]), Vec::new());
-        assert_eq!(subtract_ranges(&[(10, 5)], &[]), vec![(10, 15)]);
-    }
-
-    #[test]
-    fn sorts_coalesces_overlap_and_adjacency_and_drops_empties() {
-        let got = merge_ranges(vec![(50, 10), (10, 5), (12, 10), (22, 3), (40, 0), (30, 1)]);
-        assert_eq!(got, vec![(10, 15), (30, 1), (50, 10)]);
-    }
-
-    #[test]
-    fn a_contained_range_does_not_shrink_its_container() {
-        assert_eq!(merge_ranges(vec![(0, 100), (10, 5)]), vec![(0, 100)]);
-    }
-
-    #[test]
-    fn saturates_at_the_u32_ceiling() {
-        let got = merge_ranges(vec![(0, u32::MAX), (u32::MAX - 1, u32::MAX)]);
-        assert_eq!(got, vec![(0, u32::MAX)]);
-    }
-}
-
 /// Pass 1 of a multipass rip: walk the disc forward, write every readable
 /// sector into `path`, and record the result in the sidecar mapfile. With
 /// `skip_on_error: true`, a bad sector zero-fills + marks `NonTrimmed` and
@@ -998,10 +628,9 @@ pub fn sweep(
     // ISO reported as complete; `image_read_sectors` turns it into an
     // `Error::EmptyImage` before the output is created.
     let total_bytes = disc.image_read_sectors()? as u64 * 2048;
-    // Decrypt-aware read: `opts.decrypt` decrypts each unit in place (plaintext ISO);
-    // otherwise pure pass-through. Bad sectors are found by physical read success,
-    // not decrypt structure — proven at mux time, not capture time.
-    let (mut reader, decrypt_is_aacs) = whole_disc_decrypting_reader(
+    // Decrypt-aware read (`--raw`: pass-through); AACS reads widen onto each content
+    // file's unit grid inside it. Bad sectors = physical read failure, not decrypt.
+    let mut reader = whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
         opts.decrypt,
@@ -1108,12 +737,7 @@ pub fn sweep(
     // into the consumer thread.
     let file =
         libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
-    let mut batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
-
-    // AACS unit alignment for a decrypting sweep: units are 3 sectors and must
-    // start/span whole units or decrypt under the wrong CBC alignment. ecc_sectors()=32
-    // isn't a multiple of 3, so round batch up (32→33); region starts align down below.
-    batch = aacs_aligned_batch(batch, decrypt_is_aacs);
+    let batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
     // Pre-compute NonTried regions before handing the mapfile to the consumer
     // thread. Producer processes them in order; consumer mutates the mapfile
@@ -1195,14 +819,7 @@ pub fn sweep(
         // truncates to the wrong LBA and records shifted payload as Finished.
         let (region_pos, region_size) = snap_to_sectors(region_pos, region_size);
         let region_end = region_pos + region_size;
-        // AACS unit alignment: anchor the cursor DOWN to the nearest 6144-byte unit
-        // boundary so the decrypting reader never starts mid-unit. Re-reading the few
-        // already-covered head sectors is idempotent; only resume regions are shifted.
-        let mut pos = if decrypt_is_aacs {
-            aacs_aligned_region_start(region_pos, true)
-        } else {
-            region_pos
-        };
+        let mut pos = region_pos;
         tracing::trace!(
             target: "freemkv::disc",
             phase = "region_enter",
@@ -1221,13 +838,8 @@ pub fn sweep(
             }
 
             let block_bytes = (region_end - pos).min(batch as u64 * 2048);
-            // The region's last block can end mid-unit on a decrypting AACS sweep
-            // (region_end is only sector-snapped). Widen the physical read (never
-            // accounting) to whole units; fits `buf` since `batch` is unit-aligned.
-            let read_bytes =
-                aacs_aligned_read_bytes(pos, block_bytes, total_bytes, decrypt_is_aacs);
             let block_lba = (pos / 2048) as u32;
-            let block_count = (read_bytes / 2048) as u16;
+            let block_count = (block_bytes / 2048) as u16;
             let recovery = !opts.skip_on_error;
 
             // `require_full_read`, not a bare `Ok(_)`: `buf` is reused each iteration,
@@ -1237,10 +849,10 @@ pub fn sweep(
                 reader.read_sectors(
                     block_lba,
                     block_count,
-                    &mut buf[..read_bytes as usize],
+                    &mut buf[..block_bytes as usize],
                     recovery,
                 ),
-                read_bytes as usize,
+                block_bytes as usize,
                 block_lba,
             );
 
@@ -1796,6 +1408,7 @@ mod patch;
 mod read_error;
 mod section_recover;
 mod sweep;
+mod whole_disc;
 
 // The mapfile-backed main-title bad-byte reader, used by the multipass
 // abort-on-loss gate. `pub` so the engine can re-export it: a front-end reads
@@ -2651,48 +2264,6 @@ mod tests {
         assert!(image_state(&f, 4096).unwrap().is_short());
         assert!(image_state(&f, 2048).unwrap().is_intact());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // Region-start alignment, asserted against PRODUCTION (calls
-    // `aacs_aligned_region_start` directly rather than re-deriving its
-    // arithmetic, which used to leave a broken sweep green).
-    #[test]
-    fn aacs_region_start_anchors_down_to_a_unit_boundary() {
-        let unit = libfreemkv::aacs::content::ALIGNED_UNIT_LEN as u64; // 6144
-
-        // EXACT expected values: properties alone aren't enough, since an impl
-        // that always returned 0 would satisfy "aligned"/"moved down" while
-        // silently discarding every byte of resume progress.
-        for (pos, want) in [
-            (0u64, 0u64),
-            (2048, 0),
-            (4096, 0),
-            (6144, 6144),
-            (8192, 6144),
-            (65_536, 61_440),
-            (67_584, 67_584),
-        ] {
-            assert_eq!(
-                aacs_aligned_region_start(pos, true),
-                want,
-                "region {pos} must anchor to {want}"
-            );
-        }
-
-        // And the tightness bound the exact values encode, over a wider sweep:
-        // the cursor lands on the NEAREST boundary at or below `pos`, never a
-        // whole unit further back.
-        for pos in (0u64..40_000).step_by(512) {
-            let got = aacs_aligned_region_start(pos, true);
-            assert_eq!(got % unit, 0, "{pos} -> {got} is not unit-aligned");
-            assert!(got <= pos, "{pos} -> {got} moved the cursor UP");
-            assert!(pos - got < unit, "{pos} -> {got} skipped a whole unit back");
-        }
-
-        // A non-AACS sweep has no unit geometry; the cursor is untouched.
-        for pos in [0u64, 2048, 8192, 67_583] {
-            assert_eq!(aacs_aligned_region_start(pos, false), pos);
-        }
     }
 }
 

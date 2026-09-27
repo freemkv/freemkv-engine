@@ -1,7 +1,8 @@
 //! Whole-disc decryption (sweep / patch) over a real UDF tree: clear filesystem/nav
-//! sectors pass through unchanged even when they look AACS-flagged (#55), every
-//! `/BDMV/STREAM` unit is decrypted or refused up front (never shipped as ciphertext),
-//! and decrypt refusals keep their classification through the sweep pipeline.
+//! sectors pass through unchanged even when they look AACS-flagged (#55), every AACS
+//! content file (`/BDMV/STREAM`, HD DVD `.EVO`) is decrypted on its OWN unit grid or
+//! refused up front (never shipped as ciphertext), and decrypt refusals keep their
+//! classification through the sweep pipeline.
 
 use freemkv_engine::{Mapfile, SectorStatus, SweepOptions};
 use libfreemkv::disc::{AacsState, DiscRegion, KeyOrigin};
@@ -10,15 +11,17 @@ use libfreemkv::{ContentFormat, Disc, DiscFormat, DiscTitle, Extent};
 
 const SECTOR: usize = 2048;
 const UNIT_SECTORS: u32 = 3; // 6144-byte AACS aligned unit
-const FILE_SECTORS: usize = 30;
-const TITLE_UNITS: u32 = 8;
+const FILE_SECTORS: u32 = 30;
 
-/// A clear sector in the UDF reserved area (in no stream file) whose unit-start
+/// A clear sector in the UDF reserved area (in no content file) whose unit-start
 /// byte carries the CPI bits — the #55 trigger. Its 60-sector batch starts at 120.
 const POISONED_UNIT_LBA: u32 = 123;
 const POISONED_BLOCK_LBA: u32 = 120;
 
 const UNIT_KEY: [u8; 16] = [0x5A; 16];
+const SECOND_KEY: [u8; 16] = [0x33; 16];
+/// A key the disc's key pool does not hold: a file under it is unprovable.
+const FOREIGN_KEY: [u8; 16] = [0x77; 16];
 
 /// The plaintext of every encrypted content unit: zeroes but for a TS sync byte
 /// at offset 4 of each 192-byte BD-TS packet, plus the CPI bits on byte 0 (which
@@ -34,12 +37,9 @@ fn clear_content_unit() -> Vec<u8> {
     unit
 }
 
-fn encrypted_content_unit() -> Vec<u8> {
+fn encrypted_content_unit(key: &[u8; 16]) -> Vec<u8> {
     let mut unit = clear_content_unit();
-    assert!(
-        libfreemkv::aacs::content::encrypt_unit(&mut unit, &UNIT_KEY),
-        "a full-length unit must encrypt"
-    );
+    assert!(libfreemkv::aacs::content::encrypt_unit(&mut unit, key));
     unit
 }
 
@@ -93,35 +93,57 @@ impl libfreemkv::sector::SectorSource for MemDisc {
     }
 }
 
-/// A BD tree with two stream files: `00001.m2ts` (the one kept title plays) and
-/// `00002.m2ts` (played by no kept title, e.g. a sub-30s logo/menu clip).
+/// A synthesized UDF disc: the drive's bytes, what a correct decrypting read
+/// yields, and each tree file's `(start_lba, sectors)` in the order given.
 struct Fixture {
-    /// The drive's bytes: title units (and optionally one orphan unit) encrypted.
     source: Vec<u8>,
-    /// A correct decrypting read: `source` with every encrypted unit in the clear.
     expected: Vec<u8>,
-    /// The title's 3-aligned extent inside `00001.m2ts`.
-    title: (u32, u32),
-    /// The aligned orphan unit's LBA inside `00002.m2ts`.
-    orphan_unit: u32,
+    files: Vec<(u32, u32)>,
 }
 
-fn fixture(orphan_encrypted: bool) -> Fixture {
-    let dir = tempfile::tempdir().unwrap();
-    let stream = dir.path().join("BDMV").join("STREAM");
-    std::fs::create_dir_all(&stream).unwrap();
-    for (name, tag) in [("00001.m2ts", 0xA1u8), ("00002.m2ts", 0xB2u8)] {
-        let mut bytes = vec![0u8; FILE_SECTORS * SECTOR];
-        bytes[100..116].fill(tag); // locator; byte 0 stays 0 (not CPI-flagged)
-        std::fs::write(stream.join(name), bytes).unwrap();
+impl Fixture {
+    /// Encrypt every unit of `file` under `key`, on the FILE's own unit grid.
+    /// `decrypts`: a correct read yields plaintext (else the ciphertext stays).
+    fn encrypt(&mut self, file: usize, key: &[u8; 16], decrypts: bool) {
+        let (start, sectors) = self.files[file];
+        let unit_len = libfreemkv::aacs::content::ALIGNED_UNIT_LEN;
+        for u in 0..sectors / UNIT_SECTORS {
+            let at = (start + u * UNIT_SECTORS) as usize * SECTOR;
+            let enc = encrypted_content_unit(key);
+            self.source[at..at + unit_len].copy_from_slice(&enc);
+            let out = if decrypts { clear_content_unit() } else { enc };
+            self.expected[at..at + unit_len].copy_from_slice(&out);
+        }
     }
-    let mut dirimage = libfreemkv::DirImage::open(dir.path()).unwrap();
-    let cap = libfreemkv::sector::SectorSource::capacity_sectors(&dirimage);
+}
+
+/// Lay `paths` (each `FILE_SECTORS` long, 1 sector for `*.bdmv`) out as a UDF image.
+fn tree(paths: &[&str]) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    for (i, p) in paths.iter().enumerate() {
+        let path = dir.path().join(p);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let sectors = if p.ends_with(".bdmv") {
+            1
+        } else {
+            FILE_SECTORS
+        };
+        let mut bytes = vec![0u8; sectors as usize * SECTOR];
+        bytes[100..116].fill(0xA0 + i as u8); // byte 0 stays 0 (not CPI-flagged)
+        std::fs::write(path, bytes).unwrap();
+    }
+    let mut img = libfreemkv::DirImage::open(dir.path()).unwrap();
+    let fs = libfreemkv::read_filesystem(&mut img).unwrap();
+    let files = paths
+        .iter()
+        .map(|p| fs.file_extents(&mut img, &format!("/{p}")).unwrap()[0])
+        .collect();
+    let cap = libfreemkv::sector::SectorSource::capacity_sectors(&img);
     let mut source = vec![0u8; cap as usize * SECTOR];
     for lba in 0..cap {
         let at = lba as usize * SECTOR;
         libfreemkv::sector::SectorSource::read_sectors(
-            &mut dirimage,
+            &mut img,
             lba,
             1,
             &mut source[at..at + SECTOR],
@@ -129,53 +151,39 @@ fn fixture(orphan_encrypted: bool) -> Fixture {
         )
         .unwrap();
     }
-    let file_start = |tag: u8| -> u32 {
-        (0..cap)
-            .find(|&l| {
-                let at = l as usize * SECTOR;
-                source[at + 100..at + 116].iter().all(|&b| b == tag)
-            })
-            .unwrap()
-    };
-    let first_aligned = |start: u32| start.div_ceil(UNIT_SECTORS) * UNIT_SECTORS;
-    let title = (first_aligned(file_start(0xA1)), TITLE_UNITS * UNIT_SECTORS);
-    let orphan_unit = first_aligned(file_start(0xB2)) + UNIT_SECTORS;
-
     // #55: clear, unused reserved-area sectors, the unit start CPI-flagged.
     let p = POISONED_UNIT_LBA as usize * SECTOR;
-    assert!(
-        source[p..p + 3 * SECTOR].iter().all(|&b| b == 0),
-        "the poisoned unit must sit in unused space"
-    );
+    assert!(source[p..p + 3 * SECTOR].iter().all(|&b| b == 0));
     for (i, b) in source[p..p + 3 * SECTOR].iter_mut().enumerate() {
         *b = (i as u8).wrapping_mul(31) | 1;
     }
     source[p] = 0xC0;
-
-    let unit_len = libfreemkv::aacs::content::ALIGNED_UNIT_LEN;
-    let mut expected = source.clone();
-    let mut units: Vec<u32> = (0..TITLE_UNITS)
-        .map(|u| title.0 + u * UNIT_SECTORS)
-        .collect();
-    if orphan_encrypted {
-        units.push(orphan_unit);
-    }
-    for lba in units {
-        let at = lba as usize * SECTOR;
-        source[at..at + unit_len].copy_from_slice(&encrypted_content_unit());
-        expected[at..at + unit_len].copy_from_slice(&clear_content_unit());
-    }
     Fixture {
+        expected: source.clone(),
         source,
-        expected,
-        title,
-        orphan_unit,
+        files,
     }
 }
 
-/// A scanned single-CPS AACS 1.0 BD over `fx`: one kept title (`00001.m2ts`).
+const TITLE: usize = 0;
+const ORPHAN: usize = 1;
+
+/// A BD whose kept title plays `00001.m2ts`; `00002.m2ts` is played by no kept
+/// title (a sub-30 s logo/menu clip). The title file is encrypted under `UNIT_KEY`;
+/// `orphan` encrypts the second file under that key (`Some(false)` = unprovable).
+fn bd(orphan: Option<(&[u8; 16], bool)>) -> Fixture {
+    let mut fx = tree(&["BDMV/STREAM/00001.m2ts", "BDMV/STREAM/00002.m2ts"]);
+    fx.encrypt(TITLE, &UNIT_KEY, true);
+    if let Some((key, decrypts)) = orphan {
+        fx.encrypt(ORPHAN, key, decrypts);
+    }
+    fx
+}
+
+/// A scanned single-CPS AACS 1.0 disc over `fx`: one kept title playing file 0.
 fn disc(fx: &Fixture) -> Disc {
     let cap = (fx.source.len() / SECTOR) as u32;
+    let (start, sectors) = fx.files[TITLE];
     Disc {
         volume_id: "ISSUE55".into(),
         meta_title: Some("ISSUE55".into()),
@@ -187,13 +195,13 @@ fn disc(fx: &Fixture) -> Disc {
             playlist: "00000.mpls".into(),
             playlist_id: 0,
             duration_secs: 1.0,
-            size_bytes: fx.title.1 as u64 * SECTOR as u64,
+            size_bytes: sectors as u64 * SECTOR as u64,
             clips: Vec::new(),
             streams: Vec::new(),
             chapters: Vec::new(),
             extents: vec![Extent {
-                start_lba: fx.title.0,
-                sector_count: fx.title.1,
+                start_lba: start,
+                sector_count: sectors,
             }],
             content_format: ContentFormat::BdTs,
             codec_privates: Vec::new(),
@@ -219,12 +227,12 @@ fn disc(fx: &Fixture) -> Disc {
     }
 }
 
-/// The same disc, but its `Unit_Key_RO.inf` declares two CPS units.
+/// The same disc, but with two CPS units (keys `UNIT_KEY`, `SECOND_KEY`).
 fn multi_cps_disc(fx: &Fixture) -> Disc {
     let mut d = disc(fx);
     let aacs = d.aacs.as_mut().unwrap();
     aacs.uk_ro = unit_key_ro(2);
-    aacs.unit_keys.push((2, [0x33; 16]));
+    aacs.unit_keys.push((2, SECOND_KEY));
     d
 }
 
@@ -256,6 +264,18 @@ fn sweep_to(
     (iso, r)
 }
 
+/// Sweep `d` over `fx` and require EXACTLY the decrypted image.
+fn assert_sweeps_to_expected(fx: &Fixture, d: &Disc) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (iso, r) = sweep_to(&tmp, d, &mut MemDisc::new(&fx.source));
+    let result = r.unwrap_or_else(|e| panic!("the disc must sweep, got {e}"));
+    assert_eq!(result.bytes_good, fx.source.len() as u64);
+    assert!(
+        std::fs::read(&iso).unwrap() == fx.expected,
+        "the ISO must equal the decrypted image exactly"
+    );
+}
+
 fn assert_refused_before_output(
     iso: &std::path::Path,
     r: libfreemkv::error::Result<freemkv_engine::CopyResult>,
@@ -272,131 +292,111 @@ fn assert_refused_before_output(
 
 /// #55 + E6: a clean disc sweeps to EXACTLY the decrypted image — the clear
 /// flagged-looking reserved unit, all UDF metadata, both stream files, every unit.
+/// The title file starts at an LBA that is NOT a multiple of 3 (DirImage lays
+/// data from LBA 4096): its units must be decrypted on the file's own grid.
 #[test]
 fn a_decrypting_sweep_passes_clear_filesystem_sectors_through() {
-    let fx = fixture(false);
-    let tmp = tempfile::tempdir().unwrap();
-    let (iso, r) = sweep_to(&tmp, &disc(&fx), &mut MemDisc::new(&fx.source));
-    let result = r.unwrap_or_else(|e| panic!("a clean disc must sweep, got {e}"));
-    assert_eq!(result.bytes_good, fx.source.len() as u64);
-    assert!(
-        std::fs::read(&iso).unwrap() == fx.expected,
-        "the ISO must equal the decrypted image exactly"
+    let fx = bd(None);
+    assert_ne!(
+        fx.files[TITLE].0 % UNIT_SECTORS,
+        0,
+        "fixture: misaligned file"
     );
+    assert_sweeps_to_expected(&fx, &disc(&fx));
 }
 
-/// Single-CPS disc: an encrypted unit of a stream file no kept title plays is
-/// keyed by the disc's only unit key and lands in the ISO as plaintext.
+/// Single-CPS disc: a stream file no kept title plays is keyed and decrypted.
 #[test]
-fn a_single_cps_sweep_decrypts_a_non_title_stream_unit() {
-    let fx = fixture(true);
-    let tmp = tempfile::tempdir().unwrap();
-    let (iso, r) = sweep_to(&tmp, &disc(&fx), &mut MemDisc::new(&fx.source));
-    r.unwrap_or_else(|e| panic!("a single-CPS disc must sweep, got {e}"));
-    let image = std::fs::read(&iso).unwrap();
-    let at = fx.orphan_unit as usize * SECTOR;
-    assert_eq!(
-        &image[at..at + libfreemkv::aacs::content::ALIGNED_UNIT_LEN],
-        &clear_content_unit()[..],
-        "the non-title stream unit must be decrypted, not shipped as ciphertext"
-    );
-    assert!(
-        image == fx.expected,
-        "the ISO must equal the decrypted image"
-    );
+fn a_single_cps_sweep_decrypts_a_non_title_stream_file() {
+    let fx = bd(Some((&UNIT_KEY, true)));
+    assert_sweeps_to_expected(&fx, &disc(&fx));
 }
 
-/// Multi-CPS: which key opens a non-title stream file is unknown, so refuse
-/// before any output exists rather than failing (or shipping ciphertext) mid-rip.
+/// Multi-CPS: the non-title file's key is resolved for that file alone and
+/// proven against its own ciphertext, so it decrypts rather than refusing.
 #[test]
-fn a_multi_cps_sweep_with_non_title_streams_refuses_up_front() {
-    let fx = fixture(true);
-    let tmp = tempfile::tempdir().unwrap();
-    let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut MemDisc::new(&fx.source));
-    assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+fn a_multi_cps_sweep_decrypts_a_provable_non_title_stream_file() {
+    for key in [&UNIT_KEY, &SECOND_KEY] {
+        let fx = bd(Some((key, true)));
+        assert_sweeps_to_expected(&fx, &multi_cps_disc(&fx));
+    }
 }
 
-/// The multipass shape (skip_on_error sweep, and `copy` with `multipass`) refuses
-/// the same way up front — never a pass that aborts, or records damage, mid-disc.
+/// A non-title file no held key opens is unprovable: refused before any output,
+/// on the plain sweep, the multipass shapes (skip_on_error sweep, `copy`), and a
+/// disc whose `Unit_Key_RO.inf` is missing.
 #[test]
-fn a_multi_cps_multipass_rip_with_non_title_streams_refuses_up_front() {
-    let fx = fixture(true);
-    let d = multi_cps_disc(&fx);
-    let tmp = tempfile::tempdir().unwrap();
-    let iso = tmp.path().join("skip.iso");
-    let opts = SweepOptions {
-        skip_on_error: true,
-        ..sweep_opts()
-    };
-    let r = freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
-    assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
-
-    let iso = tmp.path().join("copy.iso");
-    let opts = freemkv_engine::CopyOptions {
-        decrypt: true,
-        multipass: true,
-        ..Default::default()
-    };
-    let r = freemkv_engine::copy(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
-    assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
-}
-
-/// FMTS (AACS 2.1 forensic) and an unparseable `Unit_Key_RO.inf` cannot prove a
-/// single CPS unit either: refused up front the same way.
-#[test]
-fn an_unprovable_single_cps_disc_refuses_up_front() {
-    let fx = fixture(false);
-    let mut fmts = disc(&fx);
-    fmts.format = DiscFormat::Fmts;
+fn an_unprovable_non_title_stream_file_refuses_up_front() {
+    let fx = bd(Some((&FOREIGN_KEY, false)));
     let mut no_ukro = disc(&fx);
     no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::new();
-    for d in [fmts, no_ukro] {
+    for d in [multi_cps_disc(&fx), disc(&fx), no_ukro] {
         let tmp = tempfile::tempdir().unwrap();
         let (iso, r) = sweep_to(&tmp, &d, &mut MemDisc::new(&fx.source));
+        assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+
+        let iso = tmp.path().join("skip.iso");
+        let opts = SweepOptions {
+            skip_on_error: true,
+            ..sweep_opts()
+        };
+        let r = freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
+        assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+
+        let iso = tmp.path().join("copy.iso");
+        let opts = freemkv_engine::CopyOptions {
+            decrypt: true,
+            multipass: true,
+            ..Default::default()
+        };
+        let r = freemkv_engine::copy(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
         assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
     }
 }
 
-/// An unreadable stream map on a BD must fail loud, not narrow the gate to the
-/// title extents (which would pass non-title stream units through as ciphertext).
+/// HD DVD: an `.EVO` no kept title plays is AACS content like a BD stream file —
+/// keyed, decrypted on its own grid, never passed through as ciphertext.
+#[test]
+fn an_hd_dvd_sweep_decrypts_a_non_title_evo() {
+    let mut fx = tree(&[
+        "BDMV/index.bdmv",
+        "HVDVD_TS/FEATURE_1.EVO",
+        "HVDVD_TS/FEATURE_2.EVO",
+    ]);
+    fx.files.remove(0);
+    fx.encrypt(TITLE, &UNIT_KEY, true);
+    fx.encrypt(ORPHAN, &UNIT_KEY, true);
+    let mut d = disc(&fx);
+    d.format = DiscFormat::HdDvd;
+    assert_sweeps_to_expected(&fx, &d);
+}
+
+/// An unreadable content-file map on an AACS disc fails loud, not narrowing the
+/// gate to the title extents (which would pass non-title units as ciphertext).
 #[test]
 fn an_unreadable_stream_map_fails_loud() {
-    let fx = fixture(true);
+    let fx = bd(Some((&UNIT_KEY, true)));
     let tmp = tempfile::tempdir().unwrap();
     let mut reader = MemDisc::new(&fx.source);
     reader.fail_at = Some((256, || Error::DecryptFailed)); // the UDF anchor
     let (iso, r) = sweep_to(&tmp, &disc(&fx), &mut reader);
     assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
 
-    // No UDF at all on a BD-format disc: the error surfaces as itself.
+    // No UDF at all: the error surfaces as itself.
     let blank = vec![0u8; fx.source.len()];
     let tmp = tempfile::tempdir().unwrap();
     let (iso, r) = sweep_to(&tmp, &disc(&fx), &mut MemDisc::new(&blank));
     assert_refused_before_output(&iso, r, Error::UdfNotFilesystem.code());
 }
 
-/// A BD whose UDF lists no `/BDMV/STREAM` file while titles exist is inconsistent:
+/// A UDF tree with no AACS content file while titles exist is inconsistent:
 /// refuse rather than trusting the title extents alone.
 #[test]
 fn an_empty_stream_map_with_titles_fails_loud() {
-    let fx = fixture(false);
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("BDMV")).unwrap();
-    std::fs::write(dir.path().join("BDMV").join("index.bdmv"), [0u8; 64]).unwrap();
-    let mut img = libfreemkv::DirImage::open(dir.path()).unwrap();
-    let cap = libfreemkv::sector::SectorSource::capacity_sectors(&img) as usize;
-    let mut image = vec![0u8; fx.source.len().max(cap * SECTOR)];
-    for lba in 0..cap {
-        let at = lba * SECTOR;
-        libfreemkv::sector::SectorSource::read_sectors(
-            &mut img,
-            lba as u32,
-            1,
-            &mut image[at..at + SECTOR],
-            false,
-        )
-        .unwrap();
-    }
+    let fx = bd(None);
+    let empty = tree(&["BDMV/index.bdmv"]);
+    let mut image = empty.source.clone();
+    image.resize(fx.source.len().max(image.len()), 0);
     let mut d = disc(&fx);
     d.capacity_sectors = (image.len() / SECTOR) as u32;
     d.capacity_bytes = image.len() as u64;
@@ -409,7 +409,7 @@ fn an_empty_stream_map_with_titles_fails_loud() {
 /// (the sweep used to relabel every producer error as E6000 "dirty disc").
 #[test]
 fn a_non_read_failure_is_not_reported_as_a_disc_read_error() {
-    let fx = fixture(false);
+    let fx = bd(None);
     let tmp = tempfile::tempdir().unwrap();
     let mut reader = MemDisc::new(&fx.source);
     reader.fail_at = Some((POISONED_BLOCK_LBA, || Error::DecryptFailed));
@@ -429,7 +429,7 @@ fn a_non_read_failure_is_not_reported_as_a_disc_read_error() {
 /// not weaken the real read-error path.
 #[test]
 fn a_genuine_read_fault_still_reports_a_disc_read_error() {
-    let fx = fixture(false);
+    let fx = bd(None);
     let tmp = tempfile::tempdir().unwrap();
     let mut reader = MemDisc::new(&fx.source);
     reader.fail_at = Some((POISONED_BLOCK_LBA, || Error::ScsiError {
@@ -484,60 +484,53 @@ fn patch_opts<'a>() -> freemkv_engine::PatchOptions<'a> {
     freemkv_engine::PatchOptions::for_patch_pass(true, None, None, None)
 }
 
-/// E5 (#55 for Pass N): patching a bad range over the clear flagged-looking unit
-/// and one over title content yields EXACTLY the decrypted image.
-#[test]
-fn a_decrypting_patch_passes_clear_filesystem_sectors_through() {
-    let fx = fixture(false);
+/// Patch `bad` ranges of `d` over `fx` and require EXACTLY the decrypted image.
+fn assert_patches_to_expected(fx: &Fixture, d: &Disc, bad: &[(u32, u32)]) {
     let tmp = tempfile::tempdir().unwrap();
-    let iso = tmp.path().join("patch55.iso");
-    prep_patch(
-        &iso,
-        &fx.expected,
-        &[(POISONED_BLOCK_LBA, 6), (fx.title.0, 6)],
-    );
-    freemkv_engine::patch(
-        &disc(&fx),
-        &mut MemDisc::new(&fx.source),
-        &iso,
-        &patch_opts(),
-    )
-    .unwrap_or_else(|e| panic!("a clean disc must patch, got {e}"));
+    let iso = tmp.path().join("patch.iso");
+    prep_patch(&iso, &fx.expected, bad);
+    let out = freemkv_engine::patch(d, &mut MemDisc::new(&fx.source), &iso, &patch_opts())
+        .unwrap_or_else(|e| panic!("the disc must patch, got {e}"));
+    assert_eq!(out.bytes_pending, 0, "every bad range must be recovered");
     assert!(
         std::fs::read(&iso).unwrap() == fx.expected,
         "the patched ISO must equal the decrypted image exactly"
     );
 }
 
-/// Single-CPS Pass N over a non-title stream unit patches in its plaintext.
+/// E5 (#55 for Pass N): bad ranges over the clear flagged-looking unit and over
+/// the misaligned title file (single sectors mid-unit) yield the decrypted image.
 #[test]
-fn a_single_cps_patch_decrypts_a_non_title_stream_unit() {
-    let fx = fixture(true);
-    let tmp = tempfile::tempdir().unwrap();
-    let iso = tmp.path().join("patch-orphan.iso");
-    prep_patch(&iso, &fx.expected, &[(fx.orphan_unit, UNIT_SECTORS)]);
-    let out = freemkv_engine::patch(
+fn a_decrypting_patch_passes_clear_filesystem_sectors_through() {
+    let fx = bd(None);
+    let t = fx.files[TITLE].0;
+    assert_patches_to_expected(
+        &fx,
         &disc(&fx),
-        &mut MemDisc::new(&fx.source),
-        &iso,
-        &patch_opts(),
-    )
-    .unwrap_or_else(|e| panic!("a single-CPS disc must patch, got {e}"));
-    assert_eq!(out.bytes_pending, 0, "the orphan unit must be recovered");
-    assert!(
-        std::fs::read(&iso).unwrap() == fx.expected,
-        "the patched ISO must hold the orphan unit's plaintext"
+        &[(POISONED_BLOCK_LBA, 6), (t + 1, 1), (t + 5, 4)],
     );
 }
 
-/// Multi-CPS Pass N: refused with `DecryptFailed` before touching the ISO or the
-/// mapfile — the bad range stays NonTrimmed, nothing is recorded Finished.
+/// Pass N over non-title stream files: single-CPS and provable multi-CPS files
+/// are patched in as plaintext.
 #[test]
-fn a_multi_cps_patch_with_non_title_streams_refuses_up_front() {
-    let fx = fixture(true);
+fn a_patch_decrypts_a_non_title_stream_file() {
+    let fx = bd(Some((&SECOND_KEY, true)));
+    let o = fx.files[ORPHAN].0;
+    assert_patches_to_expected(&fx, &multi_cps_disc(&fx), &[(o + 2, 5)]);
+    let fx = bd(Some((&UNIT_KEY, true)));
+    assert_patches_to_expected(&fx, &disc(&fx), &[(o + 2, 5)]);
+}
+
+/// Unprovable non-title file on Pass N: refused with `DecryptFailed` before
+/// touching the ISO or the mapfile — the bad range stays NonTrimmed.
+#[test]
+fn an_unprovable_patch_refuses_up_front() {
+    let fx = bd(Some((&FOREIGN_KEY, false)));
+    let o = fx.files[ORPHAN].0;
     let tmp = tempfile::tempdir().unwrap();
     let iso = tmp.path().join("patch-multi.iso");
-    prep_patch(&iso, &fx.expected, &[(fx.orphan_unit, UNIT_SECTORS)]);
+    prep_patch(&iso, &fx.expected, &[(o, UNIT_SECTORS)]);
     let iso_before = std::fs::read(&iso).unwrap();
     let map_path = freemkv_engine::mapfile_path_for(&iso);
     let map_before = std::fs::read(&map_path).unwrap();
@@ -547,16 +540,12 @@ fn a_multi_cps_patch_with_non_title_streams_refuses_up_front() {
         &iso,
         &patch_opts(),
     ) else {
-        panic!("a multi-CPS disc with non-title streams must refuse");
+        panic!("an unprovable non-title file must refuse");
     };
     assert_eq!(err.code(), Error::DecryptFailed.code(), "got {err}");
     assert!(std::fs::read(&iso).unwrap() == iso_before, "ISO untouched");
-    assert_eq!(
-        std::fs::read(&map_path).unwrap(),
-        map_before,
-        "mapfile untouched"
-    );
-    let at = fx.orphan_unit as u64 * SECTOR as u64;
+    assert_eq!(std::fs::read(&map_path).unwrap(), map_before);
+    let at = o as u64 * SECTOR as u64;
     assert_eq!(
         Mapfile::load(&map_path)
             .unwrap()
