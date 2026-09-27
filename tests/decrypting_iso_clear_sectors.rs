@@ -270,6 +270,22 @@ fn a_genuine_read_fault_still_reports_a_disc_read_error() {
         libfreemkv::error::E_DISC_READ,
         "a real SCSI read fault is still E6000: got {err}"
     );
+    // The drive's own status and sense must survive, anchored to the batch LBA.
+    match err {
+        libfreemkv::error::Error::DiscRead {
+            sector,
+            status,
+            sense,
+        } => {
+            assert_eq!(sector, POISONED_BLOCK_LBA as u64);
+            assert_eq!(status, Some(0x02));
+            assert_eq!(
+                sense.map(|s| (s.sense_key, s.asc, s.ascq)),
+                Some((0x03, 0x11, 0x00))
+            );
+        }
+        other => panic!("expected DiscRead, got {other:?}"),
+    }
 }
 
 /// Documents the exact string the reporter saw, so the misclassification cannot

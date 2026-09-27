@@ -978,7 +978,7 @@ impl PatchCtx<'_, '_> {
         };
 
         let bad_before = bad.total_len();
-        let (outcome, wedge_after) = {
+        let (outcome, wedge_after, fatal) = {
             // Progress heartbeat: a throttled closure pushing a fresh snapshot to the
             // reporter on every read, so the bar/speed move during a handler, not just
             // at section end. Scoped here so its `self.state` borrow ends before below.
@@ -1025,6 +1025,7 @@ impl PatchCtx<'_, '_> {
                 decrypt_is_aacs: self.decrypt_is_aacs,
                 tick: Some(&mut tick),
                 unproductive: 0,
+                fatal: None,
                 // Carry the pass-level wedge streak in so a fast-fail wedge is
                 // caught across many small sections, not reset each one.
                 wedge_streak: self.wedge_streak,
@@ -1042,9 +1043,14 @@ impl PatchCtx<'_, '_> {
             let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 handler_deadline(now_ptr(), budget_secs)
             });
-            (o, ctx.wedge_streak)
+            (o, ctx.wedge_streak, ctx.fatal.take())
         };
         self.wedge_streak = wedge_after;
+        // A non-read error ended the chain: fail the pass with it, before any
+        // residue is recorded NonTrimmed as if it were unreadable media.
+        if let Some(e) = fatal {
+            return Err(e);
+        }
 
         tracing::info!(
             target: "freemkv::disc",

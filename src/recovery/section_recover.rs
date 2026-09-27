@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::patch::{SubRanges, recovery_read};
+use libfreemkv::error::Error;
 use libfreemkv::scsi::SenseFamily;
 use libfreemkv::sector::SectorSource;
 
@@ -194,6 +195,9 @@ pub(super) struct HandlerCtx<'a> {
     /// handler. Seeded to max — the caller resets the drive to max before the
     /// chain runs.
     pub cur_speed: u16,
+    /// A non-read error (e.g. a decrypt refusal) that ended the chain; the
+    /// caller must surface it instead of recording the section as damage.
+    pub fatal: Option<Error>,
 }
 
 impl HandlerCtx<'_> {
@@ -296,6 +300,12 @@ fn read_span(
             ReadHit::Bad
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
+        // Not disc damage: stop the chain now (as a transport fault would) and
+        // hand the real error to the caller via `ctx.fatal`.
+        Err(e) if !super::is_damage_candidate(&e) => {
+            ctx.fatal = Some(e);
+            ReadHit::Transport
+        }
         Err(e) => {
             // Wedge watch: only a wedge-family sense AND a fast return (<
             // WEDGE_FASTFAIL_MS) count toward the streak. The latency gate keeps a
@@ -1282,6 +1292,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1320,6 +1331,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1373,6 +1385,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1412,6 +1425,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1449,6 +1463,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1487,6 +1502,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1548,6 +1564,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1593,6 +1610,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1626,6 +1644,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1658,6 +1677,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1720,6 +1740,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1778,6 +1799,7 @@ mod tests {
                 decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
+                fatal: None,
                 wedge_streak: carried,
                 cur_speed: SPEED_MAX_KBS,
             };
@@ -1830,6 +1852,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1913,6 +1936,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1990,6 +2014,7 @@ mod tests {
             decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -2066,6 +2091,7 @@ mod tests {
                 decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
+                fatal: None,
                 wedge_streak: 0,
                 cur_speed: SPEED_MAX_KBS,
             }

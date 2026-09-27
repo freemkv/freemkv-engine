@@ -12,6 +12,25 @@ use libfreemkv::sector::SectorSource;
 
 pub use patch::patch;
 
+/// A genuine read fault — the drive answered with a status/sense, or the
+/// transport died under it. Everything else (a decrypt refusal, a contract
+/// violation, a terminated source) is not disc damage.
+pub(crate) fn is_read_fault(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::ScsiError { .. }
+            | Error::DiscRead { .. }
+            | Error::IoError { .. }
+            | Error::DeviceNotFound { .. }
+    )
+}
+
+/// Whether a failed read may enter skip-on-error damage handling. `Halted`
+/// keeps its existing route there pending the unified stop redesign.
+pub(crate) fn is_damage_candidate(err: &Error) -> bool {
+    is_read_fault(err) || matches!(err, Error::Halted)
+}
+
 /// Label the error that aborted a pass at `block_lba`.
 ///
 /// Only a MEDIUM/TRANSPORT fault becomes [`Error::DiscRead`] (E6000,
@@ -21,12 +40,11 @@ pub use patch::patch;
 /// with status `0x00` and no sense data is that bug's signature.
 fn classify_pass_abort(err: Error, block_lba: u32) -> Error {
     match err {
-        // The drive answered with a status/sense, or the transport died under
-        // it: a genuine read fault, re-anchored to the block we were reading.
-        e @ (Error::ScsiError { .. }
-        | Error::DiscRead { .. }
-        | Error::IoError { .. }
-        | Error::DeviceNotFound { .. }) => {
+        // Already a DiscRead: its sector is the source's own (at least as
+        // precise as the batch start) and a `None` status must stay `None`.
+        e @ Error::DiscRead { .. } => e,
+        // A raw SCSI or dead-bus fault, re-anchored to the block we were reading.
+        e if is_read_fault(&e) => {
             let (status, sense) = extract_scsi_context(&e);
             Error::DiscRead {
                 sector: block_lba as u64,
@@ -63,6 +81,30 @@ fn require_full_read(result: Result<usize>, requested: usize, lba: u32) -> Resul
             })
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod pass_abort_tests {
+    use super::{Error, classify_pass_abort, is_damage_candidate};
+
+    #[test]
+    fn only_read_faults_and_halt_enter_damage_handling() {
+        let io = || Error::IoError {
+            source: std::io::Error::other("EIO"),
+        };
+        assert!(is_damage_candidate(&io()));
+        assert!(is_damage_candidate(&Error::Halted));
+        assert!(!is_damage_candidate(&Error::DecryptFailed));
+        assert!(!is_damage_candidate(&Error::SourceTerminated));
+    }
+
+    #[test]
+    fn non_read_errors_keep_their_own_code() {
+        for e in [Error::DecryptFailed, Error::Halted, Error::SourceTerminated] {
+            let code = e.code();
+            assert_eq!(classify_pass_abort(e, 9).code(), code);
+        }
     }
 }
 
@@ -1073,7 +1115,9 @@ pub fn sweep(
                     bytes_done = bytes_done.saturating_add(block_bytes);
                     pos += block_bytes;
                 }
-                Err(err) if !opts.skip_on_error => {
+                // Not skipping, or not disc damage (e.g. a decrypt refusal): abort
+                // with the real cause rather than zero-filling it as NonTrimmed.
+                Err(err) if !opts.skip_on_error || !is_damage_candidate(&err) => {
                     producer_err = Some(classify_pass_abort(err, block_lba));
                     break 'outer;
                 }
