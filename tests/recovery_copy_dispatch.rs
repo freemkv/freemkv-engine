@@ -647,7 +647,9 @@ fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
     );
 }
 
+#[cfg(unix)]
 struct CleanupGuard(std::path::PathBuf);
+#[cfg(unix)]
 impl Drop for CleanupGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
