@@ -1,7 +1,10 @@
 //! The whole-disc (sweep / patch) decrypting reader. AACS content is every content
-//! file (`/BDMV/STREAM`, HD DVD `/HVDVD_TS/*.EVO`), not just the kept titles: each
-//! file no title plays is keyed on its own and proven, or the rip refuses up front.
-//! Reads are widened onto each file's own 3-sector unit grid ([`UnitAligned`]).
+//! file (`/BDMV/STREAM`, HD DVD `/HVDVD_TS/*.EVO`), not just the kept titles. Each file
+//! no title plays is keyed on its own: a key proven on its ciphertext is used; ciphertext
+//! no held key opens refuses the rip up front; a file with no readable encrypted probe is
+//! keyed only on a provably single-CPS disc, else left unkeyed so an encrypted unit there
+//! fails loud mid-pass (never ships as ciphertext). Reads follow each file's own 3-sector
+//! unit grid ([`UnitAligned`]).
 
 use libfreemkv::decrypt::{AacsKeyMap, DecryptKeys, Phase};
 use libfreemkv::error::{Error, Result};
@@ -13,9 +16,9 @@ const UNIT: u64 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u64;
 /// The reader sweep and patch read through.
 pub(crate) type WholeDiscReader<'r> = UnitAligned<DecryptingSectorSource<&'r mut dyn SectorSource>>;
 
-/// Whole-disc reader: `decrypt` installs the disc's keys; for AACS the key map covers
-/// every content file (refusing an unprovable one before any output) and reads follow
-/// each file's unit grid. `--raw` / CSS / clear discs pass straight through.
+/// Whole-disc reader: `decrypt` installs the disc's keys; for AACS the key map covers every
+/// content file it can prove (see the module doc) and reads follow each file's unit grid.
+/// `--raw` / CSS / clear discs pass straight through.
 pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
     reader: &'r mut dyn SectorSource,
@@ -115,22 +118,19 @@ fn content_files(reader: &mut dyn SectorSource) -> Result<Vec<Vec<(u32, u32)>>> 
 pub(crate) type UnitSpan = (u32, u32, u64);
 
 // The unit grid of every content extent: per file by file offset (never a merged run:
-// adjacent files each start their own grid), else per title extent. Sorted, disjoint;
-// a later file overlapping an earlier one (SSIF) keeps the earlier grid.
+// adjacent files each start their own grid), then title extents no file covers (anchored
+// at the extent start). Sorted, disjoint; on overlap the earlier-listed source wins.
 fn unit_spans(files: &[Vec<(u32, u32)>], title_extents: &[(u32, u32)]) -> Vec<UnitSpan> {
     let mut raw: Vec<(UnitSpan, usize)> = Vec::new();
-    if files.is_empty() {
-        for (i, &(lba, n)) in title_extents.iter().enumerate() {
-            raw.push(((lba, n, lba as u64), i));
+    for (i, file) in files.iter().enumerate() {
+        let mut off = 0u64;
+        for &(lba, n) in file {
+            raw.push(((lba, n, (lba as u64).saturating_sub(off % UNIT)), i));
+            off += n as u64;
         }
-    } else {
-        for (i, file) in files.iter().enumerate() {
-            let mut off = 0u64;
-            for &(lba, n) in file {
-                raw.push(((lba, n, (lba as u64).saturating_sub(off % UNIT)), i));
-                off += n as u64;
-            }
-        }
+    }
+    for &(lba, n) in title_extents {
+        raw.push(((lba, n, lba as u64), files.len()));
     }
     raw.retain(|&((_, n, _), _)| n > 0);
     raw.sort_by_key(|&((lba, _, _), i)| (lba, i));
@@ -166,7 +166,7 @@ struct KeyCtx<'a> {
 
 // Extend the title `map` over every content file no kept title plays, ONE FILE AT A TIME
 // (files of different CPS units sit back to back): its own resolved key, kept only when it
-// opens the file's ciphertext. A file no held key opens refuses the rip now.
+// opens the file's ciphertext. Ciphertext no held key opens refuses the rip now.
 fn key_content_files(
     reader: &mut dyn SectorSource,
     ctx: &KeyCtx,
@@ -175,7 +175,7 @@ fn key_content_files(
     files: &[Vec<(u32, u32)>],
     spans: &[UnitSpan],
 ) -> Result<AacsKeyMap> {
-    let keyed: Vec<(u32, u32)> = map.ranges().iter().map(|&(s, e, _, _)| (s, e)).collect();
+    let mut keyed: Vec<(u32, u32)> = map.ranges().iter().map(|&(s, e, _, _)| (s, e)).collect();
     let single = single_cps_key_slot(ctx.disc, keys, &map);
     let mut ranges = map.ranges().to_vec();
     for file in files {
@@ -214,8 +214,29 @@ fn key_content_files(
                 tracing::warn!(target: "freemkv::scan", lba = s, "content file unprovable");
             }
         }
+        // Settled either way: a file re-listing these sectors (SSIF) is not re-keyed.
+        keyed.extend(orphans);
+        keyed.sort_unstable();
     }
-    Ok(AacsKeyMap::from_ranges_phased(ranges))
+    Ok(AacsKeyMap::from_ranges_phased(merge_key_ranges(ranges)))
+}
+
+// Sorted, disjoint key ranges (`AacsKeyMap::entry_for` checks one neighbour), merged as
+// libfreemkv's per-disc map is: same key + phase overlap unions; a conflicting overlap drops.
+fn merge_key_ranges(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Vec<(u32, u32, usize, Phase)> {
+    ranges.sort_by_key(|r| r.0);
+    let mut merged: Vec<(u32, u32, usize, Phase)> = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        match merged.last_mut() {
+            Some(last) if r.0 < last.1 => {
+                if r.2 == last.2 && r.3 == last.3 {
+                    last.1 = last.1.max(r.1);
+                }
+            }
+            _ => merged.push(r),
+        }
+    }
+    merged
 }
 
 // Does `map`'s key for `[start, end)` open a real encrypted unit on the file's grid
@@ -361,6 +382,23 @@ impl<S: SectorSource> UnitAligned<S> {
             scratch: Vec::new(),
         }
     }
+
+    /// Where a block of sectors `[start, end)` should end so consecutive blocks tile each
+    /// file's unit grid: `end` pulled back to its unit's head when that unit straddles it
+    /// (else a bad sector there fails both neighbouring blocks). Never at or before `start`.
+    pub(crate) fn unit_block_end(&self, start: u64, end: u64) -> u64 {
+        match span_at(&self.spans, end) {
+            Some((s, _, anchor)) if end > anchor => {
+                let head = anchor + (end - anchor) / UNIT * UNIT;
+                if head > start && head >= s as u64 {
+                    head
+                } else {
+                    end
+                }
+            }
+            _ => end,
+        }
+    }
 }
 
 impl<S: SectorSource> SectorSource for UnitAligned<S> {
@@ -399,6 +437,7 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
                     .get(i)
                     .map_or(end, |&(s, _, _)| end.min(s as u64));
                 let want = (next - cur) as usize * SECTOR;
+                self.inner.set_unit_base(cur as u32);
                 let got = self.inner.read_sectors_fua(
                     cur as u32,
                     (next - cur) as u16,
@@ -486,32 +525,168 @@ mod tests {
         assert_eq!(spans, vec![(10, 7, 10), (40, 3, 39)]);
     }
 
+    /// Synthetic drive: each sector filled with its LBA's low byte (so any LBA is
+    /// readable without an image); records reads, unit bases and FUA flags.
+    #[derive(Default)]
     struct Mem {
-        image: Vec<u8>,
         reads: Vec<(u32, u16)>,
+        bases: Vec<u32>,
+        fua: Vec<bool>,
+        /// Deliver at most this many bytes per read (a short transfer).
+        short: Option<usize>,
     }
     impl SectorSource for Mem {
         fn capacity_sectors(&self) -> u32 {
-            (self.image.len() / 2048) as u32
+            u32::MAX
         }
-        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
+            self.read_sectors_fua(lba, count, buf, r, false)
+        }
+        fn read_sectors_fua(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _: bool,
+            fua: bool,
+        ) -> Result<usize> {
             self.reads.push((lba, count));
-            let at = lba as usize * 2048;
-            let n = count as usize * 2048;
-            buf[..n].copy_from_slice(&self.image[at..at + n]);
+            self.fua.push(fua);
+            let n = self.short.unwrap_or(usize::MAX).min(count as usize * 2048);
+            for (i, b) in buf[..n].iter_mut().enumerate() {
+                *b = (lba as usize + i / 2048) as u8;
+            }
             Ok(n)
+        }
+        fn set_unit_base(&mut self, lba: u32) {
+            self.bases.push(lba);
         }
     }
 
     fn reader(spans: Vec<UnitSpan>) -> UnitAligned<Mem> {
-        let image = (0..400 * 2048).map(|i| (i / 2048) as u8).collect();
-        UnitAligned::new(
-            Mem {
-                image,
-                reads: Vec::new(),
-            },
-            spans,
+        UnitAligned::new(Mem::default(), spans)
+    }
+
+    /// A read longer than one u16-count request (after widening) is split at a
+    /// unit boundary (65532) and still hands back exactly the requested sectors.
+    #[test]
+    fn unit_aligned_splits_a_max_length_read_on_the_grid() {
+        let mut r = reader(vec![(0, 70_000, 0)]);
+        let mut buf = vec![0u8; u16::MAX as usize * 2048];
+        assert_eq!(
+            r.read_sectors(1, u16::MAX, &mut buf, false).unwrap(),
+            buf.len()
+        );
+        assert_eq!(r.inner.reads, vec![(0, 65_532), (65_532, 6)]);
+        assert!(
+            buf.chunks(2048)
+                .enumerate()
+                .all(|(i, c)| c[0] == (1 + i) as u8)
+        );
+    }
+
+    /// A short inner transfer is reported short (never padded with stale bytes).
+    #[test]
+    fn unit_aligned_reports_a_short_inner_transfer() {
+        let mut r = reader(vec![(100, 30, 100)]);
+        r.inner.short = Some(2048);
+        let mut buf = vec![0u8; 3 * 2048];
+        assert_eq!(r.read_sectors(100, 3, &mut buf, false).unwrap(), 2048);
+        r.inner.short = Some(0);
+        assert_eq!(r.read_sectors(98, 2, &mut buf, false).unwrap(), 0);
+    }
+
+    /// FUA reaches the drive on span and plain reads; plain reads reset the unit
+    /// base to their own start (no stale base from the previous span read).
+    #[test]
+    fn unit_aligned_passes_fua_and_bases_plain_reads_at_their_start() {
+        let mut r = reader(vec![(100, 30, 100)]);
+        let mut buf = vec![0u8; 5 * 2048];
+        r.read_sectors_fua(98, 5, &mut buf, true, true).unwrap();
+        assert_eq!(r.inner.fua, vec![true, true]);
+        assert_eq!(r.inner.bases, vec![98, 100]);
+    }
+
+    /// A title extent outside every file still gets its own grid (anchored at
+    /// the extent start); one inside a file defers to the file's grid.
+    #[test]
+    fn unit_spans_fold_title_extents_outside_every_file() {
+        let spans = unit_spans(&[vec![(100, 6)]], &[(100, 6), (200, 4)]);
+        assert_eq!(spans, vec![(100, 6, 100), (200, 4, 200)]);
+    }
+
+    // A single-CPS AACS 1.0 BD: `Unit_Key_RO.inf` declares one CPS unit.
+    fn aacs_disc() -> libfreemkv::Disc {
+        let mut uk_ro = vec![0u8; 144];
+        uk_ro[3] = 48; // key storage at 48
+        uk_ro[49] = 1; // one unit key
+        libfreemkv::Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 1000,
+            capacity_bytes: 1000 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: Some(libfreemkv::disc::AacsState {
+                version: 1,
+                bus_encryption: false,
+                mkb_version: None,
+                disc_hash: String::new(),
+                key_source: libfreemkv::disc::KeyOrigin::DeviceKey,
+                vuk: None,
+                unit_keys: vec![(1, [0x5A; 16])],
+                volume_id: [0; 16],
+                uk_ro,
+                mkb: Vec::new(),
+            }),
+            css: None,
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        }
+    }
+
+    /// SSIF re-lists an m2ts's extents: that file is resolved/probed once and the
+    /// map stays sorted and disjoint (`AacsKeyMap::entry_for` relies on it).
+    #[test]
+    fn a_relisted_file_is_keyed_once_into_a_disjoint_map() {
+        let disc = aacs_disc();
+        let ctx = KeyCtx {
+            disc: &disc,
+            fetch: None,
+            halt: None,
+        };
+        let mut keys = DecryptKeys::Aacs {
+            unit_keys: vec![(1, [0x5A; 16])],
+            format: libfreemkv::ContentFormat::BdTs,
+        };
+        let files = vec![vec![(300, 6)], vec![(300, 6)]];
+        let spans = unit_spans(&files, &[]);
+        let mut mem = Mem::default();
+        let map = key_content_files(
+            &mut mem,
+            &ctx,
+            &mut keys,
+            AacsKeyMap::from_ranges(Vec::new()),
+            &files,
+            &spans,
         )
+        .unwrap();
+        let r = map.ranges();
+        assert!(r.windows(2).all(|w| w[0].1 <= w[1].0), "disjoint: {r:?}");
+        assert_eq!(
+            r.len(),
+            1,
+            "one keyed range for the one physical file: {r:?}"
+        );
+        let probes = mem.reads.iter().filter(|&&(l, _)| l >= 300).count();
+        assert!(
+            probes <= 8,
+            "the re-listed file must not be probed twice: {probes}"
+        );
     }
 
     /// Reads are widened onto the span's grid and the caller gets exactly its sectors.

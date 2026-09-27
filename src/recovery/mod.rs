@@ -837,7 +837,12 @@ pub fn sweep(
                 break 'outer;
             }
 
-            let block_bytes = (region_end - pos).min(batch as u64 * 2048);
+            // Inner block ends snap back onto the file's unit grid, so a bad unit fails one block.
+            let mut block_bytes = (region_end - pos).min(batch as u64 * 2048);
+            if pos + block_bytes < region_end {
+                let end = reader.unit_block_end(pos / 2048, (pos + block_bytes) / 2048);
+                block_bytes = end * 2048 - pos;
+            }
             let block_lba = (pos / 2048) as u32;
             let block_count = (block_bytes / 2048) as u16;
             let recovery = !opts.skip_on_error;

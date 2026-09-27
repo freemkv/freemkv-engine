@@ -59,6 +59,8 @@ struct MemDisc {
     image: Vec<u8>,
     /// The read STARTING at this LBA fails with this error.
     fail_at: Option<(u32, fn() -> Error)>,
+    /// Any read COVERING this LBA fails as a medium error (a bad sector).
+    bad_lba: Option<u32>,
 }
 
 impl MemDisc {
@@ -66,6 +68,7 @@ impl MemDisc {
         MemDisc {
             image: image.to_vec(),
             fail_at: None,
+            bad_lba: None,
         }
     }
 }
@@ -85,6 +88,19 @@ impl libfreemkv::sector::SectorSource for MemDisc {
             && lba == at
         {
             return Err(make());
+        }
+        if let Some(bad) = self.bad_lba
+            && (lba..lba + count as u32).contains(&bad)
+        {
+            return Err(Error::ScsiError {
+                status: 0x02,
+                sense: Some(libfreemkv::ScsiSense {
+                    sense_key: 0x03,
+                    asc: 0x11,
+                    ascq: 0x00,
+                }),
+                opcode: 0x28,
+            });
         }
         let at = lba as usize * SECTOR;
         let n = count as usize * SECTOR;
@@ -330,7 +346,9 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     let fx = bd(Some((&FOREIGN_KEY, false)));
     let mut no_ukro = disc(&fx);
     no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::new();
-    for d in [multi_cps_disc(&fx), disc(&fx), no_ukro] {
+    let mut fmts = disc(&fx);
+    fmts.format = DiscFormat::Fmts;
+    for d in [multi_cps_disc(&fx), disc(&fx), no_ukro, fmts] {
         let tmp = tempfile::tempdir().unwrap();
         let (iso, r) = sweep_to(&tmp, &d, &mut MemDisc::new(&fx.source));
         assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
@@ -352,6 +370,44 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
         let r = freemkv_engine::copy(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
         assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
     }
+}
+
+/// A skipping sweep's batches tile each file's unit grid: a bad sector in the unit
+/// straddling a 32-sector batch edge fails ONE batch, not both neighbours.
+#[test]
+fn a_skipping_sweep_fails_only_the_batch_holding_the_bad_unit() {
+    let fx = bd(Some((&UNIT_KEY, true)));
+    let (o, _) = fx.files[ORPHAN];
+    assert_eq!(
+        o % 32,
+        30,
+        "fixture: the orphan file starts 2 sectors before a batch edge"
+    );
+    let bad = o + 1; // its first unit [o, o+3) straddles the edge at o+2
+    let tmp = tempfile::tempdir().unwrap();
+    let iso = tmp.path().join("skip.iso");
+    let mut reader = MemDisc::new(&fx.source);
+    reader.bad_lba = Some(bad);
+    let opts = SweepOptions {
+        skip_on_error: true,
+        batch_sectors: Some(32),
+        ..sweep_opts()
+    };
+    let r = freemkv_engine::sweep(&disc(&fx), &mut reader, &iso, &opts)
+        .unwrap_or_else(|e| panic!("a skipping sweep must finish, got {e}"));
+    let map = Mapfile::load(&freemkv_engine::mapfile_path_for(&iso)).unwrap();
+    let bad_ranges = map.ranges_with(&[
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+    ]);
+    let first_bad = bad_ranges.first().map(|&(p, _)| p / SECTOR as u64);
+    assert_eq!(
+        first_bad,
+        Some(o as u64),
+        "the batch BEFORE the bad unit must read clean: {bad_ranges:?}"
+    );
+    assert!(r.bytes_pending + r.bytes_unreadable > 0);
 }
 
 /// HD DVD: an `.EVO` no kept title plays is AACS content like a BD stream file —
