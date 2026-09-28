@@ -93,8 +93,8 @@ fn assert_refused(err: Error, what: &str) {
     );
     assert_eq!(
         err.to_string(),
-        format!("E{E_BUS_STREAM_UNMAPPED}: /BDMV/STREAM/00002.m2ts"),
-        "{what} must name the file"
+        format!("E{E_BUS_STREAM_UNMAPPED}: /BDMV/STREAM/00002.m2ts (E6000: 41)"),
+        "{what} must name the file and its read cause"
     );
 }
 
