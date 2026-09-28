@@ -45,7 +45,7 @@ mod streams;
 mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
-pub use extract::extract_tree;
+pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
     ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
     parse_error_code, scan_image,
