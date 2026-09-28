@@ -123,6 +123,8 @@ pub struct OpenedImage {
     pub trace: libfreemkv::aacs::trace::ResolutionTrace,
     /// Label of the key source that keyed the first piece, if any.
     pub won: Option<String>,
+    // The set after `keys_for`'s top-up, and whether `sources` were spent (asked at most once).
+    top_up: std::sync::Mutex<(ResolvedKeySet, bool)>,
 }
 
 impl OpenedImage {
@@ -231,6 +233,7 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
     Ok(OpenedImage {
         source: src.clone(),
         won: set.status().origin.map(str::to_string),
+        top_up: std::sync::Mutex::new((set.clone(), false)),
         disc,
         reader,
         keys: set,
@@ -241,24 +244,30 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
 }
 
 impl OpenedImage {
-    /// The key set for muxing `titles` (KU §3.2): this image's set when it covers them,
-    /// else ONE resolve over their scope seeded with it (before the first output byte,
-    /// stopped by `halt`), else E7022. Never re-scans the image.
+    /// The key set for muxing `titles` (KU §3.2): the held set when it covers them, else a
+    /// resolve over their scope seeded with it, before the first output byte and stopped by
+    /// `halt`. `sources` are asked at most once per opened image; later top-ups use only the
+    /// keys already held (0 requests), and the result is remembered. Never re-scans the image.
     pub(crate) fn keys_for(
         &self,
         titles: &[usize],
         halt: Option<&libfreemkv::Halt>,
     ) -> crate::Result<ResolvedKeySet> {
         let scope = KeyScope::Titles(titles.to_vec());
-        if covers(&self.keys, &scope) {
-            return Ok(self.keys.clone());
+        let mut held = self.top_up.lock().unwrap_or_else(|e| e.into_inner());
+        if covers(&held.0, &scope) {
+            return Ok(held.0.clone());
         }
         let Some(sources) = &self.sources else {
-            return known(&self.disc, self.keys.clone(), &scope);
+            return known(&self.disc, held.0.clone(), &scope);
         };
+        // KU §2.1 invariant 4: the key service is never asked twice for this image.
+        let no_sources: KeySourceFactory = std::sync::Arc::new(Vec::new);
+        let sources = if held.1 { &no_sources } else { sources };
+        held.1 = true;
         let mut reader = raw_reader(&self.source)?;
-        let vid_in_hand = in_hand_vid_fingerprint(&self.disc, None, Some(&self.keys));
-        let seed = Some(&self.keys);
+        let vid_in_hand = in_hand_vid_fingerprint(&self.disc, None, Some(&held.0));
+        let seed = Some(&held.0);
         let r = resolve(
             &self.disc,
             reader.as_mut(),
@@ -273,6 +282,7 @@ impl OpenedImage {
             .map_err(|e| vid_needs_disc(e, vid_in_hand, sidecar.as_ref()))?
             .keys;
         log_status(&keys, &format!("{scope:?}"));
+        held.0 = keys.clone();
         Ok(keys)
     }
 }
