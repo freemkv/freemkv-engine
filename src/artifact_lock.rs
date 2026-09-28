@@ -39,13 +39,6 @@ pub(crate) struct OsLockOps;
 
 impl LockOps for OsLockOps {
     fn open(&self, path: &Path) -> io::Result<File> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
-        #[allow(unreachable_code)] // ST-E1 red: a read-only open, the pre-spec shape
-        return std::fs::File::open(path);
         let mut o = std::fs::OpenOptions::new();
         // SS-8 flock(2) NOTES: on NFS "in order to place an exclusive lock, the file must be
         // opened for writing" — always read-write (ET11h).
@@ -121,11 +114,6 @@ impl ArtifactLock {
         stall: Duration,
     ) -> io::Result<Self> {
         let path = sidecar_for(artifact);
-        #[allow(unreachable_code)] // ST-E1 red: no lock, no id re-check, no wait
-        return Ok(Self {
-            file: ops.open(&path)?,
-            path,
-        });
         let progress = Progress::new();
         let mut timer = StallTimer::new(stall, &progress);
         let mut seen = snapshot(watch);

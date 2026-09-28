@@ -433,7 +433,9 @@ fn with_mux_watcher<T>(
         }
         // Stop design v5 §4.5: "`MuxEvents::on_flush_progress` … The engine's mux bridge
         // turns that into `Sink::progress(pass: "sync")`" (one call per libfreemkv call).
-        // ST-E1 red: no flush bridge (the default no-op).
+        fn on_flush_progress(&self, bytes_durable: u64, bytes_total: u64) {
+            let _ = self.flush.send((bytes_durable, bytes_total));
+        }
     }
     let opened = |title: &libfreemkv::DiscTitle| {
         sink.event(&crate::sink::Event::OutputOpened { dest, title });

@@ -34,7 +34,7 @@ pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
         selection: libfreemkv::StreamSelection::default(),
         // Stop design v5 T27: the per-frame send deadline is "retired in freemkv and the
         // engine"; "a halt-aware send only, and the user's Stop is the bound" (§2.10).
-        send_deadline: Some(Duration::from_secs(60)),
+        send_deadline: None,
     }
 }
 
@@ -96,8 +96,7 @@ pub fn mux_image_titles_with(
     sink: &dyn Sink,
     halt: &Halt,
 ) -> RipOutcome {
-    let _ = halt; // ST-E1 red: the op token is ignored
-    let halt = EngineHalt::new(&Halt::new(), None).with_sink(sink);
+    let halt = EngineHalt::new(halt, None).with_sink(sink);
     let sink = &HaltSink {
         inner: sink,
         halt: &halt,
@@ -315,8 +314,7 @@ pub(crate) fn remux_iso_sources(
 ) -> io::Result<RemuxReport> {
     // §4.2: "cancellation is `EngineHalt::is_cancelled() = op.is_cancelled() || extra ||
     // sink.should_cancel()`".
-    let _ = halt; // ST-E1 red: the op token is ignored
-    let halt = EngineHalt::new(&Halt::new(), None).with_sink(sink);
+    let halt = EngineHalt::new(halt, None).with_sink(sink);
     let sink = &HaltSink {
         inner: sink,
         halt: &halt,
@@ -490,7 +488,9 @@ fn land_verified(
     let partial = partial_path(&job.target);
     // §4.2: "`land_verified` … takes `<target>.lock` (the §2.5 acquire loop) **before**
     // creating `.partial`"; "deleted while held on every exit" (dropped last).
-    let _ = (timing, rio); // ST-E1 red: no lock, today's unbounded sync_all, a plain verify
+    let watch = [partial.clone()];
+    let lock = ArtifactLock::acquire(&job.target, &watch, halt, timing.lock_stall)?;
+    let _lock = DeleteOnDrop::new(lock);
     let _ = std::fs::remove_file(&partial);
     let mut guard = PartialFile(&partial, false);
 
@@ -511,10 +511,10 @@ fn land_verified(
             io::Error::other(format!("mux of title {} did not complete", idx + 1))
         });
     }
-    std::fs::File::open(&partial)?.sync_all()?;
+    durable_sync(rio, &partial, halt, sink, timing)?;
 
     sink.event(&Event::Phase { name: "verify" });
-    let verified = verify_mkv(&partial, title);
+    let verified = verify_watched(&partial, title, halt, sink, rio, timing);
     let stopped = verified.as_ref().is_err_and(libfreemkv::is_halt);
     if !stopped {
         sink.event(&Event::Verify {
@@ -618,8 +618,8 @@ fn sync_parent(rio: &dyn RemuxIo, path: &Path, halt: &EngineHalt<'_>) -> io::Res
         } else {
             dir
         };
-        let _ = (rio, halt);
-        std::fs::File::open(dir)?.sync_all()?;
+        let dir = std::fs::File::open(dir)?;
+        halt.linked(|h| rio.sync(&dir, h, &mut |_, _| {}))?;
     }
     #[cfg(not(unix))]
     let _ = (rio, path, halt);
