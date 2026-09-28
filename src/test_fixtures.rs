@@ -505,3 +505,20 @@ fn manual_disc(img: &EncryptedBdImage, uk_ro: &[u8], titles: &[&[usize]]) -> Dis
         content_format: libfreemkv::ContentFormat::BdTs,
     }
 }
+
+/// A clear (decrypted) one-title BD folder under `dir`, the LPCM clip of [`bd_image`].
+pub(crate) fn clear_folder(dir: &Path) {
+    let file = |rel: &str, bytes: &[u8]| {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    };
+    let n = CLIP_UNITS * 32;
+    let m2ts: Vec<u8> = (0..n)
+        .flat_map(|k| lpcm_source_packet(k, n, false))
+        .collect();
+    file("BDMV/index.bdmv", &[1u8; 64]);
+    file("BDMV/PLAYLIST/00000.mpls", &one_item_mpls(b"00000"));
+    file("BDMV/CLIPINF/00000.clpi", &minimal_clpi(n));
+    file("BDMV/STREAM/00000.m2ts", &m2ts);
+}

@@ -616,3 +616,26 @@ fn a_prescanned_disc_refuses_an_image_it_cannot_identify() {
     staged_sidecar(&fx, &staged, &[inf]);
     open(&staged).expect("a sweep-zeroed key file with sidecar identity passes");
 }
+
+/// D6 (J14 holds for `iso://` only): a `dir://` folder muxes through `input()`, which scans
+/// the folder, so a pre-scanned disc cannot be honoured there and is refused (E7013, a
+/// caller bug, KU §6). A folder opened without one keeps working.
+#[test]
+fn a_prescanned_disc_is_refused_for_a_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let folder = dir.path().join("disc");
+    crate::test_fixtures::clear_folder(&folder);
+    let src = ImageSource::Dir(folder);
+    let none = || factory(&[], &Calls::default());
+    let (disc, _) = crate::scan_image(&src).unwrap();
+    let opts = OpenImageOptions {
+        disc: Some(disc),
+        ..OpenImageOptions::resolve(none())
+    };
+    let err = open_image_with(&src, opts).map(|_| ()).unwrap_err();
+    assert_eq!(err.code(), libfreemkv::error::E_DECRYPT_FAILED, "{err}");
+    let opened = open_image_with(&src, OpenImageOptions::resolve(none())).unwrap();
+    let out = dir.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    mux_all(&opened, vec![0], &out);
+}
