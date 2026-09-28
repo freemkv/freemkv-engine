@@ -511,16 +511,17 @@ mod tests {
     /// without one; the host lookup runs at the first query.
     #[test]
     fn a_factory_build_does_no_dns_lookup() {
-        // `.test` (RFC 2606) never resolves: a build that looked it up could not keep the source.
-        let unresolvable = KeyParams {
-            key_url: Some("https://keys.ku-e1-build.test/keys".into()),
+        // `localhost` resolves to loopback, which the DNS-backed check refuses: only a build
+        // that does no lookup keeps it (the address guard refuses it at the first query).
+        let resolves_to_loopback = KeyParams {
+            key_url: Some("https://localhost/keys".into()),
             ..Default::default()
         };
-        let labels: Vec<&str> = key_source_factory(&unresolvable)()
+        let labels: Vec<&str> = key_source_factory(&resolves_to_loopback)()
             .iter()
             .map(|s| s.label())
             .collect();
-        assert_eq!(labels, ["online"], "kept, looked up at the first query");
+        assert_eq!(labels, ["online"], "no lookup at build time");
         let blocked = KeyParams {
             key_url: Some("https://169.254.169.254/keys".into()),
             ..Default::default()
