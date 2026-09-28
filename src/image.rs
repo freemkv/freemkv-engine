@@ -181,8 +181,8 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
     let prescanned = disc.is_some();
     let (disc, mut reader) = match disc {
         Some(disc) => {
-            let reader = raw_reader(src)?;
-            check_prescanned(src, &disc, reader.as_ref())?;
+            let mut reader = raw_reader(src)?;
+            check_prescanned(&disc, reader.as_mut(), sidecar.as_ref())?;
             (disc, reader)
         }
         None => scan_image(src)?,
@@ -296,11 +296,12 @@ fn raw_reader(src: &ImageSource) -> crate::Result<Box<dyn libfreemkv::SectorSour
 }
 
 // KU §3.2: a pre-scanned disc must be this image's: capacity equal, and the disc hash equal
-// when the image's `Unit_Key_RO.inf` is intact (a sweep may leave it zero-filled).
+// ("checked when the image's `Unit_Key_RO.inf` is readable"). A key file the sidecar marks
+// unread is left to its identity (§4.4); with no sidecar identity, unchecked is refused.
 fn check_prescanned(
-    src: &ImageSource,
     disc: &libfreemkv::Disc,
-    reader: &dyn libfreemkv::SectorSource,
+    reader: &mut dyn libfreemkv::SectorSource,
+    sidecar: Option<&Mapfile>,
 ) -> crate::Result<()> {
     let have = reader.capacity_sectors();
     if have < disc.capacity_sectors {
@@ -309,24 +310,32 @@ fn check_prescanned(
             want: disc.capacity_sectors as u64 * 2048,
         });
     }
-    let inputs = match src {
-        ImageSource::Iso(p) => libfreemkv::Disc::read_aacs_inputs(p),
-        ImageSource::Dir(p) => libfreemkv::Disc::read_aacs_inputs_from_dir(p),
-    };
     let norm = |h: &str| libfreemkv::hex::strip_hex_prefix(h).to_ascii_lowercase();
-    let image_hash = inputs
-        .ok()
-        .map(|(inf, _, _)| inf)
-        .filter(|inf| intact(inf))
-        .map(|inf| libfreemkv::aacs::inf::disc_hash_hex(&libfreemkv::aacs::inf::disc_hash(&inf)));
     let disc_hash = disc.aacs.as_ref().map(|a| norm(&a.disc_hash));
-    let hash_differs = matches!((&image_hash, &disc_hash), (Some(i), Some(d)) if norm(i) != *d);
-    if have != disc.capacity_sectors || hash_differs {
+    let image_hash = if sidecar.is_some_and(|m| key_file_unread(m, reader)) {
+        None
+    } else {
+        let inf = libfreemkv::read_filesystem(reader)
+            .and_then(|fs| fs.read_file(reader, KEY_FILE))
+            .ok();
+        let hash = |inf: Vec<u8>| {
+            libfreemkv::aacs::inf::disc_hash_hex(&libfreemkv::aacs::inf::disc_hash(&inf))
+        };
+        inf.map(|inf| norm(&hash(inf)))
+    };
+    let identified =
+        sidecar.is_some_and(|m| m.disc_hash().is_some() || m.vid_fingerprint().is_some());
+    let hash_ok = match (&image_hash, &disc_hash) {
+        (Some(i), Some(d)) => i == d,
+        (None, Some(_)) => identified,
+        (_, None) => true,
+    };
+    if have != disc.capacity_sectors || !hash_ok {
         tracing::warn!(
             target: "freemkv::keys",
             image_sectors = have,
             disc_sectors = disc.capacity_sectors,
-            hash_differs,
+            hash_checked = image_hash.is_some(),
             "the image is not the pre-scanned disc's"
         );
         return Err(Error::MapfileInvalid {
@@ -336,9 +345,23 @@ fn check_prescanned(
     Ok(())
 }
 
-// A `Unit_Key_RO.inf` that a sweep did not leave zero-filled (no all-zero sector of it).
-fn intact(inf: &[u8]) -> bool {
-    !inf.is_empty() && inf.chunks(2048).all(|c| c.iter().any(|&b| b != 0))
+const KEY_FILE: &str = "/AACS/Unit_Key_RO.inf";
+
+// Whether the sidecar marks any sector of `/AACS/Unit_Key_RO.inf` as not read (a sweep
+// zero-fills those). An image whose UDF cannot locate the file counts as unread.
+fn key_file_unread(map: &Mapfile, reader: &mut dyn libfreemkv::SectorSource) -> bool {
+    use crate::SectorStatus as S;
+    let extents =
+        libfreemkv::read_filesystem(reader).and_then(|fs| fs.file_extents(reader, KEY_FILE));
+    let Ok(extents) = extents else {
+        return true;
+    };
+    let file: Vec<(u64, u64)> = extents
+        .iter()
+        .map(|&(s, n)| (s as u64 * 2048, n as u64 * 2048))
+        .collect();
+    let unread = map.ranges_with(&[S::NonTried, S::NonTrimmed, S::NonScraped, S::Unreadable]);
+    !crate::recovery::mapfile::intersect(&unread, &file).is_empty()
 }
 
 // The image's sidecar mapfile, read-only. Absent is no identity; one that exists but does
