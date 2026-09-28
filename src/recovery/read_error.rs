@@ -323,6 +323,11 @@ pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 /// it once at the top. New retry policy = adjust the constants. No
 /// other read site needs to change.
 pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
+    // 0. KU §2.4 on-arrival key stop (E7022/E7032): the unit WAS read, so it is not
+    //    damage. Checked before any counter moves: no retry, skip, jump or zone entry.
+    if super::is_key_stop(err) {
+        return ReadAction::AbortPass;
+    }
     ctx.consecutive_failures += 1;
     ctx.consecutive_good = 0;
     ctx.consecutive_outer_failures += 1;

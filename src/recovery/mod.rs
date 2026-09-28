@@ -25,10 +25,17 @@ pub(crate) fn is_read_fault(err: &Error) -> bool {
     )
 }
 
+/// The decrypting readers' on-arrival loud stop: a READ unit no held key opens (KU §2.4:
+/// "No held key opens U → loud stop: E7022 (title) or E7032 (image or folder)"). Fatal in
+/// every pass: never retried, skipped, zero-filled or counted as damage.
+pub(crate) fn is_key_stop(err: &Error) -> bool {
+    matches!(err, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing)
+}
+
 /// Whether a failed read may enter skip-on-error damage handling. `Halted`
 /// keeps its existing route there pending the unified stop redesign.
 pub(crate) fn is_damage_candidate(err: &Error) -> bool {
-    is_read_fault(err) || matches!(err, Error::Halted)
+    !is_key_stop(err) && (is_read_fault(err) || matches!(err, Error::Halted))
 }
 
 /// Label the error that aborted a pass at `block_lba`.
@@ -97,6 +104,11 @@ mod pass_abort_tests {
         assert!(is_damage_candidate(&Error::Halted));
         assert!(!is_damage_candidate(&Error::DecryptFailed));
         assert!(!is_damage_candidate(&Error::SourceTerminated));
+        assert!(!is_damage_candidate(&Error::WholeDiscKeyMissing));
+        let e7022 = Error::NoDiscKey {
+            disc_hash: String::new(),
+        };
+        assert!(!is_damage_candidate(&e7022));
     }
 
     #[test]
