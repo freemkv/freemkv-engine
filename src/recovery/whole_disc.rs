@@ -1,10 +1,11 @@
 //! The whole-disc (sweep / patch) decrypting reader. AACS content is every content
 //! file (`/BDMV/STREAM`, HD DVD `/HVDVD_TS/*.EVO`), not just the kept titles. Each file
-//! no title plays is keyed on its own: a key proven on its ciphertext is used; ciphertext
-//! no held key opens refuses the rip up front; a file with no readable encrypted probe is
-//! keyed only on a provably single-CPS disc, else left unkeyed so an encrypted unit there
-//! fails loud mid-pass (never ships as ciphertext). Reads follow each file's own 3-sector
-//! unit grid ([`UnitAligned`]).
+//! no title plays is keyed on its own, probed at up to 32 units across the file:
+//! a held key proven on its ciphertext is used; ciphertext no held key opens refuses the
+//! rip up front ([`Error::WholeDiscKeyMissing`]); a file with no readable encrypted probe
+//! is keyed only on a provably single-CPS disc, else left unkeyed so an encrypted unit
+//! there fails loud mid-pass with the same error (never ships as ciphertext). Reads
+//! follow each file's own 3-sector unit grid ([`UnitAligned`]).
 
 use libfreemkv::decrypt::{AacsKeyMap, DecryptKeys, Phase};
 use libfreemkv::error::{Error, Result};
@@ -12,6 +13,9 @@ use libfreemkv::sector::{DecryptingSectorSource, SectorSource};
 
 /// Sectors in one AACS aligned unit (6144 bytes).
 const UNIT: u64 = (libfreemkv::aacs::content::ALIGNED_UNIT_LEN / 2048) as u64;
+
+/// Units probed per unplayed content file: its first unit, then evenly across it.
+const PROBES: u64 = 32;
 
 /// The reader sweep and patch read through.
 pub(crate) type WholeDiscReader<'r> = UnitAligned<DecryptingSectorSource<&'r mut dyn SectorSource>>;
@@ -33,6 +37,7 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     };
     let mut content = disc.encrypted_content_ranges();
     let mut spans = Vec::new();
+    let mut unproven = Vec::new();
     let mut key_map = None;
     if matches!(keys, DecryptKeys::Aacs { .. }) {
         let halt = halt.cloned().map(libfreemkv::halt::Halt::from_arc);
@@ -50,9 +55,9 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
             fetch: key_fetch,
             halt: halt.as_ref(),
         };
-        key_map = Some(std::sync::Arc::new(key_content_files(
-            reader, &ctx, &mut keys, map, &files, &spans,
-        )?));
+        let (map, open) = key_content_files(reader, &ctx, &mut keys, map, &files, &spans)?;
+        key_map = Some(std::sync::Arc::new(map));
+        unproven = open;
         content.extend(files.iter().flatten());
         content = merge_ranges(content);
     }
@@ -64,7 +69,9 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     if decrypt && !content.is_empty() {
         dec = dec.with_content_ranges(std::sync::Arc::from(content));
     }
-    Ok(UnitAligned::new(dec, spans))
+    let mut out = UnitAligned::new(dec, spans);
+    out.unproven = unproven;
+    Ok(out)
 }
 
 // Every AACS content file's extents, one entry per file (contiguous extents joined):
@@ -164,9 +171,9 @@ struct KeyCtx<'a> {
     halt: Option<&'a libfreemkv::halt::Halt>,
 }
 
-// Extend the title `map` over every content file no kept title plays, ONE FILE AT A TIME
-// (files of different CPS units sit back to back): its own resolved key, kept only when it
-// opens the file's ciphertext. Ciphertext no held key opens refuses the rip now.
+// Key every content file no kept title plays, ONE FILE AT A TIME (CPS units sit back to
+// back), with a held key proven on its ciphertext; none opening it refuses now. Also
+// returns the `[start, end)` pieces left unkeyed (no encrypted probe was readable).
 fn key_content_files(
     reader: &mut dyn SectorSource,
     ctx: &KeyCtx,
@@ -174,51 +181,119 @@ fn key_content_files(
     map: AacsKeyMap,
     files: &[Vec<(u32, u32)>],
     spans: &[UnitSpan],
-) -> Result<AacsKeyMap> {
+) -> Result<(AacsKeyMap, Vec<(u32, u32)>)> {
     let mut keyed: Vec<(u32, u32)> = map.ranges().iter().map(|&(s, e, _, _)| (s, e)).collect();
     let single = single_cps_key_slot(ctx.disc, keys, &map);
+    let fmts = ctx.disc.format == libfreemkv::DiscFormat::Fmts;
+    let format = ctx.disc.content_format;
     let mut ranges = map.ranges().to_vec();
+    let mut unproven = Vec::new();
     for file in files {
         let orphans = subtract_ranges(file, &keyed);
         if orphans.is_empty() {
             continue;
         }
-        let mut title = libfreemkv::DiscTitle::empty();
-        title.content_format = ctx.disc.content_format;
-        title.extents = orphans
+        // Each piece from its first unit head, so key resolution samples on the file grid.
+        let heads: Vec<(u32, u32, u64)> = orphans
             .iter()
-            .map(|&(s, e)| libfreemkv::Extent {
-                start_lba: s,
-                sector_count: e - s,
+            .map(|&(s, e)| {
+                let anchor = span_at(spans, s as u64).map_or(s as u64, |sp| sp.2);
+                let head = unit_head(s, anchor).min(e as u64) as u32;
+                (head, e, anchor)
             })
             .collect();
-        let fmap = libfreemkv::resolve_mux_key_map(
-            reader,
-            &title,
-            keys,
-            ctx.fetch,
-            ctx.disc.content_format,
-            ctx.halt,
-        )?;
-        for &(s, e) in &orphans {
-            let anchor = span_at(spans, s as u64).map_or(s as u64, |sp| sp.2);
-            if key_proven(reader, &fmap, keys, ctx.disc.content_format, (s, e), anchor)? {
-                ranges.extend(fmap.ranges().iter().filter_map(|&(rs, re, i, p)| {
-                    (rs < e && re > s).then_some((rs.max(s), re.min(e), i, p))
-                }));
-            } else if let Some(slot) = single {
-                ranges.push((s, e, slot, Phase::All));
-            } else {
-                // No encrypted sample to prove against: left unkeyed, so an encrypted
-                // unit here still fails loud (orphan refusal) — never passes as clear.
-                tracing::warn!(target: "freemkv::scan", lba = s, "content file unprovable");
+        let mut title = libfreemkv::DiscTitle::empty();
+        title.content_format = format;
+        title.extents = heads
+            .iter()
+            .filter(|&&(h, e, _)| h < e)
+            .map(|&(h, e, _)| libfreemkv::Extent {
+                start_lba: h,
+                sector_count: e - h,
+            })
+            .collect();
+        let fmap =
+            libfreemkv::resolve_mux_key_map(reader, &title, keys, ctx.fetch, format, ctx.halt)
+                .map_err(|e| unkeyable(Error::from(e), file))?;
+        for (&(s, e), &(_, _, anchor)) in orphans.iter().zip(&heads) {
+            let probe = Probe {
+                map: &fmap,
+                keys,
+                format,
+                alternates: !fmts,
+                halt: ctx.halt,
+            };
+            match probe
+                .run(reader, (s, e), anchor)
+                .map_err(|e| unkeyable(e, file))?
+            {
+                Proof::Mapped => {
+                    ranges.extend(fmap.ranges().iter().filter_map(|&(rs, re, i, p)| {
+                        (rs < e && re > s).then_some((rs.max(s), re.min(e), i, p))
+                    }));
+                }
+                Proof::Held(slot) => ranges.push((s, e, slot, Phase::All)),
+                Proof::Unsampled => match single {
+                    Some(slot) => ranges.push((s, e, slot, Phase::All)),
+                    None => {
+                        tracing::warn!(
+                            target: "freemkv::scan",
+                            start = s,
+                            end = e,
+                            probes = PROBES,
+                            "unplayed stream file: no encrypted probe was readable (damaged \
+                             area?), so its key is unproven on this multi-key disc. Left \
+                             unkeyed: if the copy meets an encrypted unit here it stops with \
+                             E7032. An MKV rip or a raw copy avoids this."
+                        );
+                        unproven.push((s, e));
+                    }
+                },
             }
         }
         // Settled either way: a file re-listing these sectors (SSIF) is not re-keyed.
         keyed.extend(orphans);
         keyed.sort_unstable();
     }
-    Ok(AacsKeyMap::from_ranges_phased(merge_key_ranges(ranges)))
+    let map = AacsKeyMap::from_ranges_phased(merge_key_ranges(ranges));
+    Ok((map, merge_ranges_end(unproven)))
+}
+
+// A key-resolution refusal for an unplayed file: "no held key opens it" is
+// [`Error::WholeDiscKeyMissing`] (the fix is an MKV rip or a raw copy).
+fn unkeyable(e: Error, file: &[(u32, u32)]) -> Error {
+    match e {
+        Error::DecryptFailed | Error::WholeDiscKeyMissing => {
+            let lba = file.first().map_or(0, |f| f.0);
+            tracing::error!(
+                target: "freemkv::scan",
+                lba,
+                code = libfreemkv::error::E_WHOLE_DISC_KEY_MISSING,
+                "unplayed stream file is encrypted and no held key opens it: a decrypted \
+                 image would keep encrypted pieces. Refusing before the copy starts."
+            );
+            Error::WholeDiscKeyMissing
+        }
+        other => other,
+    }
+}
+
+// The first unit head at or after `lba` on the grid anchored at `anchor`.
+fn unit_head(lba: u32, anchor: u64) -> u64 {
+    lba as u64 + (UNIT - (lba as u64).saturating_sub(anchor) % UNIT) % UNIT
+}
+
+// Sort + coalesce `[start, end)` ranges.
+fn merge_ranges_end(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    v.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::with_capacity(v.len());
+    for (s, e) in v {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
 }
 
 // Sorted, disjoint key ranges (`AacsKeyMap::entry_for` checks one neighbour), merged as
@@ -239,57 +314,94 @@ fn merge_key_ranges(mut ranges: Vec<(u32, u32, usize, Phase)>) -> Vec<(u32, u32,
     merged
 }
 
-// Does `map`'s key for `[start, end)` open a real encrypted unit on the file's grid
-// (`anchor`)? Ok(false): no encrypted unit sampled; Err(DecryptFailed): none opened.
-fn key_proven(
-    reader: &mut dyn SectorSource,
-    map: &AacsKeyMap,
-    keys: &DecryptKeys,
+// What probing an unplayed file's ciphertext proved.
+#[derive(Debug, PartialEq)]
+enum Proof {
+    /// The resolved map's key opens a real encrypted unit.
+    Mapped,
+    /// Another held key (pool slot) opens it; the map's does not.
+    Held(usize),
+    /// No encrypted unit could be read: nothing to prove against.
+    Unsampled,
+}
+
+// Inputs for proving an unplayed file's key.
+struct Probe<'a> {
+    map: &'a AacsKeyMap,
+    keys: &'a DecryptKeys,
     format: libfreemkv::ContentFormat,
-    (start, end): (u32, u32),
-    anchor: u64,
-) -> Result<bool> {
-    use libfreemkv::aacs::content::{aacs_unit_encrypted, decrypt_unit, is_clean};
-    const PROBES: u64 = 8;
-    let DecryptKeys::Aacs { unit_keys, .. } = keys else {
-        return Ok(false);
-    };
-    let head = start as u64 + (UNIT - (start as u64).saturating_sub(anchor) % UNIT) % UNIT;
-    let units = (end as u64).saturating_sub(head) / UNIT;
-    let mut seen = false;
-    let mut buf = vec![0u8; libfreemkv::aacs::content::ALIGNED_UNIT_LEN];
-    for p in 1..=PROBES {
-        let unit = units * p / (PROBES + 1);
-        let Ok(lba) = u32::try_from(head + unit * UNIT) else {
-            continue;
+    /// Try every held key when the mapped one fails (not on FMTS: forensic pool keys).
+    alternates: bool,
+    halt: Option<&'a libfreemkv::halt::Halt>,
+}
+
+impl Probe<'_> {
+    // Probe `[start, end)` on the file's grid (`anchor`): its first unit, then evenly
+    // across it (every unit of a short file). Unreadable and clear units are skipped.
+    // Err(WholeDiscKeyMissing): encrypted units were read and no held key opens one.
+    fn run(
+        &self,
+        reader: &mut dyn SectorSource,
+        (start, end): (u32, u32),
+        anchor: u64,
+    ) -> Result<Proof> {
+        use libfreemkv::aacs::content::{aacs_unit_encrypted, decrypt_unit, is_clean};
+        let DecryptKeys::Aacs { unit_keys, .. } = self.keys else {
+            return Ok(Proof::Unsampled);
         };
-        if unit >= units
-            || !matches!(reader.read_sectors(lba, UNIT as u16, &mut buf, false),
-                Ok(n) if n == buf.len())
-            || !aacs_unit_encrypted(&buf, format)
-        {
-            continue;
-        }
-        seen = true;
-        match map.entry_for(lba) {
-            Some((idx, Phase::All, _)) => {
-                if let Some((_, key)) = unit_keys.get(idx) {
-                    decrypt_unit(&mut buf, key);
-                    if is_clean(&buf, format) {
-                        return Ok(true);
-                    }
-                }
+        let head = unit_head(start, anchor);
+        let units = (end as u64).saturating_sub(head) / UNIT;
+        let mut seen = false;
+        let mut buf = vec![0u8; libfreemkv::aacs::content::ALIGNED_UNIT_LEN];
+        let opens = |buf: &[u8], key: &[u8; 16]| {
+            let mut u = buf.to_vec();
+            decrypt_unit(&mut u, key);
+            is_clean(&u, self.format)
+        };
+        for unit in probe_units(units) {
+            if self.halt.is_some_and(|h| h.is_cancelled()) {
+                return Err(Error::Halted);
             }
-            // Forensic segment: libfreemkv verifies every such unit as it decrypts.
-            Some(_) => return Ok(true),
-            None => {}
+            let Ok(lba) = u32::try_from(head + unit * UNIT) else {
+                continue;
+            };
+            if !matches!(reader.read_sectors(lba, UNIT as u16, &mut buf, false),
+                    Ok(n) if n == buf.len())
+                || !aacs_unit_encrypted(&buf, self.format)
+            {
+                continue;
+            }
+            seen = true;
+            match self.map.entry_for(lba) {
+                Some((idx, Phase::All, _))
+                    if unit_keys.get(idx).is_some_and(|(_, k)| opens(&buf, k)) =>
+                {
+                    return Ok(Proof::Mapped);
+                }
+                // Forensic segment: libfreemkv verifies every such unit as it decrypts.
+                Some((_, p, _)) if p != Phase::All => return Ok(Proof::Mapped),
+                _ => {}
+            }
+            if self.alternates
+                && let Some(slot) = unit_keys.iter().position(|(_, k)| opens(&buf, k))
+            {
+                return Ok(Proof::Held(slot));
+            }
         }
+        if seen {
+            return Err(Error::WholeDiscKeyMissing);
+        }
+        Ok(Proof::Unsampled)
     }
-    if seen {
-        tracing::warn!(target: "freemkv::scan", lba = start, "no held key opens content file");
-        return Err(Error::DecryptFailed);
+}
+
+// Which of a piece's `units` to probe, in order: all of them when few, else the
+// first unit, then `PROBES - 1` more spread evenly to the end.
+fn probe_units(units: u64) -> Vec<u64> {
+    if units <= PROBES {
+        return (0..units).collect();
     }
-    Ok(false)
+    (0..PROBES).map(|p| units * p / PROBES).collect()
 }
 
 // The key-pool slot of the disc's only CPS unit, when provably single-CPS: Unit_Key_RO.inf
@@ -372,6 +484,8 @@ pub(crate) struct UnitAligned<S> {
     inner: S,
     spans: Vec<UnitSpan>,
     scratch: Vec<u8>,
+    /// Unplayed-file pieces left unkeyed (no readable probe), `[start, end)`.
+    unproven: Vec<(u32, u32)>,
 }
 
 impl<S: SectorSource> UnitAligned<S> {
@@ -380,6 +494,29 @@ impl<S: SectorSource> UnitAligned<S> {
             inner,
             spans,
             scratch: Vec::new(),
+            unproven: Vec::new(),
+        }
+    }
+
+    // A decrypt refusal inside an unproven piece is the key it could not prove up front.
+    fn refusal(&self, err: Error, a0: u64, a1: u64) -> Error {
+        let hit = self
+            .unproven
+            .iter()
+            .any(|&(s, e)| (s as u64) < a1 && (e as u64) > a0);
+        match err {
+            Error::DecryptFailed if hit => {
+                tracing::error!(
+                    target: "freemkv::disc",
+                    lba = a0,
+                    code = libfreemkv::error::E_WHOLE_DISC_KEY_MISSING,
+                    "encrypted unit in an unplayed stream file whose key could not be \
+                     proven before the copy (no readable probe); stopping rather than \
+                     writing ciphertext into a decrypted image"
+                );
+                Error::WholeDiscKeyMissing
+            }
+            other => other,
         }
     }
 
@@ -463,13 +600,16 @@ impl<S: SectorSource> SectorSource for UnitAligned<S> {
             let len = (a1 - a0) as usize * SECTOR;
             self.scratch.resize(len, 0);
             self.inner.set_unit_base(a0 as u32);
-            let got = self.inner.read_sectors_fua(
-                a0 as u32,
-                (a1 - a0) as u16,
-                &mut self.scratch[..len],
-                recovery,
-                fua,
-            )?;
+            let got = self
+                .inner
+                .read_sectors_fua(
+                    a0 as u32,
+                    (a1 - a0) as u16,
+                    &mut self.scratch[..len],
+                    recovery,
+                    fua,
+                )
+                .map_err(|e| self.refusal(e, a0, a1))?;
             let skip = (cur - a0) as usize * SECTOR;
             let want = (piece_end - cur) as usize * SECTOR;
             let have = got.saturating_sub(skip).min(want);
@@ -666,7 +806,7 @@ mod tests {
         let files = vec![vec![(300, 6)], vec![(300, 6)]];
         let spans = unit_spans(&files, &[]);
         let mut mem = Mem::default();
-        let map = key_content_files(
+        let (map, _) = key_content_files(
             &mut mem,
             &ctx,
             &mut keys,
@@ -705,6 +845,30 @@ mod tests {
         assert_eq!(one[0], (305u32 % 256) as u8);
         // Grid anchored at 299: the unit holding 305 is [305, 308).
         assert_eq!(r.inner.reads, vec![(305, 3)]);
+    }
+
+    /// Probes cover a short file whole; a long one from its first unit, then evenly.
+    #[test]
+    fn probes_start_at_the_first_unit_and_spread_to_the_end() {
+        assert_eq!(probe_units(0), Vec::<u64>::new());
+        assert_eq!(probe_units(3), vec![0, 1, 2]);
+        assert_eq!(probe_units(PROBES), (0..PROBES).collect::<Vec<_>>());
+        let long = probe_units(3200);
+        assert_eq!(long.len(), PROBES as usize);
+        assert_eq!((long[0], long[1], long[31]), (0, 100, 3100));
+    }
+
+    /// A decrypt refusal is E7032 only inside an unproven piece.
+    #[test]
+    fn a_refusal_in_an_unproven_piece_is_the_mkv_or_raw_error() {
+        let mut r = reader(vec![(100, 30, 100)]);
+        r.unproven = vec![(110, 130)];
+        let got = r.refusal(Error::DecryptFailed, 109, 112);
+        assert!(matches!(got, Error::WholeDiscKeyMissing), "{got:?}");
+        let got = r.refusal(Error::DecryptFailed, 100, 103);
+        assert!(matches!(got, Error::DecryptFailed), "{got:?}");
+        let got = r.refusal(Error::Halted, 109, 112);
+        assert!(matches!(got, Error::Halted), "{got:?}");
     }
 
     /// A unit that straddles a non-contiguous extent boundary fails loud.

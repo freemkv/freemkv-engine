@@ -61,6 +61,9 @@ struct MemDisc {
     fail_at: Option<(u32, fn() -> Error)>,
     /// Any read COVERING this LBA fails as a medium error (a bad sector).
     bad_lba: Option<u32>,
+    /// One-unit (3-sector) reads starting in `[start, end)` fail: probes of a
+    /// damaged area, while the pass's longer reads still get through.
+    probe_fail: Option<(u32, u32)>,
 }
 
 impl MemDisc {
@@ -69,6 +72,7 @@ impl MemDisc {
             image: image.to_vec(),
             fail_at: None,
             bad_lba: None,
+            probe_fail: None,
         }
     }
 }
@@ -89,8 +93,13 @@ impl libfreemkv::sector::SectorSource for MemDisc {
         {
             return Err(make());
         }
-        if let Some(bad) = self.bad_lba
-            && (lba..lba + count as u32).contains(&bad)
+        let probe_hit = self
+            .probe_fail
+            .is_some_and(|(s, e)| count as u32 == UNIT_SECTORS && (s..e).contains(&lba));
+        if probe_hit
+            || self
+                .bad_lba
+                .is_some_and(|bad| (lba..lba + count as u32).contains(&bad))
         {
             return Err(Error::ScsiError {
                 status: 0x02,
@@ -121,9 +130,21 @@ impl Fixture {
     /// Encrypt every unit of `file` under `key`, on the FILE's own unit grid.
     /// `decrypts`: a correct read yields plaintext (else the ciphertext stays).
     fn encrypt(&mut self, file: usize, key: &[u8; 16], decrypts: bool) {
-        let (start, sectors) = self.files[file];
+        let units = self.files[file].1 / UNIT_SECTORS;
+        self.encrypt_units(file, key, decrypts, 0..units);
+    }
+
+    /// [`Self::encrypt`] for only `units` of the file (the rest stay clear).
+    fn encrypt_units(
+        &mut self,
+        file: usize,
+        key: &[u8; 16],
+        decrypts: bool,
+        units: std::ops::Range<u32>,
+    ) {
+        let start = self.files[file].0;
         let unit_len = libfreemkv::aacs::content::ALIGNED_UNIT_LEN;
-        for u in 0..sectors / UNIT_SECTORS {
+        for u in units {
             let at = (start + u * UNIT_SECTORS) as usize * SECTOR;
             let enc = encrypted_content_unit(key);
             self.source[at..at + unit_len].copy_from_slice(&enc);
@@ -338,9 +359,9 @@ fn a_multi_cps_sweep_decrypts_a_provable_non_title_stream_file() {
     }
 }
 
-/// A non-title file no held key opens is unprovable: refused before any output,
-/// on the plain sweep, the multipass shapes (skip_on_error sweep, `copy`), and a
-/// disc whose `Unit_Key_RO.inf` is missing.
+/// A non-title file no held key opens is unprovable: refused before any output with
+/// E7032 (MKV rip or raw copy), on the plain sweep, the multipass shapes
+/// (skip_on_error sweep, `copy`), and a disc whose `Unit_Key_RO.inf` is missing.
 #[test]
 fn an_unprovable_non_title_stream_file_refuses_up_front() {
     let fx = bd(Some((&FOREIGN_KEY, false)));
@@ -351,7 +372,7 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     for d in [multi_cps_disc(&fx), disc(&fx), no_ukro, fmts] {
         let tmp = tempfile::tempdir().unwrap();
         let (iso, r) = sweep_to(&tmp, &d, &mut MemDisc::new(&fx.source));
-        assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+        assert_refused_before_output(&iso, r, Error::WholeDiscKeyMissing.code());
 
         let iso = tmp.path().join("skip.iso");
         let opts = SweepOptions {
@@ -359,7 +380,7 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
             ..sweep_opts()
         };
         let r = freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
-        assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+        assert_refused_before_output(&iso, r, Error::WholeDiscKeyMissing.code());
 
         let iso = tmp.path().join("copy.iso");
         let opts = freemkv_engine::CopyOptions {
@@ -368,8 +389,47 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
             ..Default::default()
         };
         let r = freemkv_engine::copy(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
-        assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+        assert_refused_before_output(&iso, r, Error::WholeDiscKeyMissing.code());
     }
+}
+
+/// Multi-CPS, the unplayed file encrypted only in its first unit (evenly spaced
+/// probes all land on clear units): probing its first unit proves the held key.
+#[test]
+fn a_multi_cps_sweep_proves_a_file_from_its_first_unit() {
+    let mut fx = bd(None);
+    fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 0..1);
+    assert_sweeps_to_expected(&fx, &multi_cps_disc(&fx));
+}
+
+/// The same file under a key no held key matches is refused BEFORE the copy
+/// starts, not hours into the pass when the walk reaches it.
+#[test]
+fn a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_before_output() {
+    let mut fx = bd(None);
+    fx.encrypt_units(ORPHAN, &FOREIGN_KEY, false, 0..1);
+    let tmp = tempfile::tempdir().unwrap();
+    let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut MemDisc::new(&fx.source));
+    assert_refused_before_output(&iso, r, Error::WholeDiscKeyMissing.code());
+}
+
+/// Last resort: every probe of the unplayed file is unreadable (damage), so its key
+/// cannot be proven up front. The pass stops at its first encrypted unit with the
+/// same E7032, never writing ciphertext and never as a generic decrypt failure.
+#[test]
+fn an_unreadable_probe_stops_the_pass_with_the_mkv_or_raw_error() {
+    let fx = bd(Some((&FOREIGN_KEY, false)));
+    let (o, n) = fx.files[ORPHAN];
+    let tmp = tempfile::tempdir().unwrap();
+    let mut reader = MemDisc::new(&fx.source);
+    reader.probe_fail = Some((o, o + n));
+    let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut reader);
+    let err = r.expect_err("an encrypted unit with no proven key must stop the pass");
+    assert_eq!(err.code(), Error::WholeDiscKeyMissing.code(), "got {err}");
+    assert!(
+        iso.exists(),
+        "the pass started: this is the mid-pass last resort"
+    );
 }
 
 /// A skipping sweep's batches tile each file's unit grid: a bad sector in the unit
@@ -578,7 +638,7 @@ fn a_patch_decrypts_a_non_title_stream_file() {
     assert_patches_to_expected(&fx, &disc(&fx), &[(o + 2, 5)]);
 }
 
-/// Unprovable non-title file on Pass N: refused with `DecryptFailed` before
+/// Unprovable non-title file on Pass N: refused with E7032 before
 /// touching the ISO or the mapfile — the bad range stays NonTrimmed.
 #[test]
 fn an_unprovable_patch_refuses_up_front() {
@@ -598,7 +658,7 @@ fn an_unprovable_patch_refuses_up_front() {
     ) else {
         panic!("an unprovable non-title file must refuse");
     };
-    assert_eq!(err.code(), Error::DecryptFailed.code(), "got {err}");
+    assert_eq!(err.code(), Error::WholeDiscKeyMissing.code(), "got {err}");
     assert!(std::fs::read(&iso).unwrap() == iso_before, "ISO untouched");
     assert_eq!(std::fs::read(&map_path).unwrap(), map_before);
     let at = o as u64 * SECTOR as u64;
