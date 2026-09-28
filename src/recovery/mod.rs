@@ -630,7 +630,7 @@ pub fn sweep(
     sweep_in(disc, reader, path, opts, None)
 }
 
-/// [`sweep`] over only `scope` (`(lba, sectors)`, e.g. from
+/// [`sweep()`] over only `scope` (`(lba, sectors)`, e.g. from
 /// [`libfreemkv::Disc::mkv_staging_ranges`]): a staged image for an MKV rip. The
 /// mapfile records the scope, so the file is never taken for a whole-disc image.
 ///
