@@ -1532,6 +1532,8 @@ pub(crate) fn ecc_sectors(format: libfreemkv::DiscFormat) -> u16 {
     }
 }
 
+#[cfg(test)]
+mod ku_tests;
 pub(crate) mod mapfile;
 mod patch;
 mod read_error;
