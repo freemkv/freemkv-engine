@@ -767,7 +767,7 @@ fn extract_tree_reads_through_the_key_set() {
 }
 
 /// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, and
-/// `RipOutcome::Failed` its data (here a sidecar that turned unreadable before the top-up:
+/// `RipOutcome::Failed` its data (here a failed top-up whose sidecar turned unreadable:
 /// `MapfileInvalid { kind: "vidfp" }`), not only the code.
 #[test]
 fn an_up_front_refusal_keeps_the_whole_error() {
@@ -787,7 +787,8 @@ fn an_up_front_refusal_keeps_the_whole_error() {
     let fx = bd_image(&[Some(K1), Some(K2)], 2);
     let dir = tempfile::tempdir().unwrap();
     let iso = fx.write(dir.path(), "d.iso");
-    let f = factory(&[(Answer::Online, &[K1, K2])], &Calls::default());
+    // The top-up fails (no source holds K2), and its error path reads the corrupt sidecar.
+    let f = factory(&[(Answer::Online, &[K1])], &Calls::default());
     let opened =
         open_image_with(&ImageSource::Iso(iso.clone()), OpenImageOptions::resolve(f)).unwrap();
     std::fs::write(mapfile_path_for(&iso), "# freemkv-vidfp: zz\n0x0 0x800 +\n").unwrap();

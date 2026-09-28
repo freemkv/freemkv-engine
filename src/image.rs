@@ -125,7 +125,7 @@ pub struct OpenedImage {
     /// Label of the key source that keyed the first piece, if any.
     pub won: Option<String>,
     // The set after `keys_for`'s top-up, and whether `sources` were spent (asked at most once).
-    top_up: std::sync::Mutex<(ResolvedKeySet, bool)>,
+    top_up: std::sync::Mutex<TopUp>,
 }
 
 impl OpenedImage {
@@ -278,7 +278,7 @@ fn open_image_inner(
     Ok(OpenedImage {
         source: src.clone(),
         won: set.status().origin.map(str::to_string),
-        top_up: std::sync::Mutex::new((set.clone(), false)),
+        top_up: std::sync::Mutex::new(TopUp::new(set.clone(), &scope)),
         disc,
         reader,
         keys: set,
@@ -288,49 +288,120 @@ fn open_image_inner(
     })
 }
 
+// An opened image's key state after its top-ups: the held set and the titles it was
+// resolved over, whether the one asking top-up made a request, and that top-up's failure.
+struct TopUp {
+    keys: ResolvedKeySet,
+    titles: Vec<usize>,
+    asked: bool,
+    failure: Option<u16>,
+}
+
+impl TopUp {
+    fn new(keys: ResolvedKeySet, scope: &KeyScope) -> Self {
+        let titles = match scope {
+            KeyScope::Titles(v) => v.clone(),
+            _ => Vec::new(),
+        };
+        TopUp {
+            keys,
+            titles,
+            asked: false,
+            failure: None,
+        }
+    }
+}
+
+// A source failure a top-up remembers, to re-raise instead of E7022 (review B1).
+fn source_failure(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::KeyServiceUnavailable
+            | Error::KeyServiceUnauthorized
+            | Error::KeyServiceRateLimited
+            | Error::Halted
+    )
+}
+
+fn rebuild_failure(code: u16) -> Error {
+    use libfreemkv::error::{E_KEY_SERVICE_RATE_LIMITED, E_KEY_SERVICE_UNAUTHORIZED};
+    match code {
+        E_KEY_SERVICE_UNAUTHORIZED => Error::KeyServiceUnauthorized,
+        E_KEY_SERVICE_RATE_LIMITED => Error::KeyServiceRateLimited,
+        c if c == Error::Halted.code() => Error::Halted,
+        _ => Error::KeyServiceUnavailable,
+    }
+}
+
 impl OpenedImage {
-    /// The key set for muxing `titles` (KU §3.2): the held set when it covers them, else a
-    /// resolve over their scope seeded with it, before the first output byte and stopped by
-    /// `halt`. `sources` are asked at most once per opened image; later top-ups use only the
-    /// keys already held (0 requests), and the result is remembered. Never re-scans the image.
+    /// The key set for muxing `titles` (KU §3.2): the held set when it covers them (a gap
+    /// that is only forensic keys left Pending cannot be filled here: the held set), else a
+    /// resolve over the held titles plus `titles`, seeded with the held set, before the first
+    /// output byte and stopped by `halt`. At most one top-up per opened image asks the
+    /// sources, counted once it made a request; later ones use only held keys (0 requests)
+    /// and re-raise that top-up's source failure rather than E7022. The lock is held across
+    /// the top-up's reads: calls on one image run one at a time. Never re-scans the image.
     pub(crate) fn keys_for(
         &self,
         titles: &[usize],
         halt: Option<&libfreemkv::Halt>,
     ) -> crate::Result<ResolvedKeySet> {
-        let scope = KeyScope::Titles(titles.to_vec());
         let mut held = self.top_up.lock().unwrap_or_else(|e| e.into_inner());
-        if covers(&held.0, &self.disc, &scope) {
-            return Ok(held.0.clone());
+        if keys_scope(&held.keys, &self.disc, &KeyScope::Titles(titles.to_vec())) {
+            return Ok(held.keys.clone());
         }
         let Some(sources) = &self.sources else {
-            return known(&self.disc, held.0.clone(), &scope);
+            return known(
+                &self.disc,
+                held.keys.clone(),
+                &KeyScope::Titles(titles.to_vec()),
+            );
         };
-        // KU §2.1 invariant 4: the key service is never asked twice for this image.
+        let mut union: Vec<usize> = held.titles.iter().chain(titles).copied().collect();
+        union.sort_unstable();
+        union.dedup();
+        let scope = KeyScope::Titles(union.clone());
+        // KU §2.1 invariant 4: at most one top-up per opened image asks the key sources.
+        let ask = !held.asked;
         let no_sources: KeySourceFactory = std::sync::Arc::new(Vec::new);
-        let sources = if held.1 { &no_sources } else { sources };
-        held.1 = true;
+        let factory = if ask { sources } else { &no_sources };
         let mut reader = raw_reader(&self.source)?;
-        let vid_in_hand = in_hand_vid_fingerprint(&self.disc, None, Some(&held.0));
-        let seed = Some(&held.0);
+        let vid_in_hand = in_hand_vid_fingerprint(&self.disc, None, Some(&held.keys));
         let walk = std::sync::Mutex::new(Default::default());
+        let seed = Some(&held.keys);
         let r = resolve(
             &self.disc,
             reader.as_mut(),
             &scope,
-            sources,
+            factory,
             seed,
             None,
             halt,
             &walk,
         );
-        let sidecar = load_sidecar(&self.source)?;
-        let keys = r
-            .map_err(|e| vid_needs_disc(e, vid_in_hand, sidecar.as_ref()))?
-            .keys;
-        log_status(&keys, &format!("{scope:?}"));
-        held.0 = keys.clone();
-        Ok(keys)
+        let walk = walk.into_inner().unwrap_or_else(|e| e.into_inner());
+        let requested = ask && !walk.keys.is_empty();
+        held.asked |= requested;
+        match r {
+            Ok(k) => {
+                log_status(&k.keys, &format!("{scope:?}"));
+                held.keys = k.keys.clone();
+                held.titles = union;
+                Ok(k.keys)
+            }
+            Err((e, help)) => {
+                tracing::info!(target: "freemkv::keys", error = %e, walk = ?walk.keys, "top-up refused");
+                if requested && source_failure(&e) {
+                    held.failure = Some(e.code());
+                }
+                let missing = matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing);
+                if let (false, true, Some(code)) = (ask, missing, held.failure) {
+                    return Err(rebuild_failure(code));
+                }
+                let sidecar = load_sidecar(&self.source)?;
+                Err(vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref()))
+            }
+        }
     }
 }
 
@@ -345,12 +416,11 @@ impl OpenedImage {
         sources: Option<KeySourceFactory>,
         titles: Vec<usize>,
     ) -> Self {
-        let _ = &titles;
         OpenedImage {
             source: ImageSource::Iso(iso.to_path_buf()),
             disc,
             reader: raw_reader(&ImageSource::Iso(iso.to_path_buf())).unwrap(),
-            top_up: std::sync::Mutex::new((keys.clone(), false)),
+            top_up: std::sync::Mutex::new(TopUp::new(keys.clone(), &KeyScope::Titles(titles))),
             keys,
             sources,
             prescanned: true,
