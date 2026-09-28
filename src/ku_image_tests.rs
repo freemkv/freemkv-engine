@@ -420,3 +420,29 @@ fn a_stopped_image_mux_makes_no_top_up_request() {
     assert_eq!(out, RipOutcome::Halted);
     assert_eq!(calls.len(), 1, "the top-up saw the Stop and asked nothing");
 }
+
+/// KU §2.3 step 13 / Stop T31: `remux_iso` resolves under the sink's Stop, so a stopped
+/// remux asks no key source and ends `Halted`.
+#[test]
+fn a_stopped_remux_makes_no_key_request() {
+    struct Stopped;
+    impl crate::Sink for Stopped {
+        fn should_cancel(&self) -> bool {
+            true
+        }
+    }
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let job = crate::RemuxJob {
+        iso: ImageSource::Iso(fx.write(dir.path(), "d.iso")),
+        title: None,
+        streams: crate::StreamChoice::default(),
+        target: dir.path().join("remux.mkv"),
+        replace: false,
+    };
+    let f = factory(&[(Answer::Online, &[K1])], &calls);
+    let err = crate::remux::remux_iso_with(&job, f, &Stopped).unwrap_err();
+    assert!(libfreemkv::is_halt(&err), "{err}");
+    assert_eq!(calls.len(), 0, "the Stop reached the resolve");
+}
