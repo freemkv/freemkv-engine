@@ -396,9 +396,10 @@ fn in_hand_vid_fingerprint(
     vid: Option<[u8; 16]>,
     seed: Option<&ResolvedKeySet>,
 ) -> Option<[u8; 32]> {
-    let disc_vid = disc.aacs.as_ref().map(|a| a.volume_id);
-    vid.or(disc_vid)
-        .filter(|v| *v != [0u8; 16])
+    let real = |v: &[u8; 16]| *v != [0u8; 16];
+    let disc_vid = disc.aacs.as_ref().map(|a| a.volume_id).filter(real);
+    vid.filter(real)
+        .or(disc_vid)
         .map(|v| vid_fingerprint(&v))
         .or_else(|| seed.and_then(|s| s.vid_fingerprint()))
 }
