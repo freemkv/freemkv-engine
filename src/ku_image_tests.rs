@@ -446,3 +446,34 @@ fn a_stopped_remux_makes_no_key_request() {
     assert!(libfreemkv::is_halt(&err), "{err}");
     assert_eq!(calls.len(), 0, "the Stop reached the resolve");
 }
+
+/// D1 (KU §2.1 invariant 4, "never call the key service twice"): the server muxes one title
+/// per `mux_image_titles` call on one opened image. The one top-up is remembered: a later
+/// call for another title of the same group asks nothing, the keydb included.
+#[test]
+fn the_top_up_is_asked_once_across_mux_calls() {
+    let fx = bd_image(&[Some(K1), Some(K2), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let calls = Calls::default();
+    let f = factory(
+        &[(Answer::Keydb, &[K1]), (Answer::Online, &[K1, K2])],
+        &calls,
+    );
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    let count = |who: &str| calls.all().iter().filter(|c| c.who == who).count();
+    assert_eq!((count("keydb"), count("online")), (1, 0), "the open");
+    mux_all(&opened, vec![1], dir.path());
+    assert_eq!(
+        (count("keydb"), count("online")),
+        (2, 1),
+        "one top-up for K2"
+    );
+    mux_all(&opened, vec![2], dir.path());
+    mux_all(&opened, vec![1, 2], dir.path());
+    assert_eq!(
+        (count("keydb"), count("online")),
+        (2, 1),
+        "never asked again"
+    );
+}
