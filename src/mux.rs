@@ -706,10 +706,8 @@ mod tests {
             "a decrypting rip keeps the fatal E7031"
         );
 
-        // `session.scan` needs a live drive, so THAT call can't run here (source
-        // pin instead — see `the_drive_rip_checks_the_selection_against_the_scan_it_was_made_on`
-        // in freemkv's `engine.rs` for the same constraint). Pins that the value
-        // handed to it is this function's answer, not a hardcoded default.
+        // `session.scan` needs a live drive, so pin the source instead: the value
+        // handed to it must be this function's answer, not a hardcoded default.
         let src = include_str!("mux.rs").replace("\r\n", "\n");
         let start = src
             .find("pub fn open_scan_resolve_with(")
