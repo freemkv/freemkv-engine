@@ -111,6 +111,7 @@ fn refused_up_front(
     let io: io::Error = e.into();
     let first = plan.titles.first().copied().unwrap_or(0);
     let (verdict, code, kind) = (classify_title_error(&io), crate::error_code(&io), io.kind());
+    let data = crate::mux::error_data(&io);
     if verdict != TitleResult::Halted && !plan.titles.is_empty() {
         let dest = dest(first);
         sink.event(&Event::TitleStart {
@@ -131,6 +132,7 @@ fn refused_up_front(
             title_index: first,
             code,
             kind,
+            data,
         },
     }
 }

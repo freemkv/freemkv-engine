@@ -180,9 +180,18 @@ pub enum RipOutcome {
         /// The `io::ErrorKind`, which is where a passthrough OS error
         /// (`StorageFull`, `PermissionDenied`) keeps its meaning.
         kind: std::io::ErrorKind,
+        /// The coded error's data (`E<code>: <data>`, e.g. a disc hash), language-neutral;
+        /// empty for an uncoded error or one with no data.
+        data: String,
     },
     /// The rip was cancelled — a full stop, not a per-title cancel.
     Halted,
+}
+
+/// The data of a libfreemkv error's `E<code>: <data>` form; empty when it has none.
+pub(crate) fn error_data(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    crate::parse_error_code(&text).map_or_else(String::new, |(_, d)| d.to_string())
 }
 
 /// Drive the multi-title rip loop. `mux_one(idx) -> io::Result<()>` muxes a
@@ -221,11 +230,13 @@ where
         // the error into a coarse verdict, and the typed cause is gone after.
         let mut fail_code = None;
         let mut fail_kind = std::io::ErrorKind::Other;
+        let mut fail_data = String::new();
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
             Err(e) => {
                 fail_detail = e.to_string();
                 fail_code = crate::error_code(&e);
+                fail_data = error_data(&e);
                 fail_kind = e.kind();
                 classify_title_error(&e)
             }
@@ -262,6 +273,7 @@ where
                     title_index: idx,
                     code: fail_code,
                     kind: fail_kind,
+                    data: fail_data,
                 };
             }
         }
@@ -709,6 +721,7 @@ mod tests {
                 title_index: 3,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             },
             "the only title the rip was going to write came back a stub — that \
              is a failed rip, not a rip that skipped a bonus feature"
@@ -1071,6 +1084,7 @@ mod tests {
                 title_index: 0,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             }
         );
     }
@@ -1088,6 +1102,7 @@ mod tests {
                 title_index: 1,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             }
         );
     }
@@ -1106,6 +1121,7 @@ mod tests {
                 title_index: 1,
                 code: libfreemkv::error_code(&hard_err()),
                 kind: hard_err().kind(),
+                data: error_data(&hard_err()),
             }
         );
     }

@@ -7,6 +7,7 @@
 - Mapfiles no longer store keys or the raw Volume ID: only the disc hash (`# freemkv-disc:`) and a Volume ID fingerprint (`# freemkv-vidfp:`). Key and VID lines in an older mapfile become fingerprints and are removed the next time it is written. `build_key_fetch` and `OpenedImage::key_fetch` are removed; `OpenedImage` carries `keys`, `sources` and `prescanned`.
 - A key service whose address lookup fails for a moment is kept and retried before the rip starts, instead of being dropped.
 - The on-arrival key stop (E7022, E7032) ends every pass: it is never retried, skipped or recorded as disc damage.
+- `RipOutcome::Failed` gains `data`: the failing error's language-neutral data (`E<code>: <data>`, e.g. a disc hash). A key refusal before any title is reported as the first title's `TitleStart` / `TitleDone(Err)` with the typed error.
 
 - Whole-disc decrypt (disc → ISO) uses libfreemkv's shared `whole_disc` reader, the same one as freemkv's image → ISO path. A stream file no title plays that is encrypted, with no held key opening it, refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. A key must open two probed units before it keys such a file. A file with no proven key on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why. An AACS disc with titles but no stream folder now fails with E6003, naming the folder, instead of E7013.
 
