@@ -726,3 +726,42 @@ fn known_set_with_a_verify_phase_decrypts_both_halves() {
         "a resolved phase skips unit 21"
     );
 }
+
+/// KU §3.2 / §3.1 `ExtractOptions.keys`: a decrypted-folder extract of an AACS image reads
+/// through the rip's set (scope `WholeDisc`), with no disc-banked key, via the engine.
+#[test]
+fn extract_tree_reads_through_the_key_set() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let set = resolve(
+        &fx,
+        KeyScope::WholeDisc,
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("tree");
+    let r = crate::extract_tree_with(
+        &fx.disc,
+        &mut fx.source(),
+        &dest,
+        false,
+        Some(&set),
+        &crate::NoopSink,
+    )
+    .unwrap();
+    assert!(!r.halted);
+    let (s, n) = fx.clip(0);
+    let got = std::fs::read(dest.join("BDMV/STREAM/00000.m2ts")).unwrap();
+    let want = &fx.img.plain[s as usize * 2048..(s + n) as usize * 2048];
+    let mask = |b: &[u8]| {
+        b.chunks(192)
+            .flat_map(|p| {
+                let mut p = p.to_vec();
+                p[0] &= 0x3F;
+                p
+            })
+            .collect::<Vec<u8>>()
+    };
+    assert!(mask(&got) == mask(want), "the stream file is decrypted");
+}
