@@ -70,7 +70,11 @@ pub fn mux_image_titles(
     dest: &dyn Fn(usize) -> String,
     sink: &dyn Sink,
 ) -> RipOutcome {
-    let keys = match opened.keys_for(&plan.titles) {
+    let top_up = |h: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+        let halt = libfreemkv::Halt::from_arc(h.clone());
+        opened.keys_for(&plan.titles, Some(&halt))
+    };
+    let keys = match crate::run::with_cancel_watcher(sink, top_up) {
         Ok(keys) => keys,
         Err(e) => return refused_up_front(e, plan, sink),
     };
@@ -256,7 +260,7 @@ pub(crate) fn remux_iso_with(
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
     };
-    let keys = opened.keys_for(&[idx]).map_err(io::Error::from)?;
+    let keys = opened.keys_for(&[idx], None).map_err(io::Error::from)?;
     land_verified(job, idx, title, sink, |dest| {
         mux_opened_title(
             &opened,

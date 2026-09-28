@@ -242,9 +242,13 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
 
 impl OpenedImage {
     /// The key set for muxing `titles` (KU §3.2): this image's set when it covers them,
-    /// else ONE resolve over their scope seeded with it (before the first output byte), else
-    /// E7022. Never re-scans the image.
-    pub(crate) fn keys_for(&self, titles: &[usize]) -> crate::Result<ResolvedKeySet> {
+    /// else ONE resolve over their scope seeded with it (before the first output byte,
+    /// stopped by `halt`), else E7022. Never re-scans the image.
+    pub(crate) fn keys_for(
+        &self,
+        titles: &[usize],
+        halt: Option<&libfreemkv::Halt>,
+    ) -> crate::Result<ResolvedKeySet> {
         let scope = KeyScope::Titles(titles.to_vec());
         if covers(&self.keys, &scope) {
             return Ok(self.keys.clone());
@@ -262,7 +266,7 @@ impl OpenedImage {
             sources,
             seed,
             None,
-            None,
+            halt,
         );
         let sidecar = load_sidecar(&self.source);
         let keys = r
