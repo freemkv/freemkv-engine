@@ -1,6 +1,6 @@
 //! KU-E1 recovery tests (KU §3.2, §3.5, §2.4): the passes read through the rip's one
-//! up-front key set, the gates accept it (or, until KU-X1, legacy disc-banked keys), and
-//! the on-arrival proof's side reads never reach the damage classifier.
+//! up-front key set, the gates accept it and nothing else (KU-X1: never legacy disc-banked
+//! keys), and the on-arrival proof's side reads never reach the damage classifier.
 
 use super::read_error::CLASSIFIED;
 use crate::test_fixtures::{Answer, Calls, Damage, Drive, Fx, K1, bd_image, factory, resolve};
@@ -111,7 +111,7 @@ fn decrypting_copy_patch_pass_proves_lazy_piece() {
     let popts = PatchOptions {
         decrypt: true,
         keys: Some(set.clone()),
-        ..PatchOptions::for_patch_pass(true, None, None, None)
+        ..PatchOptions::for_patch_pass(true, None, None)
     };
     let out = super::patch(&fx.disc, &mut drive.clone(), &iso, &popts).unwrap();
     assert_eq!(out.bytes_pending + out.bytes_unreadable, 0);
@@ -204,7 +204,7 @@ fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<ResolvedKeyS
     super::sweep(disc, &mut fx.source(), &iso("sweep.iso"), &sweep).expect("sweep");
     let patch = PatchOptions {
         keys: keys.clone(),
-        ..PatchOptions::for_patch_pass(true, None, None, None)
+        ..PatchOptions::for_patch_pass(true, None, None)
     };
     super::patch(disc, &mut fx.source(), &iso("sweep.iso"), &patch).expect("patch");
     let mut job = Job::new("iso://x.iso", "mkv://x.mkv");
@@ -226,7 +226,7 @@ fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<ResolvedKeyS
 }
 
 /// EK8 (KU §3.5, N-KU8): a keyed rip passes every engine gate with the set alone (no
-/// disc-banked key); before KU-X1 also with legacy disc-banked keys alone.
+/// disc-banked key).
 #[test]
 fn keyed_rip_passes_every_engine_gate() {
     let fx = bd_image(&[Some(K1)], 1);
@@ -238,8 +238,62 @@ fn keyed_rip_passes_every_engine_gate() {
     )
     .unwrap();
     every_gate_passes(&fx, &fx.disc, Some(set));
+}
 
-    let mut banked = bd_image(&[Some(K1)], 1);
-    banked.disc.aacs.as_mut().unwrap().unit_keys = vec![(1, K1)];
-    every_gate_passes(&banked, &banked.disc, None);
+/// EK8 after KU-X1 (KU §8.2: "Remove the legacy gate fallback"): legacy disc-banked keys
+/// with no set pass no engine gate; each refuses E7022 before any output.
+/// Per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn legacy_banked_keys_pass_no_engine_gate() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let disc = &fx.disc;
+    let dir = tempfile::tempdir().unwrap();
+    let iso = |n: &str| dir.path().join(n);
+    let no_key = |r: crate::Result<()>, gate: &str| {
+        let e = r.expect_err(gate);
+        assert_eq!(e.code(), libfreemkv::error::E_NO_DISC_KEY, "{gate}: {e}");
+    };
+    let copy = CopyOptions {
+        decrypt: true,
+        ..Default::default()
+    };
+    no_key(
+        super::copy(disc, &mut fx.source(), &iso("c.iso"), &copy).map(drop),
+        "copy",
+    );
+    let sweep = SweepOptions {
+        decrypt: true,
+        ..Default::default()
+    };
+    no_key(
+        super::sweep(disc, &mut fx.source(), &iso("s.iso"), &sweep).map(drop),
+        "sweep",
+    );
+    let patch = PatchOptions {
+        decrypt: true,
+        ..Default::default()
+    };
+    no_key(
+        super::patch(disc, &mut fx.source(), &iso("s.iso"), &patch).map(drop),
+        "patch",
+    );
+    let job = Job::new("iso://x.iso", "mkv://x.mkv");
+    let pf = crate::preflight(disc, &job);
+    assert!(
+        pf.reasons().iter().any(|r| r.key == "encrypted-no-key"),
+        "{pf:?}"
+    );
+    let sink = crate::NoopSink;
+    let run = crate::recover_to_iso(disc, &mut fx.source(), &iso("r.iso"), &job, &sink);
+    no_key(run.map(drop), "recover_to_iso");
+    let single = crate::MultipassOpts {
+        max_passes: 0,
+        abort_on_lost_secs: 0,
+        is_iso_output: true,
+    };
+    let mp = crate::multipass_rip(disc, &mut fx.source(), &iso("m.iso"), &job, &single, &sink);
+    no_key(mp.map(drop), "multipass_rip");
+    for n in ["c.iso", "s.iso", "r.iso", "m.iso"] {
+        assert!(!iso(n).exists(), "{n}: refused before any output");
+    }
 }

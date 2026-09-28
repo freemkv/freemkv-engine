@@ -63,9 +63,8 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
     sources
 }
 
-/// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] (and the legacy
-/// `resolve_keys_for` / `DiscSession::resolve_keys`) calls to build the ordered sources
-/// from `p`, with the J10 transient-URL rule of [`key_sources`].
+/// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] calls to build
+/// the ordered sources from `p`, with the J10 transient-URL rule of [`key_sources`].
 pub fn key_source_factory(p: &KeyParams) -> libfreemkv::KeySourceFactory {
     let p = p.clone();
     std::sync::Arc::new(move || key_sources(&p))
@@ -180,20 +179,6 @@ pub fn won_source(trace: &libfreemkv::aacs::trace::ResolutionTrace) -> Option<St
         .iter()
         .find(|step| step.outcome == libfreemkv::aacs::trace::KeyOutcome::Resolved)
         .map(|step| step.who.clone())
-}
-
-/// Resolve an AACS key for a keyless-scanned `disc` from `p`'s sources,
-/// reading ciphertext samples through `reader`, and return the label of the
-/// source that won (or `None` if nothing resolved). No-op for an unencrypted
-/// disc (no AACS inputs).
-pub fn resolve_disc_keys(
-    disc: &mut libfreemkv::Disc,
-    reader: &mut dyn libfreemkv::SectorSource,
-    p: &KeyParams,
-) -> Option<String> {
-    let factory = key_source_factory(p);
-    let resolved = libfreemkv::resolve_keys_for(reader, disc, factory);
-    won_source(&resolved.trace)
 }
 
 #[cfg(test)]
@@ -321,129 +306,6 @@ mod tests {
             }],
         };
         assert_eq!(won_source(&trace), None);
-    }
-
-    // An unencrypted disc resolves nothing and READS nothing; guards against a fabricated
-    // winning-source label and pins the read short-circuit.
-    #[test]
-    fn resolve_disc_keys_is_none_and_reads_nothing_for_an_unencrypted_disc() {
-        struct NeverRead;
-        impl libfreemkv::SectorSource for NeverRead {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                _count: u16,
-                _buf: &mut [u8],
-                _recovery: bool,
-            ) -> libfreemkv::Result<usize> {
-                panic!("an unencrypted disc must not be sampled for key material");
-            }
-            fn capacity_sectors(&self) -> u32 {
-                1
-            }
-        }
-
-        let mut disc = libfreemkv::Disc {
-            volume_id: "PLAIN".into(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::BluRay,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles: vec![],
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs: None,
-            css: None,
-            encrypted: false,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
-        };
-        let p = KeyParams {
-            keydb_path: Some("keydb.cfg".into()),
-            key_url: None,
-            key_auth: None,
-            online_only: false,
-        };
-        assert_eq!(
-            resolve_disc_keys(&mut disc, &mut NeverRead, &p),
-            None,
-            "no AACS inputs means no resolution, and therefore no winning source"
-        );
-    }
-
-    /// ...and the other half: a disc the local keydb DOES hold a unit key for
-    /// resolves, the key is banked onto the disc, and the label of the source
-    /// that won comes back. Without this the whole verb is indistinguishable
-    /// from a body that always answers `None` — which reads as "no key found",
-    /// and sends the operator hunting for a keydb they already have.
-    #[test]
-    fn resolve_disc_keys_names_the_source_that_won_and_banks_the_key() {
-        struct NeverRead;
-        impl libfreemkv::SectorSource for NeverRead {
-            fn read_sectors(
-                &mut self,
-                _lba: u32,
-                _count: u16,
-                _buf: &mut [u8],
-                _recovery: bool,
-            ) -> libfreemkv::Result<usize> {
-                // No parsed titles: there is nothing to sample, so validation
-                // is skipped and the stored unit key is taken as terminal.
-                panic!("a title-less disc has no ciphertext to sample");
-            }
-            fn capacity_sectors(&self) -> u32 {
-                1
-            }
-        }
-
-        let disc_hash = "ab".repeat(20);
-        let unit_key = "5a".repeat(16);
-        let dir = tempfile::tempdir().unwrap();
-        let keydb = dir.path().join("keydb.cfg");
-        std::fs::write(
-            &keydb,
-            format!("0x{disc_hash} = TESTDISC | U | 1-0x{unit_key}\n"),
-        )
-        .unwrap();
-
-        let mut disc = libfreemkv::Disc {
-            volume_id: "TESTDISC".into(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::BluRay,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles: vec![],
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs: Some(
-                libfreemkv::test_util::aacs_state()
-                    .disc_hash(disc_hash.clone())
-                    .build(),
-            ),
-            css: None,
-            encrypted: true,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
-        };
-        let p = KeyParams {
-            keydb_path: Some(keydb.to_string_lossy().into_owned()),
-            key_url: None,
-            key_auth: None,
-            online_only: false,
-        };
-
-        assert_eq!(
-            resolve_disc_keys(&mut disc, &mut NeverRead, &p),
-            Some("keydb".to_string()),
-            "the local keydb held the unit key; it must be named as the winner"
-        );
-        assert_eq!(
-            disc.aacs.as_ref().unwrap().unit_keys,
-            vec![(1u32, [0x5au8; 16])],
-            "the winning key must be banked onto the disc, not merely reported"
-        );
     }
 
     // ── KU-E1: the front door (KU §3.2) ─────────────────────────────────────

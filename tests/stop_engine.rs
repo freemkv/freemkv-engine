@@ -311,7 +311,7 @@ fn patch_stop_mid_read() {
 }
 
 fn patch_opts() -> PatchOptions<'static> {
-    PatchOptions::for_patch_pass(false, None, None, None)
+    PatchOptions::for_patch_pass(false, None, None)
 }
 
 // ET6 `multipass_stop_between_passes`: a Stop that lands as the sweep ends runs no patch pass.
@@ -401,7 +401,7 @@ fn patch_latch_is_exempt() {
     swept_with_damage(&iso);
     let mut reader = Script::new(256, 0..256);
     let stop = |_: &libfreemkv::progress::PassProgress| false;
-    let opts = PatchOptions::for_patch_pass(false, Some(&stop), None, None);
+    let opts = PatchOptions::for_patch_pass(false, Some(&stop), None);
     let op = Halt::new();
     let t0 = Instant::now();
     let out = freemkv_engine::patch_with(&op, &disc(256), &mut reader, &iso, &opts);

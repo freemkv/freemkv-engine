@@ -100,8 +100,8 @@ use freemkv_engine::{
     Job, RipMode, Selection, Outcome, RipFile, KeyStatus, DamageSeverity,
     // validate without executing
     preflight, Preflight, Reason,
-    // key status as data
-    resolve_keys,
+    // the rip's keys, up front (keys-upfront KU §2.1)
+    keys::{resolve_for_rip, key_status, key_source_factory, rip_scope, RipOutput, KeyParams},
     // the seam
     Sink, Level, Progress, NoopSink,
     // recovery / multipass
@@ -154,29 +154,20 @@ match preflight(&disc, &job) {
 }
 ```
 
-### 3. `resolve_keys(&Disc) -> KeyStatus` — the keydb strip, as data
+### 3. `keys::resolve_for_rip` — the rip's keys, once, before any output
 
 ```rust
-let ks = resolve_keys(&disc);
-// ks.resolved: bool
-// ks.origin:   Option<KeyOrigin>   (where the key came from)
-// ks.summary:  stable key you localize. The COMPLETE set the engine emits —
-//              map all ten, or the strip renders a raw key at the user:
-//   "unencrypted" | "resolved-keydb" | "resolved-external" | "resolved-derived"
-//   | "resolved-css" | "no-key" | "no-keydb"   ← render the red "no KEYDB.cfg"
-//                                                 strip on "no-keydb"
-//   | "key-service-unavailable" | "key-service-unauthorized"
-//   | "key-service-rate-limited"
-// "resolved-external" is source-agnostic (an externally supplied unit key —
-// not necessarily online); "resolved-derived" means the key was derived from
-// device/processing keys. There is no "resolved-online".
-// The three "key-service-*" values are NOT "no-key": a key SOURCE failed to
-// answer, so nothing was learned about whether this disc has a key. The user
-// action is retry / fix the token / back off — not "go find a VUK" — so give
-// them their own message rather than folding them into the no-key case.
+let sources = key_source_factory(&KeyParams { keydb_path, key_url, ..Default::default() });
+let scope = rip_scope(&disc, &titles, RipOutput::DecryptedImage);
+let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, Some(&halt))?;
+// Err refuses the rip before any output: map its code (E7022/E7032 no key,
+// E7026 forensic keys pending, E7028–30 the key service, E7013, Halted).
+let status = key_status(&disc, &set);    // Ready | AacsKeysMissing | ForensicPending | …
+let job = job.with_keys(set);            // every pass and gate reads this set, nothing else
 ```
 
-No scraping logs for key state — it's here as data.
+The set lives in memory only. Without one, a decrypting rip of an AACS disc
+refuses (E7022) whatever keys the scan found on the disc.
 
 ### 4. Recover + report
 
@@ -288,9 +279,9 @@ panel fields. All `Disc` fields are public.
 
 `freemkv_engine::Result<T>` is `Result<T, libfreemkv::Error>`. `Error` is a typed
 enum with a numeric `.code()` and **no English text** — map codes to your
-localized strings, exactly as the CLI does. The sentinel for a missing keydb is
-surfaced as the `"no-keydb"` `KeyStatus` summary (don't string-match the error
-for that case — use `resolve_keys`).
+localized strings, exactly as the CLI does. A key refusal (no key, no keydb, a
+key service that failed) comes back typed from `keys::resolve_for_rip`; map its
+code, don't string-match the error.
 
 ---
 
@@ -312,12 +303,12 @@ for that case — use `resolve_keys`).
 
 ```rust
 let (disc, mut reader) = libfreemkv::scan_iso(path, Default::default())?;  // reader: Box<dyn SectorSource>
-let job = Job::new(src, dst).with_mode(RipMode::Multi);
+let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
+update_keydb_strip(key_status(&disc, &set));
+let job = Job::new(src, dst).with_mode(RipMode::Multi).with_keys(set);
 if let Preflight::Blocked(reasons) = preflight(&disc, &job) {
     return show_blocked(reasons);
 }
-let key = resolve_keys(&disc);
-update_keydb_strip(key);
 let sink = UiSink::new();                // your impl
 std::thread::spawn(move || {
     let mp = multipass_rip(&disc, &mut *reader, iso_path, &job, &opts, &sink);
@@ -327,5 +318,5 @@ std::thread::spawn(move || {
 });
 ```
 
-That's the whole contract: build a `Job`, `preflight` it, show `resolve_keys`
-state, run recovery with your `Sink`, render the `Outcome`.
+That's the whole contract: build a `Job`, resolve its keys once and show
+`key_status`, `preflight` it, run recovery with your `Sink`, render the `Outcome`.

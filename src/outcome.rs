@@ -68,7 +68,7 @@ impl Outcome {
 
 /// Key resolution state, as data rather than log lines — so a UI can render the
 /// "keydb: N entries" strip and grey out Start with a real reason instead of
-/// scraping a log. Populated by [`crate::resolve_keys`].
+/// scraping a log.
 #[derive(Clone, Debug)]
 pub struct KeyStatus {
     /// Whether usable decryption keys were resolved for the selected content.

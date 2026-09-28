@@ -94,9 +94,6 @@ fn sweep_opts(resume: bool) -> SweepOptions<'static> {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     }
 }
@@ -166,7 +163,7 @@ fn a_patch_over_a_scoped_map_reruns_only_in_scope_damage_without_the_gate() {
         map.flush().unwrap();
     }
     let (mut r, reads) = reader(true);
-    let popts = PatchOptions::for_patch_pass(false, None, None, None);
+    let popts = PatchOptions::for_patch_pass(false, None, None);
     let Ok(_) = freemkv_engine::patch(&disc(), &mut r, &iso, &popts) else {
         panic!("{SPEC_BD_3_7_NOT_STREAM}: a scoped patch needs no bus-map gate");
     };

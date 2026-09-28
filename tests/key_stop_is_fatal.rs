@@ -126,7 +126,7 @@ fn a_patch_pass_ends_on_a_key_stop_and_leaves_the_range_pending() {
             mf.record(bad.0, bad.1, SectorStatus::NonTrimmed).unwrap();
         }
         let (mut r, reads) = reader(stop);
-        let popts = PatchOptions::for_patch_pass(false, None, None, None);
+        let popts = PatchOptions::for_patch_pass(false, None, None);
         let Err(err) = freemkv_engine::patch(&disc(), &mut r, &iso, &popts) else {
             panic!("a key stop must end the patch pass");
         };

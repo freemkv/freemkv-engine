@@ -1,13 +1,11 @@
-//! Integration tests for progress reporting, halt behavior, drop safety,
+//! Integration tests for progress reporting, halt behavior,
 //! and the file-backed sector reader round trip.
 
 use freemkv_engine::CopyOptions;
 use libfreemkv::disc::DiscRegion;
 use libfreemkv::error::Result;
-use libfreemkv::pes::Stream as PesStream;
 use libfreemkv::{
-    ContentFormat, Disc, DiscFormat, DiscStream, DiscTitle, EventKind, Extent, FileSectorSource,
-    SectorSource,
+    ContentFormat, Disc, DiscFormat, DiscTitle, Extent, FileSectorSource, SectorSource,
 };
 use std::io::Write;
 use std::sync::Arc;
@@ -120,51 +118,6 @@ fn synthetic_title(sector_count: u32) -> DiscTitle {
         content_format: ContentFormat::BdTs,
         codec_privates: Vec::new(),
     }
-}
-
-// ── 1. BytesRead events emitted during disc copy ──────────────────────────
-
-#[test]
-fn test_bytes_read_emitted_during_disc_copy() {
-    // Build a tiny synthetic disc and stream it through DiscStream.
-    let reader = ZeroSectorReader::new(64);
-    let title = synthetic_title(64);
-    let keys = libfreemkv::DecryptKeys::None;
-
-    let mut stream = DiscStream::new(
-        Box::new(reader),
-        title,
-        keys,
-        60,
-        ContentFormat::BdTs,
-        false,
-        None,
-    )
-    .unwrap();
-
-    let count = Arc::new(AtomicU64::new(0));
-    let count_cb = count.clone();
-    stream.on_event(move |ev| {
-        if let EventKind::BytesRead { .. } = ev.kind {
-            count_cb.fetch_add(1, Ordering::Relaxed);
-        }
-    });
-
-    // Drive the stream to EOF. With no streams configured, read() returns
-    // Ok(None) once all extents are exhausted.
-    loop {
-        match stream.read() {
-            Ok(Some(_frame)) => {}
-            Ok(None) => break,
-            Err(e) => panic!("stream read failed: {e:?}"),
-        }
-    }
-
-    let n = count.load(Ordering::Relaxed);
-    assert!(
-        n > 0,
-        "expected at least one BytesRead event during disc copy, got {n}"
-    );
 }
 
 // ── 2. copy() on_progress callback fires (regression guard) ───────────────
@@ -280,47 +233,6 @@ fn test_halt_aborts_disc_copy_promptly() {
         "a halted sweep cannot have read the whole disc: bytes_good={} bytes_total={}",
         copy_result.bytes_good,
         copy_result.bytes_total
-    );
-}
-
-// ── 4. DiscStream Drop does not panic or block ────────────────────────────
-
-#[test]
-fn test_drop_impls_do_not_panic_or_block() {
-    let reader = ZeroSectorReader::new(64);
-    let title = synthetic_title(64);
-    let keys = libfreemkv::DecryptKeys::None;
-    let stream = DiscStream::new(
-        Box::new(reader),
-        title,
-        keys,
-        60,
-        ContentFormat::BdTs,
-        false,
-        None,
-    )
-    .unwrap();
-
-    // Two things are proved here, each with its own budget: (1) Drop must not
-    // panic and must RETURN, backstopped by a generous 60 s recv timeout; (2)
-    // Drop must not BLOCK, measured by timing the `drop` call itself in the worker.
-    let (tx, rx) = std::sync::mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let t0 = Instant::now();
-        drop(stream);
-        let took = t0.elapsed();
-        let _ = tx.send(took);
-    });
-
-    let took = rx
-        .recv_timeout(Duration::from_secs(60))
-        .expect("DiscStream drop never returned — Drop is blocking or panicked");
-    handle.join().expect("drop thread panicked");
-
-    assert!(
-        took < Duration::from_secs(1),
-        "DiscStream::drop itself took {took:?} — Drop must not block on IO, a \
-         lock, or a thread join"
     );
 }
 

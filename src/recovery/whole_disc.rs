@@ -9,19 +9,24 @@ use libfreemkv::sector::SectorSource;
 pub(crate) type WholeDiscReader<'r> =
     libfreemkv::whole_disc::WholeDiscReader<&'r mut dyn SectorSource>;
 
-/// Whole-disc reader. Decrypting with the rip's key set (KU §3.2), the set's reader: its
-/// keyed pieces, and the on-arrival proof for the rest, with no lookup. Otherwise (until
-/// KU-X1) `decrypt` installs the disc-banked keys; `--raw` / CSS / clear discs pass through.
+/// Whole-disc reader. `--raw`: the raw reader, which never decrypts. Decrypting with the
+/// rip's key set (KU §3.2), the set's reader: its keyed pieces, and the on-arrival proof
+/// for the rest, with no lookup. Decrypting without one: CSS / clear discs through an empty
+/// set; the decrypt gate has already refused an AACS disc (KU-X1).
 pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
     reader: &'r mut dyn SectorSource,
     decrypt: bool,
     halt: Option<&libfreemkv::halt::Halt>,
-    key_fetch: Option<&libfreemkv::sector::KeyFetch>,
     keys: Option<&libfreemkv::keys::ResolvedKeySet>,
 ) -> Result<WholeDiscReader<'r>> {
+    if !decrypt {
+        return Ok(libfreemkv::whole_disc::raw_whole_disc_reader(reader));
+    }
     match keys {
-        Some(set) if decrypt => set.whole_disc_reader(disc, reader, halt),
-        _ => libfreemkv::whole_disc::whole_disc_reader(disc, reader, decrypt, key_fetch, halt),
+        Some(set) => set.whole_disc_reader(disc, reader, halt),
+        // No halt: like the pre-KU-X2 reader, a stop is the pass's to observe (it ends halted,
+        // not Err(Halted) at construction); the empty set's non-AACS arm reads it nowhere else.
+        None => libfreemkv::keys::ResolvedKeySet::none().whole_disc_reader(disc, reader, None),
     }
 }

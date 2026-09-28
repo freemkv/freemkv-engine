@@ -287,7 +287,6 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
         wedged_threshold: 0,
         progress: Some(&reporter),
         halt: Some(halt.clone()),
-        key_fetch: None,
         keys: None,
     };
 

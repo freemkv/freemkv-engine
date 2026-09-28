@@ -1,6 +1,6 @@
 //! ISO/disc → MKV muxing and the multi-title rip loop.
 //!
-//! Resolves which titles to rip, muxes each through `libfreemkv::mux_stream`,
+//! Resolves which titles to rip, muxes each through `libfreemkv::mux_with_keys`,
 //! and decides when a failure is fatal vs skippable. Three load-bearing
 //! behaviours: fail-fast on a disc-level key failure (every title would fail
 //! identically), cancel is a full stop (not a per-title cancel), and a
@@ -45,6 +45,7 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             }
         }
         Selection::All => (0..n).collect(),
+        Selection::Episodes => crate::episodes::episode_titles(&disc.titles),
         // FIRST of the equal maxima, not the last: `Iterator::max_by` keeps the
         // LAST tied element, but playlist obfuscation authors decoys with the
         // SAME runtime as the feature, which is conventionally the lowest index.
@@ -297,11 +298,11 @@ where
 }
 
 /// Mux a single title from a source URL to `dest`, driving
-/// `libfreemkv::mux_stream` and reporting through the engine [`Sink`].
+/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`].
 ///
 /// Bridges the two libfreemkv seams onto the Sink:
 /// - `MuxEvents` write-progress → `Sink::progress` (via a channel + a scoped
-///   watcher thread, because `mux_stream` takes an `Arc<dyn MuxEvents + 'static>`
+///   watcher thread, because `mux_with_keys` takes an `Arc<dyn MuxEvents + 'static>`
 ///   that cannot borrow the `&dyn Sink` directly).
 /// - `Sink::should_cancel()` → the `Halt` token the mux polls (the watcher sets
 ///   it), so a UI Cancel / Ctrl-C stops the pump exactly as today.
@@ -313,7 +314,7 @@ pub fn mux_title(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let input = libfreemkv::MuxInput::Url {
+    let input = libfreemkv::MuxSource::Url {
         url: source_url,
         opts: input_opts,
     };
@@ -322,7 +323,7 @@ pub fn mux_title(
 
 /// Mux a single title live off an opened, scanned, key-resolved
 /// [`libfreemkv::DiscSession`] (the drive's staged reader), driving
-/// `libfreemkv::mux_stream` and reporting through the engine [`Sink`] —
+/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`] —
 /// the disc:// analogue of [`mux_title`]. Shares the exact same
 /// watcher/speed/halt/done scaffolding via [`mux_with_input`], so a live-drive
 /// rip gets the same speed/ETA reporting a file/ISO rip does.
@@ -335,7 +336,7 @@ pub fn mux_title_session(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let source_label = format!("disc title {}", title_index + 1);
-    let input = libfreemkv::MuxInput::Session {
+    let input = libfreemkv::MuxSource::Session {
         session,
         title_index,
     };
@@ -375,10 +376,10 @@ pub(crate) fn mux_iso_title(
 }
 
 // Shared scaffolding behind `mux_title` and `mux_title_session`: drives
-// `mux_stream` for an already-built `MuxInput`, bridging progress and cancel
+// `mux_with_keys` for an already-built `MuxSource`, bridging progress and cancel
 // onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
 fn mux_with_input(
-    input: libfreemkv::MuxInput<'_>,
+    input: libfreemkv::MuxSource<'_>,
     source_label: &str,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
@@ -393,7 +394,8 @@ fn mux_with_input(
                 human_bytes(total_bytes_hint)
             ),
         );
-        libfreemkv::mux_stream(input, dest, mux_opts, halt, events)
+        // No set: a Url carries its own `InputOptions.keys`; a Session needs none (CSS, clear).
+        libfreemkv::mux_with_keys(input, None, dest, mux_opts, halt, events)
     })
 }
 
@@ -418,7 +420,7 @@ fn with_mux_watcher<T>(
     let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
     // MuxEvents impl that forwards write-progress and the output opening over channels.
-    // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
+    // Owned + 'static (holds only Senders), so it satisfies mux_with_keys's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
@@ -505,7 +507,7 @@ fn with_mux_watcher<T>(
             opened: opened_tx,
             flush: flush_tx,
         });
-        // Same guard the recovery paths use: `mux_stream` runs on damaged media
+        // Same guard the recovery paths use: `mux_with_keys` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
         // it, leaving thread::scope joining a watcher that loops forever.
         let _signal_done = crate::run::SignalDone(&done);
@@ -513,7 +515,7 @@ fn with_mux_watcher<T>(
     })
 }
 
-// Lifted out of `open_scan_resolve`'s struct literal so the one field that
+// Lifted out of `open_scan`'s struct literal so the one field that
 // matters (`credentials`, the sole input to the SCSI AACS handshake) is
 // unit-testable — dropped, every caller silently authenticates as no-one.
 fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemkv::KeySpec {
@@ -532,52 +534,11 @@ fn scan_options(raw_copy: bool) -> libfreemkv::ScanOptions {
     }
 }
 
-/// Open a live optical drive and get it ready to rip: open the session, scan
-/// the disc, lock the tray, and resolve its AACS keys. Returns the scanned
-/// session (its `disc()` is populated and its drive is still owned, ready to
-/// be staged for a `MuxInput::Session` mux) plus the resolution trace.
-///
-/// The ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and the
-/// desktop GUI's disc:// path; `factory` and `credentials` are supplied by
-/// the caller so a shell can log key attempts or stay quiet. `disc_to_iso`
-/// uses a different, lower-level `Drive` API and isn't covered here.
-pub fn open_scan_resolve(
-    target: libfreemkv::DeviceTarget,
-    credentials: Option<libfreemkv::DriveCredentials>,
-    factory: libfreemkv::KeySourceFactory,
-) -> Result<
-    (
-        libfreemkv::DiscSession,
-        libfreemkv::aacs::trace::ResolutionTrace,
-    ),
-    libfreemkv::Error,
-> {
-    open_scan_resolve_with(target, credentials, factory, false)
-}
-
-/// [`open_scan_resolve`] with the scan's `raw_copy` set: pass `true` only for a
-/// raw (never-decrypting) disc→ISO copy, matching the CLI's `--raw`.
-pub fn open_scan_resolve_with(
-    target: libfreemkv::DeviceTarget,
-    credentials: Option<libfreemkv::DriveCredentials>,
-    factory: libfreemkv::KeySourceFactory,
-    raw_copy: bool,
-) -> Result<
-    (
-        libfreemkv::DiscSession,
-        libfreemkv::aacs::trace::ResolutionTrace,
-    ),
-    libfreemkv::Error,
-> {
-    let mut session = open_scan(target, credentials, raw_copy)?;
-    let trace = session.resolve_keys(factory)?;
-    Ok((session, trace))
-}
-
 /// Open a live optical drive, scan the disc, then lock its tray, with NO key call (KU §3.2):
 /// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
 /// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
-/// `raw_copy` as in [`open_scan_resolve_with`].
+/// `raw_copy`: pass `true` only for a raw (never-decrypting) disc→ISO copy, matching the
+/// CLI's `--raw`.
 pub fn open_scan(
     target: libfreemkv::DeviceTarget,
     credentials: Option<libfreemkv::DriveCredentials>,
@@ -628,12 +589,7 @@ mod tests {
             titles,
             region: libfreemkv::disc::DiscRegion::Free,
             aacs: if has_key {
-                Some(
-                    libfreemkv::test_util::aacs_state()
-                        .key_source(libfreemkv::KeyOrigin::KeyDb)
-                        .unit_keys(vec![(0, [0u8; 16])])
-                        .build(),
-                )
+                Some(libfreemkv::test_util::aacs_state().build())
             } else {
                 None
             },
@@ -779,7 +735,7 @@ mod tests {
         );
     }
 
-    /// `open_scan_resolve` opens a real drive, so the only testable part of it
+    /// `open_scan` opens a real drive, so the only testable part of it
     /// is the spec it opens with.
     #[test]
     fn build_keyspec_forwards_the_caller_credentials() {
@@ -824,11 +780,6 @@ mod tests {
             body("pub fn open_scan(").contains("session.scan(scan_options(raw_copy))"),
             "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
-        );
-        assert!(
-            body("pub fn open_scan_resolve_with(")
-                .contains("open_scan(target, credentials, raw_copy)"),
-            "open_scan_resolve_with must hand its raw_copy parameter on"
         );
     }
 
