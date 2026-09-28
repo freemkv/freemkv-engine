@@ -146,7 +146,7 @@ pub fn copy(
         // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
         // stream file is now located, so widen it and let the dispatch fill the rest.
         if map.scope().is_some() {
-            mapfile::check_mapfile_identity(&map, disc)
+            mapfile::check_mapfile_identity(&map, disc, None)
                 .map_err(|e| Error::IoError { source: e })?;
             map.clear_scope();
             map.flush().map_err(|e| Error::IoError { source: e })?;
@@ -154,7 +154,8 @@ pub fn copy(
         // BEFORE any resume decision, including "already complete" below: a wrong
         // disc whose predecessor finished would otherwise report the job done
         // having never touched the disc actually in the drive.
-        mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
+        mapfile::check_mapfile_identity(&map, disc, None)
+            .map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
         let covers_disc = map.total_size() == disc_size;
@@ -762,7 +763,7 @@ fn sweep_in(
                 // Identity first, crucially BEFORE the unconditional set_vid/
                 // set_unit_keys overwrite below: that stamps the current job's
                 // identity onto the mapfile, so checking after never fires.
-                mapfile::check_mapfile_identity(&existing, disc)?;
+                mapfile::check_mapfile_identity(&existing, disc, None)?;
                 if existing.total_size() != total_bytes {
                     tracing::info!(
                         "sweep: mapfile total_size {} != disc {}; forcing fresh sweep",
@@ -810,14 +811,9 @@ fn sweep_in(
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(|e| Error::IoError { source: e })?;
 
-    // Persist decryption state into the mapfile header (ddrescue-safe comment
-    // lines, no ISO payload touched) so it survives to deferred-mux/resume.
-    // KEYS XOR VID: a keyed disc writes unit keys; unresolved writes only VID.
-    if !opts.unit_keys.is_empty() {
-        map.set_unit_keys(&opts.unit_keys);
-    } else if let Some(vid) = opts.vid {
-        map.set_vid(vid);
-    }
+    // The disc's identity for a later resume (KU §4.1): its hash and VID fingerprint only,
+    // never a key byte or a raw VID (J6), whatever the legacy `vid`/`unit_keys` options hold.
+    mapfile::stamp_identity(&mut map, disc, None, opts.vid);
 
     // ISO file: resume + Finished ranges opens existing; otherwise creates fresh,
     // pre-sized to total_bytes. `is_regular` MUST come from the open handle, not a

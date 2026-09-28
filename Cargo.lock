@@ -303,6 +303,7 @@ dependencies = [
  "isolang",
  "libfreemkv",
  "serde",
+ "sha2",
  "tempfile",
  "tracing",
 ]

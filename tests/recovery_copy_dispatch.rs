@@ -1918,10 +1918,10 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
     assert_eq!(std::fs::metadata(&iso_path).unwrap().len(), total);
 }
 
-// KEYS XOR VID: the mapfile header carries one or the other, never both. A keyed disc writes
-// unit keys; an unresolved disc writes only the VID.
+// KU §4.1 (J6): the mapfile holds no key byte and no raw VID, only fingerprints, even when a
+// caller still hands the legacy `vid` / `unit_keys` options (until KU-X1).
 #[test]
-fn the_mapfile_header_carries_the_unit_keys_when_there_are_keys() {
+fn the_mapfile_header_never_carries_the_unit_keys() {
     let sectors: u32 = 64;
     let disc = make_test_disc(sectors, "KEYED");
     let tmp = tempfile::tempdir().unwrap();
@@ -1937,22 +1937,19 @@ fn the_mapfile_header_carries_the_unit_keys_when_there_are_keys() {
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
 
+    let text = std::fs::read_to_string(disc.mapfile_for(&iso_path)).unwrap();
+    assert!(!text.contains("freemkv-uk"), "{text}");
+    assert!(
+        !text.contains(&"ab".repeat(16)),
+        "no key byte on disk: {text}"
+    );
     let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
-    assert_eq!(
-        mf.unit_keys(),
-        &[(0u32, [0xABu8; 16])][..],
-        "a keyed disc must carry its unit keys to deferred mux"
-    );
-    assert_eq!(
-        mf.vid(),
-        None,
-        "keys are the final answer; the VID retry marker must not be written too"
-    );
+    assert!(mf.unit_keys().is_empty());
 }
 
-/// ...and the VID when there are none.
+/// ...and the VID only as its fingerprint.
 #[test]
-fn the_mapfile_header_carries_the_vid_when_there_are_no_keys() {
+fn the_mapfile_header_carries_only_the_vid_fingerprint() {
     let sectors: u32 = 64;
     let disc = make_test_disc(sectors, "UNKEYED");
     let tmp = tempfile::tempdir().unwrap();
@@ -1968,9 +1965,15 @@ fn the_mapfile_header_carries_the_vid_when_there_are_no_keys() {
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
 
+    let text = std::fs::read_to_string(disc.mapfile_for(&iso_path)).unwrap();
+    assert!(!text.contains("freemkv-vid:"), "{text}");
+    assert!(
+        !text.contains(&"11".repeat(16)),
+        "no raw VID on disk: {text}"
+    );
     let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
-    assert_eq!(mf.vid(), Some([0x11u8; 16]));
-    assert!(mf.unit_keys().is_empty());
+    assert_eq!(mf.vid(), None);
+    assert!(mf.vid_fingerprint().is_some());
 }
 
 // The drive's in-drive retry lever is the INVERSE of skip-on-error: a

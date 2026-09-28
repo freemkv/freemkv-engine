@@ -1214,7 +1214,7 @@ pub fn patch(
     // Same reasoning as the decrypt gate: `copy`/`sweep` verify the mapfile
     // describes THIS disc, and `patch` must not skip that — otherwise a leftover
     // mapfile from disc B patches its ranges into disc A's ISO as "Finished".
-    mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
+    mapfile::check_mapfile_identity(&map, disc, None).map_err(|e| Error::IoError { source: e })?;
     // COVERAGE. `total_bytes` (the denominator every reported figure derives
     // from) comes wholly from the untrusted mapfile, never checked against the
     // drive. `copy` forces a fresh sweep on mismatch; `patch` refuses instead.
