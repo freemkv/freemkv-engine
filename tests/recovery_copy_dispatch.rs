@@ -9,7 +9,7 @@
 use freemkv_engine::{
     CopyOptions, DamageSeverity, Mapfile, SectorStatus, SweepOptions, classify_damage,
 };
-use libfreemkv::disc::{AacsState, DiscRegion, KeyOrigin};
+use libfreemkv::disc::{AacsState, DiscRegion};
 use libfreemkv::{ContentFormat, Disc, DiscFormat};
 
 // ─── classify_damage severity thresholds ────────────────────────────────────
@@ -112,12 +112,10 @@ fn unique_title(prefix: &str) -> String {
     )
 }
 
-fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
+fn aacs_v2() -> AacsState {
     libfreemkv::test_util::aacs_state()
         .version(2)
         .bus_encryption(true)
-        .key_source(KeyOrigin::DeviceKey)
-        .unit_keys(unit_keys)
         .build()
 }
 
@@ -175,7 +173,7 @@ fn copy_decrypting_aacs_no_key_errors_and_writes_nothing() {
     };
     let mut disc = make_test_disc(sectors, "UHD");
     disc.encrypted = true;
-    disc.aacs = Some(aacs_with(Vec::new())); // encrypted, no unit key → None
+    disc.aacs = Some(aacs_v2()); // encrypted, no unit key → None
     let opts = CopyOptions {
         decrypt: true, // NOT --raw → decryption is required
         multipass: false,
@@ -213,7 +211,7 @@ fn copy_raw_aacs_no_key_proceeds() {
     };
     let mut disc = make_test_disc(sectors, "UHD");
     disc.encrypted = true;
-    disc.aacs = Some(aacs_with(Vec::new()));
+    disc.aacs = Some(aacs_v2());
     let opts = CopyOptions {
         decrypt: false, // --raw: no decryption, no key needed
         multipass: false,
@@ -1458,12 +1456,12 @@ fn mapfile_from_a_different_disc_is_refused() {
     let hash_a = "a".repeat(40);
     let mut disc_a = make_test_disc(sectors, "DiscA");
     disc_a.encrypted = true;
-    let mut aacs_a = aacs_with(vec![(0u32, [0xAA; 16])]);
+    let mut aacs_a = aacs_v2();
     aacs_a.disc_hash = hash_a.clone();
     disc_a.aacs = Some(aacs_a);
     let mut disc_b = make_test_disc(sectors, "DiscB");
     disc_b.encrypted = true;
-    let mut aacs_b = aacs_with(vec![(0u32, [0xBB; 16])]);
+    let mut aacs_b = aacs_v2();
     aacs_b.disc_hash = "b".repeat(40);
     disc_b.aacs = Some(aacs_b);
 
@@ -1866,7 +1864,7 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
 fn the_mapfile_header_never_carries_the_unit_keys() {
     let sectors: u32 = 64;
     let mut disc = make_test_disc(sectors, "KEYED");
-    let mut aacs = aacs_with(vec![(0, [0xAB; 16])]);
+    let mut aacs = aacs_v2();
     aacs.volume_id = [0x11; 16];
     disc.aacs = Some(aacs);
     let tmp = tempfile::tempdir().unwrap();
@@ -1893,7 +1891,7 @@ fn the_mapfile_header_never_carries_the_unit_keys() {
 fn the_mapfile_header_carries_only_the_vid_fingerprint() {
     let sectors: u32 = 64;
     let mut disc = make_test_disc(sectors, "UNKEYED");
-    let mut aacs = aacs_with(Vec::new());
+    let mut aacs = aacs_v2();
     aacs.volume_id = [0x11; 16];
     disc.aacs = Some(aacs);
     let tmp = tempfile::tempdir().unwrap();
@@ -2168,7 +2166,7 @@ fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
         };
         // A's volume id goes into the mapfile header — that is what makes the
         // leftover mapfile identifiably A's rather than anonymous.
-        let mut aacs = aacs_with(Vec::new());
+        let mut aacs = aacs_v2();
         aacs.volume_id = [0xAA; 16];
         disc_a.aacs = Some(aacs);
         let a_opts = plain_sweep_opts(false, true);

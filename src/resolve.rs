@@ -73,18 +73,15 @@ mod tests {
         }
     }
 
-    fn aacs(origin: libfreemkv::KeyOrigin) -> libfreemkv::AacsState {
-        libfreemkv::test_util::aacs_state()
-            .key_source(origin)
-            .unit_keys(vec![(0, [0u8; 16])])
-            .build()
+    fn aacs() -> libfreemkv::AacsState {
+        libfreemkv::test_util::aacs_state().build()
     }
 
     #[test]
     fn gate_without_a_set_passes_an_unencrypted_disc_and_a_raw_copy() {
         assert!(ensure_decryptable_with(&disc(false), false, None).is_ok());
         let mut d = disc(true);
-        d.aacs = Some(aacs(libfreemkv::KeyOrigin::KeyDb));
+        d.aacs = Some(aacs());
         assert!(ensure_decryptable_with(&d, true, None).is_ok());
     }
 
@@ -92,7 +89,7 @@ mod tests {
     #[test]
     fn gate_without_a_set_refuses_disc_banked_keys() {
         let mut d = disc(true);
-        d.aacs = Some(aacs(libfreemkv::KeyOrigin::KeyDb));
+        d.aacs = Some(aacs());
         let e = ensure_decryptable_with(&d, false, None).unwrap_err();
         assert_eq!(e.code(), libfreemkv::error::E_NO_DISC_KEY, "{e}");
     }

@@ -2401,7 +2401,6 @@ mod ku_identity_tests {
         let mut fx = bd_image(&[Some(K1)], 1);
         let aacs = fx.disc.aacs.as_mut().unwrap();
         aacs.volume_id = VID;
-        aacs.unit_keys = vec![(1, K1)];
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("disc.iso");
         let opts = crate::SweepOptions::default();
@@ -2488,8 +2487,7 @@ mod ku_identity_tests {
     #[test]
     fn identity_without_a_set_reads_no_banked_keys() {
         let (_d, p) = scratch("no_set");
-        let mut banked = disc_with(HASH_A, [0; 16]);
-        banked.aacs.as_mut().unwrap().unit_keys = vec![(1, K1)];
+        let banked = disc_with(HASH_A, [0; 16]);
         assert!(DiscIdentity::of(&banked, None).proven.is_empty());
         let map = map_with(&p, None, None, &[K2]);
         assert!(check_mapfile_identity(&map, &banked, None).is_ok());

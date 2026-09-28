@@ -250,13 +250,10 @@ mod tests {
 
     use crate::job::Job;
 
-    // An AacsState carrying disc-banked key material (non-empty unit_keys), which no
-    // preflight gate accepts without the rip's key set (KU-X1).
+    // An AacsState as a scan leaves it: it carries no key (KU-X2), so no preflight gate
+    // accepts it without the rip's key set (KU-X1).
     fn resolved_aacs() -> libfreemkv::AacsState {
-        libfreemkv::test_util::aacs_state()
-            .key_source(libfreemkv::KeyOrigin::KeyDb)
-            .unit_keys(vec![(0, [0u8; 16])])
-            .build()
+        libfreemkv::test_util::aacs_state().build()
     }
 
     // A minimal scanned Disc with `n` titles, encrypted flag, and key presence.
@@ -354,14 +351,9 @@ mod tests {
 
     #[test]
     fn blocks_encrypted_placeholder_aacs_without_key_material() {
-        // A VID-only scan leaves `aacs = Some(..)` with EMPTY unit_keys and no
-        // VUK. preflight must NOT treat that as keyed (gating on `aacs.is_some()`
-        // did); with no key set nothing is keyed.
-        let mut d = disc_with(2, true, true);
-        if let Some(a) = d.aacs.as_mut() {
-            a.unit_keys = Vec::new();
-            a.vuk = None;
-        }
+        // A scan leaves `aacs = Some(..)` with no key material. preflight must NOT treat
+        // that as keyed (gating on `aacs.is_some()` did); with no key set nothing is keyed.
+        let d = disc_with(2, true, true);
         let pf = preflight(&d, &Job::new("iso://x.iso", "/out"));
         assert!(pf.reasons().iter().any(|r| r.key == "encrypted-no-key"));
     }

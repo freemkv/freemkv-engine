@@ -245,8 +245,7 @@ fn keyed_rip_passes_every_engine_gate() {
 /// Per spec; do not change without a spec citation proving otherwise.
 #[test]
 fn legacy_banked_keys_pass_no_engine_gate() {
-    let mut fx = bd_image(&[Some(K1)], 1);
-    fx.disc.aacs.as_mut().unwrap().unit_keys = vec![(1, K1)];
+    let fx = bd_image(&[Some(K1)], 1);
     let disc = &fx.disc;
     let dir = tempfile::tempdir().unwrap();
     let iso = |n: &str| dir.path().join(n);

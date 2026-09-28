@@ -8,7 +8,7 @@
 
 use freemkv_engine::{Mapfile, SectorStatus, SweepOptions};
 use libfreemkv::aacs::types::UnitKey;
-use libfreemkv::disc::{DiscRegion, KeyOrigin};
+use libfreemkv::disc::DiscRegion;
 use libfreemkv::error::Error;
 use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use libfreemkv::keysource::ResolveCtx;
@@ -277,8 +277,6 @@ fn disc(fx: &Fixture) -> Disc {
         region: DiscRegion::Free,
         aacs: Some(
             libfreemkv::test_util::aacs_state()
-                .key_source(KeyOrigin::DeviceKey)
-                .unit_keys(vec![(1, UNIT_KEY)])
                 .uk_ro(unit_key_ro(1))
                 .build(),
         ),
@@ -295,11 +293,10 @@ fn multi_cps_disc(fx: &Fixture) -> Disc {
     let mut d = disc(fx);
     let aacs = d.aacs.as_mut().unwrap();
     aacs.uk_ro = unit_key_ro(2);
-    aacs.unit_keys.push((2, SECOND_KEY));
     d
 }
 
-/// A key source answering with the fixture disc's key pool (its `unit_keys`).
+/// A key source answering with the fixture disc's key pool (one key per declared CPS unit).
 struct Pool(Vec<(u32, [u8; 16])>);
 
 impl libfreemkv::KeySource for Pool {
@@ -314,11 +311,12 @@ impl libfreemkv::KeySource for Pool {
 /// The rip's up-front key set for `d` from its pool, resolved over `reader` (the same
 /// drive the pass reads) with scope `WholeDisc`, as a decrypted-image rip does.
 fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<ResolvedKeySet> {
-    let pool = d
-        .aacs
-        .as_ref()
-        .map(|a| a.unit_keys.clone())
-        .unwrap_or_default();
+    let two = d.aacs.as_ref().is_some_and(|a| a.uk_ro == unit_key_ro(2));
+    let pool = if two {
+        vec![(1, UNIT_KEY), (2, SECOND_KEY)]
+    } else {
+        vec![(1, UNIT_KEY)]
+    };
     let f: libfreemkv::KeySourceFactory = std::sync::Arc::new(move || {
         vec![Box::new(Pool(pool.clone())) as Box<dyn libfreemkv::KeySource>]
     });

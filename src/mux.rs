@@ -1,6 +1,6 @@
 //! ISO/disc → MKV muxing and the multi-title rip loop.
 //!
-//! Resolves which titles to rip, muxes each through `libfreemkv::mux_stream`,
+//! Resolves which titles to rip, muxes each through `libfreemkv::mux_with_keys`,
 //! and decides when a failure is fatal vs skippable. Three load-bearing
 //! behaviours: fail-fast on a disc-level key failure (every title would fail
 //! identically), cancel is a full stop (not a per-title cancel), and a
@@ -298,11 +298,11 @@ where
 }
 
 /// Mux a single title from a source URL to `dest`, driving
-/// `libfreemkv::mux_stream` and reporting through the engine [`Sink`].
+/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`].
 ///
 /// Bridges the two libfreemkv seams onto the Sink:
 /// - `MuxEvents` write-progress → `Sink::progress` (via a channel + a scoped
-///   watcher thread, because `mux_stream` takes an `Arc<dyn MuxEvents + 'static>`
+///   watcher thread, because `mux_with_keys` takes an `Arc<dyn MuxEvents + 'static>`
 ///   that cannot borrow the `&dyn Sink` directly).
 /// - `Sink::should_cancel()` → the `Halt` token the mux polls (the watcher sets
 ///   it), so a UI Cancel / Ctrl-C stops the pump exactly as today.
@@ -314,7 +314,7 @@ pub fn mux_title(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let input = libfreemkv::MuxInput::Url {
+    let input = libfreemkv::MuxSource::Url {
         url: source_url,
         opts: input_opts,
     };
@@ -323,7 +323,7 @@ pub fn mux_title(
 
 /// Mux a single title live off an opened, scanned, key-resolved
 /// [`libfreemkv::DiscSession`] (the drive's staged reader), driving
-/// `libfreemkv::mux_stream` and reporting through the engine [`Sink`] —
+/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`] —
 /// the disc:// analogue of [`mux_title`]. Shares the exact same
 /// watcher/speed/halt/done scaffolding via [`mux_with_input`], so a live-drive
 /// rip gets the same speed/ETA reporting a file/ISO rip does.
@@ -336,7 +336,7 @@ pub fn mux_title_session(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let source_label = format!("disc title {}", title_index + 1);
-    let input = libfreemkv::MuxInput::Session {
+    let input = libfreemkv::MuxSource::Session {
         session,
         title_index,
     };
@@ -376,10 +376,10 @@ pub(crate) fn mux_iso_title(
 }
 
 // Shared scaffolding behind `mux_title` and `mux_title_session`: drives
-// `mux_stream` for an already-built `MuxInput`, bridging progress and cancel
+// `mux_with_keys` for an already-built `MuxSource`, bridging progress and cancel
 // onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
 fn mux_with_input(
-    input: libfreemkv::MuxInput<'_>,
+    input: libfreemkv::MuxSource<'_>,
     source_label: &str,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
@@ -394,7 +394,8 @@ fn mux_with_input(
                 human_bytes(total_bytes_hint)
             ),
         );
-        libfreemkv::mux_stream(input, dest, mux_opts, halt, events)
+        // No set: a Url carries its own `InputOptions.keys`; a Session needs none (CSS, clear).
+        libfreemkv::mux_with_keys(input, None, dest, mux_opts, halt, events)
     })
 }
 
@@ -419,7 +420,7 @@ fn with_mux_watcher<T>(
     let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
     // MuxEvents impl that forwards write-progress and the output opening over channels.
-    // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
+    // Owned + 'static (holds only Senders), so it satisfies mux_with_keys's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
@@ -506,7 +507,7 @@ fn with_mux_watcher<T>(
             opened: opened_tx,
             flush: flush_tx,
         });
-        // Same guard the recovery paths use: `mux_stream` runs on damaged media
+        // Same guard the recovery paths use: `mux_with_keys` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
         // it, leaving thread::scope joining a watcher that loops forever.
         let _signal_done = crate::run::SignalDone(&done);
@@ -588,12 +589,7 @@ mod tests {
             titles,
             region: libfreemkv::disc::DiscRegion::Free,
             aacs: if has_key {
-                Some(
-                    libfreemkv::test_util::aacs_state()
-                        .key_source(libfreemkv::KeyOrigin::KeyDb)
-                        .unit_keys(vec![(0, [0u8; 16])])
-                        .build(),
-                )
+                Some(libfreemkv::test_util::aacs_state().build())
             } else {
                 None
             },
