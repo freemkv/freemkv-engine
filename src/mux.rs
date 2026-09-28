@@ -567,10 +567,23 @@ pub fn open_scan(
     credentials: Option<libfreemkv::DriveCredentials>,
     raw_copy: bool,
 ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
-    let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
-    // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
-    session.lock_tray();
-    session.scan(scan_options(raw_copy))?;
+    let session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
+    scan_then_lock(
+        session,
+        |session| session.scan(scan_options(raw_copy)).map(drop),
+        // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
+        libfreemkv::DiscSession::lock_tray,
+    )
+}
+
+// ST-E1 red: the pre-ST-E1 order (lock, then scan).
+fn scan_then_lock<S>(
+    mut session: S,
+    scan: impl FnOnce(&mut S) -> Result<(), libfreemkv::Error>,
+    lock: impl FnOnce(&mut S),
+) -> Result<S, libfreemkv::Error> {
+    lock(&mut session);
+    scan(&mut session)?;
     Ok(session)
 }
 
@@ -800,6 +813,41 @@ mod tests {
                 .contains("open_scan(target, credentials, raw_copy)"),
             "open_scan_resolve_with must hand its raw_copy parameter on"
         );
+    }
+
+    // ET9 `open_scan_with_locks_tray_after_scan` — stop design v5 §4.2: "KU's `open_scan`
+    // (which replaces `open_scan_resolve*`, `raw_copy` preserved) locks the tray after the
+    // scan"; §5.4: "a Stop during the scan leaves the tray unlocked".
+    #[test]
+    fn open_scan_with_locks_tray_after_scan() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let stopped = scan_then_lock(
+            (),
+            |_| {
+                steps.borrow_mut().push("scan");
+                Err(libfreemkv::Error::Halted)
+            },
+            |_| steps.borrow_mut().push("lock"),
+        );
+        assert!(matches!(stopped, Err(libfreemkv::Error::Halted)));
+        assert_eq!(
+            *steps.borrow(),
+            ["scan"],
+            "a Stop during the scan locks nothing"
+        );
+        steps.borrow_mut().clear();
+        let ok = scan_then_lock(
+            (),
+            |_| Ok(steps.borrow_mut().push("scan")),
+            |_| steps.borrow_mut().push("lock"),
+        );
+        assert!(ok.is_ok());
+        assert_eq!(*steps.borrow(), ["scan", "lock"]);
+        // `open_scan` needs a live drive: pin that it goes through the ordered helper.
+        let src = include_str!("mux.rs").replace("\r\n", "\n");
+        let start = src.find("pub fn open_scan(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("scan_then_lock(") && !body.contains("session.lock_tray()"));
     }
 
     /// Wait for `cond` to hold, up to `secs`. Returns whether it held — a
