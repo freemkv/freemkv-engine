@@ -76,7 +76,7 @@ pub fn mux_image_titles(
     };
     let keys = match crate::run::with_cancel_watcher(sink, top_up) {
         Ok(keys) => keys,
-        Err(e) => return refused_up_front(e, plan, sink),
+        Err(e) => return refused_up_front(e, plan, dest, sink),
     };
     run_titles(&plan.titles, plan.explicit_selection, sink, |idx| {
         let dest = dest(idx);
@@ -95,20 +95,42 @@ pub fn mux_image_titles(
     })
 }
 
-// A key refusal before any title started (E7022/E7026/E7034, or a halt), as the loop would.
-fn refused_up_front(e: libfreemkv::Error, plan: &MuxPlan, sink: &dyn Sink) -> RipOutcome {
+// A key refusal before any title started (E7022/E7026/E7034, or a halt), as the loop would
+// report it: a refusal is the first planned title's TitleStart + TitleDone(Err), so a
+// consumer never reads it as a Stop; a halt stays silent, as a Stop between titles is.
+fn refused_up_front(
+    e: libfreemkv::Error,
+    plan: &MuxPlan,
+    dest: &dyn Fn(usize) -> String,
+    sink: &dyn Sink,
+) -> RipOutcome {
     sink.log(
         Level::Error,
         &format!("keys refused before any output: {e}"),
     );
     let io: io::Error = e.into();
-    match classify_title_error(&io) {
+    let first = plan.titles.first().copied().unwrap_or(0);
+    let (verdict, code, kind) = (classify_title_error(&io), crate::error_code(&io), io.kind());
+    if verdict != TitleResult::Halted && !plan.titles.is_empty() {
+        let dest = dest(first);
+        sink.event(&Event::TitleStart {
+            idx: first,
+            dest: &dest,
+        });
+        let result: io::Result<libfreemkv::MuxOutcome> = Err(io);
+        sink.event(&Event::TitleDone {
+            idx: first,
+            dest: &dest,
+            result: result.as_ref(),
+        });
+    }
+    match verdict {
         TitleResult::Halted => RipOutcome::Halted,
         TitleResult::DiscLevelNoKey => RipOutcome::NoKey,
         _ => RipOutcome::Failed {
-            title_index: plan.titles.first().copied().unwrap_or(0),
-            code: crate::error_code(&io),
-            kind: io.kind(),
+            title_index: first,
+            code,
+            kind,
         },
     }
 }
