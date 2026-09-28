@@ -243,16 +243,20 @@ pub(crate) fn remux_iso_with(
 ) -> io::Result<RemuxReport> {
     refuse_existing(job)?;
     sink.event(&Event::Phase { name: "open" });
-    let open = |h: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+    // The open, its title and its key top-up all run under one halt (KU §2.3 step 13).
+    let open = |h: &std::sync::Arc<std::sync::atomic::AtomicBool>| -> io::Result<_> {
+        let halt = libfreemkv::Halt::from_arc(h.clone());
         let opts = OpenImageOptions {
             scope: job.title.map(|i| KeyScope::Titles(vec![i])),
-            halt: Some(libfreemkv::Halt::from_arc(h.clone())),
+            halt: Some(halt.clone()),
             ..OpenImageOptions::resolve(sources)
         };
-        open_image_with(&job.iso, opts)
+        let opened = open_image_with(&job.iso, opts)?;
+        let idx = pick_title(&opened.disc, job.title)?;
+        let keys = opened.keys_for(&[idx], Some(&halt))?;
+        Ok((opened, idx, keys))
     };
-    let opened = crate::run::with_cancel_watcher(sink, open).map_err(io::Error::from)?;
-    let idx = pick_title(&opened.disc, job.title)?;
+    let (opened, idx, keys) = crate::run::with_cancel_watcher(sink, open)?;
     let title = &opened.disc.titles[idx];
     let selection = if job.streams.is_all() {
         libfreemkv::StreamSelection::default()
@@ -264,7 +268,6 @@ pub(crate) fn remux_iso_with(
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
     };
-    let keys = opened.keys_for(&[idx], None).map_err(io::Error::from)?;
     land_verified(job, idx, title, sink, |dest| {
         mux_opened_title(
             &opened,
