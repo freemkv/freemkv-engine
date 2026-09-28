@@ -514,7 +514,8 @@ pub fn multipass_rip(
     // progress ticks, so `should_cancel` can't be polled while waiting. Run the
     // whole multipass under one halt token so Stop works mid-cooldown too.
     crate::run::with_cancel_watcher(sink, |halt| {
-        multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, halt)
+        let halt = crate::EngineHalt::legacy(Some(halt.clone()));
+        multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, &halt)
     })
 }
 
@@ -529,8 +530,10 @@ pub fn multipass_rip_with(
     opts: &MultipassOpts,
     sink: &dyn Sink,
 ) -> crate::EngineOutcome<MultipassResult> {
-    let halt = crate::EngineHalt::new(op, None);
-    let r = multipass_rip(disc, reader, iso_path, job, opts, sink);
+    // §4.2: "ST-E1 stops depending on [the watchers], because the op token is observed
+    // directly"; the Sink's `should_cancel` stays a cancel input.
+    let halt = crate::EngineHalt::new(op, None).with_sink(sink);
+    let r = multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, &halt);
     crate::EngineOutcome::from_result(r, &halt, |r| r.halted)
 }
 
@@ -565,7 +568,8 @@ pub fn multipass_rip_staged(
     sink: &dyn Sink,
 ) -> crate::Result<MultipassResult> {
     crate::run::with_cancel_watcher(sink, |halt| {
-        multipass_rip_inner(disc, reader, iso_path, job, opts, scope, sink, halt)
+        let halt = crate::EngineHalt::legacy(Some(halt.clone()));
+        multipass_rip_inner(disc, reader, iso_path, job, opts, scope, sink, &halt)
     })
 }
 
@@ -578,7 +582,7 @@ fn multipass_rip_inner(
     opts: &MultipassOpts,
     scope: Option<&[(u32, u32)]>,
     sink: &dyn Sink,
-    halt: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    halt: &crate::EngineHalt<'_>,
 ) -> crate::Result<MultipassResult> {
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
 
@@ -606,7 +610,7 @@ fn multipass_rip_inner(
             decrypt: pass_should_decrypt(job.raw),
             multipass: false,
             progress: Some(&bridge),
-            halt: Some(halt.clone()),
+            halt: None,
             vid,
             unit_keys,
             key_fetch: None,
@@ -627,9 +631,10 @@ fn multipass_rip_inner(
                     key_fetch: None,
                     keys: copy_opts.keys.clone(),
                 };
-                crate::recovery::sweep_scoped(disc, reader, iso_path, &sweep_opts, scope)?
+                let scope = crate::recovery::sector_scope_to_bytes(scope);
+                crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, Some(scope), halt)?
             }
-            None => crate::recovery::copy(disc, reader, iso_path, &copy_opts)?,
+            None => crate::recovery::copy_in(disc, reader, iso_path, &copy_opts, halt)?,
         };
         // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
         // here (unlike the aggregate `bad_sector_count` forbids) because every
@@ -673,7 +678,7 @@ fn multipass_rip_inner(
             batch_sectors: None,
             skip_on_error: true,
             progress: Some(&bridge),
-            halt: Some(halt.clone()),
+            halt: None,
             vid,
             unit_keys: unit_keys.clone(),
             key_fetch: None,
@@ -681,9 +686,10 @@ fn multipass_rip_inner(
         };
         let sr = match scope {
             Some(scope) => {
-                crate::recovery::sweep_scoped(disc, reader, iso_path, &sweep_opts, scope)?
+                let scope = Some(crate::recovery::sector_scope_to_bytes(scope));
+                crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, scope, halt)?
             }
-            None => crate::recovery::sweep(disc, reader, iso_path, &sweep_opts)?,
+            None => crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, None, halt)?,
         };
         passes += 1;
         last_good = sr.bytes_good;
@@ -696,7 +702,7 @@ fn multipass_rip_inner(
     let mapfile_path = disc.mapfile_for(iso_path);
     if !halted {
         for _ in 1..=plan.patch_passes {
-            if sink.should_cancel() {
+            if sink.should_cancel() || halt.is_cancelled() {
                 halted = true;
                 break;
             }
@@ -731,10 +737,10 @@ fn multipass_rip_inner(
             let patch_opts = PatchOptions::for_patch_pass(
                 pass_should_decrypt(job.raw),
                 Some(&bridge),
-                Some(halt.clone()),
+                None,
                 None,
             );
-            let pr = crate::recovery::patch(disc, reader, iso_path, &patch_opts)?;
+            let pr = crate::recovery::patch_in(disc, reader, iso_path, &patch_opts, halt)?;
             passes += 1;
             last_good = pr.bytes_good;
             last_unreadable = pr.bytes_unreadable;

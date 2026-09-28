@@ -16,19 +16,12 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
     reader: &'r mut dyn SectorSource,
     decrypt: bool,
-    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    halt: Option<&libfreemkv::halt::Halt>,
     key_fetch: Option<&libfreemkv::sector::KeyFetch>,
     keys: Option<&libfreemkv::keys::ResolvedKeySet>,
 ) -> Result<WholeDiscReader<'r>> {
-    let halt = halt.cloned().map(libfreemkv::halt::Halt::from_arc);
     match keys {
-        Some(set) if decrypt => set.whole_disc_reader(disc, reader, halt.as_ref()),
-        _ => libfreemkv::whole_disc::whole_disc_reader(
-            disc,
-            reader,
-            decrypt,
-            key_fetch,
-            halt.as_ref(),
-        ),
+        Some(set) if decrypt => set.whole_disc_reader(disc, reader, halt),
+        _ => libfreemkv::whole_disc::whole_disc_reader(disc, reader, decrypt, key_fetch, halt),
     }
 }

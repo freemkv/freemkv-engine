@@ -50,11 +50,13 @@ impl EngineHalt<'static> {
     /// [`new`](Self::new) for a caller that holds the Drive: in debug builds, asserts the
     /// op token is the Drive's (§4.2: "`debug_assert!(ptr_eq(op, drive.token()))`").
     pub fn for_drive(op: &Halt, extra: Option<Arc<AtomicBool>>, drive: Option<&Halt>) -> Self {
-        let _ = drive;
+        debug_assert!(
+            drive.is_some_and(|t| Arc::ptr_eq(t.as_arc(), op.as_arc())),
+            "the op token must be the Drive's token (stop design §4.2)"
+        );
         Self::new(op, extra)
     }
 
-    #[allow(dead_code)] // ST-E1 red: wired in the green commit
     // A legacy entry (no op token): only `extra` can cancel, exactly as before ST-E1.
     pub(crate) fn legacy(extra: Option<Arc<AtomicBool>>) -> Self {
         Self {
@@ -66,7 +68,6 @@ impl EngineHalt<'static> {
     }
 }
 
-#[allow(dead_code)] // ST-E1 red: wired in the green commit
 impl<'a> EngineHalt<'a> {
     // Adds the Sink probe (§4.2: "`op.is_cancelled() || extra || sink.should_cancel()`").
     pub(crate) fn with_sink<'b>(self, sink: &'b dyn Sink) -> EngineHalt<'b>
@@ -83,9 +84,12 @@ impl<'a> EngineHalt<'a> {
 
     /// `op || extra || sink.should_cancel()`.
     pub fn is_cancelled(&self) -> bool {
-        self.extra
-            .as_ref()
-            .is_some_and(|e| e.load(Ordering::Acquire))
+        self.op.is_cancelled()
+            || self
+                .extra
+                .as_ref()
+                .is_some_and(|e| e.load(Ordering::Acquire))
+            || self.sink.is_some_and(|s| s.should_cancel())
     }
 
     /// The caller's op token (a private, never-cancelled one for a legacy entry).
@@ -116,7 +120,11 @@ impl<'a> EngineHalt<'a> {
     // One libfreemkv `Halt` that is cancelled once `self` is: the token itself when it is the
     // only input, else a child a bridge thread cancels within one `WAIT_SLICE`.
     pub(crate) fn linked<R>(&self, f: impl FnOnce(&Halt) -> R) -> R {
-        f(&self.op)
+        match (&self.extra, self.sink, self.op_private) {
+            (None, None, _) => f(&self.op),
+            (Some(extra), None, true) => f(&Halt::from_arc(extra.clone())),
+            _ => self.bridged(f),
+        }
     }
 
     fn bridged<R>(&self, f: impl FnOnce(&Halt) -> R) -> R {
@@ -160,9 +168,14 @@ impl<T> EngineOutcome<T> {
         halt: &EngineHalt<'_>,
         halted: impl FnOnce(&T) -> bool,
     ) -> Self {
-        let _ = (halt, halted);
         match r {
+            Ok(t) if halted(&t) => EngineOutcome::Stopped(Some(t)),
             Ok(t) => EngineOutcome::Done(t),
+            Err(libfreemkv::Error::Halted) if halt.is_cancelled() => EngineOutcome::Stopped(None),
+            Err(libfreemkv::Error::Halted) => {
+                debug_assert!(false, "Halted with no cancel (stop design §2.6)");
+                EngineOutcome::Failed(libfreemkv::Error::Halted)
+            }
             Err(e) => EngineOutcome::Failed(e),
         }
     }
@@ -178,35 +191,6 @@ impl<T> EngineOutcome<T> {
     /// `true` for [`EngineOutcome::Stopped`].
     pub fn is_stopped(&self) -> bool {
         matches!(self, EngineOutcome::Stopped(_))
-    }
-}
-
-// A Sink whose `should_cancel` is `halt.is_cancelled()` (op, extra and the inner Sink): hands
-// the op token to code that polls a Sink (the mux watcher, the title loop).
-#[allow(dead_code)] // ST-E1 red: wired in the green commit
-pub(crate) struct HaltSink<'a> {
-    pub(crate) inner: &'a dyn Sink,
-    pub(crate) halt: &'a EngineHalt<'a>,
-}
-
-impl Sink for HaltSink<'_> {
-    fn log(&self, level: crate::sink::Level, msg: &str) {
-        self.inner.log(level, msg)
-    }
-    fn title_opened(&self, title: &libfreemkv::DiscTitle) {
-        self.inner.title_opened(title)
-    }
-    fn progress(&self, p: &crate::sink::Progress) {
-        self.inner.progress(p)
-    }
-    fn completed(&self, outcome: &crate::Outcome) {
-        self.inner.completed(outcome)
-    }
-    fn event(&self, e: &crate::sink::Event<'_>) {
-        self.inner.event(e)
-    }
-    fn should_cancel(&self) -> bool {
-        self.halt.is_cancelled()
     }
 }
 
