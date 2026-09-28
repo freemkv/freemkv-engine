@@ -447,7 +447,12 @@ pub(crate) fn resolve(
     vid: Option<[u8; 16]>,
     halt: Option<&libfreemkv::Halt>,
 ) -> crate::Result<libfreemkv::keys::KeyResolution> {
-    let opts = ResolveKeysOptions { halt, seed, vid };
+    let opts = ResolveKeysOptions {
+        halt,
+        seed,
+        vid,
+        vid_would_help: None,
+    };
     ResolvedKeySet::resolve(disc, reader, scope.clone(), sources, opts)
 }
 

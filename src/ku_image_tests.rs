@@ -805,3 +805,32 @@ fn an_up_front_refusal_keeps_the_whole_error() {
     let events = sink.0.lock().unwrap();
     assert_eq!(*events, [r#"Some(MapfileInvalid { kind: "vidfp" })"#]);
 }
+
+/// J23 (amends J11 / SG28; KS-16 "Kvu = AES-G(Km, IDv)"): E7034 only when the VID would
+/// actually help: a Km is obtainable (a keydb reports "matched, Media Key, no VID") or a
+/// configured source consumes the VID (online). Otherwise a plain "no key yet" is E7022.
+#[test]
+fn vid_needs_disc_only_when_a_vid_would_help() {
+    let c = vid_case(true);
+    let code = |specs: &[(Answer, &[[u8; 16]])]| {
+        let opts = OpenImageOptions::resolve(factory(specs, &Calls::default()));
+        let r = open_image_with(&ImageSource::Iso(c.iso.clone()), opts);
+        r.map(|_| ()).unwrap_err().code()
+    };
+    assert_eq!(
+        code(&[(Answer::Keydb, &[])]),
+        E_NO_DISC_KEY,
+        "no Km path, no online source"
+    );
+    assert_eq!(
+        code(&[(Answer::KeydbKmNoVid, &[])]),
+        E_AACS_VID_NEEDS_DISC,
+        "a Km path"
+    );
+    let online = [(Answer::Keydb, &[][..]), (Answer::Online, &[][..])];
+    assert_eq!(
+        code(&online),
+        E_AACS_VID_NEEDS_DISC,
+        "an online source configured"
+    );
+}

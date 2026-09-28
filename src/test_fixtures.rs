@@ -229,6 +229,9 @@ pub(crate) enum Answer {
     Online,
     /// An online service that can derive the key only with the disc's VID (KS-16).
     OnlineNeedsVid,
+    /// A keydb that matched the disc and holds its Media Key but got no VID: no key, the
+    /// "matched > no VID" miss path (KU J23: a Km path, so the VID would help).
+    KeydbKmNoVid,
 }
 
 struct Fake {
@@ -256,6 +259,7 @@ impl KeySource for Fake {
         });
         let keys: Vec<[u8; 16]> = match self.answer {
             Answer::Keydb => self.keys.clone(),
+            Answer::KeydbKmNoVid => Vec::new(),
             Answer::OnlineNeedsVid if vid.is_none() => Vec::new(),
             Answer::Online | Answer::OnlineNeedsVid => {
                 let samples = ctx.samples(usize::MAX).unwrap_or_default();
@@ -290,8 +294,28 @@ impl KeySource for Fake {
     fn label(&self) -> &'static str {
         self.who
     }
+    fn resolve_unit_keys(
+        &self,
+        ctx: &dyn ResolveCtx,
+    ) -> libfreemkv::Result<libfreemkv::keysource::UnitKeyResolution> {
+        let keys = self.get_unit_keys(ctx)?;
+        let km_no_vid = self.answer == Answer::KeydbKmNoVid;
+        Ok(libfreemkv::keysource::UnitKeyResolution {
+            keys,
+            matched: km_no_vid,
+            miss_path: if km_no_vid {
+                vec![libfreemkv::aacs::trace::KeyNode::NoVid]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+    }
     fn answer_depends_on_samples(&self) -> bool {
-        self.answer != Answer::Keydb
+        matches!(self.answer, Answer::Online | Answer::OnlineNeedsVid)
+    }
+    fn uses_vid(&self) -> bool {
+        matches!(self.answer, Answer::Online | Answer::OnlineNeedsVid)
     }
 }
 
@@ -314,10 +338,10 @@ pub(crate) fn fmts_factory(
             .iter()
             .map(|(answer, keys)| {
                 Box::new(Fake {
-                    who: if *answer == Answer::Keydb {
-                        "keydb"
-                    } else {
+                    who: if matches!(answer, Answer::Online | Answer::OnlineNeedsVid) {
                         "online"
+                    } else {
+                        "keydb"
                     },
                     answer: *answer,
                     keys: keys.clone(),
