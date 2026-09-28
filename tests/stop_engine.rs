@@ -354,3 +354,17 @@ fn multipass_stop_between_passes() {
     let r = out.value().expect("the partial result");
     assert!(r.halted && r.passes == 1, "{r:?}");
 }
+
+// ET18 `remux_iso_signature_is_stable` — §4.4: "`remux_iso(job: &RemuxJob, keys: &KeyParams,
+// sink: &dyn Sink) -> io::Result<RemuxReport>` … **unchanged** signature and behaviour".
+#[test]
+fn remux_iso_signature_is_stable() {
+    use freemkv_engine::{KeyParams, RemuxJob, RemuxReport, Sink};
+    let legacy: fn(&RemuxJob, &KeyParams, &dyn Sink) -> std::io::Result<RemuxReport> =
+        freemkv_engine::remux_iso;
+    let with: fn(&RemuxJob, &KeyParams, &dyn Sink, &Halt) -> std::io::Result<RemuxReport> =
+        freemkv_engine::remux_iso_with;
+    let _ = (legacy, with);
+    // `Sink::should_cancel` stays a defaulted cancel input (§4.4, `sink.rs`).
+    assert!(!NoopSink.should_cancel());
+}

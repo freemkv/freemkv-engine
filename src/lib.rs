@@ -9,6 +9,7 @@
 // message + code carried on events.
 #![forbid(unsafe_code)]
 
+mod artifact_lock;
 pub mod drive_info;
 mod engine_halt;
 mod extract;
@@ -69,7 +70,8 @@ pub use mux::{
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
-    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_options, remux_iso, verify_mkv,
+    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
+    remux_iso, remux_iso_with, verify_mkv,
 };
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;

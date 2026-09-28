@@ -415,12 +415,14 @@ fn with_mux_watcher<T>(
     }
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
     let (opened_tx, opened_rx) = mpsc::channel::<libfreemkv::DiscTitle>();
+    let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
     // MuxEvents impl that forwards write-progress and the output opening over channels.
     // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
+        flush: mpsc::Sender<(u64, u64)>,
     }
     impl libfreemkv::MuxEvents for ChannelEvents {
         fn on_write_progress(&self, bytes_written: u64, bytes_total: u64) {
@@ -429,6 +431,9 @@ fn with_mux_watcher<T>(
         fn on_output_opened(&self, title: &libfreemkv::DiscTitle) {
             let _ = self.opened.send(title.clone());
         }
+        // Stop design v5 §4.5: "`MuxEvents::on_flush_progress` … The engine's mux bridge
+        // turns that into `Sink::progress(pass: "sync")`" (one call per libfreemkv call).
+        // ST-E1 red: no flush bridge (the default no-op).
     }
     let opened = |title: &libfreemkv::DiscTitle| {
         sink.event(&crate::sink::Event::OutputOpened { dest, title });
@@ -470,6 +475,14 @@ fn with_mux_watcher<T>(
                     };
                     sink.progress(&p);
                 }
+                for (done_b, total_b) in flush_rx.try_iter() {
+                    sink.progress(&crate::sink::Progress {
+                        pass: std::borrow::Cow::Borrowed("sync"),
+                        bytes_done: done_b,
+                        bytes_total: total_b,
+                        ..Default::default()
+                    });
+                }
                 if sink.should_cancel() {
                     watcher_halt.cancel();
                 }
@@ -488,6 +501,7 @@ fn with_mux_watcher<T>(
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents {
             tx,
             opened: opened_tx,
+            flush: flush_tx,
         });
         // Same guard the recovery paths use: `mux_stream` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
@@ -973,6 +987,35 @@ mod tests {
             *sink.0.lock().unwrap(),
             vec![("mpg:///o.mpg".to_string(), 0)]
         );
+    }
+
+    // ET23 `mux_close_flush_progress_reaches_sink` — stop design v5 §4.5: "The driver … forwards
+    // increases through a new **defaulted** `MuxEvents::on_flush_progress` … The engine's mux
+    // bridge turns that into `Sink::progress(pass: "sync")`"; no call when nothing moves.
+    #[test]
+    fn mux_close_flush_progress_reaches_sink() {
+        let sink = RecordingSink::default();
+        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            assert!(
+                sink.ticks.lock().unwrap().is_empty(),
+                "a call with no flush progress"
+            );
+            events.on_flush_progress(1 << 20, 4 << 20);
+            events.on_flush_progress(2 << 20, 4 << 20);
+            assert!(
+                wait_for(5, || sink.ticks.lock().unwrap().len() == 2),
+                "the flush progress did not reach the sink"
+            );
+        });
+        let ticks = sink.ticks.lock().unwrap();
+        assert!(
+            ticks
+                .iter()
+                .all(|p| p.pass == "sync" && p.bytes_total == 4 << 20)
+        );
+        assert_eq!(ticks[0].bytes_done, 1 << 20);
+        assert_eq!(ticks[1].bytes_done, 2 << 20);
     }
 
     // A panic inside the mux must still release the watcher, or an unwind skips storing `done`

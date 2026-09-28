@@ -129,6 +129,10 @@ impl<'a> EngineHalt<'a> {
 
     fn bridged<R>(&self, f: impl FnOnce(&Halt) -> R) -> R {
         let child = Halt::new();
+        // Asked once before the work starts, so a cancelled op never races its bridge.
+        if self.is_cancelled() {
+            child.cancel();
+        }
         let done = AtomicBool::new(false);
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -191,6 +195,34 @@ impl<T> EngineOutcome<T> {
     /// `true` for [`EngineOutcome::Stopped`].
     pub fn is_stopped(&self) -> bool {
         matches!(self, EngineOutcome::Stopped(_))
+    }
+}
+
+// A Sink whose `should_cancel` is `halt.is_cancelled()` (op, extra and the inner Sink): hands
+// the op token to code that polls a Sink (the mux watcher, the title loop).
+pub(crate) struct HaltSink<'a> {
+    pub(crate) inner: &'a dyn Sink,
+    pub(crate) halt: &'a EngineHalt<'a>,
+}
+
+impl Sink for HaltSink<'_> {
+    fn log(&self, level: crate::sink::Level, msg: &str) {
+        self.inner.log(level, msg)
+    }
+    fn title_opened(&self, title: &libfreemkv::DiscTitle) {
+        self.inner.title_opened(title)
+    }
+    fn progress(&self, p: &crate::sink::Progress) {
+        self.inner.progress(p)
+    }
+    fn completed(&self, outcome: &crate::Outcome) {
+        self.inner.completed(outcome)
+    }
+    fn event(&self, e: &crate::sink::Event<'_>) {
+        self.inner.event(e)
+    }
+    fn should_cancel(&self) -> bool {
+        self.halt.is_cancelled()
     }
 }
 
