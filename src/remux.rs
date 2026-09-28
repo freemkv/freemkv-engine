@@ -187,8 +187,18 @@ pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Resul
     })
 }
 
+// Only NotFound means absent: EIO/ESTALE/permission errors surface, so a flaky
+// mount never reads as an empty folder.
+fn target_present(path: &Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
-    if !job.replace && job.target.exists() {
+    if !job.replace && target_present(&job.target)? {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} exists", job.target.display()),
@@ -274,7 +284,7 @@ fn land_verified(
     sink.event(&Event::Phase { name: "replace" });
     // Re-checked: the target may have appeared while the title muxed.
     refuse_existing(job)?;
-    let replaced = job.target.exists();
+    let replaced = target_present(&job.target)?;
     std::fs::rename(&partial, &job.target)?;
     guard.1 = true;
     sync_parent(&job.target)?;
@@ -402,6 +412,29 @@ mod tests {
             std::fs::write(path, bytes)?;
             Ok(outcome(completed))
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_target_folder_is_refused_not_taken_as_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let target = locked.join("Title").join("Title.mkv");
+        let probe = std::fs::symlink_metadata(&target);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if probe.is_ok() || probe.as_ref().unwrap_err().kind() == io::ErrorKind::NotFound {
+            return; // running as root: permissions are not enforced
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let refused = refuse_existing(&job(target.clone(), false));
+        let present = target_present(&target);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = refused.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(present.is_err());
     }
 
     #[test]
