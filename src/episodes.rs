@@ -14,7 +14,7 @@ const EPISODE_MIN_SECS: f64 = 600.0;
 /// The episode titles of a TV disc, in disc order: drops the "play all"
 /// sum-title, extras/menus (far from the episode-length cluster), and
 /// duplicate-content titles.
-pub(crate) fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
+pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
     let durations: Vec<f64> = titles.iter().map(|t| t.duration_secs).collect();
     dedup_by_content(titles, episode_cluster(&durations, EPISODE_MIN_SECS))
 }
