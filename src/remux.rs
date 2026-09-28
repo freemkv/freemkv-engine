@@ -155,7 +155,8 @@ pub struct RemuxReport {
 /// Remux one title of `job.iso` to `job.target`: mux into `<target>.partial`,
 /// fsync, [`verify_mkv`], then rename over the target and fsync its folder.
 /// On any failure the partial file is removed and an existing target is left
-/// exactly as it was. Phases and the title are reported as [`Event`]s.
+/// exactly as it was. The chosen title goes to [`Sink::title_opened`]; phases
+/// and the title's mux are reported as [`Event`]s.
 pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Result<RemuxReport> {
     refuse_existing(job)?;
     sink.event(&Event::Phase { name: "open" });
@@ -236,6 +237,7 @@ fn land_verified(
     sink: &dyn Sink,
     mux: impl FnOnce(&str) -> io::Result<libfreemkv::MuxOutcome>,
 ) -> io::Result<RemuxReport> {
+    sink.title_opened(title);
     let partial = partial_path(&job.target);
     let _ = std::fs::remove_file(&partial);
     let mut guard = PartialFile(&partial, false);
@@ -360,6 +362,10 @@ mod tests {
     #[derive(Default)]
     struct Events(Mutex<Vec<String>>);
     impl Sink for Events {
+        fn title_opened(&self, _title: &libfreemkv::DiscTitle) {
+            self.0.lock().unwrap().push("title".into());
+        }
+
         fn event(&self, e: &Event<'_>) {
             let s = match e {
                 Event::Phase { name } => format!("phase:{name}"),
@@ -452,6 +458,7 @@ mod tests {
         assert_eq!(
             *sink.0.lock().unwrap(),
             [
+                "title",
                 "phase:mux",
                 "start:0",
                 "done:0:true",
