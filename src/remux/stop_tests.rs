@@ -7,8 +7,8 @@
 
 use super::tests::{Events, job, mkv, outcome, title, writes};
 use super::*;
-use crate::artifact_lock::sidecar_for;
 use libfreemkv::halt::Progress as Counter;
+use libfreemkv::io::artifact_lock::lock_path as sidecar_for;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
@@ -46,7 +46,6 @@ impl FakeIo {
     fn new(sync: SyncPlan, read: ReadPlan) -> Self {
         Self {
             timing: RemuxTiming {
-                lock_stall: WINDOW,
                 verify_stall: WINDOW,
                 activity_every: Duration::from_millis(10),
             },
@@ -282,8 +281,9 @@ fn remux_takes_target_lock() {
 fn remux_lock_wait_times_out_on_a_frozen_holder() {
     let dir = tempfile::tempdir().unwrap();
     let (target, mtime) = old_target(dir.path());
-    let held = ArtifactLock::acquire(&target, &[], &EngineHalt::new(&Halt::new(), None), WINDOW);
-    let _held = DeleteOnDrop::new(held.unwrap());
+    let _held = DeleteOnDrop(Some(
+        ArtifactLock::acquire(&target, &[], &Halt::new()).unwrap(),
+    ));
     let rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
     let muxed = AtomicBool::new(false);
     let e = run(&target, &Events::default(), &Halt::new(), &rio, |_| {
@@ -454,11 +454,11 @@ fn remux_should_cancel_still_cancels_everywhere() {
     assert!(t0.elapsed() < STOP_LATENCY);
     untouched(&target, mtime);
     // (c) while waiting for the sidecar lock: no `.partial` is ever created.
-    let held = ArtifactLock::acquire(&target, &[], &EngineHalt::new(&Halt::new(), None), WINDOW);
-    let held = DeleteOnDrop::new(held.unwrap());
+    let held = DeleteOnDrop(Some(
+        ArtifactLock::acquire(&target, &[], &Halt::new()).unwrap(),
+    ));
     let w = Arc::new(Watch::default());
-    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
-    rio.timing.lock_stall = Duration::from_secs(30);
+    let rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
     flip(&w);
     let muxed = AtomicBool::new(false);
     let e = run(&target, &*w, &Halt::new(), &rio, |_| {
@@ -706,4 +706,35 @@ fn remux_real_sync_reports_through_the_sink() {
     );
     let (done, total, _) = *w.of("verify").last().expect("verify activity");
     assert!(done > 0 && done <= total);
+}
+
+// ET11 `artifact_lock_survives_real_mapfile_flush` — §2.5: "A lock on the mapfile would pin
+// the old inode after the first flush and exclude nothing"; SS-11 rename(): "a link named
+// new shall remain visible to other threads throughout the renaming operation".
+#[test]
+fn artifact_lock_survives_real_mapfile_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("Movie.iso");
+    let mf = crate::mapfile_path_for(&iso);
+    let mut map = crate::Mapfile::create(&mf, 1 << 20, "t").unwrap();
+    let held = ArtifactLock::acquire(&iso, &[&mf], &Halt::new()).unwrap();
+    let got = Arc::new(Mutex::new(None));
+    let (iso2, mf2, got2) = (iso.clone(), mf.clone(), got.clone());
+    let waiter = std::thread::spawn(move || {
+        let r = ArtifactLock::acquire(&iso2, &[&mf2], &Halt::new());
+        *got2.lock().unwrap() = Some(Instant::now());
+        r
+    });
+    for i in 0..10u64 {
+        map.record(i * 2048, 2048, crate::SectorStatus::Finished)
+            .unwrap();
+        map.flush().unwrap(); // the real tmp + rename
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(got.lock().unwrap().is_none(), "acquired while held");
+    }
+    let released = Instant::now();
+    drop(held);
+    let lock = waiter.join().unwrap().expect("acquires once released");
+    assert!(got.lock().unwrap().unwrap() >= released);
+    assert_eq!(lock.path(), sidecar_for(&iso));
 }

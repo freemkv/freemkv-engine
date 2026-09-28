@@ -9,7 +9,6 @@
 // message + code carried on events.
 #![forbid(unsafe_code)]
 
-mod artifact_lock;
 pub mod drive_info;
 mod engine_halt;
 mod extract;

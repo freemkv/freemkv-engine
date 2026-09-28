@@ -6,7 +6,6 @@
 //! mux, the `<target>.lock` wait, the durable sync and verify). Sync and verify report
 //! real progress as `Sink::progress` passes `"sync"` / `"verify"` (§4.5, T12b, T30).
 
-use crate::artifact_lock::{ArtifactLock, DeleteOnDrop, LOCK_STALL};
 use crate::engine_halt::{EngineHalt, HaltSink};
 use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
 use crate::job::{Selection, StreamChoice};
@@ -17,6 +16,7 @@ use crate::sink::Level;
 use crate::sink::{Event, Sink};
 use libfreemkv::Halt;
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
+use libfreemkv::io::ArtifactLock;
 use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -399,6 +399,18 @@ fn partial_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
+// §4.2: remux keeps no resumable state, "so the sidecar is **deleted while held on every
+// exit**" — a panic included.
+struct DeleteOnDrop(Option<ArtifactLock>);
+
+impl Drop for DeleteOnDrop {
+    fn drop(&mut self) {
+        if let Some(lock) = self.0.take() {
+            let _ = lock.delete();
+        }
+    }
+}
+
 // Removes the partial file unless disarmed — every early return and a panic included.
 struct PartialFile<'a>(&'a Path, bool);
 
@@ -413,8 +425,6 @@ impl Drop for PartialFile<'_> {
 /// The remux path's waits, production values by default; a parameter so tests scale time.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RemuxTiming {
-    /// T10: the `<target>.lock` wait's no-progress window.
-    pub(crate) lock_stall: Duration,
     /// T30: §3.1 "60 s with no bytes read (HR1)".
     pub(crate) verify_stall: Duration,
     /// §4.4: "rate-limited to one call per 250 ms".
@@ -424,7 +434,6 @@ pub(crate) struct RemuxTiming {
 impl Default for RemuxTiming {
     fn default() -> Self {
         Self {
-            lock_stall: LOCK_STALL,
             verify_stall: Duration::from_secs(60),
             activity_every: Duration::from_millis(250),
         }
@@ -488,9 +497,9 @@ fn land_verified(
     let partial = partial_path(&job.target);
     // §4.2: "`land_verified` … takes `<target>.lock` (the §2.5 acquire loop) **before**
     // creating `.partial`"; "deleted while held on every exit" (dropped last).
-    let watch = [partial.clone()];
-    let lock = ArtifactLock::acquire(&job.target, &watch, halt, timing.lock_stall)?;
-    let _lock = DeleteOnDrop::new(lock);
+    // libfreemkv's lock watches `<target>.partial` as the holder's T10 progress.
+    let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &[], h))?;
+    let _lock = DeleteOnDrop(Some(lock));
     let _ = std::fs::remove_file(&partial);
     let mut guard = PartialFile(&partial, false);
 
