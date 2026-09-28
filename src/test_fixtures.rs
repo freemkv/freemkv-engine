@@ -414,10 +414,12 @@ pub(crate) const F2: [u8; 16] = *b"\xF6KU-E1 forensic2";
 const ALT: [u8; 16] = *b"\x07KU-E1 alternate";
 
 /// An AACS 2.1 FMTS disc (KS-25, KS-26: evidence, no public spec), after libfreemkv's
-/// KU-L2 fixture: clip 0 (K1, 10 units) and the forensic clip 1 (base K2, 60 units) with an
+/// KU-L2 fixture: clip 0 (K1, 10 units), forensic clip 1 (base K2, 60 units) with an
 /// index-1 segment over units 0..16 and an index-2 one over 20..36. Our phase is Even
-/// (F1 / F2); odd segment units are the alternate variant. Titles: [0], [1], [0, 1].
-pub(crate) fn fmts_image() -> Fx {
+/// (F1 / F2); odd segment units are the alternate variant, except that with `verify` index
+/// 2's odd units also open with F2, so only `Phase::Verify` decrypts them (KU §5.3).
+/// Titles: [0], [1], [0, 1].
+pub(crate) fn fmts_image_with(verify: bool) -> Fx {
     let files = [
         BdFile::new("BDMV/STREAM/00001.m2ts", 30, Some(K1)),
         BdFile::new("BDMV/STREAM/00002.fmts", 180, Some(K2)),
@@ -443,7 +445,8 @@ pub(crate) fn fmts_image() -> Fx {
     for &(index, a, b) in &segs {
         let ours = if index == 1 { F1 } else { F2 };
         for u in a..b {
-            let key = if (u - a) % 2 == 0 { ours } else { ALT };
+            let alt = if verify && index == 2 { ours } else { ALT };
+            let key = if (u - a) % 2 == 0 { ours } else { alt };
             let at = (clip + u * 3) as usize * 2048;
             let mut unit = img.plain[at..at + 6144].to_vec();
             assert!(libfreemkv::aacs::content::encrypt_unit(&mut unit, &key));
@@ -456,6 +459,11 @@ pub(crate) fn fmts_image() -> Fx {
         disc,
         metadata: Vec::new(),
     }
+}
+
+/// [`fmts_image_with`] without the `Phase::Verify` variant.
+pub(crate) fn fmts_image() -> Fx {
+    fmts_image_with(false)
 }
 
 // A UHD FMTS disc over `img` whose title `t` plays files `titles[t]` (not scanned: the

@@ -6,7 +6,7 @@ use crate::recovery::mapfile::vid_fingerprint;
 use crate::remux::MuxPlan;
 use crate::test_fixtures::{
     Answer, Calls, Damage, Drive, F1, F2, Fx, K1, K2, VID, bd_image, factory, fmts_factory,
-    fmts_image, resolve,
+    fmts_image, fmts_image_with, resolve,
 };
 use crate::{Mapfile, RipOutcome, mapfile_path_for, mux_image_titles};
 use libfreemkv::error::{E_AACS_VID_NEEDS_DISC, E_NO_DISC_KEY};
@@ -61,8 +61,10 @@ fn titles(v: &[usize]) -> Option<KeyScope> {
 }
 
 /// EK13 (J14, the server's staged-ISO regression): a staged ISO whose MPLS and
-/// `Unit_Key_RO.inf` sectors were never read muxes both titles from the drive-scanned
-/// disc and its set. The image is never rescanned: a rescan finds no playlist there.
+/// `Unit_Key_RO.inf` sectors were never read (zeroed, marked NonTrimmed in its sidecar)
+/// muxes both titles from the drive-scanned disc and its set, byte-equal to the whole
+/// image's mux. No rescan: a rescan finds no playlist there. `MuxSource::Iso` opens the
+/// file itself, so reads are not counted; the one metadata read is §3.2's key-file check.
 #[test]
 fn staged_iso_with_damaged_udf_muxes_from_drive_scanned_title() {
     let fx = bd_image(&[Some(K1), Some(K2)], 2);
@@ -105,9 +107,10 @@ fn staged_iso_with_damaged_udf_muxes_from_drive_scanned_title() {
         let probe = |p: &Path| crate::verify_mkv(p, &fx.disc.titles[0]).unwrap();
         assert_eq!(probe(&g).tracks.len(), 1, "{t}");
         assert_eq!(probe(&g).last_cue_secs, probe(&w).last_cue_secs, "{t}");
-        assert_eq!(
-            std::fs::metadata(&g).unwrap().len(),
-            std::fs::metadata(&w).unwrap().len()
+        let bytes = |p: &Path| std::fs::read(p).unwrap();
+        assert!(
+            bytes(&g) == bytes(&w),
+            "{t}: byte-equal to the whole image's mux"
         );
     }
     assert_eq!(calls.len(), asked, "a Known set makes no request");
@@ -656,4 +659,70 @@ fn a_zero_vid_never_hides_the_discs_vid() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(err.code(), E_NO_DISC_KEY, "{err}");
+}
+
+/// EK14, `Phase::Verify` (KU §5.3; KS-25, KS-26 evidence): an index whose every phase probe
+/// faulted at the drive is held as `Verify`. A Known set carrying it makes 0 requests from
+/// the image, and each unit is kept decrypted only if it opens clean: here both halves of
+/// index 2 open with F2, which only `Verify` decrypts (a resolved phase leaves one half).
+#[test]
+fn known_set_with_a_verify_phase_decrypts_both_halves() {
+    let fx = fmts_image_with(true);
+    let (clip, _) = fx.img.files[1];
+    let calls = Calls::default();
+    let f = fmts_factory(&[(Answer::Online, &[K1, K2])], &[F1, F2], &calls);
+    let drive = Drive::new(&fx.img.image);
+    drive.set(Damage::Range(clip + 20 * 3, clip + 36 * 3));
+    let scope = KeyScope::Titles(vec![1]);
+    let set = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut drive.clone(),
+        scope.clone(),
+        &f,
+        Default::default(),
+    )
+    .unwrap()
+    .keys;
+    let asked = calls.len();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "uhd.iso");
+    let opts = OpenImageOptions {
+        disc: Some(fmts_image_with(true).disc),
+        scope: Some(scope),
+        ..OpenImageOptions::known(set)
+    };
+    let opened = open_image_with(&ImageSource::Iso(iso.clone()), opts).unwrap();
+    let raw = libfreemkv::FileSectorSource::open(&iso).unwrap();
+    let mut r = opened.keys.title_reader(&opened.disc, 1, raw).unwrap();
+    r.set_unit_base(clip);
+    for u in [20u32, 21] {
+        let mut buf = vec![0u8; 3 * 2048];
+        r.read_sectors(clip + u * 3, 3, &mut buf, true).unwrap();
+        assert!(
+            buf.chunks(192).all(|p| p[4] == 0x47),
+            "index-2 unit {u} decrypted"
+        );
+    }
+    assert_eq!(calls.len(), asked, "0 requests from the image");
+
+    // Control: with the phase probes readable, index 2 resolves to Even and unit 21 (odd)
+    // is left as ciphertext, so the decrypt above is Verify's.
+    let set = ResolvedKeySet::resolve(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![1]),
+        &f,
+        Default::default(),
+    )
+    .unwrap()
+    .keys;
+    let raw = libfreemkv::FileSectorSource::open(&iso).unwrap();
+    let mut r = set.title_reader(&fx.disc, 1, raw).unwrap();
+    r.set_unit_base(clip);
+    let mut buf = vec![0u8; 3 * 2048];
+    r.read_sectors(clip + 21 * 3, 3, &mut buf, true).unwrap();
+    assert!(
+        !buf.chunks(192).all(|p| p[4] == 0x47),
+        "a resolved phase skips unit 21"
+    );
 }

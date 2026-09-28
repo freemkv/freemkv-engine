@@ -627,8 +627,8 @@ mod tests {
         }
     }
 
-    // KU-L2 review: the readers' on-arrival loud stop ("a readable unit no held key opens",
-    // E7022 title / E7032 image, KU §2.4, §6) is never damage: no retry, skip, jump or count.
+    // KU §2.4: "No held key opens U → loud stop: E7022 (title) or E7032 (image or folder)".
+    // U was read, so the stop is never damage: no retry, skip, jump or count.
     #[test]
     fn a_key_stop_aborts_the_pass_and_leaves_the_damage_state_untouched() {
         let stops = [
