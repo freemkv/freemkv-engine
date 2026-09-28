@@ -875,6 +875,32 @@ mod tests {
         assert_eq!(p.bytes_total, 8192);
     }
 
+    // The output opening reaches the sink with its dest and title (the front ends print the
+    // pre-mux note there), even when the mux returns before the watcher's next poll.
+    #[test]
+    fn output_opened_reaches_the_sink_even_from_a_mux_that_returns_at_once() {
+        #[derive(Default)]
+        struct Opened(std::sync::Mutex<Vec<(String, usize)>>);
+        impl Sink for Opened {
+            fn event(&self, e: &crate::sink::Event<'_>) {
+                if let crate::sink::Event::OutputOpened { dest, title } = e {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push((dest.to_string(), title.streams.len()));
+                }
+            }
+        }
+        let sink = Opened::default();
+        with_mux_watcher(&sink, "mpg:///o.mpg", |_halt, events| {
+            events.on_output_opened(&libfreemkv::DiscTitle::empty());
+        });
+        assert_eq!(
+            *sink.0.lock().unwrap(),
+            vec![("mpg:///o.mpg".to_string(), 0)]
+        );
+    }
+
     // A panic inside the mux must still release the watcher, or an unwind skips storing `done`
     // and the watcher loops forever — a hang, not a failure. Bounded here for that reason.
     #[test]
