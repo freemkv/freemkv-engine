@@ -503,6 +503,29 @@ mod tests {
         assert_eq!(labels, ["keydb"], "a permanent rejection still drops it");
     }
 
+    /// Stop rule (stall-based only; Stop can interrupt every wait): a factory build has no
+    /// Halt, so it does no DNS lookup. keysources' static check drops a URL that is wrong
+    /// without one; the host lookup runs at the first query, halt-aware.
+    #[test]
+    fn a_factory_build_does_no_dns_lookup() {
+        let src = include_str!("keys.rs").replace("\r\n", "\n");
+        let start = src.find("pub fn key_sources(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("check_keyserver_url_static("), "{body}");
+        assert!(
+            !body.contains("check_keyserver_url("),
+            "no lookup at build time"
+        );
+        let blocked = KeyParams {
+            key_url: Some("https://169.254.169.254/keys".into()),
+            ..Default::default()
+        };
+        assert!(
+            key_source_factory(&blocked)().is_empty(),
+            "a literal non-public address"
+        );
+    }
+
     /// KU §2.3 via the engine's one front door: one resolve over the scope, the set keys it,
     /// and the factory is released (LK7): nothing can ask a source after it returns.
     #[test]
