@@ -1,9 +1,8 @@
 //! Test fixtures for the keys-up-front (KU) engine tests: a scannable AACS-encrypted BD
 //! image (one playlist per stream file) and counting fake key sources.
 //!
-//! The MPLS/CLPI builders mirror libfreemkv's `dirimage::tests::{one_item_mpls,
-//! minimal_clpi}` (crate-private there). The clips carry TS sync and CPI but no
-//! elementary stream, so a mux of them reads every unit, then ends E6008 (`MkvInvalid`).
+//! The MPLS/CLPI builders follow libfreemkv's crate-private test builders. Each clip is
+//! BD LPCM audio in real TS/PES, so a title muxes to a verifiable MKV.
 
 use libfreemkv::aacs::mkb::AacsVersion;
 use libfreemkv::aacs::types::UnitKey;
@@ -21,33 +20,69 @@ pub(crate) const VID: [u8; 16] = *b"\x5AKU-E1 volumeID!";
 /// sample-dependent source is asked with this piece alone (KU §2.3 step 9.2).
 pub(crate) const CLIP_UNITS: u32 = 10;
 
-// A one-PlayItem MPLS on `clip`, 2 min long (`parse_playlist` drops < 30 s stubs).
+/// The clips' one elementary stream: BD LPCM stereo 48 kHz 16-bit on this PID.
+pub(crate) const AUDIO_PID: u16 = 0x1100;
+/// Each title's running time; its clip's audio spans it.
+pub(crate) const TITLE_SECS: u32 = 120;
+
+// A one-PlayItem MPLS on `clip` whose STN lists the LPCM stream (KS-10 aside, one CPS
+// unit per clip here). In/out times in 45 kHz ticks from 1 s.
 fn one_item_mpls(clip: &[u8; 5]) -> Vec<u8> {
-    let mut buf = b"MPLS0200".to_vec();
-    buf.extend_from_slice(&40u32.to_be_bytes());
-    buf.extend_from_slice(&[0u8; 28]);
-    let pl = buf.len();
-    buf.extend_from_slice(&[0u8; 4]);
-    buf.extend_from_slice(&[0u8; 2]);
-    buf.extend_from_slice(&1u16.to_be_bytes());
-    buf.extend_from_slice(&[0u8; 2]);
     let mut item = clip.to_vec();
     item.extend_from_slice(b"M2TS");
     item.extend_from_slice(&[0u8; 3]);
-    item.extend_from_slice(&0u32.to_be_bytes());
-    item.extend_from_slice(&(45_000u32 * 120).to_be_bytes());
+    item.extend_from_slice(&45_000u32.to_be_bytes());
+    item.extend_from_slice(&(45_000u32 * (1 + TITLE_SECS)).to_be_bytes());
     item.extend_from_slice(&[0u8; 12]);
-    item.extend_from_slice(&16u16.to_be_bytes());
-    item.extend_from_slice(&[0u8; 16]);
-    buf.extend_from_slice(&(item.len() as u16).to_be_bytes());
-    buf.extend_from_slice(&item);
-    let pl_len = (buf.len() - pl - 4) as u32;
-    buf[pl..pl + 4].copy_from_slice(&pl_len.to_be_bytes());
-    let mark_start = buf.len() as u32;
-    buf[12..16].copy_from_slice(&mark_start.to_be_bytes());
-    buf.extend_from_slice(&2u32.to_be_bytes());
-    buf.extend_from_slice(&0u16.to_be_bytes());
+    let mut stn = vec![0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    stn.extend_from_slice(&[3, 0x01]);
+    stn.extend_from_slice(&AUDIO_PID.to_be_bytes());
+    stn.extend_from_slice(&[5, 0x80, 0x31]);
+    stn.extend_from_slice(b"eng");
+    item.extend_from_slice(&stn);
+    let mut pl = vec![0u8; 6];
+    pl.extend_from_slice(&1u16.to_be_bytes());
+    pl.extend_from_slice(&[0u8; 2]);
+    pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
+    pl.extend_from_slice(&item);
+    let pl_len = (pl.len() - 4) as u32;
+    pl[0..4].copy_from_slice(&pl_len.to_be_bytes());
+    let mut buf = b"MPLS0200".to_vec();
+    buf.extend_from_slice(&40u32.to_be_bytes());
+    buf.extend_from_slice(&[0u8; 28]);
+    buf.extend_from_slice(&pl);
     buf
+}
+
+// Source packet `k` of a clip: a TP_extra_header (CPI 11₂ when `encrypted`, KS-5) and one
+// TS packet holding one whole LPCM PES (private_stream_1), PTS spread over the title.
+fn lpcm_source_packet(k: u32, n: u32, encrypted: bool) -> [u8; 192] {
+    const AUDIO: usize = 160;
+    let mut p = [0u8; 192];
+    p[..4].copy_from_slice(&(k * 100).to_be_bytes());
+    p[0] = if encrypted { p[0] | 0xC0 } else { p[0] & 0x3F };
+    let ts = &mut p[4..];
+    ts[..4].copy_from_slice(&[0x47, 0x40 | (AUDIO_PID >> 8) as u8, AUDIO_PID as u8, 0x30]);
+    ts[3] |= (k & 0x0F) as u8;
+    let stuffing = 188 - 4 - 1 - (14 + 4 + AUDIO);
+    ts[4] = stuffing as u8;
+    ts[5] = 0x00;
+    ts[6..5 + stuffing].fill(0xFF);
+    let pts = 90_000u64 + u64::from(k) * 90_000 * u64::from(TITLE_SECS) / u64::from(n);
+    let pes = &mut ts[5 + stuffing..];
+    pes[..4].copy_from_slice(&[0, 0, 1, 0xBD]);
+    pes[4..6].copy_from_slice(&((8 + 4 + AUDIO) as u16).to_be_bytes());
+    pes[6..9].copy_from_slice(&[0x81, 0x80, 5]);
+    pes[9] = 0x21 | ((pts >> 29) & 0x0E) as u8;
+    pes[10..12].copy_from_slice(&((((pts >> 14) & 0xFFFE) | 1) as u16).to_be_bytes());
+    pes[12..14].copy_from_slice(&((((pts << 1) & 0xFFFE) | 1) as u16).to_be_bytes());
+    pes[14..16].copy_from_slice(&(AUDIO as u16).to_be_bytes());
+    pes[16] = 0x31;
+    pes[17] = 0x40;
+    for (i, b) in pes[18..18 + AUDIO].iter_mut().enumerate() {
+        *b = (k as usize * 7 + i) as u8;
+    }
+    p
 }
 
 // A CLPI with what `clpi::parse` needs: magic and the source packet count at 56.
@@ -110,6 +145,21 @@ pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
         ));
     }
     let mut img = encrypted_bd_image(&files, &uk_ro);
+    let n_packets = CLIP_UNITS * 32;
+    for (i, key) in clips.iter().enumerate() {
+        let (start, _) = img.files[1 + 2 * n + i];
+        for u in 0..CLIP_UNITS {
+            let mut unit: Vec<u8> = (0..32)
+                .flat_map(|j| lpcm_source_packet(u * 32 + j, n_packets, key.is_some()))
+                .collect();
+            let at = (start + u * 3) as usize * 2048;
+            img.plain[at..at + unit.len()].copy_from_slice(&unit);
+            if let Some(k) = key {
+                assert!(libfreemkv::aacs::content::encrypt_unit(&mut unit, k));
+            }
+            img.image[at..at + unit.len()].copy_from_slice(&unit);
+        }
+    }
     for i in 0..n {
         let clip = format!("{i:05}");
         let clip: [u8; 5] = clip.as_bytes().try_into().unwrap();

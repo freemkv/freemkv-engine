@@ -33,6 +33,8 @@ pub use recovery::{
     bytes_bad_in_title_from_mapfile, copy, ensure_titles_staged, ensure_whole_image, patch,
     progress_snapshot_from_mapfile, sweep, sweep_scoped,
 };
+#[cfg(test)]
+mod ku_image_tests;
 mod remux;
 mod resolve;
 mod run;
