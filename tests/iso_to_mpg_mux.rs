@@ -267,10 +267,24 @@ fn iso_dvd_source_muxes_to_mpg_through_the_engine() {
     assert!(codecs.contains(&libfreemkv::Codec::Mp2));
 
     let mut saw_video_frame = false;
+    let mut audio: Vec<u8> = Vec::new();
+    let mut audio_frames = 0;
     while let Some(frame) = readback.read().unwrap() {
-        if matches!(streams[frame.track], libfreemkv::Stream::Video(_)) {
-            saw_video_frame = true;
+        match streams[frame.track] {
+            libfreemkv::Stream::Video(_) => saw_video_frame = true,
+            libfreemkv::Stream::Audio(_) => {
+                audio_frames += 1;
+                audio.extend_from_slice(&frame.data);
+            }
+            _ => {}
         }
     }
     assert!(saw_video_frame, "the readback must yield the video frame");
+    // D7: the audio comes back too, byte for byte: the one MP2 frame the VOB carried.
+    assert_eq!(audio_frames, 1, "the readback must yield the audio frame");
+    assert_eq!(
+        audio,
+        mp2_frame(),
+        "the audio ES bytes survive iso -> mpg -> read"
+    );
 }
