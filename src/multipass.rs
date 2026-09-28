@@ -518,6 +518,22 @@ pub fn multipass_rip(
     })
 }
 
+/// [`multipass_rip`] under the op token `op` (stop design v5 §4.2): every pass and the
+/// pass boundaries observe it. A Stop is [`crate::EngineOutcome::Stopped`].
+pub fn multipass_rip_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    opts: &MultipassOpts,
+    sink: &dyn Sink,
+) -> crate::EngineOutcome<MultipassResult> {
+    let halt = crate::EngineHalt::new(op, None);
+    let r = multipass_rip(disc, reader, iso_path, job, opts, sink);
+    crate::EngineOutcome::from_result(r, &halt, |r| r.halted)
+}
+
 /// What a staged image for an MKV rip of `titles` must cover: `None` = the whole disc,
 /// `Some(ranges)` = only [`libfreemkv::Disc::mkv_staging_ranges`] (nav, UDF and those
 /// titles), which holds no bus-encrypted byte even when a stream file is unmapped.

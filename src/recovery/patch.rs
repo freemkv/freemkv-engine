@@ -1180,6 +1180,19 @@ pub fn bytes_bad_in_title_from_mapfile(
     bytes_bad_in_title(title, &bad_ranges)
 }
 
+/// [`patch()`] under the op token `op` (stop design v5 §4.2), OR'd with `opts.halt`; the
+/// pass latch stays exempt. A Stop is [`crate::EngineOutcome::Stopped`].
+pub fn patch_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &PatchOptions,
+) -> crate::EngineOutcome<PatchOutcome> {
+    let halt = crate::EngineHalt::new(op, opts.halt.clone());
+    crate::EngineOutcome::from_result(patch(disc, reader, path, opts), &halt, |r| r.halted)
+}
+
 /// Pass 2..N of a multipass rip: re-read the bad ranges recorded in the
 /// sidecar mapfile and try to recover them.
 ///

@@ -5,12 +5,13 @@
 //! `read_error.rs`, `section_recover.rs`, `patch.rs`, and the private
 //! `sweep.rs` producer/consumer plumbing are unchanged in logic.
 
+use crate::engine_halt::{EngineHalt, EngineOutcome};
 use libfreemkv::disc::{bytes_bad_in_title, locate_ranges};
 use libfreemkv::error::{Error, Result};
 use libfreemkv::extract_scsi_context;
 use libfreemkv::sector::SectorSource;
 
-pub use patch::patch;
+pub use patch::{patch, patch_with};
 
 /// A genuine read fault — the drive answered with a status/sense, or the
 /// transport died under it. Everything else (a decrypt refusal, a contract
@@ -118,6 +119,19 @@ mod pass_abort_tests {
             assert_eq!(classify_pass_abort(e, 9).code(), code);
         }
     }
+}
+
+/// [`copy()`] under the op token `op` (stop design v5 §4.2): the token is observed at every
+/// read, pause and hand-off, OR'd with `opts.halt`. A Stop is [`EngineOutcome::Stopped`].
+pub fn copy_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &CopyOptions,
+) -> EngineOutcome<CopyResult> {
+    let halt = EngineHalt::new(op, opts.halt.clone());
+    EngineOutcome::from_result(copy(disc, reader, path, opts), &halt, |r| r.halted)
 }
 
 pub fn copy(
@@ -645,6 +659,18 @@ pub fn sweep(
     opts: &SweepOptions,
 ) -> Result<CopyResult> {
     sweep_in(disc, reader, path, opts, None)
+}
+
+/// [`sweep()`] under the op token `op`, as [`copy_with`].
+pub fn sweep_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+) -> EngineOutcome<CopyResult> {
+    let halt = EngineHalt::new(op, opts.halt.clone());
+    EngineOutcome::from_result(sweep(disc, reader, path, opts), &halt, |r| r.halted)
 }
 
 /// [`sweep()`] over only `scope` (`(lba, sectors)`, e.g. from
@@ -1483,6 +1509,7 @@ impl<'a> PatchOptions<'a> {
 }
 
 /// Result returned by [`patch()`].
+#[derive(Debug)]
 pub struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,

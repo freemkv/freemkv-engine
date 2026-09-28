@@ -1,0 +1,136 @@
+//! ET1, ET8, ET10 (stop design v5 §5.4) and the `linked` bridge.
+//! Per spec; do not change without a spec citation proving otherwise.
+
+use super::*;
+use libfreemkv::Error;
+use std::time::{Duration, Instant};
+
+struct Cancels(AtomicBool);
+impl Sink for Cancels {
+    fn should_cancel(&self) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+// ET1 `engine_halt_is_op_or_extra` — §4.2: "`is_cancelled() = op || extra`".
+#[test]
+fn engine_halt_is_op_or_extra() {
+    let op = Halt::new();
+    let extra = Arc::new(AtomicBool::new(false));
+    let h = EngineHalt::new(&op, Some(extra.clone()));
+    assert!(!h.is_cancelled());
+    op.cancel();
+    assert!(h.is_cancelled(), "the op token alone cancels");
+
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, Some(extra.clone()));
+    extra.store(true, Ordering::SeqCst);
+    assert!(h.is_cancelled(), "the narrower flag alone cancels");
+
+    // §4.2 (remux): "`op.is_cancelled() || extra || sink.should_cancel()`".
+    let sink = Cancels(AtomicBool::new(false));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    assert!(!h.is_cancelled());
+    sink.0.store(true, Ordering::SeqCst);
+    assert!(h.is_cancelled(), "the Sink probe alone cancels");
+}
+
+// §4.2: "The op token is always observed" — also with no narrower flag wired.
+#[test]
+fn the_op_token_is_observed_without_extra() {
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, None);
+    op.cancel();
+    assert!(h.is_cancelled());
+    let t0 = Instant::now();
+    assert!(
+        h.wait(Duration::from_secs(30)),
+        "a cancelled wait reports the cancel"
+    );
+    assert!(t0.elapsed() < Duration::from_secs(1));
+}
+
+// The libfreemkv token `linked` hands out follows every input within about one slice.
+#[test]
+fn linked_follows_op_extra_and_sink() {
+    let within = |cancel: &dyn Fn(), h: &EngineHalt<'_>| {
+        h.linked(|lh| {
+            assert!(!lh.is_cancelled());
+            cancel();
+            let t0 = Instant::now();
+            while !lh.is_cancelled() {
+                assert!(t0.elapsed() < Duration::from_secs(1), "not linked");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        })
+    };
+    let (op, extra) = (Halt::new(), Arc::new(AtomicBool::new(false)));
+    within(&|| op.cancel(), &EngineHalt::new(&op, Some(extra.clone())));
+    within(
+        &|| extra.store(true, Ordering::SeqCst),
+        &EngineHalt::new(&Halt::new(), Some(extra.clone())),
+    );
+    let sink = Cancels(AtomicBool::new(false));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    within(&|| sink.0.store(true, Ordering::SeqCst), &h);
+    // The legacy view hands the narrower flag over exactly (§4.2 "`from_arc` bridge sites").
+    let flag = Arc::new(AtomicBool::new(false));
+    EngineHalt::legacy(Some(flag.clone())).linked(|lh| assert!(Arc::ptr_eq(lh.as_arc(), &flag)));
+}
+
+// ET8 `engine_outcome_mapping` — §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when
+// the op token is cancelled"; "`TimedOut` → **Failed** always".
+#[test]
+fn engine_outcome_mapping() {
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, None);
+    let never = |_: &u8| false;
+    let r = EngineOutcome::from_result(Err(Error::TimedOut { op: "verify" }), &h, never);
+    assert!(matches!(r, EngineOutcome::Failed(Error::TimedOut { .. })));
+    let r = EngineOutcome::from_result(Err(Error::SyncTimeout), &h, never);
+    assert!(matches!(r, EngineOutcome::Failed(Error::SyncTimeout)));
+    assert!(matches!(
+        EngineOutcome::from_result(Ok(1u8), &h, never),
+        EngineOutcome::Done(1)
+    ));
+    // An artifact result carrying its own Stop flag is Stopped, with the partial result.
+    let r = EngineOutcome::from_result(Ok(2u8), &h, |_| true);
+    assert!(matches!(r, EngineOutcome::Stopped(Some(2))));
+    op.cancel();
+    let r = EngineOutcome::from_result(Err(Error::Halted), &h, never);
+    assert!(r.is_stopped());
+    let r = EngineOutcome::from_result(Err(Error::TimedOut { op: "x" }), &h, never);
+    assert!(
+        matches!(r, EngineOutcome::Failed(_)),
+        "TimedOut stays Failed after a Stop"
+    );
+}
+
+// ET8, last case — §2.6: "Otherwise it `debug_assert!`s and maps to `Failed`."
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "Halted with no cancel")]
+fn halted_without_a_cancel_is_a_debug_panic() {
+    let h = EngineHalt::new(&Halt::new(), None);
+    let _ = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+}
+
+// ET10 `op_token_ptr_eq_drive_token` — §4.2: "`debug_assert!(ptr_eq(op, drive.token()))`".
+#[test]
+fn op_token_ptr_eq_drive_token() {
+    let (_fake, _handle) = libfreemkv::test_util::FakeTransport::new();
+    let op = Halt::new();
+    let drive = libfreemkv::Drive::from_transport_with(Box::new(_fake), &op);
+    let h = EngineHalt::for_drive(&op, None, drive.token());
+    op.cancel();
+    assert!(h.is_cancelled());
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the op token must be the Drive's token")]
+fn a_foreign_op_token_is_a_debug_panic() {
+    let (fake, _handle) = libfreemkv::test_util::FakeTransport::new();
+    let drive = libfreemkv::Drive::from_transport_with(Box::new(fake), &Halt::new());
+    let _ = EngineHalt::for_drive(&Halt::new(), None, drive.token());
+}
