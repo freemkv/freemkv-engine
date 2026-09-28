@@ -32,6 +32,7 @@ pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
     bytes_bad_in_title_from_mapfile, copy, patch, progress_snapshot_from_mapfile, sweep,
 };
+mod remux;
 mod resolve;
 mod run;
 mod sink;
@@ -58,9 +59,12 @@ pub use mux::{
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
+pub use remux::{
+    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_options, remux_iso, verify_mkv,
+};
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
-pub use sink::{Level, NoopSink, Progress, Sink};
+pub use sink::{Event, Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;
 pub use streams::{
     StreamSelError, SubtitleFilter, UnmatchedClass, resolve_stream_selection,

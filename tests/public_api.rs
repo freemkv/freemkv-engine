@@ -32,6 +32,9 @@ fn returned_types_are_nameable() {
     fn _holds_unmatched(_: Vec<freemkv_engine::UnmatchedClass>) {}
     // `Preflight::Blocked` carries these; a UI must destructure it.
     fn _holds_reasons(_: &[freemkv_engine::Reason]) {}
+    fn _holds_opened(_: freemkv_engine::OpenedImage) {}
+    fn _holds_remux(_: freemkv_engine::RemuxReport) {}
+    fn _holds_event(_: freemkv_engine::Event<'_>) {}
 }
 
 /// `resolve_stream_selection` is referenced by `StreamFilter`'s own doc as

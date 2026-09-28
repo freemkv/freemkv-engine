@@ -9,6 +9,8 @@
 ### Added
 
 - `ImageSource`, `scan_image`, `open_image` and `build_key_fetch`: one path to scan an ISO or disc folder, resolve its keys and fetch keys mid-mux over the full local-first key chain.
+- `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
+- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
 - `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
 - `open_scan_resolve_with(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
 

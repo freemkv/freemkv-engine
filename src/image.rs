@@ -230,6 +230,73 @@ mod tests {
         assert!(build_key_fetch(&src, &keydb).is_none(), "no AACS inputs");
     }
 
+    // Index, banked keys, selection and fetch: each is invisible when dropped.
+    #[test]
+    fn input_options_carry_index_keys_selection_and_fetch() {
+        struct NoRead;
+        impl libfreemkv::SectorSource for NoRead {
+            fn read_sectors(
+                &mut self,
+                _: u32,
+                _: u16,
+                _: &mut [u8],
+                _: bool,
+            ) -> libfreemkv::Result<usize> {
+                unreachable!()
+            }
+            fn capacity_sectors(&self) -> u32 {
+                0
+            }
+        }
+        let keys = vec![(1u32, [9u8; 16])];
+        let disc = libfreemkv::Disc {
+            volume_id: String::new(),
+            meta_title: None,
+            format: libfreemkv::DiscFormat::BluRay,
+            capacity_sectors: 1,
+            capacity_bytes: 2048,
+            layers: 1,
+            titles: vec![],
+            region: libfreemkv::disc::DiscRegion::Free,
+            aacs: Some(libfreemkv::AacsState {
+                version: 1,
+                bus_encryption: false,
+                mkb_version: None,
+                disc_hash: String::new(),
+                key_source: libfreemkv::KeyOrigin::ExternalUk,
+                vuk: None,
+                unit_keys: keys.clone(),
+                volume_id: [0u8; 16],
+                uk_ro: Vec::new(),
+                mkb: Vec::new(),
+            }),
+            css: None,
+            encrypted: true,
+            aacs_error: None,
+            css_error: None,
+            content_format: libfreemkv::ContentFormat::BdTs,
+        };
+        let fetch =
+            libfreemkv::keysource::key_fetch(disc.inputs().unwrap(), std::sync::Arc::new(Vec::new));
+        let opened = OpenedImage {
+            source: ImageSource::Iso("x.iso".into()),
+            disc,
+            reader: Box::new(NoRead),
+            key_fetch: Some(fetch),
+            trace: libfreemkv::aacs::trace::ResolutionTrace::new(),
+            won: None,
+        };
+        let sel = libfreemkv::StreamSelection {
+            audio: libfreemkv::PidFilter::Only(vec![4352]),
+            subtitle: libfreemkv::PidFilter::Only(vec![]),
+        };
+        let input = opened.input_options(3, sel.clone());
+        assert_eq!(input.title_index, Some(3));
+        assert_eq!(input.unit_keys, keys);
+        assert_eq!(input.selection, sel);
+        assert!(input.key_fetch.is_some());
+    }
+
     #[test]
     fn open_image_reports_a_missing_image_as_a_scan_error() {
         let src = ImageSource::Iso("/nonexistent/freemkv/none.iso".into());
