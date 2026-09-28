@@ -330,6 +330,38 @@ pub fn mux_title_session(
     mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
 }
 
+/// Mux `title` (already scanned: the drive's, or the image's own) out of the ISO at `path`
+/// through the rip's key set, WITHOUT rescanning the image (KU J14): an unread UDF/MPLS
+/// area of a staged ISO does not matter. `mux_opts.selection` picks the streams.
+pub(crate) fn mux_iso_title(
+    path: &std::path::Path,
+    title: libfreemkv::DiscTitle,
+    format: libfreemkv::ContentFormat,
+    keys: &libfreemkv::keys::ResolvedKeySet,
+    dest: &str,
+    mux_opts: &libfreemkv::MuxOptions,
+    sink: &dyn Sink,
+) -> std::io::Result<libfreemkv::MuxOutcome> {
+    let hint = title.size_bytes;
+    with_mux_watcher(sink, |halt, events| {
+        sink.log(
+            Level::Info,
+            &format!(
+                "mux: iso://{} {} -> {dest} (~{})",
+                path.display(),
+                title.playlist,
+                human_bytes(hint)
+            ),
+        );
+        let source = libfreemkv::MuxSource::Iso {
+            path,
+            title,
+            format,
+        };
+        libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, halt, events)
+    })
+}
+
 // Shared scaffolding behind `mux_title` and `mux_title_session`: drives
 // `mux_stream` for an already-built `MuxInput`, bridging progress and cancel
 // onto the Sink via `with_mux_watcher` (see its doc for the mechanism).

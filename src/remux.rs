@@ -1,11 +1,14 @@
 //! Muxing titles out of an opened image, verifying the MKV that comes out, and
 //! the verified in-place remux a library runs when the engine improves.
 
-use crate::image::{ImageSource, OpenedImage, open_image};
+use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
 use crate::job::{Selection, StreamChoice};
-use crate::keys::KeyParams;
-use crate::mux::{RipOutcome, mux_title, resolve_selection, run_titles};
+use crate::keys::{KeyParams, key_source_factory};
+use crate::mux::{RipOutcome, TitleResult, classify_title_error, mux_title, resolve_selection};
+use crate::mux::{mux_iso_title, run_titles};
+use crate::sink::Level;
 use crate::sink::{Event, Sink};
+use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +18,7 @@ pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
         skip_errors: false,
         batch_sectors: 64,
         raw,
-        // Selection lives on InputOptions for an image mux (see `MuxPlan::streams`).
+        // Per title from `MuxPlan::streams` (an `iso://` title) or `InputOptions` (`dir://`).
         selection: libfreemkv::StreamSelection::default(),
         send_deadline: Some(std::time::Duration::from_secs(60)),
     }
@@ -57,19 +60,25 @@ impl MuxPlan {
 /// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails into a
 /// file sink has its partial file removed (a directory sink, ending in `/`,
 /// is left alone).
+///
+/// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
+/// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
+/// with no rescan (J14).
 pub fn mux_image_titles(
     opened: &OpenedImage,
     plan: &MuxPlan,
     dest: &dyn Fn(usize) -> String,
     sink: &dyn Sink,
 ) -> RipOutcome {
-    let src_url = opened.source.url();
+    let keys = match opened.keys_for(&plan.titles) {
+        Ok(keys) => keys,
+        Err(e) => return refused_up_front(e, plan, sink),
+    };
     run_titles(&plan.titles, plan.explicit_selection, sink, |idx| {
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
-        let hint = opened.disc.titles.get(idx).map_or(0, |t| t.size_bytes);
-        let input = opened.input_options(idx, plan.selection_for(idx));
-        let result = mux_title(&src_url, &dest, input, &plan.mux, hint, sink);
+        let selection = plan.selection_for(idx);
+        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink);
         if result.is_err() && !dest.ends_with('/') {
             let _ = std::fs::remove_file(libfreemkv::parse_url(&dest).path_str());
         }
@@ -80,6 +89,66 @@ pub fn mux_image_titles(
         });
         result.map(|_| ())
     })
+}
+
+// A key refusal before any title started (E7022/E7026/E7034, or a halt), as the loop would.
+fn refused_up_front(e: libfreemkv::Error, plan: &MuxPlan, sink: &dyn Sink) -> RipOutcome {
+    sink.log(
+        Level::Error,
+        &format!("keys refused before any output: {e}"),
+    );
+    let io: io::Error = e.into();
+    match classify_title_error(&io) {
+        TitleResult::Halted => RipOutcome::Halted,
+        TitleResult::DiscLevelNoKey => RipOutcome::NoKey,
+        _ => RipOutcome::Failed {
+            title_index: plan.titles.first().copied().unwrap_or(0),
+            code: crate::error_code(&io),
+            kind: io.kind(),
+        },
+    }
+}
+
+// Title `idx` of `opened` through `keys`: an ISO title straight from the image (no rescan),
+// a `dir://` folder through `input()` with the same set.
+fn mux_opened_title(
+    opened: &OpenedImage,
+    keys: &ResolvedKeySet,
+    idx: usize,
+    selection: libfreemkv::StreamSelection,
+    dest: &str,
+    mux: &libfreemkv::MuxOptions,
+    sink: &dyn Sink,
+) -> io::Result<libfreemkv::MuxOutcome> {
+    let title = opened
+        .disc
+        .titles
+        .get(idx)
+        .ok_or(libfreemkv::Error::DiscTitleRange {
+            index: idx,
+            count: opened.disc.titles.len(),
+        })?;
+    match &opened.source {
+        ImageSource::Iso(path) => {
+            let opts = libfreemkv::MuxOptions {
+                skip_errors: mux.skip_errors,
+                batch_sectors: mux.batch_sectors,
+                raw: mux.raw,
+                selection,
+                send_deadline: mux.send_deadline,
+            };
+            let format = opened.disc.content_format;
+            mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)
+        }
+        ImageSource::Dir(_) => {
+            let input = libfreemkv::InputOptions {
+                keys: Some(keys.clone()),
+                ..opened.input_options(idx, selection)
+            };
+            let url = opened.source.url();
+            mux_title(&url, dest, input, mux, title.size_bytes, sink)
+        }
+    }
 }
 
 // A muxed runtime may differ from the title's by this much (whichever is larger).
@@ -158,9 +227,23 @@ pub struct RemuxReport {
 /// exactly as it was. The chosen title goes to [`Sink::title_opened`]; phases
 /// and the title's mux are reported as [`Event`]s.
 pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Result<RemuxReport> {
+    remux_iso_with(job, key_source_factory(keys), sink)
+}
+
+// `remux_iso` over any key sources: one open, one resolution round for the job's title
+// (KU §3.2), then its mux through that set.
+pub(crate) fn remux_iso_with(
+    job: &RemuxJob,
+    sources: libfreemkv::KeySourceFactory,
+    sink: &dyn Sink,
+) -> io::Result<RemuxReport> {
     refuse_existing(job)?;
     sink.event(&Event::Phase { name: "open" });
-    let opened = open_image(&job.iso, keys).map_err(io::Error::from)?;
+    let opts = OpenImageOptions {
+        scope: job.title.map(|i| KeyScope::Titles(vec![i])),
+        ..OpenImageOptions::resolve(sources)
+    };
+    let opened = open_image_with(&job.iso, opts).map_err(io::Error::from)?;
     let idx = pick_title(&opened.disc, job.title)?;
     let title = &opened.disc.titles[idx];
     let selection = if job.streams.is_all() {
@@ -173,15 +256,15 @@ pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Resul
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
     };
-    let src_url = opened.source.url();
+    let keys = opened.keys_for(&[idx]).map_err(io::Error::from)?;
     land_verified(job, idx, title, sink, |dest| {
-        let input = opened.input_options(idx, selection);
-        mux_title(
-            &src_url,
+        mux_opened_title(
+            &opened,
+            &keys,
+            idx,
+            selection,
             dest,
-            input,
             &mux_options(false),
-            title.size_bytes,
             sink,
         )
     })

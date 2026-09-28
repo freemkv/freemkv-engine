@@ -166,6 +166,7 @@ fn known_set_makes_no_key_request_fmts() {
     let opened = open_image_with(&src, opts).unwrap();
     let raw = libfreemkv::FileSectorSource::open(&iso).unwrap();
     let mut r = opened.keys.title_reader(&opened.disc, 1, raw).unwrap();
+    r.set_unit_base(clip);
     let mut buf = vec![0u8; 3 * 2048];
     r.read_sectors(clip, 3, &mut buf, true).unwrap();
     assert_eq!(buf[4], 0x47, "index-1 unit 0 decrypts with the held F1");
@@ -186,7 +187,7 @@ fn known_set_makes_no_key_request_fmts() {
     assert!(!opened.keys.forensic_pending());
     let all = calls.all();
     assert_eq!(all.len(), 1, "exactly the one anchor request: {all:?}");
-    assert!(all[0].forensic);
+    assert_eq!((calls.forensic(), all[0].who), (1, "online"));
     assert_eq!(
         all[0].vid,
         Some(VID),
@@ -243,7 +244,6 @@ fn open_image_resolves_once_and_hands_the_set_to_every_title() {
 
 // A VID-derivable disc (KS-16: the key needs the VID) with a sidecar mapfile.
 struct VidCase {
-    fx: Fx,
     dir: tempfile::TempDir,
     iso: std::path::PathBuf,
 }
@@ -260,7 +260,7 @@ fn vid_case(sidecar_vidfp: bool) -> VidCase {
         map.set_vid_fingerprint(vid_fingerprint(&VID));
     }
     map.flush().unwrap();
-    VidCase { fx, dir, iso }
+    VidCase { dir, iso }
 }
 
 fn needs_vid(calls: &Calls) -> libfreemkv::KeySourceFactory {

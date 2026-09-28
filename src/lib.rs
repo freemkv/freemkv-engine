@@ -42,13 +42,13 @@ mod sink;
 mod speed;
 mod streams;
 #[cfg(test)]
-#[allow(dead_code)] // KU-E1 fixtures, used by the later KU-E1 test groups
 mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
 pub use extract::extract_tree;
 pub use image::{
-    ImageSource, OpenedImage, build_key_fetch, error_code, open_image, parse_error_code, scan_image,
+    ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
+    parse_error_code, scan_image,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};

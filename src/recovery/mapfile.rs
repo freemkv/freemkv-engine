@@ -2325,41 +2325,22 @@ fn disc_vid_fingerprint(
         .or_else(|| keys.and_then(|k| k.vid_fingerprint()))
 }
 
-/// Does `map` describe `disc`? KU §4.4, over what is known on both sides:
-/// 1. disc hashes both known and different → mismatch;
-/// 2. VID fingerprints both known and different → mismatch;
-/// 3. legacy key fingerprints, only when base keys were proven (`keys`' proven keys; with no
-///    set, the legacy disc-banked keys until KU-X1): none matches → mismatch. A set that
-///    proved no base key cannot check them, and that is not a mismatch.
-pub(crate) fn check_mapfile_identity(
-    map: &Mapfile,
-    disc: &libfreemkv::Disc,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
-) -> io::Result<()> {
-    let mismatch = |rule: &str| -> io::Error {
-        tracing::warn!(
-            target: "freemkv::disc",
-            rule,
-            "mapfile identity does not match the disc in hand — refusing to resume"
-        );
-        invalid("disc-mismatch")
-    };
-    let disc_hash = disc
-        .aacs
-        .as_ref()
-        .and_then(|a| parse_disc_hash(&a.disc_hash));
-    if let (Some(m), Some(d)) = (map.disc_hash(), disc_hash.as_deref())
-        && m != d
-    {
-        return Err(mismatch("disc hash"));
-    }
-    if let (Some(m), Some(d)) = (map.vid_fingerprint(), disc_vid_fingerprint(disc, keys))
-        && m != d
-    {
-        return Err(mismatch("vidfp"));
-    }
-    if !map.legacy_keyfps.is_empty() {
-        let proven: Vec<[u8; 8]> = match keys {
+/// What the disc in hand offers the §4.4 identity check; `None` = unknown (not compared).
+pub(crate) struct DiscIdentity {
+    pub disc_hash: Option<String>,
+    pub vidfp: Option<[u8; 32]>,
+    /// Fingerprints of the proven base keys; empty = none proven (rule 3 cannot check).
+    pub proven: Vec<[u8; 8]>,
+}
+
+impl DiscIdentity {
+    /// `disc`'s identity with the rip's `keys` (their VID and proven keys); with no set, the
+    /// legacy disc-banked keys stand in as proven until KU-X1.
+    pub(crate) fn of(
+        disc: &libfreemkv::Disc,
+        keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    ) -> Self {
+        let proven = match keys {
             Some(set) => set.proven_key_fingerprints(),
             None => disc
                 .aacs
@@ -2369,9 +2350,55 @@ pub(crate) fn check_mapfile_identity(
                 .map(|(_, k)| key_fingerprint(k))
                 .collect(),
         };
-        if !proven.is_empty() && !map.legacy_keyfps.iter().any(|f| proven.contains(f)) {
-            return Err(mismatch("legacy key fingerprints"));
+        DiscIdentity {
+            disc_hash: disc
+                .aacs
+                .as_ref()
+                .and_then(|a| parse_disc_hash(&a.disc_hash)),
+            vidfp: disc_vid_fingerprint(disc, keys),
+            proven,
         }
+    }
+}
+
+/// Does `map` describe `disc`? [`check_identity`] over [`DiscIdentity::of`].
+pub(crate) fn check_mapfile_identity(
+    map: &Mapfile,
+    disc: &libfreemkv::Disc,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+) -> io::Result<()> {
+    check_identity(map, &DiscIdentity::of(disc, keys))
+}
+
+/// KU §4.4, over what is known on both sides:
+/// 1. disc hashes both known and different → mismatch;
+/// 2. VID fingerprints both known and different → mismatch;
+/// 3. legacy key fingerprints, only when base keys were proven: none matches → mismatch. A
+///    set that proved no base key cannot check them, and that is not a mismatch.
+pub(crate) fn check_identity(map: &Mapfile, disc: &DiscIdentity) -> io::Result<()> {
+    let mismatch = |rule: &str| -> io::Error {
+        tracing::warn!(
+            target: "freemkv::disc",
+            rule,
+            "mapfile identity does not match the disc in hand — refusing to resume"
+        );
+        invalid("disc-mismatch")
+    };
+    if let (Some(m), Some(d)) = (map.disc_hash(), disc.disc_hash.as_deref())
+        && m != d
+    {
+        return Err(mismatch("disc hash"));
+    }
+    if let (Some(m), Some(d)) = (map.vid_fingerprint(), disc.vidfp)
+        && m != d
+    {
+        return Err(mismatch("vidfp"));
+    }
+    if !map.legacy_keyfps.is_empty()
+        && !disc.proven.is_empty()
+        && !map.legacy_keyfps.iter().any(|f| disc.proven.contains(f))
+    {
+        return Err(mismatch("legacy key fingerprints"));
     }
     Ok(())
 }
