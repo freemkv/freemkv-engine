@@ -1283,3 +1283,26 @@ fn a_remembered_stop_does_not_cancel_a_later_call() {
     assert_ne!(out, RipOutcome::Halted, "nobody stopped this call");
     assert_eq!(calls.len(), asked, "the ask was spent");
 }
+
+/// KU-E1b item 3: a top-up that made a request remembers any refusal but Missing and a
+/// Stop, keydb failures included: a keydb that went unreadable after a keyed open is E8002
+/// for the top-up and for a later call, never a later E7022 that hides it.
+#[test]
+fn a_top_up_remembers_a_keydb_failure() {
+    let fx = bd_image(&[Some(K1), Some(K2), Some(K2)], 2);
+    let (t0, t1, t2) = (title_of(&fx, 0), title_of(&fx, 1), title_of(&fx, 2));
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let f = factory(&[(Answer::KeydbThenUnreadable, &[K1])], &Calls::default());
+    let opts = OpenImageOptions {
+        scope: titles(&[t0]),
+        ..OpenImageOptions::resolve(f)
+    };
+    let opened = open_image_with(&src, opts).unwrap();
+    let sink = DoneCodes::default();
+    for plan in [vec![t1], vec![t2]] {
+        mux_image_titles(&opened, &MuxPlan::new(plan), &mkv_dest(dir.path()), &sink);
+    }
+    let e8002 = Some(libfreemkv::error::E_KEYDB_INVALID);
+    assert_eq!(*sink.0.lock().unwrap(), [e8002, e8002]);
+}

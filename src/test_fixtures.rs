@@ -243,11 +243,16 @@ pub(crate) enum Answer {
     Unavailable,
     /// An online service that never answers (transport class: `resolve` retries it, J13).
     Down,
+    /// A keydb that answers its first request, then fails to read (E8002, `KeydbInvalid`).
+    KeydbThenUnreadable,
 }
 
 impl Answer {
     fn is_online(self) -> bool {
-        !matches!(self, Answer::Keydb | Answer::KeydbKmNoVid)
+        !matches!(
+            self,
+            Answer::Keydb | Answer::KeydbKmNoVid | Answer::KeydbThenUnreadable
+        )
     }
 }
 
@@ -277,8 +282,20 @@ impl KeySource for Fake {
         if matches!(self.answer, Answer::Unavailable | Answer::Down) {
             return Err(libfreemkv::Error::KeyServiceUnavailable);
         }
+        let asked_before = self
+            .calls
+            .all()
+            .iter()
+            .filter(|c| c.who == self.who)
+            .count()
+            > 1;
+        if self.answer == Answer::KeydbThenUnreadable && asked_before {
+            return Err(libfreemkv::Error::KeydbInvalid);
+        }
         let keys: Vec<[u8; 16]> = match self.answer {
-            Answer::Keydb | Answer::Unavailable | Answer::Down => self.keys.clone(),
+            Answer::Keydb | Answer::Unavailable | Answer::Down | Answer::KeydbThenUnreadable => {
+                self.keys.clone()
+            }
             Answer::KeydbKmNoVid => Vec::new(),
             Answer::OnlineNeedsVid if vid.is_none() => Vec::new(),
             Answer::Online | Answer::OnlineNeedsVid => {
