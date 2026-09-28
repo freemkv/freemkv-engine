@@ -110,6 +110,9 @@ impl SweepSink {
     }
 }
 
+// No `close_stopped` override (the default `close`): this sink renames nothing, and a
+// data-less mapfile flush would claim sectors not yet durable. T8: "halted: **Stopped**
+// (not a failure)" after one 5 s grace; the disowned mapfile keeps the resumable record.
 impl Sink<WorkItem> for SweepSink {
     type Output = ConsumerSummary;
 
