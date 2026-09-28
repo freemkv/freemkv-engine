@@ -34,13 +34,14 @@ fn disc(sectors: u32) -> Disc {
     }
 }
 
-// SPC-4 sense key 4h HARDWARE ERROR: the firmware-wedge family the 30 s pause follows.
-fn hardware_error(lba: u32) -> Error {
+// SPC-4 sense key 4h HARDWARE ERROR: the firmware-wedge family the 30 s pause follows;
+// 3h MEDIUM ERROR: plain damage the patch handlers keep re-reading.
+fn read_error(lba: u32, sense_key: u8) -> Error {
     Error::DiscRead {
         sector: lba as u64,
         status: Some(2),
         sense: Some(libfreemkv::ScsiSense {
-            sense_key: libfreemkv::scsi::SENSE_KEY_HARDWARE_ERROR,
+            sense_key,
             asc: 0x44,
             ascq: 0x00,
         }),
@@ -56,6 +57,7 @@ struct Script {
     after: Arc<AtomicBool>,
     late: Arc<AtomicU64>,
     hook: Box<dyn FnMut(u32, u16) + Send>,
+    sense_key: u8,
 }
 
 impl Script {
@@ -67,6 +69,7 @@ impl Script {
             after: Arc::default(),
             late: Arc::default(),
             hook: Box::new(|_, _| {}),
+            sense_key: libfreemkv::scsi::SENSE_KEY_HARDWARE_ERROR,
         }
     }
 }
@@ -79,7 +82,7 @@ impl SectorSource for Script {
         self.reads.fetch_add(1, Ordering::SeqCst);
         (self.hook)(lba, count);
         if (lba..lba + count as u32).any(|l| self.bad.contains(&l)) {
-            return Err(hardware_error(lba));
+            return Err(read_error(lba, self.sense_key));
         }
         let n = count as usize * SECTOR;
         buf[..n].fill(0);
@@ -366,4 +369,45 @@ fn remux_iso_signature_is_stable() {
     let _ = (legacy, with);
     // `Sink::should_cancel` stays a defaulted cancel input (§4.4, `sink.rs`).
     assert!(!NoopSink.should_cancel());
+}
+
+// ET5, case "during the error pause": every READ fails slowly, so the handlers grind their
+// per-handler budgets (60 s each, §3.1 "INTENTIONAL"); a Stop ends the pass, not the budget.
+#[test]
+fn patch_stop_during_the_error_pause() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    swept_with_damage(&iso);
+    let mut reader = Script::new(256, 0..256);
+    reader.sense_key = libfreemkv::scsi::SENSE_KEY_MEDIUM_ERROR;
+    // A damaged drive answers slowly: without a Stop this pass grinds for many seconds.
+    reader.hook = Box::new(|_, _| std::thread::sleep(Duration::from_millis(20)));
+    let op = Halt::new();
+    let delay = Duration::from_millis(300);
+    cancel_later(&op, delay);
+    let t0 = Instant::now();
+    let out = freemkv_engine::patch_with(&op, &disc(256), &mut reader, &iso, &patch_opts());
+    assert!(t0.elapsed() < delay + STOP_LATENCY, "{:?}", t0.elapsed());
+    assert!(out.is_stopped(), "{out:?}");
+    mapfile_is_sane(&iso);
+}
+
+// ET5 "(+ the latch is exempt)" — §4.2: "The patch latch is exempt": a Stop that reaches the
+// pass only through its progress reporter (no token cancelled) still ends it as halted.
+#[test]
+fn patch_latch_is_exempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    swept_with_damage(&iso);
+    let mut reader = Script::new(256, 0..256);
+    let stop = |_: &libfreemkv::progress::PassProgress| false;
+    let opts = PatchOptions::for_patch_pass(false, Some(&stop), None, None);
+    let op = Halt::new();
+    let t0 = Instant::now();
+    let out = freemkv_engine::patch_with(&op, &disc(256), &mut reader, &iso, &opts);
+    assert!(t0.elapsed() < STOP_LATENCY, "{:?}", t0.elapsed());
+    assert!(!op.is_cancelled());
+    let r = out.value().expect("an artifact result, not an error");
+    assert!(r.halted && out.is_stopped(), "{out:?}");
+    mapfile_is_sane(&iso);
 }
