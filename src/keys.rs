@@ -20,11 +20,10 @@ pub struct KeyParams {
     /// chain or `shellexpand` its shell uses — this module does no further
     /// resolution of the path itself.
     pub keydb_path: Option<String>,
-    /// The online key-service URL, or `None` to skip it. SSRF-validated here
-    /// via [`freemkv_keysources::check_keyserver_url`] before use; a
-    /// permanently rejected URL is silently dropped (the local source, if any,
-    /// still applies), one whose host lookup failed transiently is kept (J10).
-    /// The visible warning is the CLI's job, not this module's.
+    /// The online key-service URL, or `None` to skip it. Checked here without DNS
+    /// ([`freemkv_keysources::check_keyserver_url_static`]); a URL wrong on its face is
+    /// silently dropped (the local source, if any, still applies). Its host is looked up and
+    /// SSRF-guarded at the first query (J10). The visible warning is the CLI's job.
     pub key_url: Option<String>,
     /// Bearer token for the online service, if any.
     pub key_auth: Option<String>,
@@ -37,8 +36,9 @@ pub struct KeyParams {
 /// `online_only`) then the online service (unless its URL is absent or
 /// permanently SSRF-rejected). Quiet: it emits no warnings.
 ///
-/// KU J10: a URL whose host lookup failed TRANSIENTLY keeps the online source, whose
-/// requests `resolve` then retries up front until 60 s pass with no answer (J13).
+/// KU J10: no DNS lookup here (a factory build has no Stop). The host is looked up at the
+/// first query, halt-aware; a lookup that gives no answer is retried by `resolve` up front
+/// until 60 s pass with no answer (J13), one that finds a non-public address is refused.
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
@@ -49,7 +49,7 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
     }
 
     if let Some(url) = &p.key_url
-        && freemkv_keysources::check_keyserver_url(url).map_or_else(|r| r.is_temporary(), |()| true)
+        && freemkv_keysources::check_keyserver_url_static(url).is_ok()
     {
         sources.push(Box::new(freemkv_keysources::OnlineSource::new(
             url.clone(),
