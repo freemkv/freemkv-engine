@@ -537,7 +537,6 @@ fn an_alternate_key_opening_one_probe_is_not_trusted() {
 /// The same file under a key no held key matches is refused BEFORE the copy
 /// starts, not hours into the pass when the walk reaches it.
 #[test]
-#[ignore = "KU-X1: legacy-reader contract; the key set refuses this at arrival (E7032), after the ISO opens"]
 fn a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_before_output() {
     let mut fx = bd(None);
     fx.encrypt_units(ORPHAN, &FOREIGN_KEY, false, 0..1);
@@ -641,7 +640,6 @@ fn an_unreadable_stream_map_fails_loud() {
 /// A UDF tree with no AACS content file while titles exist is inconsistent:
 /// refuse (E6003, naming the missing folder) rather than trust the title extents.
 #[test]
-#[ignore = "KU-X1: legacy-reader contract; the key set's whole-disc reader has no E6003 check (reported)"]
 fn an_empty_stream_map_with_titles_fails_loud() {
     let fx = bd(None);
     let empty = tree(&["BDMV/index.bdmv"]);
