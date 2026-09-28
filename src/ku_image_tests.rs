@@ -861,3 +861,35 @@ fn a_none_set_never_covers_an_aacs_title() {
     )
     .expect("none() covers a clear disc");
 }
+
+/// The operator's "why no key": the per-source walk comes back on a refusal too, from both
+/// front doors, and matches `OpenedImage.trace` on success.
+#[test]
+fn the_front_doors_return_the_trace_on_a_refusal() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Keydb, &[K1]), (Answer::Online, &[K1])], &calls);
+    let (r, trace) = crate::keys::resolve_for_rip_traced(
+        &fx.disc,
+        &mut fx.source(),
+        KeyScope::Titles(vec![1]),
+        &f,
+        None,
+        None,
+    );
+    assert_eq!(r.map(|_| ()).unwrap_err().code(), E_NO_DISC_KEY);
+    let who: Vec<&str> = trace.keys.iter().map(|s| s.who.as_str()).collect();
+    assert_eq!(who, ["keydb", "online"], "{trace:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let opts = OpenImageOptions {
+        scope: titles(&[1]),
+        ..OpenImageOptions::resolve(f.clone())
+    };
+    let (r, trace) = crate::open_image_with_traced(&src, opts);
+    assert!(r.is_err());
+    assert_eq!(trace.keys.len(), 2, "{trace:?}");
+    let (r, trace) = crate::open_image_with_traced(&src, OpenImageOptions::resolve(f));
+    assert_eq!(r.unwrap().trace, trace);
+}
