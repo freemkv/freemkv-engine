@@ -219,7 +219,7 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
     let halt = halt.as_ref();
     let (set, sources, trace) = match keys {
         KeyInput::Known(set) => (known(&disc, set, &scope)?, None, Default::default()),
-        KeyInput::Seeded(f, seed) if seed.is_for(&disc) && covers(&seed, &scope) => {
+        KeyInput::Seeded(f, seed) if seed.is_for(&disc) && covers(&seed, &disc, &scope) => {
             (seed, Some(f), Default::default())
         }
         KeyInput::Seeded(f, seed) => {
@@ -264,7 +264,7 @@ impl OpenedImage {
     ) -> crate::Result<ResolvedKeySet> {
         let scope = KeyScope::Titles(titles.to_vec());
         let mut held = self.top_up.lock().unwrap_or_else(|e| e.into_inner());
-        if covers(&held.0, &scope) {
+        if covers(&held.0, &self.disc, &scope) {
             return Ok(held.0.clone());
         }
         let Some(sources) = &self.sources else {
@@ -410,9 +410,16 @@ fn identity_ok(map: &Mapfile, identity: &DiscIdentity) -> crate::Result<()> {
     })
 }
 
-// `covers`, and no forensic keys left Pending.
-fn covers(set: &ResolvedKeySet, scope: &KeyScope) -> bool {
-    set.covers(scope) && !set.forensic_pending()
+// Whether `set` keys `scope` of `disc`. A set with no AACS key (`none()`) never keys an
+// AACS disc's titles, though `covers(scope)` (no disc) says so; a clear disc needs none.
+fn keys_scope(set: &ResolvedKeySet, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+    let aacs_needed = disc.aacs.is_some() && *scope != KeyScope::None;
+    (set.is_aacs() || !aacs_needed) && set.covers(scope)
+}
+
+// `keys_scope`, and no forensic keys left Pending.
+fn covers(set: &ResolvedKeySet, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+    keys_scope(set, disc, scope) && !set.forensic_pending()
 }
 
 // KU §3.2 `Known`: the set as-is; what it does not cover refuses, with no request.
@@ -428,7 +435,7 @@ fn known(
     if set.forensic_pending() {
         return Err(Error::FmtsKeyMissing);
     }
-    if !set.covers(scope) {
+    if !keys_scope(&set, disc, scope) {
         return Err(Error::NoDiscKey {
             disc_hash: disc.aacs.as_ref().map_or_else(String::new, |a| {
                 libfreemkv::hex::strip_hex_prefix(&a.disc_hash).to_string()
