@@ -520,18 +520,12 @@ mod tests {
             titles,
             region: libfreemkv::disc::DiscRegion::Free,
             aacs: if has_key {
-                Some(libfreemkv::AacsState {
-                    version: 1,
-                    bus_encryption: false,
-                    mkb_version: None,
-                    disc_hash: String::new(),
-                    key_source: libfreemkv::KeyOrigin::KeyDb,
-                    vuk: None,
-                    unit_keys: vec![(0, [0u8; 16])],
-                    volume_id: [0u8; 16],
-                    uk_ro: Vec::new(),
-                    mkb: Vec::new(),
-                })
+                Some(
+                    libfreemkv::test_util::aacs_state()
+                        .key_source(libfreemkv::KeyOrigin::KeyDb)
+                        .unit_keys(vec![(0, [0u8; 16])])
+                        .build(),
+                )
             } else {
                 None
             },

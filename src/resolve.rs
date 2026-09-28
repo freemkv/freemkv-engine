@@ -197,18 +197,10 @@ mod tests {
     }
 
     fn aacs(origin: libfreemkv::KeyOrigin) -> libfreemkv::AacsState {
-        libfreemkv::AacsState {
-            version: 1,
-            bus_encryption: false,
-            mkb_version: None,
-            disc_hash: String::new(),
-            key_source: origin,
-            vuk: None,
-            unit_keys: vec![(0, [0u8; 16])],
-            volume_id: [0u8; 16],
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
-        }
+        libfreemkv::test_util::aacs_state()
+            .key_source(origin)
+            .unit_keys(vec![(0, [0u8; 16])])
+            .build()
     }
 
     #[test]

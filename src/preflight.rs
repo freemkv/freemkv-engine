@@ -244,21 +244,12 @@ mod tests {
     use crate::job::Job;
 
     // A resolved AacsState carrying real key material (non-empty unit_keys) —
-    // what the preflight decrypt gate (via resolve_keys) accepts as "keyed". All
-    // fields spelled out because the lib's plain-data types don't derive Default.
+    // what the preflight decrypt gate (via resolve_keys) accepts as "keyed".
     fn resolved_aacs() -> libfreemkv::AacsState {
-        libfreemkv::AacsState {
-            version: 1,
-            bus_encryption: false,
-            mkb_version: None,
-            disc_hash: String::new(),
-            key_source: libfreemkv::KeyOrigin::KeyDb,
-            vuk: None,
-            unit_keys: vec![(0, [0u8; 16])],
-            volume_id: [0u8; 16],
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
-        }
+        libfreemkv::test_util::aacs_state()
+            .key_source(libfreemkv::KeyOrigin::KeyDb)
+            .unit_keys(vec![(0, [0u8; 16])])
+            .build()
     }
 
     // A minimal scanned Disc with `n` titles, encrypted flag, and key presence.

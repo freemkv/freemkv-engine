@@ -118,6 +118,9 @@ pub fn copy(
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". One the drive's bus map could not locate would land here still encrypted.
+    libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
     // A zero-capacity disc (READ CAPACITY failed during scan, swallowed to 0) drives
     // every resume/complete decision below off `capacity_bytes == 0` and writes a
     // 0-byte ISO reported as done. Reject it here, before dispatch, as `Error::EmptyImage`.
@@ -127,7 +130,15 @@ pub fn copy(
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
-        let map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
+        let mut map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
+        // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
+        // stream file is now located, so widen it and let the dispatch fill the rest.
+        if map.scope().is_some() {
+            mapfile::check_mapfile_identity(&map, disc)
+                .map_err(|e| Error::IoError { source: e })?;
+            map.clear_scope();
+            map.flush().map_err(|e| Error::IoError { source: e })?;
+        }
         // BEFORE any resume decision, including "already complete" below: a wrong
         // disc whose predecessor finished would otherwise report the job done
         // having never touched the disc actually in the drive.
@@ -609,11 +620,94 @@ fn patch_internal(
 ///
 /// One of the two flat verbs the library exposes for rip orchestration;
 /// multipass + retry decisions are the caller's job — see [`PatchOptions`].
+/// A resume over a scoped (MKV-staging) mapfile widens it to the whole disc.
 pub fn sweep(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
     path: &std::path::Path,
     opts: &SweepOptions,
+) -> Result<CopyResult> {
+    sweep_in(disc, reader, path, opts, None)
+}
+
+/// [`sweep()`] over only `scope` (`(lba, sectors)`, e.g. from
+/// [`libfreemkv::Disc::mkv_staging_ranges`]): a staged image for an MKV rip. The
+/// mapfile records the scope, so the file is never taken for a whole-disc image.
+///
+/// No bus-map gate: every sector in such a scope is either BEF=0 (AACS BD Pre-recorded
+/// 0.953 §3.7: "the BEF shall be set to 0b for the sectors that do not correspond to
+/// Clip AV stream files") or a title extent the drive de-busses.
+pub fn sweep_scoped(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+    scope: &[(u32, u32)],
+) -> Result<CopyResult> {
+    sweep_in(disc, reader, path, opts, Some(sector_scope_to_bytes(scope)))
+}
+
+/// Refuse the image at `path` as a whole-disc image (`iso://` copy, `dir://` extract)
+/// when its sidecar mapfile records a scope: it was staged for an MKV rip, and nothing
+/// outside that scope was read. A missing mapfile is fine; an unreadable one is an error.
+pub fn ensure_whole_image(path: &std::path::Path) -> Result<()> {
+    match mapfile::Mapfile::load(&mapfile::mapfile_path_for(path)) {
+        Ok(map) if map.scope().is_some() => Err(Error::ImageScoped {
+            path: path.display().to_string(),
+        }),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::IoError { source: e }),
+    }
+}
+
+/// Refuse muxing `titles` (indices into `disc.titles`, scanned from the image at `path`)
+/// when the image was staged for an MKV rip and its scope does not hold every sector of
+/// their extents: the rest was never read, so it would mux zeros. Checked by extents, so
+/// a staging mux that re-maps its titles against the staged image still passes.
+pub fn ensure_titles_staged(
+    path: &std::path::Path,
+    disc: &libfreemkv::Disc,
+    titles: &[usize],
+) -> Result<()> {
+    let map = match mapfile::Mapfile::load(&mapfile::mapfile_path_for(path)) {
+        Ok(map) => map,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::IoError { source: e }),
+    };
+    let Some(scope) = map.scope() else {
+        return Ok(());
+    };
+    let extents = titles
+        .iter()
+        .filter_map(|&i| disc.titles.get(i))
+        .flat_map(|t| &t.extents);
+    for e in extents {
+        let want = (e.start_lba as u64 * 2048, e.sector_count as u64 * 2048);
+        let have: u64 = mapfile::intersect(&[want], scope).iter().map(|r| r.1).sum();
+        if have != want.1 {
+            return Err(Error::ImageScoped {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// `(lba, sectors)` ranges as the mapfile's `(pos, size)` byte ranges.
+pub(crate) fn sector_scope_to_bytes(scope: &[(u32, u32)]) -> Vec<(u64, u64)> {
+    scope
+        .iter()
+        .map(|&(l, n)| (l as u64 * 2048, n as u64 * 2048))
+        .collect()
+}
+
+fn sweep_in(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+    scope: Option<Vec<(u64, u64)>>,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
     use libfreemkv::sector::SectorSource;
@@ -623,6 +717,11 @@ pub fn sweep(
     // direct `sweep` caller can't bypass it: a decrypting sweep of an encrypted
     // disc with no usable key would write ciphertext at exit 0. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". One the drive's bus map could not locate would land here still encrypted.
+    if scope.is_none() {
+        libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
+    }
 
     // A zero-capacity disc would size the read domain at 0 and write a 0-byte
     // ISO reported as complete; `image_read_sectors` turns it into an
@@ -739,10 +838,23 @@ pub fn sweep(
         libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
     let batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
+    // A scoped sweep reads only its scope (plus any earlier staging's); a whole-disc
+    // sweep over a scoped mapfile fills the rest (the gate above passed).
+    match scope {
+        Some(mut s) => {
+            s.extend_from_slice(map.scope().unwrap_or(&[]));
+            map.set_scope(s);
+        }
+        None => map.clear_scope(),
+    }
+
     // Pre-compute NonTried regions before handing the mapfile to the consumer
     // thread. Producer processes them in order; consumer mutates the mapfile
     // per work-item. Regions left NonTrimmed/Unreadable are the patch pass's job.
-    let regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
+    let mut regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
+    if let Some(scope) = map.scope() {
+        regions = mapfile::intersect(&regions, scope);
+    }
 
     // Spawn the consumer (owns WritebackFile + Mapfile; producer keeps reader/halt).
     // `map_disown` is taken BEFORE `map` moves into the sink: it's the only way left
@@ -1269,6 +1381,8 @@ impl CopyResult {
 ///
 /// Named `Disc::sweep` before 1.6.0, when recovery moved out of libfreemkv
 /// and the receiver became a `&Disc` argument.
+// KU-E0 (keys-upfront-design §8.2): "`Default` for `SweepOptions`, `PatchOptions`".
+#[derive(Default)]
 pub struct SweepOptions<'a> {
     pub decrypt: bool,
     pub resume: bool,
@@ -1288,6 +1402,8 @@ pub struct SweepOptions<'a> {
 }
 
 /// Options for [`patch()`] (Pass N retry pass over bad ranges).
+// KU-E0 (keys-upfront-design §8.2): "`Default` for `SweepOptions`, `PatchOptions`".
+#[derive(Default)]
 pub struct PatchOptions<'a> {
     pub decrypt: bool,
     /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only

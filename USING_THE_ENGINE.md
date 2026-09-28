@@ -106,6 +106,7 @@ use freemkv_engine::{
     Sink, Level, Progress, NoopSink,
     // recovery / multipass
     recover_to_iso, multipass_rip, MultipassOpts, MultipassResult,
+    multipass_rip_staged, mkv_staging_scope, ensure_whole_image, ensure_titles_staged,
     classify_damage, loss_aborts, effective_abort_secs,
     // re-exported disc model (no direct libfreemkv dep needed)
     Disc, DiscTitle, DiscFormat, Codec, Resolution, VideoStream, AudioStream,
@@ -217,6 +218,29 @@ interchangeable:
   resume from the mapfile. Without this field a bridge crash is
   indistinguishable from an ordinary partial rip — `halted` and
   `aborted_for_loss` are both false and the byte counts look unremarkable.
+
+**MKV through a staged image.** When the deliverable is MKV (a multipass MKV
+rip that stages an image first), stage only what the mux needs:
+
+```rust
+let scope = mkv_staging_scope(&disc, &mut *reader, &title_indices, keep_iso)?;
+let mp = multipass_rip_staged(&disc, &mut *reader, iso_path, &job, &opts,
+                              scope.as_deref(), &sink)?;
+if scope.is_some() {
+    // Not a whole-disc image: delete it after a successful mux, even with keep_iso.
+}
+```
+
+`title_indices` index `disc.titles` of THIS scan. With a scope the passes read
+only UDF, nav/AACS files and those titles (none of it bus-encrypted), so a disc
+whose drive could not locate a bus-encrypted stream file still rips; the plain
+`multipass_rip` refuses such a disc with E6021. The mapfile records the scope:
+`copy`/`recover_to_iso` over it refuses (E6021) until every stream file is
+located, then fills the rest. Before using an image as a whole-disc source
+(`iso://` → `iso://`, `dir://`), call `ensure_whole_image(path)`: it returns
+E6022 for a staged image. Before muxing titles from an image, call
+`ensure_titles_staged(path, &disc, &indices)`: it returns E6022 when a staged
+image's scope does not hold every sector of those titles.
 
 `reader` is a `&mut dyn libfreemkv::SectorSource`. `scan_iso` hands back a
 `Box<dyn SectorSource>`, so reborrow it through the box: `&mut *reader`. For a

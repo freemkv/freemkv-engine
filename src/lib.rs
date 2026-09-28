@@ -30,7 +30,8 @@ mod recovery;
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
-    bytes_bad_in_title_from_mapfile, copy, patch, progress_snapshot_from_mapfile, sweep,
+    bytes_bad_in_title_from_mapfile, copy, ensure_titles_staged, ensure_whole_image, patch,
+    progress_snapshot_from_mapfile, sweep, sweep_scoped,
 };
 mod remux;
 mod resolve;
@@ -49,9 +50,9 @@ pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, wo
 pub use multipass::{
     MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
-    end_of_recovery_promotion, loss_aborts, measured_scope_bad, multipass_rip, pass_exit,
-    patch_made_progress, patch_pass_decision, plan_passes, scope_bad_bytes, scope_converged,
-    should_abort_for_loss,
+    end_of_recovery_promotion, loss_aborts, measured_scope_bad, mkv_staging_scope, multipass_rip,
+    multipass_rip_staged, pass_exit, patch_made_progress, patch_pass_decision, plan_passes,
+    scope_bad_bytes, scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,

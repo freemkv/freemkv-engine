@@ -311,7 +311,10 @@ pub(super) fn compute_initial_state(
     // Retry passes act on NonTrimmed/NonScraped/Unreadable (a failed sector gets
     // a fresh shot next pass); NonTried is excluded since a preceding sweep pass
     // covers it. Not reversed for `opts.reverse`: `PatchCtx::run` sorts this list.
-    let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
+    let mut bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
+    if let Some(scope) = map.scope() {
+        bad_ranges = mapfile::intersect(&bad_ranges, scope);
+    }
     let work_total: u64 = bad_ranges.iter().map(|(_, sz)| *sz).sum();
     // Fail safe when metadata is indeterminate: assume a regular file so a real
     // `sync_all` failure surfaces rather than gets swallowed. `/dev/null` and
@@ -1203,6 +1206,11 @@ pub fn patch(
     let mapfile_path = disc.mapfile_for(path);
     let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
         compute_initial_state(path, &mapfile_path)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". A scoped (MKV-staging) map only re-reads its scope, where none is lost.
+    if map.scope().is_none() {
+        libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
+    }
     // Same reasoning as the decrypt gate: `copy`/`sweep` verify the mapfile
     // describes THIS disc, and `patch` must not skip that — otherwise a leftover
     // mapfile from disc B patches its ranges into disc A's ISO as "Finished".
