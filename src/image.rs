@@ -303,7 +303,7 @@ struct TopUp {
     keys: ResolvedKeySet,
     titles: Vec<usize>,
     asked: bool,
-    failure: Option<u16>,
+    failure: Option<Remembered>,
 }
 
 impl TopUp {
@@ -321,27 +321,57 @@ impl TopUp {
     }
 }
 
-// What a top-up remembers, to re-raise for a later Missing instead of E7022 (review B1,
-// minor 2): a source failure, or E7034. A Stop is not remembered: it belongs to its call.
-fn remembered(e: &Error) -> bool {
-    matches!(
-        e,
-        Error::KeyServiceUnavailable
-            | Error::KeyServiceUnauthorized
-            | Error::KeyServiceRateLimited
-            | Error::AacsVidNeedsDisc
-    )
+// A top-up's refusal kept to re-raise for a later Missing instead of E7022 (review B1,
+// minor 2, KU-E1b): its code and the data of its `E<code>: <data>` form.
+struct Remembered {
+    code: u16,
+    data: String,
 }
 
-fn rebuild_failure(code: u16) -> Error {
-    use libfreemkv::error::{
-        E_AACS_VID_NEEDS_DISC, E_KEY_SERVICE_RATE_LIMITED, E_KEY_SERVICE_UNAUTHORIZED,
-    };
-    match code {
-        E_KEY_SERVICE_UNAUTHORIZED => Error::KeyServiceUnauthorized,
-        E_KEY_SERVICE_RATE_LIMITED => Error::KeyServiceRateLimited,
-        E_AACS_VID_NEEDS_DISC => Error::AacsVidNeedsDisc,
-        _ => Error::KeyServiceUnavailable,
+impl Remembered {
+    // Any refusal of a top-up that made a request, but Missing (a later call's own verdict)
+    // and a Stop (it belongs to the call that was stopped).
+    fn of(e: &Error) -> Option<Self> {
+        let missing = matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing);
+        if missing || matches!(e, Error::Halted) {
+            return None;
+        }
+        let text = e.to_string();
+        let data = crate::parse_error_code(&text)
+            .map_or("", |(_, d)| d)
+            .to_string();
+        Some(Remembered {
+            code: e.code(),
+            data,
+        })
+    }
+
+    // The refusal again, by code: the key service, E7034, the keydb (E8xxx) and the other
+    // key refusals; any other kept as an I/O error carrying its `E<code>: <data>` text.
+    fn rebuild(&self) -> Error {
+        use libfreemkv::error as c;
+        let d = self.data.clone();
+        match self.code {
+            c::E_KEY_SERVICE_UNAVAILABLE => Error::KeyServiceUnavailable,
+            c::E_KEY_SERVICE_UNAUTHORIZED => Error::KeyServiceUnauthorized,
+            c::E_KEY_SERVICE_RATE_LIMITED => Error::KeyServiceRateLimited,
+            c::E_AACS_VID_NEEDS_DISC => Error::AacsVidNeedsDisc,
+            c::E_FMTS_KEY_MISSING => Error::FmtsKeyMissing,
+            c::E_DECRYPT_FAILED => Error::DecryptFailed,
+            c::E_KEYDB_CONNECT => Error::KeydbConnect { host: d },
+            c::E_KEYDB_HTTP => Error::KeydbHttp {
+                status: d.parse().unwrap_or(0),
+            },
+            c::E_KEYDB_INVALID => Error::KeydbInvalid,
+            c::E_KEYDB_WRITE => Error::KeydbWrite { path: d },
+            c::E_KEYDB_PARSE => Error::KeydbParse,
+            c::E_KEYDB_LOAD => Error::KeydbLoad { path: d },
+            c::E_KEYDB_UNSUPPORTED_SCHEME => Error::KeydbUnsupportedScheme { scheme: d },
+            c::E_KEYDB_TOO_MANY_REDIRECTS => Error::KeydbTooManyRedirects,
+            code => Error::IoError {
+                source: std::io::Error::other(format!("E{code}: {d}")),
+            },
+        }
     }
 }
 
@@ -404,13 +434,13 @@ impl OpenedImage {
             Err((e, help)) => {
                 tracing::info!(target: "freemkv::keys", error = %e, walk = ?walk.keys, "top-up refused");
                 let missing = matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing);
-                if let (false, true, Some(code)) = (ask, missing, held.failure) {
-                    return Err(rebuild_failure(code));
+                if let (false, true, Some(kept)) = (ask, missing, &held.failure) {
+                    return Err(kept.rebuild());
                 }
                 let sidecar = load_sidecar(&self.source)?;
                 let e = vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref());
-                if requested && remembered(&e) {
-                    held.failure = Some(e.code());
+                if requested {
+                    held.failure = Remembered::of(&e);
                 }
                 Err(e)
             }
@@ -723,5 +753,46 @@ mod tests {
     fn open_image_reports_a_missing_image_as_a_scan_error() {
         let src = ImageSource::Iso("/nonexistent/freemkv/none.iso".into());
         assert!(open_image(&src, &KeyParams::default()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod remembered_tests {
+    use super::*;
+
+    // Every refusal a top-up keeps comes back with its own code and text; Missing and a
+    // Stop are never kept.
+    #[test]
+    fn a_kept_refusal_rebuilds_to_itself() {
+        let kept = [
+            Error::KeyServiceUnavailable,
+            Error::KeyServiceUnauthorized,
+            Error::KeyServiceRateLimited,
+            Error::AacsVidNeedsDisc,
+            Error::FmtsKeyMissing,
+            Error::DecryptFailed,
+            Error::KeydbConnect {
+                host: "h.test".into(),
+            },
+            Error::KeydbHttp { status: 403 },
+            Error::KeydbInvalid,
+            Error::KeydbWrite { path: "/k".into() },
+            Error::KeydbParse,
+            Error::KeydbLoad { path: "/k".into() },
+            Error::KeydbUnsupportedScheme {
+                scheme: "ftp".into(),
+            },
+            Error::KeydbTooManyRedirects,
+        ];
+        for e in kept {
+            let back = Remembered::of(&e).expect("kept").rebuild();
+            assert_eq!((back.code(), back.to_string()), (e.code(), e.to_string()));
+        }
+        let missing = Error::NoDiscKey {
+            disc_hash: String::new(),
+        };
+        assert!(Remembered::of(&missing).is_none());
+        assert!(Remembered::of(&Error::WholeDiscKeyMissing).is_none());
+        assert!(Remembered::of(&Error::Halted).is_none());
     }
 }
