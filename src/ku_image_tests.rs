@@ -1007,3 +1007,134 @@ fn a_pending_only_gap_is_not_re_resolved() {
     assert!(held.forensic_pending());
     assert_eq!(calls.len(), asked, "keydb not re-asked");
 }
+
+// A staged copy of `fx` whose key file is zeroed and whose sidecar (written by `side`) is
+// then adjusted as each test needs; `open` opens it with the drive disc and `set`.
+fn staged_with(fx: &Fx, dir: &Path, name: &str) -> std::path::PathBuf {
+    let iso = fx.write(dir, name);
+    let inf = *fx.metadata.last().unwrap();
+    let mut b = std::fs::read(&iso).unwrap();
+    b[inf.0 as usize * 2048..(inf.0 + inf.1) as usize * 2048].fill(0);
+    std::fs::write(&iso, b).unwrap();
+    iso
+}
+
+fn open_prescanned(iso: &Path, disc_vid: [u8; 16], set: &ResolvedKeySet) -> crate::Result<()> {
+    let mut disc = bd_image(&[Some(K1)], 1).disc;
+    disc.aacs.as_mut().unwrap().volume_id = disc_vid;
+    let opts = OpenImageOptions {
+        disc: Some(disc),
+        ..OpenImageOptions::known(set.clone())
+    };
+    open_image_with(&ImageSource::Iso(iso.to_path_buf()), opts).map(|_| ())
+}
+
+// A sidecar marking `unread` NonTrimmed, with `identity` lines inserted after its header.
+fn sidecar_text(fx: &Fx, iso: &Path, unread: &[(u32, u32)], identity: &str) {
+    let total = fx.img.image.len() as u64;
+    let path = mapfile_path_for(iso);
+    let mut map = Mapfile::create(&path, total, "t").unwrap();
+    map.record(0, total, crate::SectorStatus::Finished).unwrap();
+    for &(s, n) in unread {
+        let (p, l) = (s as u64 * 2048, n as u64 * 2048);
+        map.record(p, l, crate::SectorStatus::NonTrimmed).unwrap();
+    }
+    map.flush().unwrap();
+    drop(map);
+    let text = std::fs::read_to_string(&path).unwrap();
+    let (head, rest) = text.split_once('\n').unwrap();
+    std::fs::write(&path, format!("{head}\n{identity}{rest}")).unwrap();
+}
+
+/// Review minors 5-7 (D4, KU §3.2 / §4.4): the key-file check is skipped only for sectors
+/// the sidecar marks unread (a UDF that cannot locate the file counts only if some sector is
+/// unread), and only when the sidecar identifies the disc: a disc hash, a `vidfp` with a VID
+/// in hand, or legacy key fingerprints a proven key of the set matches (rule 3).
+#[test]
+fn a_prescanned_image_is_identified_only_by_real_identity() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let inf = *fx.metadata.last().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let hash = libfreemkv::hex::strip_hex_prefix(&fx.disc.aacs.as_ref().unwrap().disc_hash)
+        .to_ascii_lowercase();
+    let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let mismatch = |r: crate::Result<()>| {
+        matches!(
+            r,
+            Err(Error::MapfileInvalid {
+                kind: "disc-mismatch"
+            })
+        )
+    };
+
+    // 5. The UDF anchor is gone (the key file cannot be located): refused unless the
+    // sidecar marks some sector unread.
+    let broken = staged_with(&fx, dir.path(), "noudf.iso");
+    let mut b = std::fs::read(&broken).unwrap();
+    b[256 * 2048..257 * 2048].fill(0);
+    std::fs::write(&broken, b).unwrap();
+    sidecar_text(&fx, &broken, &[], &format!("# freemkv-disc: {hash}\n"));
+    assert!(
+        mismatch(open_prescanned(&broken, [0; 16], &set)),
+        "nothing unread"
+    );
+    sidecar_text(
+        &fx,
+        &broken,
+        &[(256, 1)],
+        &format!("# freemkv-disc: {hash}\n"),
+    );
+    open_prescanned(&broken, [0; 16], &set).expect("the anchor was never read");
+
+    // 6. A vidfp alone identifies only with a VID in hand to compare.
+    let vidfp = staged_with(&fx, dir.path(), "vidfp.iso");
+    let fp = hex(&vid_fingerprint(&VID));
+    sidecar_text(&fx, &vidfp, &[inf], &format!("# freemkv-vidfp: {fp}\n"));
+    assert!(
+        mismatch(open_prescanned(&vidfp, [0; 16], &set)),
+        "no VID in hand"
+    );
+    open_prescanned(&vidfp, VID, &set).expect("the disc's VID matches the vidfp");
+
+    // 7. A pre-1.8 sidecar identified only by legacy key fingerprints: rule 3.
+    let legacy = staged_with(&fx, dir.path(), "legacy.iso");
+    sidecar_text(
+        &fx,
+        &legacy,
+        &[inf],
+        &format!("# freemkv-uk: 1:{}\n", hex(&K1)),
+    );
+    open_prescanned(&legacy, [0; 16], &set).expect("a proven key matches");
+    sidecar_text(
+        &fx,
+        &legacy,
+        &[inf],
+        &format!("# freemkv-uk: 1:{}\n", hex(&K2)),
+    );
+    assert!(
+        mismatch(open_prescanned(&legacy, [0; 16], &set)),
+        "no proven key matches"
+    );
+}
+
+/// Review minor 8 (D5): only an unparseable sidecar is `MapfileInvalid`; one that cannot be
+/// read at all (EIO, permissions; here a directory in its place) surfaces as an I/O error.
+#[test]
+fn an_unreadable_sidecar_is_an_io_error() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    std::fs::create_dir(mapfile_path_for(&iso)).unwrap();
+    let opts = OpenImageOptions::resolve(factory(&[(Answer::Keydb, &[K1])], &Calls::default()));
+    let err = open_image_with(&ImageSource::Iso(iso), opts)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(err, Error::IoError { .. }), "{err:?}");
+}
