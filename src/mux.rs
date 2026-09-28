@@ -225,7 +225,7 @@ where
             Ok(()) => TitleResult::Ok,
             Err(e) => {
                 fail_detail = e.to_string();
-                fail_code = libfreemkv::error_code(&e);
+                fail_code = crate::error_code(&e);
                 fail_kind = e.kind();
                 classify_title_error(&e)
             }

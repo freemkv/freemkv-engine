@@ -8,6 +8,8 @@
 
 ### Added
 
+- `ImageSource`, `scan_image`, `open_image` and `build_key_fetch`: one path to scan an ISO or disc folder, resolve its keys and fetch keys mid-mux over the full local-first key chain.
+- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
 - `open_scan_resolve_with(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
 
 ## [1.7.7] — 2026-09-26
