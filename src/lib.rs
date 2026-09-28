@@ -48,7 +48,7 @@ pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_byt
 pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
     ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
-    parse_error_code, scan_image,
+    open_image_with_traced, parse_error_code, scan_image,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};

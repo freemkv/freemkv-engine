@@ -171,6 +171,33 @@ pub fn open_image(src: &ImageSource, keys: &KeyParams) -> crate::Result<OpenedIm
 /// E7034 (J11): a piece in scope is Missing, no VID is in hand (`vid`, the disc's, the
 /// seed's) and the sidecar has a `vidfp`, so only the disc can supply the key's VID.
 pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Result<OpenedImage> {
+    open_image_with_traced(src, opts).0
+}
+
+/// [`open_image_with`], also returning the resolve's per-source walk (e.g. "keydb, matched
+/// disc, online") on success AND on a refusal: the operator's answer to "why no key". It
+/// holds source labels, node outcomes and counts only, never a key, VID or MKB byte.
+pub fn open_image_with_traced(
+    src: &ImageSource,
+    opts: OpenImageOptions,
+) -> (
+    crate::Result<OpenedImage>,
+    libfreemkv::aacs::trace::ResolutionTrace,
+) {
+    let trace = std::sync::Mutex::new(Default::default());
+    let r = open_image_inner(src, opts, &trace);
+    let trace = trace.into_inner().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = &r {
+        tracing::info!(target: "freemkv::keys", error = %e, walk = ?trace.keys, "image open refused");
+    }
+    (r, trace)
+}
+
+fn open_image_inner(
+    src: &ImageSource,
+    opts: OpenImageOptions,
+    walk: &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
+) -> crate::Result<OpenedImage> {
     let OpenImageOptions {
         keys,
         disc,
@@ -223,12 +250,21 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
             (seed, Some(f), Default::default())
         }
         KeyInput::Seeded(f, seed) => {
-            let r = resolve(&disc, reader.as_mut(), &scope, &f, Some(&seed), vid, halt);
+            let r = resolve(
+                &disc,
+                reader.as_mut(),
+                &scope,
+                &f,
+                Some(&seed),
+                vid,
+                halt,
+                walk,
+            );
             let r = r.map_err(|e| vid_needs_disc(e, vid_in_hand, sidecar.as_ref()))?;
             (r.keys, Some(f), r.trace)
         }
         KeyInput::Resolve(f) => {
-            let r = resolve(&disc, reader.as_mut(), &scope, &f, None, vid, halt);
+            let r = resolve(&disc, reader.as_mut(), &scope, &f, None, vid, halt, walk);
             let r = r.map_err(|e| vid_needs_disc(e, vid_in_hand, sidecar.as_ref()))?;
             (r.keys, Some(f), r.trace)
         }
@@ -277,6 +313,7 @@ impl OpenedImage {
         let mut reader = raw_reader(&self.source)?;
         let vid_in_hand = in_hand_vid_fingerprint(&self.disc, None, Some(&held.0));
         let seed = Some(&held.0);
+        let walk = std::sync::Mutex::new(Default::default());
         let r = resolve(
             &self.disc,
             reader.as_mut(),
@@ -285,6 +322,7 @@ impl OpenedImage {
             seed,
             None,
             halt,
+            &walk,
         );
         let sidecar = load_sidecar(&self.source)?;
         let keys = r
@@ -445,6 +483,7 @@ fn known(
     Ok(set)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
@@ -453,6 +492,7 @@ pub(crate) fn resolve(
     seed: Option<&ResolvedKeySet>,
     vid: Option<[u8; 16]>,
     halt: Option<&libfreemkv::Halt>,
+    walk: &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
 ) -> Result<libfreemkv::keys::KeyResolution, (Error, bool)> {
     let help = std::sync::atomic::AtomicBool::new(false);
     let opts = ResolveKeysOptions {
@@ -460,7 +500,7 @@ pub(crate) fn resolve(
         seed,
         vid,
         vid_would_help: Some(&help),
-        trace: None,
+        trace: Some(walk),
     };
     ResolvedKeySet::resolve(disc, reader, scope.clone(), sources, opts)
         .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))

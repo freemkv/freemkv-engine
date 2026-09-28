@@ -8,6 +8,7 @@
 //!
 //! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted here.
 
+use libfreemkv::aacs::trace::ResolutionTrace;
 use libfreemkv::keys::{DecryptStatus, KeyScope, ResolveKeysOptions, ResolvedKeySet};
 
 /// Already-resolved key configuration, boundary-normalized by the calling
@@ -107,17 +108,42 @@ pub fn resolve_for_rip(
     seed: Option<&ResolvedKeySet>,
     halt: Option<&libfreemkv::Halt>,
 ) -> crate::Result<ResolvedKeySet> {
+    resolve_for_rip_traced(disc, reader, scope, sources, seed, halt).0
+}
+
+/// [`resolve_for_rip`], also returning the per-source walk ("keydb > matched disc > online >
+/// …") on success AND on a refusal, for the device log and the "why no key" answer. It holds
+/// source labels, node outcomes and counts only, never a key, VID or MKB byte.
+pub fn resolve_for_rip_traced(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    seed: Option<&ResolvedKeySet>,
+    halt: Option<&libfreemkv::Halt>,
+) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
     let scope_log = format!("{scope:?}");
+    let walk = std::sync::Mutex::new(ResolutionTrace::new());
     let opts = ResolveKeysOptions {
         halt,
         seed,
         vid: None,
         vid_would_help: None,
-        trace: None,
+        trace: Some(&walk),
     };
-    let keys = ResolvedKeySet::resolve(disc, reader, scope, sources, opts)?.keys;
-    log_status(&keys, &scope_log);
-    Ok(keys)
+    let r = ResolvedKeySet::resolve(disc, reader, scope, sources, opts).map(|r| r.keys);
+    let walk = walk.into_inner().unwrap_or_else(|e| e.into_inner());
+    match &r {
+        Ok(keys) => log_status(keys, &scope_log),
+        Err(e) => tracing::info!(
+            target: "freemkv::keys",
+            error = %e,
+            scope = scope_log,
+            walk = ?walk.keys,
+            "keys: refused up front"
+        ),
+    }
+    (r, walk)
 }
 
 // The qa key log line (KU §7.6): counts only, never a key or the VID.
