@@ -477,3 +477,55 @@ fn the_top_up_is_asked_once_across_mux_calls() {
         "never asked again"
     );
 }
+
+/// D3: a key refusal before any output (E7022 here; E7026/E7034 alike) is reported as the
+/// first planned title's failure (TitleStart, then TitleDone with the error), never as the
+/// silence a consumer reads as a user Stop.
+#[test]
+fn an_up_front_key_refusal_reports_the_first_title_failed() {
+    #[derive(Default)]
+    struct Events(std::sync::Mutex<Vec<String>>);
+    impl crate::Sink for Events {
+        fn event(&self, e: &crate::Event<'_>) {
+            let s = match e {
+                crate::Event::TitleStart { idx, .. } => format!("start:{idx}"),
+                crate::Event::TitleDone { idx, result, .. } => format!(
+                    "done:{idx}:{:?}",
+                    result.as_ref().err().and_then(|e| crate::error_code(e))
+                ),
+                _ => return,
+            };
+            self.0.lock().unwrap().push(s);
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let narrow = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let opened = open_image_with(&src, OpenImageOptions::known(narrow)).unwrap();
+    let sink = Events::default();
+    let out = mux_image_titles(
+        &opened,
+        &MuxPlan::new(vec![1, 0]),
+        &mkv_dest(dir.path()),
+        &sink,
+    );
+    assert!(
+        matches!(
+            out,
+            RipOutcome::Failed { title_index: 1, .. } | RipOutcome::NoKey
+        ),
+        "{out:?}"
+    );
+    let want = [
+        "start:1".to_string(),
+        format!("done:1:Some({E_NO_DISC_KEY})"),
+    ];
+    assert_eq!(*sink.0.lock().unwrap(), want);
+}
