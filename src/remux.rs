@@ -243,11 +243,15 @@ pub(crate) fn remux_iso_with(
 ) -> io::Result<RemuxReport> {
     refuse_existing(job)?;
     sink.event(&Event::Phase { name: "open" });
-    let opts = OpenImageOptions {
-        scope: job.title.map(|i| KeyScope::Titles(vec![i])),
-        ..OpenImageOptions::resolve(sources)
+    let open = |h: &std::sync::Arc<std::sync::atomic::AtomicBool>| {
+        let opts = OpenImageOptions {
+            scope: job.title.map(|i| KeyScope::Titles(vec![i])),
+            halt: Some(libfreemkv::Halt::from_arc(h.clone())),
+            ..OpenImageOptions::resolve(sources)
+        };
+        open_image_with(&job.iso, opts)
     };
-    let opened = open_image_with(&job.iso, opts).map_err(io::Error::from)?;
+    let opened = crate::run::with_cancel_watcher(sink, open).map_err(io::Error::from)?;
     let idx = pick_title(&opened.disc, job.title)?;
     let title = &opened.disc.titles[idx];
     let selection = if job.streams.is_all() {
