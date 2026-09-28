@@ -765,3 +765,43 @@ fn extract_tree_reads_through_the_key_set() {
     };
     assert!(mask(&got) == mask(want), "the stream file is decrypted");
 }
+
+/// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, and
+/// `RipOutcome::Failed` its data (here a sidecar that turned unreadable before the top-up:
+/// `MapfileInvalid { kind: "vidfp" }`), not only the code.
+#[test]
+fn an_up_front_refusal_keeps_the_whole_error() {
+    #[derive(Default)]
+    struct Done(std::sync::Mutex<Vec<String>>);
+    impl crate::Sink for Done {
+        fn event(&self, e: &crate::Event<'_>) {
+            if let crate::Event::TitleDone {
+                result: Err(err), ..
+            } = e
+            {
+                let typed = err.get_ref().and_then(|i| i.downcast_ref::<Error>());
+                self.0.lock().unwrap().push(format!("{typed:?}"));
+            }
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    let f = factory(&[(Answer::Online, &[K1, K2])], &Calls::default());
+    let opened =
+        open_image_with(&ImageSource::Iso(iso.clone()), OpenImageOptions::resolve(f)).unwrap();
+    std::fs::write(mapfile_path_for(&iso), "# freemkv-vidfp: zz\n0x0 0x800 +\n").unwrap();
+    let sink = Done::default();
+    let out = mux_image_titles(
+        &opened,
+        &MuxPlan::new(vec![1]),
+        &mkv_dest(dir.path()),
+        &sink,
+    );
+    let RipOutcome::Failed { data, .. } = &out else {
+        panic!("{out:?}")
+    };
+    assert_eq!(data, "vidfp");
+    let events = sink.0.lock().unwrap();
+    assert_eq!(*events, [r#"Some(MapfileInvalid { kind: "vidfp" })"#]);
+}
