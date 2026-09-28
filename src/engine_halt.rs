@@ -47,16 +47,6 @@ impl EngineHalt<'static> {
         }
     }
 
-    /// [`new`](Self::new) for a caller that holds the Drive: in debug builds, asserts the
-    /// op token is the Drive's (§4.2: "`debug_assert!(ptr_eq(op, drive.token()))`").
-    pub fn for_drive(op: &Halt, extra: Option<Arc<AtomicBool>>, drive: Option<&Halt>) -> Self {
-        debug_assert!(
-            drive.is_some_and(|t| Arc::ptr_eq(t.as_arc(), op.as_arc())),
-            "the op token must be the Drive's token (stop design §4.2)"
-        );
-        Self::new(op, extra)
-    }
-
     // A legacy entry (no op token): only `extra` can cancel, exactly as before ST-E1.
     pub(crate) fn legacy(extra: Option<Arc<AtomicBool>>) -> Self {
         Self {

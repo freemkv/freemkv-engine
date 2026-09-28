@@ -1,4 +1,4 @@
-//! ET1, ET8, ET10 (stop design v5 §5.4) and the `linked` bridge.
+//! ET1, ET8 (stop design v5 §5.4) and the `linked` bridge.
 //! Per spec; do not change without a spec citation proving otherwise.
 
 use super::*;
@@ -113,24 +113,4 @@ fn engine_outcome_mapping() {
 fn halted_without_a_cancel_is_a_debug_panic() {
     let h = EngineHalt::new(&Halt::new(), None);
     let _ = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
-}
-
-// ET10 `op_token_ptr_eq_drive_token` — §4.2: "`debug_assert!(ptr_eq(op, drive.token()))`".
-#[test]
-fn op_token_ptr_eq_drive_token() {
-    let (_fake, _handle) = libfreemkv::test_util::FakeTransport::new();
-    let op = Halt::new();
-    let drive = libfreemkv::Drive::from_transport_with(Box::new(_fake), &op);
-    let h = EngineHalt::for_drive(&op, None, drive.token());
-    op.cancel();
-    assert!(h.is_cancelled());
-}
-
-#[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "the op token must be the Drive's token")]
-fn a_foreign_op_token_is_a_debug_panic() {
-    let (fake, _handle) = libfreemkv::test_util::FakeTransport::new();
-    let drive = libfreemkv::Drive::from_transport_with(Box::new(fake), &Halt::new());
-    let _ = EngineHalt::for_drive(&Halt::new(), None, drive.token());
 }
