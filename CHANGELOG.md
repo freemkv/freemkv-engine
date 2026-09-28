@@ -4,7 +4,7 @@
 
 ### Changed
 
-- Whole-disc decrypt (disc → ISO): a stream file no title plays that is encrypted and opened by no held key refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. Each such file is probed at its first unit and up to 32 units across it, and any held key that opens it is used. A file with no readable probe on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why.
+- Whole-disc decrypt (disc → ISO) uses libfreemkv's shared `whole_disc` reader, the same one as freemkv's image → ISO path. A stream file no title plays that is encrypted, with no held key opening it, refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. A key must open two probed units before it keys such a file. A file with no proven key on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why.
 
 ## [1.7.7] — 2026-09-26
 

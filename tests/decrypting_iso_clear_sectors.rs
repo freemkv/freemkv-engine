@@ -393,13 +393,42 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     }
 }
 
-/// Multi-CPS, the unplayed file encrypted only in its first unit (evenly spaced
-/// probes all land on clear units): probing its first unit proves the held key.
+/// Multi-CPS, the unplayed file encrypted only at its ends (the resolver's evenly
+/// spaced samples all land on clear units): the probes prove the other held key.
 #[test]
-fn a_multi_cps_sweep_proves_a_file_from_its_first_unit() {
+fn a_multi_cps_sweep_proves_a_file_from_its_first_and_last_units() {
     let mut fx = bd(None);
     fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 0..1);
+    fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 9..10);
     assert_sweeps_to_expected(&fx, &multi_cps_disc(&fx));
+}
+
+/// An FMTS disc still tries its other held BASE keys, so the same file keys.
+#[test]
+fn an_fmts_sweep_proves_an_unplayed_file_with_another_base_key() {
+    let mut fx = bd(None);
+    fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 0..1);
+    fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 9..10);
+    let mut d = multi_cps_disc(&fx);
+    d.format = DiscFormat::Fmts;
+    assert_sweeps_to_expected(&fx, &d);
+}
+
+/// One probe is not proof for a key the resolver did not pick: a single chance
+/// TS sync pass must not key a whole file. The file stays unkeyed, so the pass
+/// stops at its encrypted unit with E7032 rather than trusting one sample.
+#[test]
+fn an_alternate_key_opening_one_probe_is_not_trusted() {
+    let mut fx = bd(None);
+    fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 0..1);
+    let tmp = tempfile::tempdir().unwrap();
+    let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut MemDisc::new(&fx.source));
+    let err = r.expect_err("one opened probe must not key the file");
+    assert_eq!(err.code(), Error::WholeDiscKeyMissing.code(), "got {err}");
+    assert!(
+        iso.exists(),
+        "not refused up front: one probe is no evidence either way"
+    );
 }
 
 /// The same file under a key no held key matches is refused BEFORE the copy
