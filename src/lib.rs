@@ -13,7 +13,7 @@ pub mod drive_info;
 mod extract;
 mod image;
 mod job;
-mod keys;
+pub mod keys;
 mod multipass;
 mod mux;
 mod outcome;
@@ -40,6 +40,7 @@ mod sink;
 mod speed;
 mod streams;
 #[cfg(test)]
+#[allow(dead_code)] // KU-E1 fixtures, used by the later KU-E1 test groups
 mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
@@ -58,7 +59,8 @@ pub use multipass::{
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
-    mux_title_session, open_scan_resolve, open_scan_resolve_with, resolve_selection, run_titles,
+    mux_title_session, open_scan, open_scan_resolve, open_scan_resolve_with, resolve_selection,
+    run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};

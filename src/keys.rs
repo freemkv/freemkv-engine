@@ -1,12 +1,14 @@
-//! AACS key-source orchestration, shared by every front-end.
+//! AACS key-source orchestration and the rip's up-front key set, shared by every front-end.
 //!
 //! Both the CLI and the desktop UI build the SAME local-first ordered
-//! [`freemkv_keysources::KeySource`] list and extract "which source won"
-//! from a resolution trace — this is that logic, hoisted once. Each shell
-//! keeps its own boundary-specific bits (online-only derivation, path
-//! search/expansion, English presentation) out of this module.
+//! [`freemkv_keysources::KeySource`] list ([`key_source_factory`]) and resolve a rip's keys
+//! through ONE call, [`resolve_for_rip`], before any output (keys-upfront design, KU §2.1):
+//! the resulting [`ResolvedKeySet`] lives in memory only and is handed to every pass and
+//! mux of the rip, which never ask a source again.
 //!
 //! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted here.
+
+use libfreemkv::keys::{DecryptStatus, KeyScope, ResolveKeysOptions, ResolvedKeySet};
 
 /// Already-resolved key configuration, boundary-normalized by the calling
 /// shell. See the module docs for what each field means and does NOT mean.
@@ -18,9 +20,10 @@ pub struct KeyParams {
     /// resolution of the path itself.
     pub keydb_path: Option<String>,
     /// The online key-service URL, or `None` to skip it. SSRF-validated here
-    /// via [`freemkv_keysources::validate_keyserver_url`] before use; a
-    /// rejected URL is silently dropped (the local source, if any, still
-    /// applies) — the visible warning is the CLI's job, not this module's.
+    /// via [`freemkv_keysources::check_keyserver_url`] before use; a
+    /// permanently rejected URL is silently dropped (the local source, if any,
+    /// still applies), one whose host lookup failed transiently is kept (J10).
+    /// The visible warning is the CLI's job, not this module's.
     pub key_url: Option<String>,
     /// Bearer token for the online service, if any.
     pub key_auth: Option<String>,
@@ -31,8 +34,10 @@ pub struct KeyParams {
 
 /// Build the ordered `KeySource` list, **local-first**: the keydb (unless
 /// `online_only`) then the online service (unless its URL is absent or
-/// SSRF-rejected). Pure / quiet — safe to call repeatedly (e.g. once per
-/// on-decrypt-miss fetch); it emits no warnings.
+/// permanently SSRF-rejected). Quiet: it emits no warnings.
+///
+/// KU J10: a URL whose host lookup failed TRANSIENTLY keeps the online source, whose
+/// requests `resolve` then retries up front until 60 s pass with no answer (J13).
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
@@ -43,7 +48,7 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
     }
 
     if let Some(url) = &p.key_url
-        && freemkv_keysources::validate_keyserver_url(url).is_ok()
+        && freemkv_keysources::check_keyserver_url(url).map_or_else(|r| r.is_temporary(), |()| true)
     {
         sources.push(Box::new(freemkv_keysources::OnlineSource::new(
             url.clone(),
@@ -54,12 +59,85 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
     sources
 }
 
-/// Build the [`libfreemkv::KeySourceFactory`] the library's key resolution
-/// (`resolve_keys_for` / `DiscSession::resolve_keys`) calls to (re)build the
-/// ordered sources from `p`.
+/// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] (and the legacy
+/// `resolve_keys_for` / `DiscSession::resolve_keys`) calls to build the ordered sources
+/// from `p`, with the J10 transient-URL rule of [`key_sources`].
 pub fn key_source_factory(p: &KeyParams) -> libfreemkv::KeySourceFactory {
     let p = p.clone();
     std::sync::Arc::new(move || key_sources(&p))
+}
+
+/// What a rip writes, which decides what it must decrypt (KU §2.5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RipOutput {
+    /// MKV / M2TS / MP4 / demux / json / fvi: the selected titles.
+    Streams,
+    /// A decrypted ISO or folder: every stream file.
+    DecryptedImage,
+    /// A raw copy (`--raw`, "Keep encrypted"): nothing is decrypted.
+    RawImage,
+}
+
+/// The [`KeyScope`] a rip of `titles` (indices into `disc.titles`) to `output` resolves
+/// (KU §2.5): `Titles(selected)`, or `Titles([main])` for a plain rip with no selection;
+/// `WholeDisc` for a decrypted image; `None` for a raw copy, which makes no key call.
+pub fn rip_scope(disc: &libfreemkv::Disc, titles: &[usize], output: RipOutput) -> KeyScope {
+    match output {
+        RipOutput::RawImage => KeyScope::None,
+        RipOutput::DecryptedImage => KeyScope::WholeDisc,
+        RipOutput::Streams if titles.is_empty() => {
+            KeyScope::Titles(crate::resolve_selection(disc, &crate::Selection::MainMovie))
+        }
+        RipOutput::Streams => KeyScope::Titles(titles.to_vec()),
+    }
+}
+
+/// Resolve a rip's keys ONCE, before any output (KU §2.1, §2.3): the one engine call every
+/// front-end makes. `seed` is a set the rip already holds (its keys join the pool first);
+/// `halt` stops the resolve and its retry waits. The factory is dropped by the resolve, so
+/// nothing can ask a source after this returns; the set is memory-only.
+///
+/// `Err` refuses the rip before any output (E7022/E7032 Missing, E7013, E7026, E7028–30,
+/// `Halted`).
+pub fn resolve_for_rip(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    seed: Option<&ResolvedKeySet>,
+    halt: Option<&libfreemkv::Halt>,
+) -> crate::Result<ResolvedKeySet> {
+    let scope_log = format!("{scope:?}");
+    let opts = ResolveKeysOptions {
+        halt,
+        seed,
+        vid: None,
+    };
+    let keys = ResolvedKeySet::resolve(disc, reader, scope, sources, opts)?.keys;
+    log_status(&keys, &scope_log);
+    Ok(keys)
+}
+
+// The qa key log line (KU §7.6): counts only, never a key or the VID.
+pub(crate) fn log_status(keys: &ResolvedKeySet, scope: &str) {
+    let st = keys.status();
+    tracing::info!(
+        target: "freemkv::keys",
+        requests = st.requests,
+        scope,
+        keyed = st.keyed,
+        clear = st.clear,
+        lazy = st.lazy,
+        forensic = ?st.forensic,
+        declared = ?st.declared,
+        "keys: resolved up front"
+    );
+}
+
+/// Whether `disc` can be decrypted from the rip's `set` (KU §12.2: `Ready`, Missing as
+/// `AacsKeysMissing`, `ForensicPending`); CSS and clear discs as the library reads them.
+pub fn key_status(disc: &libfreemkv::Disc, set: &ResolvedKeySet) -> DecryptStatus {
+    libfreemkv::keys::decrypt_status(disc, Some(set))
 }
 
 /// Which key source won, from a resolution trace: the first

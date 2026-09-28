@@ -112,14 +112,15 @@ fn sweep_and_patch_options_are_default() {
 #[test]
 fn key_front_door_is_nameable() {
     use libfreemkv::keys::{KeyScope, ResolvedKeySet};
-    let _: fn(
+    type ResolveForRip = fn(
         &libfreemkv::Disc,
         &mut dyn libfreemkv::SectorSource,
         KeyScope,
         &libfreemkv::KeySourceFactory,
         Option<&ResolvedKeySet>,
         Option<&libfreemkv::Halt>,
-    ) -> Result<ResolvedKeySet, libfreemkv::Error> = freemkv_engine::keys::resolve_for_rip;
+    ) -> Result<ResolvedKeySet, libfreemkv::Error>;
+    let _: ResolveForRip = freemkv_engine::keys::resolve_for_rip;
     let _: fn(&libfreemkv::Disc, &[usize], freemkv_engine::keys::RipOutput) -> KeyScope =
         freemkv_engine::keys::rip_scope;
     let _: fn(&libfreemkv::Disc, &ResolvedKeySet) -> libfreemkv::keys::DecryptStatus =

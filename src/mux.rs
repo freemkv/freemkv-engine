@@ -488,12 +488,25 @@ pub fn open_scan_resolve_with(
     ),
     libfreemkv::Error,
 > {
+    let mut session = open_scan(target, credentials, raw_copy)?;
+    let trace = session.resolve_keys(factory)?;
+    Ok((session, trace))
+}
+
+/// Open a live optical drive, lock its tray and scan the disc, with NO key call (KU §3.2):
+/// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
+/// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
+/// `raw_copy` as in [`open_scan_resolve_with`].
+pub fn open_scan(
+    target: libfreemkv::DeviceTarget,
+    credentials: Option<libfreemkv::DriveCredentials>,
+    raw_copy: bool,
+) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
     let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
     // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
     session.lock_tray();
     session.scan(scan_options(raw_copy))?;
-    let trace = session.resolve_keys(factory)?;
-    Ok((session, trace))
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -703,18 +716,23 @@ mod tests {
         // `session.scan` needs a live drive, so pin the source instead: the value
         // handed to it must be this function's answer, not a hardcoded default.
         let src = include_str!("mux.rs").replace("\r\n", "\n");
-        let start = src
-            .find("pub fn open_scan_resolve_with(")
-            .expect("open_scan_resolve_with definition present");
-        let end = start
-            + src[start..]
-                .find("\n}\n")
-                .expect("the function body still ends the definition");
-        let body = &src[start..end];
+        let body = |name: &str| {
+            let start = src.find(name).expect("definition present");
+            let end = start
+                + src[start..]
+                    .find("\n}\n")
+                    .expect("the function body still ends the definition");
+            src[start..end].to_string()
+        };
         assert!(
-            body.contains("session.scan(scan_options(raw_copy))"),
-            "open_scan_resolve_with must hand its own raw_copy parameter to the scan, \
+            body("pub fn open_scan(").contains("session.scan(scan_options(raw_copy))"),
+            "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
+        );
+        assert!(
+            body("pub fn open_scan_resolve_with(")
+                .contains("open_scan(target, credentials, raw_copy)"),
+            "open_scan_resolve_with must hand its raw_copy parameter on"
         );
     }
 
