@@ -113,6 +113,22 @@ pub fn resolve_for_rip(
     resolve_for_rip_traced(disc, reader, scope, sources, seed, halt).0
 }
 
+/// [`resolve_for_rip_traced`] reporting to an open's `progress` (stop design v5 §4.3, T29):
+/// each source call holds it `busy()` and hands it out as `ResolveCtx::progress()`.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_for_rip_observed(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    seed: Option<&ResolvedKeySet>,
+    halt: Option<&libfreemkv::Halt>,
+    progress: &libfreemkv::halt::Progress,
+) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+    let _ = progress;
+    resolve_for_rip_traced(disc, reader, scope, sources, seed, halt)
+}
+
 /// [`resolve_for_rip`], also returning the per-source walk ("keydb > matched disc > online >
 /// …") on success AND on a refusal, for the device log and the "why no key" answer. It holds
 /// source labels, node outcomes and counts only, never a key, VID or MKB byte.
@@ -447,6 +463,40 @@ mod tests {
         );
         assert!(matches!(r, Err(libfreemkv::Error::Halted)), "{r:?}");
         assert_eq!(calls.len(), 0);
+    }
+
+    // A source that reports each chunk it moves on the op's progress (§2.7, T29).
+    struct Trickle;
+    impl libfreemkv::KeySource for Trickle {
+        fn get_unit_keys(
+            &self,
+            ctx: &dyn libfreemkv::keysource::ResolveCtx,
+        ) -> libfreemkv::Result<Vec<libfreemkv::aacs::UnitKey>> {
+            if let Some(p) = ctx.progress() {
+                p.bump();
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// Stop design v5 §4.3, "The open token": its `Progress` is threaded "into the up-front
+    /// resolution (`ResolveCtx::halt()` and `ResolveCtx::progress()`)". Per spec.
+    #[test]
+    fn resolve_for_rip_observed_hands_the_progress_to_each_source() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let f: libfreemkv::KeySourceFactory =
+            std::sync::Arc::new(|| vec![Box::new(Trickle) as Box<dyn libfreemkv::KeySource>]);
+        let progress = libfreemkv::halt::Progress::new();
+        let (_, _) = resolve_for_rip_observed(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0]),
+            &f,
+            None,
+            None,
+            &progress,
+        );
+        assert!(progress.get() > 0, "no source saw the open's progress");
     }
 
     /// A seed set (e.g. from `info` / the GUI open) joins the pool first: a second resolve
