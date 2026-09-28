@@ -453,6 +453,7 @@ pub(crate) fn resolve(
         seed,
         vid,
         vid_would_help: Some(&help),
+        trace: None,
     };
     ResolvedKeySet::resolve(disc, reader, scope.clone(), sources, opts)
         .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))

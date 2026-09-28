@@ -113,6 +113,7 @@ pub fn resolve_for_rip(
         seed,
         vid: None,
         vid_would_help: None,
+        trace: None,
     };
     let keys = ResolvedKeySet::resolve(disc, reader, scope, sources, opts)?.keys;
     log_status(&keys, &scope_log);

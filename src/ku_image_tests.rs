@@ -834,3 +834,30 @@ fn vid_needs_disc_only_when_a_vid_would_help() {
         "an online source configured"
     );
 }
+
+/// `ResolvedKeySet::none()` holds no AACS key, so it never covers an AACS disc's titles
+/// (`covers(scope)` alone has no disc): `Seeded(f, none)` resolves, asking once; `Known(none)`
+/// refuses E7022 up front. On a clear disc `none()` still covers.
+#[test]
+fn a_none_set_never_covers_an_aacs_title() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Online, &[K1])], &calls);
+    let opened = open_image_with(&src, OpenImageOptions::seeded(f, ResolvedKeySet::none()))
+        .expect("Seeded(none) resolves");
+    assert_eq!(calls.len(), 1, "the factory was asked once");
+    assert!(opened.keys.is_aacs());
+    let err = open_image_with(&src, OpenImageOptions::known(ResolvedKeySet::none()))
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.code(), E_NO_DISC_KEY, "{err}");
+    let folder = dir.path().join("clear");
+    crate::test_fixtures::clear_folder(&folder);
+    open_image_with(
+        &ImageSource::Dir(folder),
+        OpenImageOptions::known(ResolvedKeySet::none()),
+    )
+    .expect("none() covers a clear disc");
+}
