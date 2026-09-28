@@ -738,3 +738,34 @@ fn artifact_lock_survives_real_mapfile_flush() {
     assert!(got.lock().unwrap().unwrap() >= released);
     assert_eq!(lock.path(), sidecar_for(&iso));
 }
+
+// §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`" — a Stop that
+// lands once the rename has replaced the target (during the folder sync) is Done, not Halted.
+#[test]
+fn a_stop_after_the_rename_is_done() {
+    struct CancelAtReplace(AtomicBool);
+    impl Sink for CancelAtReplace {
+        fn event(&self, e: &Event<'_>) {
+            if matches!(e, Event::Phase { name: "replace" }) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        fn should_cancel(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let sink = CancelAtReplace(AtomicBool::new(false));
+    let r = run(
+        &target,
+        &sink,
+        &Halt::new(),
+        &OsRemuxIo,
+        writes(good(), true),
+    )
+    .expect("the target was replaced before the Stop: Done");
+    assert!(r.replaced);
+    assert_eq!(std::fs::read(&target).unwrap(), good());
+    assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
+}
