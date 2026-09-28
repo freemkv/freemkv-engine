@@ -125,8 +125,7 @@ pub fn resolve_for_rip_observed(
     halt: Option<&libfreemkv::Halt>,
     progress: &libfreemkv::halt::Progress,
 ) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
-    let _ = progress;
-    resolve_for_rip_traced(disc, reader, scope, sources, seed, halt)
+    resolve_traced(disc, reader, scope, sources, seed, halt, Some(progress))
 }
 
 /// [`resolve_for_rip`], also returning the per-source walk ("keydb > matched disc > online >
@@ -140,6 +139,19 @@ pub fn resolve_for_rip_traced(
     seed: Option<&ResolvedKeySet>,
     halt: Option<&libfreemkv::Halt>,
 ) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+    resolve_traced(disc, reader, scope, sources, seed, halt, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_traced(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    seed: Option<&ResolvedKeySet>,
+    halt: Option<&libfreemkv::Halt>,
+    progress: Option<&libfreemkv::halt::Progress>,
+) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
     let scope_log = format!("{scope:?}");
     let walk = std::sync::Mutex::new(ResolutionTrace::new());
     let opts = ResolveKeysOptions {
@@ -149,7 +161,11 @@ pub fn resolve_for_rip_traced(
         vid_would_help: None,
         trace: Some(&walk),
     };
-    let r = ResolvedKeySet::resolve(disc, reader, scope, sources, opts).map(|r| r.keys);
+    let r = match progress {
+        Some(p) => ResolvedKeySet::resolve_with_progress(disc, reader, scope, sources, opts, p),
+        None => ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
+    }
+    .map(|r| r.keys);
     let walk = walk.into_inner().unwrap_or_else(|e| e.into_inner());
     match &r {
         Ok(keys) => log_status(keys, &scope_log),
