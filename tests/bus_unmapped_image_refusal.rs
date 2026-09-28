@@ -79,9 +79,6 @@ fn sweep_opts() -> SweepOptions<'static> {
         skip_on_error: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     }
 }
@@ -159,7 +156,7 @@ fn patch_refuses_to_write_into_an_existing_image() {
         let mut mf = Mapfile::create(&mf_path, total, "test").unwrap();
         mf.record(0, total, SectorStatus::NonTrimmed).unwrap();
     }
-    let popts = PatchOptions::for_patch_pass(false, None, None, None);
+    let popts = PatchOptions::for_patch_pass(false, None, None);
     let Err(err) = freemkv_engine::patch(&disc(), &mut lost_clip(), &iso, &popts) else {
         panic!("{SPEC_BD_3_7_NOTE}");
     };

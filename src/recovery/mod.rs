@@ -620,9 +620,6 @@ fn sweep_internal(
         skip_on_error: opts.multipass,
         progress: opts.progress,
         halt: opts.halt.clone(),
-        vid: opts.vid,
-        unit_keys: opts.unit_keys.clone(),
-        key_fetch: opts.key_fetch.clone(),
         keys: opts.keys.clone(),
     };
     sweep_in(disc, reader, path, &sweep_opts, None, halt)
@@ -637,12 +634,7 @@ fn patch_internal(
 ) -> Result<CopyResult> {
     let patch_opts = PatchOptions {
         keys: opts.keys.clone(),
-        ..PatchOptions::for_patch_pass(
-            opts.decrypt,
-            opts.progress,
-            opts.halt.clone(),
-            opts.key_fetch.clone(),
-        )
+        ..PatchOptions::for_patch_pass(opts.decrypt, opts.progress, opts.halt.clone())
     };
     let pr = patch::patch_in(disc, reader, path, &patch_opts, halt)?;
     tracing::info!(
@@ -828,7 +820,6 @@ fn sweep_linked(
         reader,
         opts.decrypt,
         halt.is_wired().then_some(lib),
-        opts.key_fetch.as_ref(),
         opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
@@ -842,9 +833,8 @@ fn sweep_linked(
     if resume && mapfile_path.exists() {
         match mapfile::Mapfile::load(&mapfile_path) {
             Ok(existing) => {
-                // Identity first, crucially BEFORE the unconditional set_vid/
-                // set_unit_keys overwrite below: that stamps the current job's
-                // identity onto the mapfile, so checking after never fires.
+                // Identity first, crucially BEFORE `stamp_identity` below: that stamps
+                // the current job's identity onto the mapfile, so checking after never fires.
                 mapfile::check_mapfile_identity(&existing, disc, opts.keys.as_ref())?;
                 if existing.total_size() != total_bytes {
                     tracing::info!(
@@ -894,8 +884,8 @@ fn sweep_linked(
         .map_err(|e| Error::IoError { source: e })?;
 
     // The disc's identity for a later resume (KU §4.1): its hash and VID fingerprint only,
-    // never a key byte or a raw VID (J6), whatever the legacy `vid`/`unit_keys` options hold.
-    mapfile::stamp_identity(&mut map, disc, opts.keys.as_ref(), opts.vid);
+    // never a key byte or a raw VID (J6).
+    mapfile::stamp_identity(&mut map, disc, opts.keys.as_ref());
 
     // ISO file: resume + Finished ranges opens existing; otherwise creates fresh,
     // pre-sized to total_bytes. `is_regular` MUST come from the open handle, not a
@@ -1410,28 +1400,9 @@ pub struct CopyOptions<'a> {
     pub multipass: bool,
     pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// AACS Volume ID (16 bytes) to persist into the mapfile during
-    /// Pass 1 so it survives to deferred-mux / resume. `None` for
-    /// unencrypted / non-AACS discs. Caller wires this from
-    /// `Disc::aacs.volume_id`.
-    ///
-    /// Persisted ONLY when `unit_keys` is empty (the disc didn't resolve a
-    /// key): the VID is the "still unresolved, retry-able" marker.
-    pub vid: Option<[u8; 16]>,
-    /// Resolved AACS unit keys `(CPS unit, key)` to persist into the mapfile
-    /// during Pass 1. When non-empty these are written (the final answer, so
-    /// deferred-mux/resume decrypts directly) and the VID is NOT — keys XOR VID.
-    /// Caller wires this from `Disc::aacs.unit_keys`.
-    pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// On-decrypt-miss key fetch (see [`libfreemkv::sector::KeyFetch`]).
-    /// When set, a read that hits AACS ciphertext no held key opens asks the
-    /// application's key sources for the CPS unit's key, caches it, and retries —
-    /// recovering an orphan CPS unit never sampled at resolve time. `None`
-    /// disables it (the prior behaviour). Threaded into sweep + patch.
-    pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
-    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
-    /// (until KU-X1).
+    /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
+    /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
     pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 
@@ -1486,18 +1457,9 @@ pub struct SweepOptions<'a> {
     pub skip_on_error: bool,
     pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// AACS Volume ID (16 bytes) persisted into the mapfile when the
-    /// sweep creates / opens it. `None` for unencrypted discs. Written ONLY
-    /// when `unit_keys` is empty (keys XOR VID — the VID is the retry marker).
-    pub vid: Option<[u8; 16]>,
-    /// Resolved AACS unit keys persisted into the mapfile when the sweep
-    /// creates / opens it. When non-empty these win over `vid`.
-    pub unit_keys: Vec<(u32, [u8; 16])>,
-    /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]).
-    pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
-    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
-    /// (until KU-X1).
+    /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
+    /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
     pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 
@@ -1524,12 +1486,9 @@ pub struct PatchOptions<'a> {
     pub wedged_threshold: u64,
     pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]). Lets Pass N
-    /// recover an orphan CPS unit's key when re-reading its bad range.
-    pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
-    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
-    /// (until KU-X1).
+    /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
+    /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
     pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 impl<'a> PatchOptions<'a> {
@@ -1545,7 +1504,6 @@ impl<'a> PatchOptions<'a> {
         decrypt: bool,
         progress: Option<&'a dyn libfreemkv::progress::Progress>,
         halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-        key_fetch: Option<libfreemkv::sector::KeyFetch>,
     ) -> Self {
         PatchOptions {
             decrypt,
@@ -1555,7 +1513,6 @@ impl<'a> PatchOptions<'a> {
             wedged_threshold: 50,
             progress,
             halt,
-            key_fetch,
             keys: None,
         }
     }
@@ -2659,7 +2616,7 @@ mod patch_preset_tests {
     /// future change to them is at least deliberate.
     #[test]
     fn for_patch_pass_carries_the_shipped_tuning() {
-        let o = PatchOptions::for_patch_pass(false, None, None, None);
+        let o = PatchOptions::for_patch_pass(false, None, None);
         assert_eq!(o.block_sectors, Some(32));
         assert!(o.full_recovery, "diagnostics-only, but pinned");
         assert!(o.reverse);
@@ -2667,7 +2624,7 @@ mod patch_preset_tests {
         assert!(!o.decrypt, "decrypt is the caller's, forwarded verbatim");
 
         // And `decrypt` really is forwarded, not hard-coded.
-        assert!(PatchOptions::for_patch_pass(true, None, None, None).decrypt);
+        assert!(PatchOptions::for_patch_pass(true, None, None).decrypt);
     }
 
     /// The behaviour `block_sectors` + `reverse` still have: the pass label the
@@ -2676,7 +2633,7 @@ mod patch_preset_tests {
     #[test]
     fn the_preset_reports_a_reverse_trim_pass() {
         use libfreemkv::progress::PassKind;
-        let o = PatchOptions::for_patch_pass(false, None, None, None);
+        let o = PatchOptions::for_patch_pass(false, None, None);
 
         let kind = patch::pass_kind(patch::initial_batch_of(&o), o.reverse);
         assert!(
@@ -2687,7 +2644,7 @@ mod patch_preset_tests {
         // The contrast, so the assertion above is not just "whatever it does":
         // a single-sector batch is a SCRAPE pass, and `reverse` really is the
         // flag that decorates it.
-        let mut scrape = PatchOptions::for_patch_pass(false, None, None, None);
+        let mut scrape = PatchOptions::for_patch_pass(false, None, None);
         scrape.block_sectors = Some(1);
         scrape.reverse = false;
         assert!(matches!(
@@ -2696,7 +2653,7 @@ mod patch_preset_tests {
         ));
 
         // `Some(0)` must not underflow into the scrape label by accident.
-        let mut zero = PatchOptions::for_patch_pass(false, None, None, None);
+        let mut zero = PatchOptions::for_patch_pass(false, None, None);
         zero.block_sectors = Some(0);
         assert_eq!(
             patch::initial_batch_of(&zero),
@@ -2709,7 +2666,7 @@ mod patch_preset_tests {
     // the pass look wedged.
     #[test]
     fn the_wedged_threshold_is_reported_not_enforced() {
-        let o = PatchOptions::for_patch_pass(false, None, None, None);
+        let o = PatchOptions::for_patch_pass(false, None, None);
 
         let state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
         let summary = patch::PatchSummary {

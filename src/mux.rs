@@ -514,7 +514,7 @@ fn with_mux_watcher<T>(
     })
 }
 
-// Lifted out of `open_scan_resolve`'s struct literal so the one field that
+// Lifted out of `open_scan`'s struct literal so the one field that
 // matters (`credentials`, the sole input to the SCSI AACS handshake) is
 // unit-testable — dropped, every caller silently authenticates as no-one.
 fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemkv::KeySpec {
@@ -533,52 +533,11 @@ fn scan_options(raw_copy: bool) -> libfreemkv::ScanOptions {
     }
 }
 
-/// Open a live optical drive and get it ready to rip: open the session, scan
-/// the disc, lock the tray, and resolve its AACS keys. Returns the scanned
-/// session (its `disc()` is populated and its drive is still owned, ready to
-/// be staged for a `MuxInput::Session` mux) plus the resolution trace.
-///
-/// The ONE drive-bring-up sequence shared by the CLI's `pipe_disc` and the
-/// desktop GUI's disc:// path; `factory` and `credentials` are supplied by
-/// the caller so a shell can log key attempts or stay quiet. `disc_to_iso`
-/// uses a different, lower-level `Drive` API and isn't covered here.
-pub fn open_scan_resolve(
-    target: libfreemkv::DeviceTarget,
-    credentials: Option<libfreemkv::DriveCredentials>,
-    factory: libfreemkv::KeySourceFactory,
-) -> Result<
-    (
-        libfreemkv::DiscSession,
-        libfreemkv::aacs::trace::ResolutionTrace,
-    ),
-    libfreemkv::Error,
-> {
-    open_scan_resolve_with(target, credentials, factory, false)
-}
-
-/// [`open_scan_resolve`] with the scan's `raw_copy` set: pass `true` only for a
-/// raw (never-decrypting) disc→ISO copy, matching the CLI's `--raw`.
-pub fn open_scan_resolve_with(
-    target: libfreemkv::DeviceTarget,
-    credentials: Option<libfreemkv::DriveCredentials>,
-    factory: libfreemkv::KeySourceFactory,
-    raw_copy: bool,
-) -> Result<
-    (
-        libfreemkv::DiscSession,
-        libfreemkv::aacs::trace::ResolutionTrace,
-    ),
-    libfreemkv::Error,
-> {
-    let mut session = open_scan(target, credentials, raw_copy)?;
-    let trace = session.resolve_keys(factory)?;
-    Ok((session, trace))
-}
-
 /// Open a live optical drive, scan the disc, then lock its tray, with NO key call (KU §3.2):
 /// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
 /// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
-/// `raw_copy` as in [`open_scan_resolve_with`].
+/// `raw_copy`: pass `true` only for a raw (never-decrypting) disc→ISO copy, matching the
+/// CLI's `--raw`.
 pub fn open_scan(
     target: libfreemkv::DeviceTarget,
     credentials: Option<libfreemkv::DriveCredentials>,
@@ -780,7 +739,7 @@ mod tests {
         );
     }
 
-    /// `open_scan_resolve` opens a real drive, so the only testable part of it
+    /// `open_scan` opens a real drive, so the only testable part of it
     /// is the spec it opens with.
     #[test]
     fn build_keyspec_forwards_the_caller_credentials() {
@@ -825,11 +784,6 @@ mod tests {
             body("pub fn open_scan(").contains("session.scan(scan_options(raw_copy))"),
             "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
-        );
-        assert!(
-            body("pub fn open_scan_resolve_with(")
-                .contains("open_scan(target, credentials, raw_copy)"),
-            "open_scan_resolve_with must hand its raw_copy parameter on"
         );
     }
 

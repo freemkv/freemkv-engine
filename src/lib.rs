@@ -55,7 +55,7 @@ pub use image::{
     open_image_with_traced, parse_error_code, scan_image,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
-pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
+pub use keys::{KeyParams, key_source_factory, key_sources, won_source};
 pub use multipass::{
     MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
@@ -65,8 +65,7 @@ pub use multipass::{
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
-    mux_title_session, open_scan, open_scan_resolve, open_scan_resolve_with, resolve_selection,
-    run_titles,
+    mux_title_session, open_scan, resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
@@ -74,7 +73,6 @@ pub use remux::{
     MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
     remux_iso, remux_iso_with, verify_mkv,
 };
-pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
 pub use sink::{Event, Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;

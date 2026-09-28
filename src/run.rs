@@ -175,13 +175,6 @@ pub fn recover_to_iso(
             multipass: matches!(job.mode, RipMode::Multi),
             progress: Some(&bridge),
             halt: Some(halt.clone()),
-            vid: disc.aacs.as_ref().map(|a| a.volume_id),
-            unit_keys: disc
-                .aacs
-                .as_ref()
-                .map(|a| a.unit_keys.clone())
-                .unwrap_or_default(),
-            key_fetch: None,
             keys: job.keys.clone(),
         };
 

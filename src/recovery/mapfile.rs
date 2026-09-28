@@ -537,29 +537,6 @@ impl Mapfile {
         Ok(())
     }
 
-    /// Record the disc's Volume ID as its [`vid_fingerprint`] only (`# freemkv-vidfp:`);
-    /// the raw VID is never held or written (KU J6). Legacy setter, removed at KU-X1.
-    pub fn set_vid(&mut self, vid: [u8; 16]) {
-        if vid != [0u8; 16] {
-            self.set_vid_fingerprint(vid_fingerprint(&vid));
-        }
-    }
-
-    /// Always `None` from KU-E1: a mapfile holds no raw Volume ID (KU J6), only
-    /// [`Self::vid_fingerprint`]. Legacy accessor, removed at KU-X1.
-    pub fn vid(&self) -> Option<[u8; 16]> {
-        None
-    }
-
-    /// Ignored from KU-E1: a mapfile holds no key bytes (KU §4.1, "memory only"); the keys
-    /// live in the rip's in-memory key set. Legacy setter, removed at KU-X1.
-    pub fn set_unit_keys(&mut self, _keys: &[(u32, [u8; 16])]) {}
-
-    /// Always empty from KU-E1 (see [`Self::set_unit_keys`]). Legacy, removed at KU-X1.
-    pub fn unit_keys(&self) -> &[(u32, [u8; 16])] {
-        &[]
-    }
-
     /// Record the disc hash (SHA-1 of `Unit_Key_RO.inf`, `0x` optional), written as
     /// `# freemkv-disc:`. A value that is not 40 hex digits is ignored.
     pub fn set_disc_hash(&mut self, hash: &str) {
@@ -2105,21 +2082,6 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// KU §4.1: the legacy key setter is inert; it never clears the VID fingerprint the
-    /// legacy VID setter recorded, and neither keeps a raw byte.
-    #[test]
-    fn set_unit_keys_never_clears_the_vid_fingerprint() {
-        let p = tmpfile("uk_keeps_vidfp");
-        let _ = std::fs::remove_file(&p);
-        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
-        mf.set_vid([0x7Au8; 16]);
-        mf.set_unit_keys(&[(1, [0x11; 16])]);
-        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&[0x7Au8; 16])));
-        assert_eq!(mf.vid(), None);
-        assert!(mf.unit_keys().is_empty());
-        let _ = std::fs::remove_file(&p);
-    }
-
     /// Drop flushes pending in-memory state (a sweep that returns early
     /// must not lose records). After dropping a dirty Mapfile, a fresh
     /// load() sees the last record.
@@ -2293,20 +2255,17 @@ mod load_if_present_tests {
 }
 
 /// Stamp `disc`'s identity on `map` (KU §4.1): its disc hash, and the fingerprint of its
-/// Volume ID (the scanned disc's own, else the rip's key set's, else a legacy caller's `vid`).
+/// Volume ID (the scanned disc's own, else the rip's key set's).
 pub(crate) fn stamp_identity(
     map: &mut Mapfile,
     disc: &libfreemkv::Disc,
     keys: Option<&libfreemkv::keys::ResolvedKeySet>,
-    legacy_vid: Option<[u8; 16]>,
 ) {
     if let Some(a) = &disc.aacs {
         map.set_disc_hash(&a.disc_hash);
     }
     if let Some(fp) = disc_vid_fingerprint(disc, keys) {
         map.set_vid_fingerprint(fp);
-    } else if let Some(vid) = legacy_vid {
-        map.set_vid(vid);
     }
 }
 
@@ -2332,22 +2291,13 @@ pub(crate) struct DiscIdentity {
 }
 
 impl DiscIdentity {
-    /// `disc`'s identity with the rip's `keys` (their VID and proven keys); with no set, the
-    /// legacy disc-banked keys stand in as proven until KU-X1.
+    /// `disc`'s identity with the rip's `keys` (their VID and proven keys). With no set nothing
+    /// is proven: KU §4.4 rule 3 is "checked **only if** the set proved at least one base key".
     pub(crate) fn of(
         disc: &libfreemkv::Disc,
         keys: Option<&libfreemkv::keys::ResolvedKeySet>,
     ) -> Self {
-        let proven = match keys {
-            Some(set) => set.proven_key_fingerprints(),
-            None => disc
-                .aacs
-                .iter()
-                .flat_map(|a| &a.unit_keys)
-                .filter(|(cps, _)| *cps < LEGACY_BASE_CPS_LIMIT)
-                .map(|(_, k)| key_fingerprint(k))
-                .collect(),
-        };
+        let proven = keys.map_or_else(Vec::new, |set| set.proven_key_fingerprints());
         DiscIdentity {
             disc_hash: disc
                 .aacs
@@ -2444,19 +2394,17 @@ mod ku_identity_tests {
     }
 
     /// EK1 (KU §4.1, J6): "From KU-E1 the engine writes neither `# freemkv-uk:` nor a raw
-    /// `# freemkv-vid:` line": only `# freemkv-disc:` and `# freemkv-vidfp:`. A sweep handed
-    /// the legacy `vid` / `unit_keys` options still writes no key and no raw VID.
+    /// `# freemkv-vid:` line": only `# freemkv-disc:` and `# freemkv-vidfp:`, from a disc
+    /// whose scan banked a key and whose VID is in hand.
     #[test]
     fn mapfile_never_writes_key_or_raw_vid_lines() {
         let mut fx = bd_image(&[Some(K1)], 1);
-        fx.disc.aacs.as_mut().unwrap().volume_id = VID;
+        let aacs = fx.disc.aacs.as_mut().unwrap();
+        aacs.volume_id = VID;
+        aacs.unit_keys = vec![(1, K1)];
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("disc.iso");
-        let opts = crate::SweepOptions {
-            vid: Some(VID),
-            unit_keys: vec![(1, K1)],
-            ..Default::default()
-        };
+        let opts = crate::SweepOptions::default();
         crate::sweep(&fx.disc, &mut fx.source(), &iso, &opts).unwrap();
         let text = std::fs::read_to_string(mapfile_path_for(&iso)).unwrap();
         for banned in ["freemkv-uk", "freemkv-vid:", &hex(&K1), &hex(&VID)] {
@@ -2471,21 +2419,6 @@ mod ku_identity_tests {
         );
         let fp = hex(&vid_fingerprint(&VID));
         assert!(text.contains(&format!("# freemkv-vidfp: {fp}\n")), "{text}");
-
-        // The legacy setters (removed at KU-X1) write no key and no raw VID either.
-        let (_d, p) = scratch("setters");
-        let mut mf = Mapfile::create(&p, 4096, "test").unwrap();
-        mf.set_unit_keys(&[(1, K1)]);
-        mf.set_vid(VID);
-        mf.record(0, 2048, SectorStatus::Finished).unwrap();
-        mf.flush().unwrap();
-        let text = std::fs::read_to_string(&p).unwrap();
-        for banned in ["freemkv-uk", "freemkv-vid:", &hex(&K1), &hex(&VID)] {
-            assert!(!text.contains(banned), "{banned} on disk:\n{text}");
-        }
-        assert!(text.contains(&format!("# freemkv-vidfp: {fp}\n")));
-        assert_eq!(mf.vid(), None, "no raw VID is held either");
-        assert!(mf.unit_keys().is_empty());
     }
 
     /// EK2 (KU §4.1, §4.5): legacy `# freemkv-uk:` / `# freemkv-vid:` lines load as
@@ -2516,7 +2449,6 @@ mod ku_identity_tests {
             "base keys only (CPS id < 2^24); the malformed line is dropped"
         );
         assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&VID)));
-        assert_eq!(mf.vid(), None);
         assert_eq!(
             std::fs::read_to_string(&p).unwrap(),
             legacy,

@@ -1315,7 +1315,6 @@ fn patch_linked(
         reader,
         opts.decrypt,
         halt.is_wired().then_some(lib),
-        opts.key_fetch.as_ref(),
         opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
@@ -1498,7 +1497,7 @@ mod tests {
         // …but the image on disk is half that long.
         std::fs::write(&iso, vec![0u8; (full / 2) as usize]).unwrap();
 
-        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let opts = PatchOptions::for_patch_pass(true, None, None);
         let err = match patch(&disc, &mut NoReader, &iso, &opts) {
             Err(e) => e,
             Ok(_) => panic!("a truncated image must not be patched and called good"),
@@ -1541,7 +1540,7 @@ mod tests {
         // is satisfied — this must still be refused.
         std::fs::write(&iso, vec![0u8; half as usize]).unwrap();
 
-        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let opts = PatchOptions::for_patch_pass(true, None, None);
         let err = match patch(&disc, &mut NoReader, &iso, &opts) {
             Err(e) => e,
             Ok(out) => panic!(
@@ -1579,7 +1578,7 @@ mod tests {
 
         // Nothing bad to patch, so this returns without reading a sector — the
         // point is only that it did NOT return ImageTruncated.
-        let opts = PatchOptions::for_patch_pass(true, None, None, None);
+        let opts = PatchOptions::for_patch_pass(true, None, None);
         let r = patch(&disc, &mut NoReader, &iso, &opts);
         assert!(
             !matches!(r, Err(Error::ImageTruncated { .. })),
@@ -1619,7 +1618,7 @@ mod tests {
             0,
             "precondition: the character device measures as zero-length"
         );
-        let opts = PatchOptions::for_patch_pass(false, None, None, None);
+        let opts = PatchOptions::for_patch_pass(false, None, None);
         let r = patch(&disc, &mut NoReader, dev_null, &opts);
         let _ = std::fs::remove_file(&mapfile_path);
         match r {
@@ -1821,7 +1820,7 @@ mod tests {
         std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
 
         let mut reader = TraceReader { lbas: Vec::new() };
-        let opts = PatchOptions::for_patch_pass(false, None, None, None);
+        let opts = PatchOptions::for_patch_pass(false, None, None);
         patch(&disc, &mut reader, &iso, &opts).expect("the pass itself must complete");
 
         let _ = std::fs::remove_dir_all(&dir);

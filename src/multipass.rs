@@ -594,13 +594,6 @@ fn multipass_rip_inner(
     }
     let empty_title = libfreemkv::DiscTitle::empty();
     let main_title = disc.titles.first().unwrap_or(&empty_title);
-    let vid = disc.aacs.as_ref().map(|a| a.volume_id);
-    let unit_keys = disc
-        .aacs
-        .as_ref()
-        .map(|a| a.unit_keys.clone())
-        .unwrap_or_default();
-
     if !plan.multipass {
         // Single-pass: one `copy` dispatch (sweep-or-resume via mapfile
         // state), no retry loop, no ISO-multipass semantics, no abort gate —
@@ -611,9 +604,6 @@ fn multipass_rip_inner(
             multipass: false,
             progress: Some(&bridge),
             halt: None,
-            vid,
-            unit_keys,
-            key_fetch: None,
             keys: job.keys.clone(),
         };
         let cr = match scope {
@@ -626,9 +616,6 @@ fn multipass_rip_inner(
                     skip_on_error: false,
                     progress: copy_opts.progress,
                     halt: copy_opts.halt.clone(),
-                    vid,
-                    unit_keys: copy_opts.unit_keys.clone(),
-                    key_fetch: None,
                     keys: copy_opts.keys.clone(),
                 };
                 let scope = crate::recovery::sector_scope_to_bytes(scope);
@@ -679,9 +666,6 @@ fn multipass_rip_inner(
             skip_on_error: true,
             progress: Some(&bridge),
             halt: None,
-            vid,
-            unit_keys: unit_keys.clone(),
-            key_fetch: None,
             keys: job.keys.clone(),
         };
         let sr = match scope {
@@ -734,12 +718,8 @@ fn multipass_rip_inner(
             }
 
             let bridge = ProgressBridge::new(sink);
-            let patch_opts = PatchOptions::for_patch_pass(
-                pass_should_decrypt(job.raw),
-                Some(&bridge),
-                None,
-                None,
-            );
+            let patch_opts =
+                PatchOptions::for_patch_pass(pass_should_decrypt(job.raw), Some(&bridge), None);
             let pr = crate::recovery::patch_in(disc, reader, iso_path, &patch_opts, halt)?;
             passes += 1;
             last_good = pr.bytes_good;

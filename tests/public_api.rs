@@ -96,7 +96,7 @@ fn sweep_and_patch_options_are_default() {
     assert!(!s.decrypt && !s.resume && !s.skip_on_error);
     assert!(s.batch_sectors.is_none());
     assert!(s.progress.is_none() && s.halt.is_none());
-    assert!(s.vid.is_none() && s.unit_keys.is_empty() && s.key_fetch.is_none());
+    assert!(s.keys.is_none());
 
     let p = freemkv_engine::PatchOptions {
         decrypt: false,
@@ -104,7 +104,7 @@ fn sweep_and_patch_options_are_default() {
     };
     assert!(!p.decrypt && !p.full_recovery && !p.reverse);
     assert!(p.block_sectors.is_none() && p.wedged_threshold == 0);
-    assert!(p.progress.is_none() && p.halt.is_none() && p.key_fetch.is_none());
+    assert!(p.progress.is_none() && p.halt.is_none() && p.keys.is_none());
 }
 
 /// KU-E1 (KU §3.2, §12.2): the engine's key front door, nameable where the server and

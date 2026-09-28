@@ -140,10 +140,6 @@ fn sweep_to_dev_null_no_enodev() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
@@ -185,10 +181,6 @@ fn copy_decrypting_aacs_no_key_errors_and_writes_nothing() {
         multipass: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let err = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
@@ -227,10 +219,6 @@ fn copy_raw_aacs_no_key_proceeds() {
         multipass: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
@@ -267,10 +255,6 @@ fn sweep_to_dev_null_real() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
@@ -315,10 +299,6 @@ fn sweep_marks_bad_region_nontrimmed_and_engages_damage_jump() {
         skip_on_error: true, // multipass → damage-jump engaged
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
@@ -418,10 +398,6 @@ fn sweep_resume_downgrades_on_size_mismatch() {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     freemkv_engine::sweep(&small_disc, &mut small_reader, &iso_path, &opts0)
@@ -488,10 +464,6 @@ fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts0).expect("initial clean sweep");
@@ -584,10 +556,6 @@ fn sweep_resume_downgrades_on_corrupt_mapfile() {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
@@ -637,10 +605,6 @@ fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts);
@@ -677,10 +641,6 @@ fn sweep_dev_null_full_good() {
         multipass: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts);
@@ -764,10 +724,6 @@ fn resume_sweeps_nontried_tail_even_with_retryable_present() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
@@ -860,10 +816,6 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
         multipass: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
@@ -914,10 +866,6 @@ fn patch_dev_null_after_sweep() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let sweep_result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &sweep_opts);
@@ -936,10 +884,6 @@ fn patch_dev_null_after_sweep() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let patch_result = freemkv_engine::copy(&disc, &mut reader2, &iso_path, &patch_opts);
@@ -978,9 +922,6 @@ fn patch_dev_null_direct() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     };
 
@@ -1041,10 +982,6 @@ fn sweep_pipeline_full_good_100_batches() {
         multipass: false,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
@@ -1106,10 +1043,6 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-
-        key_fetch: None,
         keys: None,
     };
 
@@ -1354,7 +1287,7 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         reads: Arc::clone(&reads),
     };
     let reporter = CancelNow;
-    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None, None);
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None);
     let out = freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let n = reads.load(Ordering::Relaxed);
@@ -1449,7 +1382,7 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None);
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let after = Mapfile::load(&mf_path).unwrap();
@@ -1565,7 +1498,7 @@ fn mapfile_from_a_different_disc_is_refused() {
     // The same guard must hold for a DIRECT patch() call: `patch` is half of
     // the exposed sweep/patch pair a front-end drives itself on resume, and
     // it used to trust the loaded mapfile without checking disc identity.
-    let patch_opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None, None);
+    let patch_opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None);
     let r = freemkv_engine::patch(&disc_b, &mut reader, &iso_path, &patch_opts);
     assert!(
         r.is_err(),
@@ -1593,9 +1526,6 @@ fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
         skip_on_error: false, // plain copy: the first error is fatal
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     };
 
@@ -1659,9 +1589,6 @@ fn a_resume_does_not_truncate_the_already_recovered_prefix() {
         skip_on_error: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("resume sweep");
@@ -1800,9 +1727,6 @@ fn plain_sweep_opts(resume: bool, skip_on_error: bool) -> SweepOptions<'static> 
         skip_on_error,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     }
 }
@@ -1813,9 +1737,6 @@ fn multipass_copy_opts() -> CopyOptions<'static> {
         multipass: true,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     }
 }
@@ -1939,23 +1860,22 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
     assert_eq!(std::fs::metadata(&iso_path).unwrap().len(), total);
 }
 
-// KU §4.1 (J6): the mapfile holds no key byte and no raw VID, only fingerprints, even when a
-// caller still hands the legacy `vid` / `unit_keys` options (until KU-X1).
+// KU §4.1 (J6): the mapfile holds no key byte and no raw VID, only fingerprints, even from a
+// disc whose scan banked a key and read its VID.
 #[test]
 fn the_mapfile_header_never_carries_the_unit_keys() {
     let sectors: u32 = 64;
-    let disc = make_test_disc(sectors, "KEYED");
+    let mut disc = make_test_disc(sectors, "KEYED");
+    let mut aacs = aacs_with(vec![(0, [0xAB; 16])]);
+    aacs.volume_id = [0x11; 16];
+    disc.aacs = Some(aacs);
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("keyed.iso");
     let mut reader = MockReader {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let opts = SweepOptions {
-        vid: Some([0x11; 16]),
-        unit_keys: vec![(0, [0xAB; 16])],
-        ..plain_sweep_opts(false, true)
-    };
+    let opts = plain_sweep_opts(false, true);
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
 
     let text = std::fs::read_to_string(disc.mapfile_for(&iso_path)).unwrap();
@@ -1965,25 +1885,24 @@ fn the_mapfile_header_never_carries_the_unit_keys() {
         "no key byte on disk: {text}"
     );
     let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
-    assert!(mf.unit_keys().is_empty());
+    assert!(mf.legacy_key_fingerprints().is_empty());
 }
 
 /// ...and the VID only as its fingerprint.
 #[test]
 fn the_mapfile_header_carries_only_the_vid_fingerprint() {
     let sectors: u32 = 64;
-    let disc = make_test_disc(sectors, "UNKEYED");
+    let mut disc = make_test_disc(sectors, "UNKEYED");
+    let mut aacs = aacs_with(Vec::new());
+    aacs.volume_id = [0x11; 16];
+    disc.aacs = Some(aacs);
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("unkeyed.iso");
     let mut reader = MockReader {
         total_sectors: sectors,
         bad_sectors: std::collections::HashSet::new(),
     };
-    let opts = SweepOptions {
-        vid: Some([0x11; 16]),
-        unit_keys: Vec::new(),
-        ..plain_sweep_opts(false, true)
-    };
+    let opts = plain_sweep_opts(false, true);
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
 
     let text = std::fs::read_to_string(disc.mapfile_for(&iso_path)).unwrap();
@@ -1993,8 +1912,10 @@ fn the_mapfile_header_carries_only_the_vid_fingerprint() {
         "no raw VID on disk: {text}"
     );
     let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
-    assert_eq!(mf.vid(), None);
-    assert!(mf.vid_fingerprint().is_some());
+    assert_eq!(
+        mf.vid_fingerprint(),
+        Some(freemkv_engine::vid_fingerprint(&[0x11; 16]))
+    );
 }
 
 // The drive's in-drive retry lever is the INVERSE of skip-on-error: a
@@ -2233,7 +2154,7 @@ fn equal_pending_and_unreadable_counts_still_route_to_a_patch_pass() {
 fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
     let sectors: u32 = 128;
     let total = sectors as u64 * SEC;
-    let disc_a = make_test_disc(sectors, "DISC-A");
+    let mut disc_a = make_test_disc(sectors, "DISC-A");
     let disc_b = make_test_disc(sectors, "DISC-B");
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("swap.iso");
@@ -2247,10 +2168,10 @@ fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
         };
         // A's volume id goes into the mapfile header — that is what makes the
         // leftover mapfile identifiably A's rather than anonymous.
-        let a_opts = SweepOptions {
-            vid: Some([0xAA; 16]),
-            ..plain_sweep_opts(false, true)
-        };
+        let mut aacs = aacs_with(Vec::new());
+        aacs.volume_id = [0xAA; 16];
+        disc_a.aacs = Some(aacs);
+        let a_opts = plain_sweep_opts(false, true);
         freemkv_engine::sweep(&disc_a, &mut reader, &iso_path, &a_opts).expect("disc A sweep");
         let a_map = Mapfile::load(&disc_a.mapfile_for(&iso_path)).unwrap();
         assert!(
@@ -2275,7 +2196,7 @@ fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
 
     let mf = Mapfile::load(&disc_b.mapfile_for(&iso_path)).unwrap();
     assert_eq!(
-        mf.vid(),
+        mf.vid_fingerprint(),
         None,
         "A's mapfile must have been dropped, not inherited"
     );

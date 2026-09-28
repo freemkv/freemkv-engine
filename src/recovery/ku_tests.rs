@@ -111,7 +111,7 @@ fn decrypting_copy_patch_pass_proves_lazy_piece() {
     let popts = PatchOptions {
         decrypt: true,
         keys: Some(set.clone()),
-        ..PatchOptions::for_patch_pass(true, None, None, None)
+        ..PatchOptions::for_patch_pass(true, None, None)
     };
     let out = super::patch(&fx.disc, &mut drive.clone(), &iso, &popts).unwrap();
     assert_eq!(out.bytes_pending + out.bytes_unreadable, 0);
@@ -204,7 +204,7 @@ fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<ResolvedKeyS
     super::sweep(disc, &mut fx.source(), &iso("sweep.iso"), &sweep).expect("sweep");
     let patch = PatchOptions {
         keys: keys.clone(),
-        ..PatchOptions::for_patch_pass(true, None, None, None)
+        ..PatchOptions::for_patch_pass(true, None, None)
     };
     super::patch(disc, &mut fx.source(), &iso("sweep.iso"), &patch).expect("patch");
     let mut job = Job::new("iso://x.iso", "mkv://x.mkv");

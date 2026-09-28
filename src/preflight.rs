@@ -134,14 +134,14 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     }
 
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key. The rip's key
-    // set decides (KU §3.5); without one, `resolve_keys` over the disc-banked keys, so
-    // preflight can't disagree with the key-status report.
+    // set decides (KU §3.5); without one, the executors' gate over no set (KU-X1: never the
+    // disc-banked keys), so preflight can't pass a rip the passes refuse.
     let keyed = match &job.keys {
         Some(set) => matches!(
             crate::keys::key_status(disc, set),
             libfreemkv::keys::DecryptStatus::Ready | libfreemkv::keys::DecryptStatus::NotEncrypted
         ),
-        None => crate::resolve::resolve_keys(disc).resolved,
+        None => crate::resolve::ensure_decryptable_with(disc, false, None).is_ok(),
     };
     if disc.encrypted && !job.raw && !keyed {
         reasons.push(Reason::new("encrypted-no-key"));
@@ -250,8 +250,8 @@ mod tests {
 
     use crate::job::Job;
 
-    // A resolved AacsState carrying real key material (non-empty unit_keys) —
-    // what the preflight decrypt gate (via resolve_keys) accepts as "keyed".
+    // An AacsState carrying disc-banked key material (non-empty unit_keys), which no
+    // preflight gate accepts without the rip's key set (KU-X1).
     fn resolved_aacs() -> libfreemkv::AacsState {
         libfreemkv::test_util::aacs_state()
             .key_source(libfreemkv::KeyOrigin::KeyDb)
@@ -316,11 +316,21 @@ mod tests {
         assert_eq!(preflight(&d, &raw_job), Preflight::Ready);
     }
 
+    // KU §3.5: the rip's key set keys the disc. KU §8.2 KU-X1: "Remove the legacy gate
+    // fallback", so keys banked on the disc alone do not.
     #[test]
-    fn encrypted_with_key_is_ready() {
-        let d = disc_with(2, true, true);
+    fn encrypted_is_ready_with_a_set_not_with_banked_keys() {
+        use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
+        let fx = bd_image(&[Some(K1)], 1);
+        let scope = libfreemkv::keys::KeyScope::Titles(vec![0]);
+        let set = resolve(&fx, scope, &[(Answer::Keydb, &[K1])], &Calls::default()).unwrap();
         let j = Job::new("iso://x.iso", "/out");
-        assert_eq!(preflight(&d, &j), Preflight::Ready);
+        assert_eq!(
+            preflight(&fx.disc, &j.clone().with_keys(set)),
+            Preflight::Ready
+        );
+        let banked = preflight(&disc_with(2, true, true), &j);
+        assert!(banked.reasons().iter().any(|r| r.key == "encrypted-no-key"));
     }
 
     // `is_ready` is the accessor a front-end greys out Start on; assert both directions against
@@ -346,7 +356,7 @@ mod tests {
     fn blocks_encrypted_placeholder_aacs_without_key_material() {
         // A VID-only scan leaves `aacs = Some(..)` with EMPTY unit_keys and no
         // VUK. preflight must NOT treat that as keyed (gating on `aacs.is_some()`
-        // did); it now delegates to resolve_keys, which reports unresolved.
+        // did); with no key set nothing is keyed.
         let mut d = disc_with(2, true, true);
         if let Some(a) = d.aacs.as_mut() {
             a.unit_keys = Vec::new();

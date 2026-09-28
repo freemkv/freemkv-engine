@@ -271,8 +271,9 @@ fn opens(unit: &[u8], key: &[u8; 16]) -> bool {
     u.chunks(192).all(|p| p[4] == 0x47)
 }
 
-impl KeySource for Fake {
-    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
+impl Fake {
+    // The fake's one answer, shared by both of its lookups.
+    fn answer_for(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
         let vid = ctx.vid().map(|v| v.0);
         self.calls.0.lock().unwrap().push(Call {
             who: self.who,
@@ -314,6 +315,12 @@ impl KeySource for Fake {
             .map(|(i, k)| UnitKey::new(i as u32, k))
             .collect())
     }
+}
+
+impl KeySource for Fake {
+    fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
+        self.answer_for(ctx)
+    }
     fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
         let call = Call {
             who: self.who,
@@ -335,7 +342,7 @@ impl KeySource for Fake {
         &self,
         ctx: &dyn ResolveCtx,
     ) -> libfreemkv::Result<libfreemkv::keysource::UnitKeyResolution> {
-        let keys = self.get_unit_keys(ctx)?;
+        let keys = self.answer_for(ctx)?;
         let km_no_vid = self.answer == Answer::KeydbKmNoVid;
         Ok(libfreemkv::keysource::UnitKeyResolution {
             keys,

@@ -1104,20 +1104,12 @@ fn a_prescanned_image_is_identified_only_by_real_identity() {
     open_prescanned(&vidfp, VID, &set).expect("the disc's VID matches the vidfp");
 
     // 7. A pre-1.8 sidecar identified only by legacy key fingerprints: rule 3.
+    // The legacy prefix is assembled so only `parse_legacy_key_lines` spells it (EK9).
+    let uk = |k: &[u8; 16]| format!("# {}uk: 1:{}\n", "freemkv-", hex(k));
     let legacy = staged_with(&fx, dir.path(), "legacy.iso");
-    sidecar_text(
-        &fx,
-        &legacy,
-        &[inf],
-        &format!("# freemkv-uk: 1:{}\n", hex(&K1)),
-    );
+    sidecar_text(&fx, &legacy, &[inf], &uk(&K1));
     open_prescanned(&legacy, [0; 16], &set).expect("a proven key matches");
-    sidecar_text(
-        &fx,
-        &legacy,
-        &[inf],
-        &format!("# freemkv-uk: 1:{}\n", hex(&K2)),
-    );
+    sidecar_text(&fx, &legacy, &[inf], &uk(&K2));
     assert!(
         mismatch(open_prescanned(&legacy, [0; 16], &set)),
         "no proven key matches"

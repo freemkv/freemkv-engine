@@ -58,7 +58,8 @@ pub struct Job {
     /// everything (archival).
     pub streams: StreamChoice,
     /// The rip's up-front key set ([`crate::keys::resolve_for_rip`], KU §2.1), in memory
-    /// only. `None` keeps the legacy disc-banked keys (until KU-X1).
+    /// only. `None` holds no key: a decrypting rip of an AACS disc refuses (E7022) whatever
+    /// keys the disc banked (KU-X1).
     pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 

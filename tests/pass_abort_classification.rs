@@ -65,9 +65,6 @@ fn opts(skip_on_error: bool) -> SweepOptions<'static> {
         skip_on_error,
         progress: None,
         halt: None,
-        vid: None,
-        unit_keys: Vec::new(),
-        key_fetch: None,
         keys: None,
     }
 }
@@ -210,7 +207,7 @@ fn a_patch_pass_aborts_on_a_non_read_error() {
     let mut reader = FaultyReader {
         fault: Fault::Err(|| Error::DecryptFailed),
     };
-    let popts = PatchOptions::for_patch_pass(false, None, None, None);
+    let popts = PatchOptions::for_patch_pass(false, None, None);
     let Err(err) = freemkv_engine::patch(&disc(CAPACITY), &mut reader, &iso, &popts) else {
         panic!("a decrypt refusal must abort the patch pass");
     };
