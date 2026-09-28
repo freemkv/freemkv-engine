@@ -336,4 +336,164 @@ mod tests {
             "the winning key must be banked onto the disc, not merely reported"
         );
     }
+
+    // ── KU-E1: the front door (KU §3.2) ─────────────────────────────────────
+
+    use crate::test_fixtures::{Answer, Calls, K1, K2, bd_image, factory};
+    use libfreemkv::keys::{DecryptStatus, KeyScope, ResolvedKeySet};
+
+    /// EK5 (KU §2.5): MKV/M2TS/MP4/… → `Titles(selected)`, a plain rip `Titles([main])`;
+    /// decrypted ISO or folder → `WholeDisc`; raw copy → `None` (no key call).
+    #[test]
+    fn rip_scope_table() {
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let d = &fx.disc;
+        assert_eq!(
+            rip_scope(d, &[1], RipOutput::Streams),
+            KeyScope::Titles(vec![1])
+        );
+        assert_eq!(
+            rip_scope(d, &[0, 1], RipOutput::Streams),
+            KeyScope::Titles(vec![0, 1])
+        );
+        assert_eq!(
+            rip_scope(d, &[], RipOutput::Streams),
+            KeyScope::Titles(vec![0]),
+            "a plain rip is Titles([main])"
+        );
+        assert_eq!(
+            rip_scope(d, &[1], RipOutput::DecryptedImage),
+            KeyScope::WholeDisc
+        );
+        assert_eq!(rip_scope(d, &[1], RipOutput::RawImage), KeyScope::None);
+    }
+
+    /// EK6 (J10): a key-service URL whose host lookup fails TRANSIENTLY keeps the online
+    /// source (resolve retries it, J13); a permanently rejected one is still dropped.
+    #[test]
+    fn transient_url_keeps_online_source() {
+        let p = KeyParams {
+            keydb_path: Some("keydb.cfg".into()),
+            key_url: Some("https://keys.freemkv-ku-e1.invalid/keys".into()),
+            key_auth: None,
+            online_only: false,
+        };
+        let url = p.key_url.as_deref().unwrap();
+        let rejected = freemkv_keysources::check_keyserver_url(url).unwrap_err();
+        assert!(
+            rejected.is_temporary(),
+            "`.invalid` never resolves: {rejected}"
+        );
+        let labels: Vec<&str> = key_source_factory(&p)().iter().map(|s| s.label()).collect();
+        assert_eq!(labels, ["keydb", "online"], "the online source is kept");
+        let loopback = KeyParams {
+            key_url: Some("https://127.0.0.1:8443/keys".into()),
+            ..p
+        };
+        let labels: Vec<&str> = key_source_factory(&loopback)()
+            .iter()
+            .map(|s| s.label())
+            .collect();
+        assert_eq!(labels, ["keydb"], "a permanent rejection still drops it");
+    }
+
+    /// KU §2.3 via the engine's one front door: one resolve over the scope, the set keys it,
+    /// and the factory is released (LK7): nothing can ask a source after it returns.
+    #[test]
+    fn resolve_for_rip_resolves_once_and_keeps_no_source() {
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+        let set = resolve_for_rip(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0, 1]),
+            &f,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(calls.len(), 2, "one request per key group");
+        assert!(set.covers(&KeyScope::Titles(vec![0, 1])));
+        assert_eq!(set.status().proven, 2);
+        assert_eq!(std::sync::Arc::strong_count(&f), 1, "no factory retained");
+        assert!(matches!(key_status(&fx.disc, &set), DecryptStatus::Ready));
+    }
+
+    /// KU §2.5 raw copy: `KeyScope::None` makes no key-source call at all.
+    #[test]
+    fn resolve_for_rip_raw_scope_asks_nothing() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+        let set =
+            resolve_for_rip(&fx.disc, &mut fx.source(), KeyScope::None, &f, None, None).unwrap();
+        assert_eq!(calls.len(), 0);
+        assert!(set.status().proven == 0);
+    }
+
+    /// KU §2.3 step 13: Stop before the resolve builds no set and asks nothing.
+    #[test]
+    fn resolve_for_rip_honours_halt() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Online, &[K1])], &calls);
+        let halt = libfreemkv::Halt::new();
+        halt.cancel();
+        let r = resolve_for_rip(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0]),
+            &f,
+            None,
+            Some(&halt),
+        );
+        assert!(matches!(r, Err(libfreemkv::Error::Halted)), "{r:?}");
+        assert_eq!(calls.len(), 0);
+    }
+
+    /// A seed set (e.g. from `info` / the GUI open) joins the pool first: a second resolve
+    /// over what it already proves asks no online source (KU §2.3 step 11).
+    #[test]
+    fn resolve_for_rip_seed_is_not_asked_again() {
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+        let scope = KeyScope::Titles(vec![0, 1]);
+        let seed =
+            resolve_for_rip(&fx.disc, &mut fx.source(), scope.clone(), &f, None, None).unwrap();
+        let before = calls.len();
+        let set =
+            resolve_for_rip(&fx.disc, &mut fx.source(), scope, &f, Some(&seed), None).unwrap();
+        assert_eq!(calls.len(), before, "the seed's keys open every piece");
+        assert_eq!(set.status().proven, 2);
+    }
+
+    /// `key_status` (KU §12.2 `Ready | Missing | ForensicPending`) reads the set, never the
+    /// disc-banked keys; a clear disc is `NotEncrypted`.
+    #[test]
+    fn key_status_reads_the_set() {
+        let fx = bd_image(&[Some(K1)], 1);
+        assert!(matches!(
+            key_status(&fx.disc, &ResolvedKeySet::none()),
+            DecryptStatus::AacsKeysMissing(_)
+        ));
+        let mut clear = bd_image(&[None], 1).disc;
+        clear.aacs = None;
+        clear.encrypted = false;
+        assert!(matches!(
+            key_status(&clear, &ResolvedKeySet::none()),
+            DecryptStatus::NotEncrypted
+        ));
+    }
+
+    /// `open_scan` (KU §3.2): the raw drive bring-up, no key call; signature pinned.
+    #[test]
+    fn open_scan_signature() {
+        let _: fn(
+            libfreemkv::DeviceTarget,
+            Option<libfreemkv::DriveCredentials>,
+            bool,
+        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = crate::mux::open_scan;
+    }
 }

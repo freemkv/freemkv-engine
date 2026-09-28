@@ -39,6 +39,8 @@ mod run;
 mod sink;
 mod speed;
 mod streams;
+#[cfg(test)]
+mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
 pub use extract::extract_tree;

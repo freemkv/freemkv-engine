@@ -106,3 +106,29 @@ fn sweep_and_patch_options_are_default() {
     assert!(p.block_sectors.is_none() && p.wedged_threshold == 0);
     assert!(p.progress.is_none() && p.halt.is_none() && p.key_fetch.is_none());
 }
+
+/// KU-E1 (KU §3.2, §12.2): the engine's key front door, nameable where the server and
+/// both shells call it.
+#[test]
+fn key_front_door_is_nameable() {
+    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    let _: fn(
+        &libfreemkv::Disc,
+        &mut dyn libfreemkv::SectorSource,
+        KeyScope,
+        &libfreemkv::KeySourceFactory,
+        Option<&ResolvedKeySet>,
+        Option<&libfreemkv::Halt>,
+    ) -> Result<ResolvedKeySet, libfreemkv::Error> = freemkv_engine::keys::resolve_for_rip;
+    let _: fn(&libfreemkv::Disc, &[usize], freemkv_engine::keys::RipOutput) -> KeyScope =
+        freemkv_engine::keys::rip_scope;
+    let _: fn(&libfreemkv::Disc, &ResolvedKeySet) -> libfreemkv::keys::DecryptStatus =
+        freemkv_engine::keys::key_status;
+    let _: fn(&freemkv_engine::KeyParams) -> libfreemkv::KeySourceFactory =
+        freemkv_engine::key_source_factory;
+    let _: fn(
+        libfreemkv::DeviceTarget,
+        Option<libfreemkv::DriveCredentials>,
+        bool,
+    ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = freemkv_engine::open_scan;
+}
