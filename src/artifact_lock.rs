@@ -46,8 +46,8 @@ impl LockOps for OsLockOps {
         #[cfg(windows)]
         {
             use std::os::windows::fs::OpenOptionsExt;
-            // SS-10 CreateFileW dwShareMode: FILE_SHARE_READ | FILE_SHARE_WRITE |
-            // FILE_SHARE_DELETE, so a Discard can delete the sidecar a waiter holds open.
+            // SS-10 CreateFileW FILE_SHARE_DELETE: "Enables subsequent open operations on a
+            // file or device to request delete access" (read + write + delete sharing).
             o.share_mode(0x1 | 0x2 | 0x4);
         }
         o.open(path)
@@ -77,7 +77,8 @@ fn same_file(file: &File, path: &Path) -> io::Result<bool> {
     Ok(held.dev() == named.dev() && held.ino() == named.ino())
 }
 
-// SS-10 BY_HANDLE_FILE_INFORMATION: the volume serial number and the file index identify it.
+// SS-10 BY_HANDLE_FILE_INFORMATION: "You can compare the VolumeSerialNumber and FileIndex
+// members … to determine if two paths map to the same target".
 #[cfg(windows)]
 fn same_file(file: &File, path: &Path) -> io::Result<bool> {
     let held = same_file::Handle::from_file(file.try_clone()?)?;

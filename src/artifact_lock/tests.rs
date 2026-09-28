@@ -18,7 +18,8 @@ fn blocked_for(artifact: &Path, watch: &[PathBuf], for_: Duration) -> io::Result
 }
 
 // ET11 `artifact_lock_survives_real_mapfile_flush` — §2.5: "A lock on the mapfile would pin
-// the old inode after the first flush and exclude nothing"; SS-11 rename() "shall be atomic".
+// the old inode after the first flush and exclude nothing"; SS-11 rename(): "a link named
+// new shall remain visible to other threads throughout the renaming operation".
 #[test]
 fn artifact_lock_survives_real_mapfile_flush() {
     let dir = tempfile::tempdir().unwrap();
@@ -112,7 +113,8 @@ fn same_stem_artifacts_do_not_share_a_lock() {
 }
 
 // ET11e `windows_share_delete_sidecar` — compile-only on dev; runs in qa Windows
-// `release-tests`. SS-10 CreateFileW: FILE_SHARE_DELETE lets a Discard delete an open file.
+// `release-tests`. SS-10 CreateFileW FILE_SHARE_DELETE: "Enables subsequent open operations
+// on a file or device to request delete access".
 #[cfg(windows)]
 #[test]
 fn windows_share_delete_sidecar() {
