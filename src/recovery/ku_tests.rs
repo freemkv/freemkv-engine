@@ -3,73 +3,17 @@
 //! the on-arrival proof's side reads never reach the damage classifier.
 
 use super::read_error::CLASSIFIED;
-use crate::test_fixtures::{Answer, Calls, Fx, K1, bd_image, factory, resolve};
+use crate::test_fixtures::{Answer, Calls, Damage, Drive, Fx, K1, bd_image, factory, resolve};
 use crate::{CopyOptions, Job, PatchOptions, SweepOptions};
 use libfreemkv::keys::{KeyScope, ResolvedKeySet};
-use libfreemkv::test_util::{CountingSource, MemSource};
-use libfreemkv::{Error, Result, SectorSource};
-use std::sync::{Arc, Mutex};
-
-/// What the fake drive refuses (media damage), switched between phases of a test.
-#[derive(Clone, Copy)]
-enum Damage {
-    None,
-    /// Every read touching `[s, e)`.
-    Range(u32, u32),
-    /// Every read touching `[s, e)` except one wholly inside `[ok_s, ok_e)`.
-    RangeExcept(u32, u32, u32, u32),
-    /// Every read of 9+ sectors touching `[s, e)`: the on-arrival side reads (up to 32
-    /// units), never a pass's own read of one widened unit (KU §2.4).
-    LongReads(u32, u32),
-}
-
-#[derive(Clone)]
-struct Drive {
-    inner: MemSource,
-    damage: Arc<Mutex<Damage>>,
-}
-
-impl Drive {
-    fn new(fx: &Fx) -> Self {
-        Drive {
-            inner: fx.source(),
-            damage: Arc::new(Mutex::new(Damage::None)),
-        }
-    }
-    fn set(&self, d: Damage) {
-        *self.damage.lock().unwrap() = d;
-    }
-}
-
-impl SectorSource for Drive {
-    fn capacity_sectors(&self) -> u32 {
-        self.inner.capacity_sectors()
-    }
-    fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], r: bool) -> Result<usize> {
-        let end = lba + count as u32;
-        let touches = |s: u32, e: u32| s < end && lba < e;
-        let dead = match *self.damage.lock().unwrap() {
-            Damage::None => false,
-            Damage::Range(s, e) => touches(s, e),
-            Damage::RangeExcept(s, e, os, oe) => touches(s, e) && !(os <= lba && end <= oe),
-            Damage::LongReads(s, e) => count >= 9 && touches(s, e),
-        };
-        if dead {
-            return Err(Error::DiscRead {
-                sector: lba as u64,
-                status: None,
-                sense: None,
-            });
-        }
-        self.inner.read_sectors(lba, count, buf, r)
-    }
-}
+use libfreemkv::test_util::CountingSource;
+use std::sync::Arc;
 
 // Two clips of one key, K1: clip 0 proves it; clip 1 is left Lazy when every probe of it
 // faults at resolve time (KU §2.3 step 9.5), to be proven on arrival (§2.4).
 fn lazy_fixture() -> (Fx, Drive, ResolvedKeySet) {
     let fx = bd_image(&[Some(K1), Some(K1)], 2);
-    let drive = Drive::new(&fx);
+    let drive = Drive::new(&fx.img.image);
     let (s, n) = fx.clip(1);
     drive.set(Damage::Range(s, s + n));
     let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());

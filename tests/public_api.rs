@@ -133,3 +133,33 @@ fn key_front_door_is_nameable() {
         bool,
     ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = freemkv_engine::open_scan;
 }
+
+/// KU-E1 (KU §3.2, §12.1): the one image-open API the server calls, and what it returns.
+#[test]
+fn image_front_door_is_nameable() {
+    use freemkv_engine::{ImageSource, KeyInput, OpenImageOptions, OpenedImage};
+    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    let _: fn(&ImageSource, OpenImageOptions) -> Result<OpenedImage, libfreemkv::Error> =
+        freemkv_engine::open_image_with;
+    let _: fn(&ImageSource, &freemkv_engine::KeyParams) -> Result<OpenedImage, libfreemkv::Error> =
+        freemkv_engine::open_image;
+    let f: libfreemkv::KeySourceFactory = std::sync::Arc::new(Vec::new);
+    let set = ResolvedKeySet::none();
+    for keys in [
+        KeyInput::Resolve(f.clone()),
+        KeyInput::Known(set.clone()),
+        KeyInput::Seeded(f, set),
+    ] {
+        let opts = OpenImageOptions {
+            keys,
+            disc: None,
+            scope: Some(KeyScope::Titles(vec![0])),
+            vid: None,
+            halt: Some(libfreemkv::Halt::new()),
+        };
+        drop(opts);
+    }
+    fn _fields(o: &OpenedImage) -> (&ResolvedKeySet, Option<&libfreemkv::KeySourceFactory>, bool) {
+        (&o.keys, o.sources.as_ref(), o.prescanned)
+    }
+}

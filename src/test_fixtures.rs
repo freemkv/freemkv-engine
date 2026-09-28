@@ -200,6 +200,8 @@ fn uk_ro_extent(img: &EncryptedBdImage) -> (u32, u32) {
 pub(crate) struct Call {
     pub who: &'static str,
     pub vid: Option<[u8; 16]>,
+    /// A forensic (FMTS index-key) request (KU §5.1).
+    pub forensic: bool,
 }
 
 /// Every request the fakes of one factory answered, shared across its builds.
@@ -212,6 +214,9 @@ impl Calls {
     }
     pub(crate) fn all(&self) -> Vec<Call> {
         self.0.lock().unwrap().clone()
+    }
+    pub(crate) fn forensic(&self) -> usize {
+        self.all().iter().filter(|c| c.forensic).count()
     }
 }
 
@@ -230,6 +235,7 @@ struct Fake {
     who: &'static str,
     answer: Answer,
     keys: Vec<[u8; 16]>,
+    fmts: Vec<[u8; 16]>,
     calls: Calls,
 }
 
@@ -243,11 +249,11 @@ fn opens(unit: &[u8], key: &[u8; 16]) -> bool {
 impl KeySource for Fake {
     fn get_unit_keys(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
         let vid = ctx.vid().map(|v| v.0);
-        self.calls
-            .0
-            .lock()
-            .unwrap()
-            .push(Call { who: self.who, vid });
+        self.calls.0.lock().unwrap().push(Call {
+            who: self.who,
+            vid,
+            forensic: false,
+        });
         let keys: Vec<[u8; 16]> = match self.answer {
             Answer::Keydb => self.keys.clone(),
             Answer::OnlineNeedsVid if vid.is_none() => Vec::new(),
@@ -267,6 +273,20 @@ impl KeySource for Fake {
             .map(|(i, k)| UnitKey::new(i as u32, k))
             .collect())
     }
+    fn get_fmts_indexes(&self, ctx: &dyn ResolveCtx) -> libfreemkv::Result<Vec<UnitKey>> {
+        let call = Call {
+            who: self.who,
+            vid: ctx.vid().map(|v| v.0),
+            forensic: true,
+        };
+        self.calls.0.lock().unwrap().push(call);
+        Ok(self
+            .fmts
+            .iter()
+            .enumerate()
+            .map(|(i, k)| UnitKey::new(i as u32, *k))
+            .collect())
+    }
     fn label(&self) -> &'static str {
         self.who
     }
@@ -278,8 +298,17 @@ impl KeySource for Fake {
 /// A factory building one fake per `(answer, keys)`, recording into `calls`. The
 /// returned `Arc` also counts the factory's own holders (LK7: nothing may keep it).
 pub(crate) fn factory(specs: &[(Answer, &[[u8; 16]])], calls: &Calls) -> KeySourceFactory {
+    fmts_factory(specs, &[], calls)
+}
+
+/// [`factory`] whose sources also answer the forensic index keys `fmts` (KU §5.2).
+pub(crate) fn fmts_factory(
+    specs: &[(Answer, &[[u8; 16]])],
+    fmts: &[[u8; 16]],
+    calls: &Calls,
+) -> KeySourceFactory {
     let specs: Vec<(Answer, Vec<[u8; 16]>)> = specs.iter().map(|(a, k)| (*a, k.to_vec())).collect();
-    let calls = calls.clone();
+    let (fmts, calls) = (fmts.to_vec(), calls.clone());
     Arc::new(move || {
         specs
             .iter()
@@ -292,6 +321,7 @@ pub(crate) fn factory(specs: &[(Answer, &[[u8; 16]])], calls: &Calls) -> KeySour
                     },
                     answer: *answer,
                     keys: keys.clone(),
+                    fmts: fmts.clone(),
                     calls: calls.clone(),
                 }) as Box<dyn KeySource>
             })
@@ -315,4 +345,163 @@ pub(crate) fn resolve(
         libfreemkv::keys::ResolveKeysOptions::default(),
     )
     .map(|r| r.keys)
+}
+
+/// What a fake drive refuses (media damage), switchable between phases of a test.
+#[derive(Clone, Copy)]
+pub(crate) enum Damage {
+    None,
+    /// Every read touching `[s, e)`.
+    Range(u32, u32),
+    /// Every read touching `[s, e)` except one wholly inside `[ok_s, ok_e)`.
+    RangeExcept(u32, u32, u32, u32),
+    /// Every read of 9+ sectors touching `[s, e)`: the on-arrival side reads (up to 32
+    /// units), never a pass's own read of one widened unit (KU §2.4).
+    LongReads(u32, u32),
+}
+
+/// A random-access fake drive over an image, with switchable [`Damage`].
+#[derive(Clone)]
+pub(crate) struct Drive {
+    inner: MemSource,
+    damage: Arc<Mutex<Damage>>,
+}
+
+impl Drive {
+    pub(crate) fn new(image: &[u8]) -> Self {
+        Drive {
+            inner: MemSource::new(image.to_vec()),
+            damage: Arc::new(Mutex::new(Damage::None)),
+        }
+    }
+    pub(crate) fn set(&self, d: Damage) {
+        *self.damage.lock().unwrap() = d;
+    }
+}
+
+impl SectorSource for Drive {
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity_sectors()
+    }
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        r: bool,
+    ) -> libfreemkv::Result<usize> {
+        let end = lba + count as u32;
+        let touches = |s: u32, e: u32| s < end && lba < e;
+        let dead = match *self.damage.lock().unwrap() {
+            Damage::None => false,
+            Damage::Range(s, e) => touches(s, e),
+            Damage::RangeExcept(s, e, os, oe) => touches(s, e) && !(os <= lba && end <= oe),
+            Damage::LongReads(s, e) => count >= 9 && touches(s, e),
+        };
+        if dead {
+            return Err(libfreemkv::Error::DiscRead {
+                sector: lba as u64,
+                status: None,
+                sense: None,
+            });
+        }
+        self.inner.read_sectors(lba, count, buf, r)
+    }
+}
+
+pub(crate) const F1: [u8; 16] = *b"\xE5KU-E1 forensic1";
+pub(crate) const F2: [u8; 16] = *b"\xF6KU-E1 forensic2";
+const ALT: [u8; 16] = *b"\x07KU-E1 alternate";
+
+/// An AACS 2.1 FMTS disc (KS-25, KS-26: evidence, no public spec), after libfreemkv's
+/// KU-L2 fixture: clip 0 (K1, 10 units) and the forensic clip 1 (base K2, 60 units) with an
+/// index-1 segment over units 0..16 and an index-2 one over 20..36. Our phase is Even
+/// (F1 / F2); odd segment units are the alternate variant. Titles: [0], [1], [0, 1].
+pub(crate) fn fmts_image() -> Fx {
+    let files = [
+        BdFile::new("BDMV/STREAM/00001.m2ts", 30, Some(K1)),
+        BdFile::new("BDMV/STREAM/00002.fmts", 180, Some(K2)),
+        BdFile::new("AACS/IndividualSegment.tbl", 1, None),
+    ];
+    let uk_ro = libfreemkv::test_util::unit_key_ro(AacsVersion::V10, &[[0xEE; 16]; 2], &[1; 3]);
+    let mut img = encrypted_bd_image(&files, &uk_ro);
+    let segs = [(1u16, 0u32, 16u32), (2, 20, 36)];
+    let mut tbl = Vec::new();
+    tbl.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+    tbl.extend_from_slice(&(segs.len() as u16).to_be_bytes());
+    tbl.extend_from_slice(&16u16.to_be_bytes());
+    for &(index, a, b) in &segs {
+        tbl.extend_from_slice(&0x0100_0000u32.to_be_bytes());
+        tbl.extend_from_slice(&index.to_be_bytes());
+        tbl.extend_from_slice(&1u16.to_be_bytes());
+        tbl.extend_from_slice(&(a * 32).to_be_bytes());
+        tbl.extend_from_slice(&(b * 32 - 1).to_be_bytes());
+    }
+    let at = img.files[2].0 as usize * 2048;
+    img.image[at..at + tbl.len()].copy_from_slice(&tbl);
+    let clip = img.files[1].0;
+    for &(index, a, b) in &segs {
+        let ours = if index == 1 { F1 } else { F2 };
+        for u in a..b {
+            let key = if (u - a) % 2 == 0 { ours } else { ALT };
+            let at = (clip + u * 3) as usize * 2048;
+            let mut unit = img.plain[at..at + 6144].to_vec();
+            assert!(libfreemkv::aacs::content::encrypt_unit(&mut unit, &key));
+            img.image[at..at + 6144].copy_from_slice(&unit);
+        }
+    }
+    let disc = manual_disc(&img, &uk_ro, &[&[0], &[1], &[0, 1]]);
+    Fx {
+        img,
+        disc,
+        metadata: Vec::new(),
+    }
+}
+
+// A UHD FMTS disc over `img` whose title `t` plays files `titles[t]` (not scanned: the
+// fixture has no playlists).
+fn manual_disc(img: &EncryptedBdImage, uk_ro: &[u8], titles: &[&[usize]]) -> Disc {
+    let titles = titles
+        .iter()
+        .enumerate()
+        .map(|(t, files)| {
+            let extents: Vec<libfreemkv::disc::Extent> = files
+                .iter()
+                .map(|&f| libfreemkv::disc::Extent {
+                    start_lba: img.files[f].0,
+                    sector_count: img.files[f].1,
+                })
+                .collect();
+            libfreemkv::DiscTitle {
+                playlist: format!("{t:05}.mpls"),
+                size_bytes: extents.iter().map(|e| e.sector_count as u64 * 2048).sum(),
+                extents,
+                ..libfreemkv::DiscTitle::empty()
+            }
+        })
+        .collect();
+    let capacity = (img.image.len() / 2048) as u32;
+    let hash = libfreemkv::aacs::inf::disc_hash_hex(&libfreemkv::aacs::inf::disc_hash(uk_ro));
+    Disc {
+        volume_id: "KU_E1_FMTS".into(),
+        meta_title: None,
+        format: libfreemkv::DiscFormat::Fmts,
+        capacity_sectors: capacity,
+        capacity_bytes: capacity as u64 * 2048,
+        layers: 1,
+        titles,
+        region: libfreemkv::disc::DiscRegion::Free,
+        aacs: Some(
+            libfreemkv::test_util::aacs_state()
+                .disc_hash(hash)
+                .volume_id(VID)
+                .uk_ro(uk_ro.to_vec())
+                .build(),
+        ),
+        css: None,
+        encrypted: true,
+        aacs_error: None,
+        css_error: None,
+        content_format: libfreemkv::ContentFormat::BdTs,
+    }
 }
