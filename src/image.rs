@@ -258,18 +258,11 @@ mod tests {
             layers: 1,
             titles: vec![],
             region: libfreemkv::disc::DiscRegion::Free,
-            aacs: Some(libfreemkv::AacsState {
-                version: 1,
-                bus_encryption: false,
-                mkb_version: None,
-                disc_hash: String::new(),
-                key_source: libfreemkv::KeyOrigin::ExternalUk,
-                vuk: None,
-                unit_keys: keys.clone(),
-                volume_id: [0u8; 16],
-                uk_ro: Vec::new(),
-                mkb: Vec::new(),
-            }),
+            aacs: Some(
+                libfreemkv::test_util::aacs_state()
+                    .unit_keys(keys.clone())
+                    .build(),
+            ),
             css: None,
             encrypted: true,
             aacs_error: None,

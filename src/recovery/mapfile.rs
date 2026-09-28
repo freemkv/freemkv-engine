@@ -2356,18 +2356,12 @@ mod check_mapfile_identity_tests {
         unit_keys: Vec<(u32, [u8; 16])>,
         volume_id: [u8; 16],
     ) -> libfreemkv::disc::AacsState {
-        libfreemkv::disc::AacsState {
-            version: 2,
-            bus_encryption: true,
-            mkb_version: None,
-            disc_hash: String::new(),
-            key_source: libfreemkv::disc::KeyOrigin::ExternalUk,
-            vuk: None,
-            unit_keys,
-            volume_id,
-            uk_ro: Vec::new(),
-            mkb: Vec::new(),
-        }
+        libfreemkv::test_util::aacs_state()
+            .version(2)
+            .bus_encryption(true)
+            .unit_keys(unit_keys)
+            .volume_id(volume_id)
+            .build()
     }
 
     fn tmpfile2(tag: &str) -> PathBuf {

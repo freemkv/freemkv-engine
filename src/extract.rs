@@ -27,10 +27,13 @@ pub fn extract_tree(
     // `with_cancel_watcher`), so cancelling even a small extraction is
     // deterministic. No progress channel: both shells poll the final result.
     crate::run::with_cancel_watcher(sink, |halt| {
+        // `..Default`: KU-L2 adds `ExtractOptions::keys`; until then every field is set.
+        #[allow(clippy::needless_update)]
         let opts = libfreemkv::ExtractOptions {
             force,
             progress: None,
             halt: Some(libfreemkv::Halt::from_arc(halt.clone())),
+            ..Default::default()
         };
         disc.extract_tree(reader, dest, &opts)
     })

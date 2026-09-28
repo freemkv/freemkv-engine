@@ -113,18 +113,12 @@ fn unique_title(prefix: &str) -> String {
 }
 
 fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> AacsState {
-    AacsState {
-        version: 2,
-        bus_encryption: true,
-        mkb_version: None,
-        disc_hash: String::new(),
-        key_source: KeyOrigin::DeviceKey,
-        vuk: None,
-        unit_keys,
-        volume_id: [0u8; 16],
-        uk_ro: Vec::new(),
-        mkb: Vec::new(),
-    }
+    libfreemkv::test_util::aacs_state()
+        .version(2)
+        .bus_encryption(true)
+        .key_source(KeyOrigin::DeviceKey)
+        .unit_keys(unit_keys)
+        .build()
 }
 
 // A multipass copy over a damaged region completes rather than erroring.

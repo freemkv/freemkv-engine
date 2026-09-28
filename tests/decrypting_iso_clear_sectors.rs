@@ -5,7 +5,7 @@
 //! classification through the sweep pipeline.
 
 use freemkv_engine::{Mapfile, SectorStatus, SweepOptions};
-use libfreemkv::disc::{AacsState, DiscRegion, KeyOrigin};
+use libfreemkv::disc::{DiscRegion, KeyOrigin};
 use libfreemkv::error::Error;
 use libfreemkv::{ContentFormat, Disc, DiscFormat, DiscTitle, Extent};
 
@@ -244,18 +244,13 @@ fn disc(fx: &Fixture) -> Disc {
             codec_privates: Vec::new(),
         }],
         region: DiscRegion::Free,
-        aacs: Some(AacsState {
-            version: 1,
-            bus_encryption: false,
-            mkb_version: None,
-            disc_hash: String::new(),
-            key_source: KeyOrigin::DeviceKey,
-            vuk: None,
-            unit_keys: vec![(1, UNIT_KEY)],
-            volume_id: [0u8; 16],
-            uk_ro: unit_key_ro(1),
-            mkb: Vec::new(),
-        }),
+        aacs: Some(
+            libfreemkv::test_util::aacs_state()
+                .key_source(KeyOrigin::DeviceKey)
+                .unit_keys(vec![(1, UNIT_KEY)])
+                .uk_ro(unit_key_ro(1))
+                .build(),
+        ),
         css: None,
         encrypted: true,
         aacs_error: None,
