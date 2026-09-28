@@ -639,3 +639,21 @@ fn a_prescanned_disc_is_refused_for_a_folder() {
     std::fs::create_dir(&out).unwrap();
     mux_all(&opened, vec![0], &out);
 }
+
+/// D8: an all-zero `vid` is no VID (KS-29: a VID is read from the media); it never hides the
+/// scanned disc's real one, so a Missing piece with the disc's VID in hand stays E7022.
+#[test]
+fn a_zero_vid_never_hides_the_discs_vid() {
+    let c = vid_case(true);
+    let mut disc = bd_image(&[Some(K1)], 1).disc;
+    disc.aacs.as_mut().unwrap().volume_id = VID;
+    let opts = OpenImageOptions {
+        disc: Some(disc),
+        vid: Some([0; 16]),
+        ..OpenImageOptions::resolve(factory(&[(Answer::Online, &[])], &Calls::default()))
+    };
+    let err = open_image_with(&ImageSource::Iso(c.iso.clone()), opts)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(err.code(), E_NO_DISC_KEY, "{err}");
+}
