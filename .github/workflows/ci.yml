@@ -282,11 +282,11 @@ jobs:
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
-          checkout: libfreemkv freemkv-keysources freemkv-unlock freemkv-i18n freemkv autorip
-      - name: Point both consumers at THIS engine commit
+          checkout: libfreemkv freemkv-keysources freemkv-unlock freemkv-i18n freemkv
+      - name: Point the consumer at THIS engine commit
         shell: bash
         run: |
-          for c in freemkv autorip; do
+          for c in freemkv; do
             mkdir -p "$c/.cargo"
             cat > "$c/.cargo/config.toml" <<'EOF'
           [patch.crates-io]
@@ -302,7 +302,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev build-essential
-      # The consumers (freemkv/autorip) track a higher MSRV than the engine —
+      # The consumer (freemkv) tracks a higher MSRV than the engine —
       # the binaries always float to the highest supported Rust. Build them on
       # `stable` so this job satisfies that floor; the engine's own lower MSRV
       # (verified by the `test` job) cannot compile them.
@@ -311,13 +311,10 @@ jobs:
         with:
           workspaces: |
             freemkv
-            autorip
       - run: cargo check --all-targets
         working-directory: freemkv
       - run: cargo check --all-targets --features gui
         working-directory: freemkv
-      - run: cargo check --all-targets
-        working-directory: autorip
 
   # Coverage — additive, NON-REQUIRED (not wired into any release gate; failure
   # here does not block a push or a release). Mirrors the `test` job's sibling
