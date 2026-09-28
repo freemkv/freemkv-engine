@@ -397,3 +397,26 @@ fn vid_needed_only_when_no_vid_in_hand_and_disc_has_one() {
         "no vidfp"
     );
 }
+
+/// KU §2.3 step 13 / Stop T31: a Stop before an image mux's scope top-up stops that resolve
+/// too (no request), and the loop reports the halt.
+#[test]
+fn a_stopped_image_mux_makes_no_top_up_request() {
+    struct Stopped;
+    impl crate::Sink for Stopped {
+        fn should_cancel(&self) -> bool {
+            true
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    assert_eq!(calls.len(), 1);
+    let plan = MuxPlan::new(vec![0, 1]);
+    let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &Stopped);
+    assert_eq!(out, RipOutcome::Halted);
+    assert_eq!(calls.len(), 1, "the top-up saw the Stop and asked nothing");
+}
