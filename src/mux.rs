@@ -516,8 +516,8 @@ fn scan_options(raw_copy: bool) -> libfreemkv::ScanOptions {
     }
 }
 
-/// Open a live optical drive and get it ready to rip: open the session, lock
-/// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
+/// Open a live optical drive and get it ready to rip: open the session, scan
+/// the disc, lock the tray, and resolve its AACS keys. Returns the scanned
 /// session (its `disc()` is populated and its drive is still owned, ready to
 /// be staged for a `MuxInput::Session` mux) plus the resolution trace.
 ///
@@ -558,7 +558,7 @@ pub fn open_scan_resolve_with(
     Ok((session, trace))
 }
 
-/// Open a live optical drive, lock its tray and scan the disc, with NO key call (KU §3.2):
+/// Open a live optical drive, scan the disc, then lock its tray, with NO key call (KU §3.2):
 /// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
 /// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
 /// `raw_copy` as in [`open_scan_resolve_with`].
@@ -576,14 +576,15 @@ pub fn open_scan(
     )
 }
 
-// ST-E1 red: the pre-ST-E1 order (lock, then scan).
+// Stop design v5 §4.2: `open_scan` "locks the tray after the scan (ET9)", so a scan that
+// fails or is stopped never leaves the tray locked.
 fn scan_then_lock<S>(
     mut session: S,
     scan: impl FnOnce(&mut S) -> Result<(), libfreemkv::Error>,
     lock: impl FnOnce(&mut S),
 ) -> Result<S, libfreemkv::Error> {
-    lock(&mut session);
     scan(&mut session)?;
+    lock(&mut session);
     Ok(session)
 }
 
@@ -838,7 +839,10 @@ mod tests {
         steps.borrow_mut().clear();
         let ok = scan_then_lock(
             (),
-            |_| Ok(steps.borrow_mut().push("scan")),
+            |_| {
+                steps.borrow_mut().push("scan");
+                Ok(())
+            },
             |_| steps.borrow_mut().push("lock"),
         );
         assert!(ok.is_ok());
