@@ -221,6 +221,10 @@ pub struct Mapfile {
     /// comment headers when the disc was successfully keyed. Mutually exclusive
     /// with `vid` (see above). Empty when unresolved.
     unit_keys: Vec<(u32, [u8; 16])>,
+    /// Byte ranges a SCOPED (MKV-staging) image was read over, persisted as a
+    /// `# freemkv-scope:` header. Outside them nothing is read: the file is not a
+    /// whole-disc image, and `stats()` leaves those unread bytes out of pending.
+    scope: Option<Vec<(u64, u64)>>,
     /// Raised through a [`MapfileDisown`] handle when this mapfile's owner
     /// has been abandoned; once set, no further write reaches the path. See
     /// [`MapfileDisown`].
@@ -251,6 +255,7 @@ impl Mapfile {
             last_flushed: Instant::now(),
             vid: None,
             unit_keys: Vec::new(),
+            scope: None,
             disowned: Arc::new(AtomicBool::new(false)),
         };
         // Eager initial persist so a resume can pick this up even if
@@ -268,6 +273,7 @@ impl Mapfile {
         let mut version = String::from("unknown");
         let mut vid: Option<[u8; 16]> = None;
         let mut unit_keys: Vec<(u32, [u8; 16])> = Vec::new();
+        let mut scope: Option<Vec<(u64, u64)>> = None;
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
@@ -297,6 +303,16 @@ impl Mapfile {
                         return Err(e);
                     };
                     unit_keys.push(entry);
+                }
+                // Like the identity headers, a malformed scope is refused: dropping it
+                // would present a partial image as a whole-disc one.
+                if let Some(sc) = rest.strip_prefix("freemkv-scope:") {
+                    let Some(ranges) = parse_scope(sc.trim()) else {
+                        let e: io::Error =
+                            libfreemkv::error::Error::MapfileInvalid { kind: "scope" }.into();
+                        return Err(e);
+                    };
+                    scope = Some(ranges);
                 }
                 continue;
             }
@@ -413,6 +429,7 @@ impl Mapfile {
             last_flushed: Instant::now(),
             vid,
             unit_keys,
+            scope,
             disowned: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -610,9 +627,52 @@ impl Mapfile {
     }
 
     /// Snapshot of the incrementally-maintained summary statistics.
-    /// O(1) — returns the cached `MapStats`.
+    /// O(1) — returns the cached `MapStats`. On a scoped mapfile the never-read bytes
+    /// outside the scope are not pending: they are not part of this image's job.
     pub fn stats(&self) -> MapStats {
-        self.stats
+        let mut s = self.stats;
+        if self.scope.is_some() {
+            let outside = self.nontried_outside_scope();
+            s.bytes_pending = s.bytes_pending.saturating_sub(outside);
+            s.bytes_nontried = s.bytes_nontried.saturating_sub(outside);
+        }
+        s
+    }
+
+    fn nontried_outside_scope(&self) -> u64 {
+        let Some(scope) = &self.scope else {
+            return 0;
+        };
+        let nontried: u64 = self
+            .entries
+            .iter()
+            .filter(|e| e.status == SectorStatus::NonTried)
+            .map(|e| e.size)
+            .sum();
+        let inside: u64 = self
+            .ranges_with(&[SectorStatus::NonTried])
+            .iter()
+            .map(|&r| intersect(&[r], scope).iter().map(|&(_, n)| n).sum::<u64>())
+            .sum();
+        nontried - inside
+    }
+
+    /// The byte ranges a scoped (MKV-staging) image covers; `None` = the whole disc.
+    pub fn scope(&self) -> Option<&[(u64, u64)]> {
+        self.scope.as_deref()
+    }
+
+    /// Limit this image to `ranges` (bytes, sorted and merged here). Marks the mapfile dirty.
+    pub fn set_scope(&mut self, mut ranges: Vec<(u64, u64)>) {
+        self.scope = Some(merge_byte_ranges(&mut ranges));
+        self.dirty = true;
+    }
+
+    /// Widen a scoped image back to the whole disc: its unread rest becomes pending.
+    pub fn clear_scope(&mut self) {
+        if self.scope.take().is_some() {
+            self.dirty = true;
+        }
     }
 
     fn compute_stats(entries: &[MapEntry], total_size: u64) -> MapStats {
@@ -681,6 +741,13 @@ impl Mapfile {
                         let _ = write!(hex, "{b:02x}");
                     }
                     writeln!(w, "# freemkv-vid: {hex}")?;
+                }
+                if let Some(scope) = &self.scope {
+                    let list: Vec<String> = scope
+                        .iter()
+                        .map(|(p, n)| format!("0x{p:x}+0x{n:x}"))
+                        .collect();
+                    writeln!(w, "# freemkv-scope: {}", list.join(","))?;
                 }
                 writeln!(w, "# Current pos / status / pass / pass_time")?;
                 writeln!(w, "0x000000000  ?  1  0")?;
@@ -757,6 +824,47 @@ fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let cps: u32 = cps.trim().parse().ok()?;
     let key = parse_vid_hex(hex.trim())?; // 32-hex → [u8; 16], shared parser
     Some((cps, key))
+}
+
+// `0xPOS+0xSIZE,...` (possibly empty) → sorted, merged byte ranges; `None` if malformed.
+fn parse_scope(s: &str) -> Option<Vec<(u64, u64)>> {
+    let mut out = Vec::new();
+    for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (p, n) = part.split_once('+')?;
+        let p = parse_hex(p.trim()).ok()?;
+        let n = parse_hex(n.trim()).ok()?;
+        p.checked_add(n)?;
+        out.push((p, n));
+    }
+    Some(merge_byte_ranges(&mut out))
+}
+
+/// Sort and merge `(pos, size)` byte ranges; zero-size ranges are dropped.
+pub(crate) fn merge_byte_ranges(ranges: &mut [(u64, u64)]) -> Vec<(u64, u64)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &(p, n) in ranges.iter().filter(|r| r.1 > 0) {
+        match out.last_mut() {
+            Some((lp, ln)) if p <= *lp + *ln => *ln = (*ln).max(p + n - *lp),
+            _ => out.push((p, n)),
+        }
+    }
+    out
+}
+
+/// The parts of `ranges` that lie inside `scope` (both sorted, merged byte ranges).
+pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &(p, n) in ranges {
+        let end = p + n;
+        for &(sp, sn) in scope {
+            let (a, b) = (p.max(sp), end.min(sp + sn));
+            if a < b {
+                out.push((a, b - a));
+            }
+        }
+    }
+    out
 }
 
 fn parse_hex(s: &str) -> io::Result<u64> {
@@ -1555,6 +1663,68 @@ mod tests {
     /// A `# freemkv-uk:` line missing the `cps:hex` shape, with a bad cps,
     /// or a wrong-length key, must parse to None. (`load()` turns that None
     /// into a hard error — see `load_rejects_a_malformed_unit_key_header`.)
+    // The scope survives a flush/load as a ddrescue-safe comment, and on load a scoped
+    // map's never-read rest is not pending (it is not this image's job).
+    #[test]
+    fn scope_round_trips_and_scopes_the_pending_stats() {
+        let p = tmpfile("scope_round_trip");
+        let mut mf = Mapfile::create(&p, 64 * 2048, "test").unwrap();
+        mf.set_scope(vec![
+            (32 * 2048, 8 * 2048),
+            (0, 8 * 2048),
+            (4 * 2048, 2 * 2048),
+        ]);
+        mf.record(0, 8 * 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("# freemkv-scope: 0x0+0x4000,0x10000+0x4000"),
+            "{text}"
+        );
+        let loaded = Mapfile::load(&p).unwrap();
+        assert_eq!(loaded.scope(), Some(&[(0, 0x4000), (0x10000, 0x4000)][..]));
+        let st = loaded.stats();
+        assert_eq!((st.bytes_pending, st.bytes_nontried), (8 * 2048, 8 * 2048));
+        assert_eq!(st.bytes_total, 64 * 2048);
+        let mut widened = loaded;
+        widened.clear_scope();
+        assert_eq!(
+            widened.stats().bytes_pending,
+            56 * 2048,
+            "the rest is pending again"
+        );
+        widened.flush().unwrap();
+        assert!(
+            !std::fs::read_to_string(&p)
+                .unwrap()
+                .contains("freemkv-scope")
+        );
+    }
+
+    // Dropping a malformed scope would present a partial image as a whole one.
+    #[test]
+    fn a_malformed_scope_header_is_refused() {
+        for bad in ["zz", "0x0", "0x0+", "0xffffffffffffffff+0x2"] {
+            let p = tmpfile("scope_bad");
+            std::fs::write(
+                &p,
+                format!("# freemkv-scope: {bad}\n0x0 ? 1\n0x0 0x800 ?\n"),
+            )
+            .unwrap();
+            assert!(Mapfile::load(&p).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn intersect_keeps_only_the_overlap() {
+        assert_eq!(
+            intersect(&[(0, 100)], &[(10, 5), (90, 20)]),
+            [(10, 5), (90, 10)]
+        );
+        assert!(intersect(&[(0, 10)], &[(10, 5)]).is_empty());
+        assert_eq!(merge_byte_ranges(&mut [(5, 5), (0, 5), (20, 0)]), [(0, 10)]);
+    }
+
     #[test]
     fn parse_uk_line_rejects_malformed() {
         assert_eq!(parse_uk_line("no-colon"), None);

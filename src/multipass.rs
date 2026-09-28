@@ -514,7 +514,42 @@ pub fn multipass_rip(
     // progress ticks, so `should_cancel` can't be polled while waiting. Run the
     // whole multipass under one halt token so Stop works mid-cooldown too.
     crate::run::with_cancel_watcher(sink, |halt| {
-        multipass_rip_inner(disc, reader, iso_path, job, opts, sink, halt)
+        multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, halt)
+    })
+}
+
+/// What a staged image for an MKV rip of `titles` must cover: `None` = the whole disc,
+/// `Some(ranges)` = only [`libfreemkv::Disc::mkv_staging_ranges`] (nav, UDF and those
+/// titles), which holds no bus-encrypted byte even when a stream file is unmapped.
+///
+/// JUDGEMENT (`keep_image`): a kept staging image must be a real whole-disc image, so
+/// it is whole only when kept AND the drive's bus map located every stream file. A
+/// scoped image is never a keepable deliverable: the caller discards it after the mux.
+pub fn mkv_staging_scope(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    titles: &[usize],
+    keep_image: bool,
+) -> crate::Result<Option<Vec<(u32, u32)>>> {
+    if keep_image && reader.unmapped_stream_files().is_empty() {
+        return Ok(None);
+    }
+    disc.mkv_staging_ranges(reader, titles).map(Some)
+}
+
+/// [`multipass_rip`] for an MKV deliverable staged through an image: with `scope`
+/// (from [`mkv_staging_scope`]) the sweep and patch passes read only those sectors.
+pub fn multipass_rip_staged(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    opts: &MultipassOpts,
+    scope: Option<&[(u32, u32)]>,
+    sink: &dyn Sink,
+) -> crate::Result<MultipassResult> {
+    crate::run::with_cancel_watcher(sink, |halt| {
+        multipass_rip_inner(disc, reader, iso_path, job, opts, scope, sink, halt)
     })
 }
 
@@ -525,6 +560,7 @@ fn multipass_rip_inner(
     iso_path: &std::path::Path,
     job: &Job,
     opts: &MultipassOpts,
+    scope: Option<&[(u32, u32)]>,
     sink: &dyn Sink,
     halt: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> crate::Result<MultipassResult> {
@@ -559,7 +595,24 @@ fn multipass_rip_inner(
             unit_keys,
             key_fetch: None,
         };
-        let cr = crate::recovery::copy(disc, reader, iso_path, &copy_opts)?;
+        let cr = match scope {
+            // A scoped single pass resumes its own staging; `copy` is the iso:// path.
+            Some(scope) => {
+                let sweep_opts = SweepOptions {
+                    decrypt: copy_opts.decrypt,
+                    resume: disc.mapfile_for(iso_path).exists(),
+                    batch_sectors: None,
+                    skip_on_error: false,
+                    progress: copy_opts.progress,
+                    halt: copy_opts.halt.clone(),
+                    vid,
+                    unit_keys: copy_opts.unit_keys.clone(),
+                    key_fetch: None,
+                };
+                crate::recovery::sweep_scoped(disc, reader, iso_path, &sweep_opts, scope)?
+            }
+            None => crate::recovery::copy(disc, reader, iso_path, &copy_opts)?,
+        };
         // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
         // here (unlike the aggregate `bad_sector_count` forbids) because every
         // un-halted route here has `nontried == 0`, so pending is retryable damage.
@@ -607,7 +660,12 @@ fn multipass_rip_inner(
             unit_keys: unit_keys.clone(),
             key_fetch: None,
         };
-        let sr = crate::recovery::sweep(disc, reader, iso_path, &sweep_opts)?;
+        let sr = match scope {
+            Some(scope) => {
+                crate::recovery::sweep_scoped(disc, reader, iso_path, &sweep_opts, scope)?
+            }
+            None => crate::recovery::sweep(disc, reader, iso_path, &sweep_opts)?,
+        };
         passes += 1;
         last_good = sr.bytes_good;
         last_unreadable = sr.bytes_unreadable;
