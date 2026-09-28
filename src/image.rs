@@ -67,8 +67,9 @@ pub enum KeyInput {
 /// Options for [`open_image_with`].
 pub struct OpenImageOptions {
     pub keys: KeyInput,
-    /// An already-scanned disc (the drive scan): the image is NOT scanned (J14), only a raw
-    /// reader is opened, checked for capacity and (when readable) disc hash.
+    /// An already-scanned disc (the drive scan) for an `iso://` image: it is NOT scanned
+    /// (J14); a raw reader is opened and checked for capacity and disc hash. A `dir://`
+    /// folder is always scanned, so a disc given with one is refused (E7013, caller bug).
     pub disc: Option<libfreemkv::Disc>,
     /// What the rip decrypts; `None` = `Titles([main])`.
     pub scope: Option<KeyScope>,
@@ -180,6 +181,14 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
     let sidecar = load_sidecar(src)?;
     let prescanned = disc.is_some();
     let (disc, mut reader) = match disc {
+        Some(_) if matches!(src, ImageSource::Dir(_)) => {
+            // J14 holds for `iso://` only: a folder muxes through `input()`, which scans it.
+            tracing::error!(
+                target: "freemkv::keys",
+                "a pre-scanned disc needs an iso:// image; a dir:// folder is always scanned"
+            );
+            return Err(Error::DecryptFailed);
+        }
         Some(disc) => {
             let mut reader = raw_reader(src)?;
             check_prescanned(&disc, reader.as_mut(), sidecar.as_ref())?;
