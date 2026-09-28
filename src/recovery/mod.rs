@@ -495,9 +495,8 @@ pub(crate) fn sweep_batch_sectors(
     }
 }
 
-// Deadline for ONE producer→consumer handoff on a recovery pipeline. Reuses `JOIN_TIMEOUT_SECS`
-// (600s, the same budget `finish_with_halt` gives the consumer at join) rather than inventing a
-// second number.
+// Deadline for ONE producer→consumer handoff (T9): re-armed per send, so already stall-shaped.
+// Reuses `JOIN_TIMEOUT_SECS`, since ST-L2 `finish_with_halt`'s 600 s no-progress window (T7).
 const SEND_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS);
 
@@ -580,9 +579,8 @@ pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
     pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
     halt: &libfreemkv::halt::Halt,
 ) -> Result<R> {
-    // `Some(halt)` even with no Stop bit wired (a never-cancelled default) still
-    // arms `JOIN_TIMEOUT_SECS`, the same 600s budget `SEND_DEADLINE` gives one
-    // handoff — the producer/joiner symmetry `SEND_DEADLINE`'s doc argues for.
+    // `Some(halt)` even with no Stop bit wired (a never-cancelled default) still arms the
+    // join's `JOIN_TIMEOUT_SECS` window: 600 s with no consumer progress, not a total (T7).
     pipe.finish_with_halt(Some(halt))
 }
 
