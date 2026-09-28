@@ -821,6 +821,32 @@ mod tests {
         assert!(body.contains("scan_then_lock(") && !body.contains("session.lock_tray()"));
     }
 
+    // Stop design v5 §4.3, "The open token": "Both are threaded into the scan (the Drive
+    // bumps the `Progress` per `exec` …)". The scan needs a live drive, so this pins the
+    // wiring. Per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn open_scan_with_threads_the_open_token_into_the_scan() {
+        let src = include_str!("mux.rs").replace("\r\n", "\n");
+        let body = |name: &str| {
+            let start = src.find(name).expect("definition present");
+            src[start..start + src[start..].find("\n}\n").unwrap()].to_string()
+        };
+        let with = body("pub fn open_scan_with(");
+        for wiring in [
+            "DiscSession::open_with(target, build_keyspec(credentials), halt)",
+            "session.attach_progress(progress);",
+            "let opts = scan_options_with(raw_copy, halt);",
+            "session.scan_with(opts)",
+            "scan_then_lock(",
+        ] {
+            assert!(with.contains(wiring), "open_scan_with lacks {wiring}");
+        }
+        assert!(
+            body("pub fn open_scan(").contains("open_scan_with("),
+            "open_scan delegates"
+        );
+    }
+
     /// Wait for `cond` to hold, up to `secs`. Returns whether it held — a
     /// bounded wait, so a bridge that never fires fails the test instead of
     /// hanging the suite forever.
