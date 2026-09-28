@@ -5,8 +5,8 @@ use crate::image::{ImageSource, OpenImageOptions, open_image_with};
 use crate::recovery::mapfile::vid_fingerprint;
 use crate::remux::MuxPlan;
 use crate::test_fixtures::{
-    Answer, Calls, Damage, Drive, F1, F2, Fx, K1, K2, VID, bd_image, factory, fmts_factory,
-    fmts_image, fmts_image_with, resolve,
+    Answer, Calls, Damage, Drive, F1, F2, Fx, K1, K2, VID, bd_image, bd_image_sized, factory,
+    fmts_factory, fmts_image, fmts_image_with, resolve,
 };
 use crate::{Mapfile, RipOutcome, mapfile_path_for, mux_image_titles};
 use libfreemkv::error::{E_AACS_VID_NEEDS_DISC, E_NO_DISC_KEY};
@@ -1165,4 +1165,121 @@ fn a_stop_after_the_remux_open_asks_nothing_more() {
     assert!(libfreemkv::is_halt(&err), "{err}");
     assert_eq!(calls.len(), 1, "the open's one request, then nothing");
     assert!(!job.target.exists());
+}
+
+// The title index that plays clip `clip` (`0000{clip}.mpls`).
+fn title_of(fx: &Fx, clip: usize) -> usize {
+    let name = format!("{clip:05}.mpls");
+    fx.disc
+        .titles
+        .iter()
+        .position(|t| t.playlist == name)
+        .unwrap()
+}
+
+// `fx` written with a sidecar carrying the disc hash and the VID's fingerprint.
+fn with_vidfp_sidecar(fx: &Fx, dir: &Path) -> std::path::PathBuf {
+    let iso = fx.write(dir, "capture.iso");
+    let total = fx.img.image.len() as u64;
+    let mut map = Mapfile::create(&mapfile_path_for(&iso), total, "t").unwrap();
+    map.record(0, total, crate::SectorStatus::Finished).unwrap();
+    map.set_disc_hash(&fx.disc.aacs.as_ref().unwrap().disc_hash);
+    map.set_vid_fingerprint(vid_fingerprint(&VID));
+    map.flush().unwrap();
+    iso
+}
+
+/// Review B-1: with the key service down, an image open over two Missing pieces (the larger
+/// title's asked first, the other skipped as the source is dead) refuses with the outage
+/// (E7028), never E7022 turned into E7034 ("insert the disc") by the vidfp sidecar.
+#[test]
+fn an_outage_is_never_e7034() {
+    let fx = bd_image_sized(&[(Some(K1), 10), (Some(K2), 20)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = with_vidfp_sidecar(&fx, dir.path());
+    let f = factory(&[(Answer::Unavailable, &[])], &Calls::default());
+    let opts = OpenImageOptions {
+        scope: titles(&[0, 1]),
+        ..OpenImageOptions::resolve(f)
+    };
+    let err = open_image_with(&ImageSource::Iso(iso), opts)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE,
+        "{err}"
+    );
+}
+
+/// Review B-1 and minor 2 at the top-up: the outage is the top-up's refusal and is
+/// remembered (a later call re-raises it); a first top-up's E7034 is re-raised too, never
+/// a later E7022.
+#[test]
+fn a_top_up_outage_or_vid_need_is_remembered() {
+    let fx = bd_image_sized(&[(Some(K1), 10), (Some(K2), 10), (Some(K2), 20)], 2);
+    let (t0, t1, t2) = (title_of(&fx, 0), title_of(&fx, 1), title_of(&fx, 2));
+    let dir = tempfile::tempdir().unwrap();
+    let iso = with_vidfp_sidecar(&fx, dir.path());
+    let src = ImageSource::Iso(iso);
+    let open = |second: Answer| {
+        let f = factory(
+            &[(Answer::Keydb, &[K1]), (second, &[K2])],
+            &Calls::default(),
+        );
+        let opts = OpenImageOptions {
+            scope: titles(&[t0]),
+            ..OpenImageOptions::resolve(f)
+        };
+        open_image_with(&src, opts).unwrap()
+    };
+    let codes = |opened: &crate::OpenedImage, plans: &[Vec<usize>]| {
+        let sink = DoneCodes::default();
+        for p in plans {
+            mux_image_titles(
+                opened,
+                &MuxPlan::new(p.clone()),
+                &mkv_dest(dir.path()),
+                &sink,
+            );
+        }
+        sink.0.into_inner().unwrap()
+    };
+    let e7028 = Some(libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE);
+    let got = codes(&open(Answer::Unavailable), &[vec![t1, t2], vec![t1]]);
+    assert_eq!(got, [e7028, e7028], "the outage, then remembered");
+    let e7034 = Some(E_AACS_VID_NEEDS_DISC);
+    let got = codes(&open(Answer::OnlineNeedsVid), &[vec![t1], vec![t1]]);
+    assert_eq!(got, [e7034, e7034], "the VID need, then remembered");
+}
+
+/// Review minor 2: a first top-up stopped after its request went out spends the ask, but a
+/// later call that nobody stopped is not reported as cancelled.
+#[test]
+fn a_remembered_stop_does_not_cancel_a_later_call() {
+    struct StopAfter(Calls, usize);
+    impl crate::Sink for StopAfter {
+        fn should_cancel(&self) -> bool {
+            self.0.len() >= self.1
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let (t0, t1) = (title_of(&fx, 0), title_of(&fx, 1));
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Keydb, &[K1]), (Answer::Down, &[K2])], &calls);
+    let opts = OpenImageOptions {
+        scope: titles(&[t0]),
+        ..OpenImageOptions::resolve(f)
+    };
+    let opened = open_image_with(&src, opts).unwrap();
+    let plan = MuxPlan::new(vec![t1]);
+    let stop = StopAfter(calls.clone(), 3);
+    let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &stop);
+    assert_eq!(out, RipOutcome::Halted, "stopped during the retry");
+    let asked = calls.len();
+    let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &crate::NoopSink);
+    assert_ne!(out, RipOutcome::Halted, "nobody stopped this call");
+    assert_eq!(calls.len(), asked, "the ask was spent");
 }

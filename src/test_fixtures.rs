@@ -124,6 +124,13 @@ impl Fx {
 /// A BD image with one title per entry of `clips` (each `CLIP_UNITS` units encrypted with
 /// its key, `None` = clear), declaring `declared` CPS units. Scanned like a real image.
 pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
+    let sized: Vec<(Option<[u8; 16]>, u32)> = clips.iter().map(|k| (*k, CLIP_UNITS)).collect();
+    bd_image_sized(&sized, declared)
+}
+
+/// [`bd_image`] with each clip's length in units (a larger title's piece is asked first).
+pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize) -> Fx {
+    let clips: Vec<Option<[u8; 16]>> = sized.iter().map(|c| c.0).collect();
     let uk_ro = libfreemkv::test_util::unit_key_ro(
         AacsVersion::V10,
         &vec![[0xEE; 16]; declared],
@@ -140,15 +147,15 @@ pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
     for (i, key) in clips.iter().enumerate() {
         files.push(BdFile::new(
             format!("BDMV/STREAM/{i:05}.m2ts"),
-            CLIP_UNITS * 3,
+            sized[i].1 * 3,
             *key,
         ));
     }
     let mut img = encrypted_bd_image(&files, &uk_ro);
-    let n_packets = CLIP_UNITS * 32;
     for (i, key) in clips.iter().enumerate() {
         let (start, _) = img.files[1 + 2 * n + i];
-        for u in 0..CLIP_UNITS {
+        let n_packets = sized[i].1 * 32;
+        for u in 0..sized[i].1 {
             let mut unit: Vec<u8> = (0..32)
                 .flat_map(|j| lpcm_source_packet(u * 32 + j, n_packets, key.is_some()))
                 .collect();
@@ -165,7 +172,7 @@ pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
         let clip: [u8; 5] = clip.as_bytes().try_into().unwrap();
         for (f, bytes) in [
             (1 + i, one_item_mpls(&clip)),
-            (1 + n + i, minimal_clpi(CLIP_UNITS * 32)),
+            (1 + n + i, minimal_clpi(sized[i].1 * 32)),
         ] {
             let at = img.files[f].0 as usize * 2048;
             img.image[at..at + bytes.len()].copy_from_slice(&bytes);
@@ -234,6 +241,14 @@ pub(crate) enum Answer {
     KeydbKmNoVid,
     /// An online service that answers with a failure (a 5xx): E7028, not transport class.
     Unavailable,
+    /// An online service that never answers (transport class: `resolve` retries it, J13).
+    Down,
+}
+
+impl Answer {
+    fn is_online(self) -> bool {
+        !matches!(self, Answer::Keydb | Answer::KeydbKmNoVid)
+    }
 }
 
 struct Fake {
@@ -259,11 +274,11 @@ impl KeySource for Fake {
             vid,
             forensic: false,
         });
-        if self.answer == Answer::Unavailable {
+        if matches!(self.answer, Answer::Unavailable | Answer::Down) {
             return Err(libfreemkv::Error::KeyServiceUnavailable);
         }
         let keys: Vec<[u8; 16]> = match self.answer {
-            Answer::Keydb | Answer::Unavailable => self.keys.clone(),
+            Answer::Keydb | Answer::Unavailable | Answer::Down => self.keys.clone(),
             Answer::KeydbKmNoVid => Vec::new(),
             Answer::OnlineNeedsVid if vid.is_none() => Vec::new(),
             Answer::Online | Answer::OnlineNeedsVid => {
@@ -316,17 +331,14 @@ impl KeySource for Fake {
             ..Default::default()
         })
     }
+    fn last_failure_was_transport(&self) -> bool {
+        self.answer == Answer::Down
+    }
     fn answer_depends_on_samples(&self) -> bool {
-        matches!(
-            self.answer,
-            Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
-        )
+        self.answer.is_online()
     }
     fn uses_vid(&self) -> bool {
-        matches!(
-            self.answer,
-            Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
-        )
+        self.answer.is_online()
     }
 }
 
@@ -349,10 +361,7 @@ pub(crate) fn fmts_factory(
             .iter()
             .map(|(answer, keys)| {
                 Box::new(Fake {
-                    who: if matches!(
-                        answer,
-                        Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
-                    ) {
+                    who: if answer.is_online() {
                         "online"
                     } else {
                         "keydb"
