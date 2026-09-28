@@ -614,6 +614,36 @@ mod tests {
         }
     }
 
+    // KU-L2 review: the readers' on-arrival loud stop ("a readable unit no held key opens",
+    // E7022 title / E7032 image, KU §2.4, §6) is never damage: no retry, skip, jump or count.
+    #[test]
+    fn a_key_stop_aborts_the_pass_and_leaves_the_damage_state_untouched() {
+        let stops = [
+            Error::NoDiscKey {
+                disc_hash: "ab".repeat(20),
+            },
+            Error::WholeDiscKeyMissing,
+        ];
+        for err in stops {
+            for mut ctx in [ReadCtx::for_sweep(32), ReadCtx::for_patch(32)] {
+                assert_eq!(
+                    handle_read_error(&err, &mut ctx),
+                    ReadAction::AbortPass,
+                    "{err}"
+                );
+                assert_eq!(ctx.total_errors, 0, "{err}: not counted as a read error");
+                assert_eq!(ctx.consecutive_failures, 0);
+                assert_eq!(ctx.consecutive_outer_failures, 0);
+                assert!(
+                    ctx.damage_window.is_empty(),
+                    "{err}: no damage-window entry"
+                );
+                assert_eq!((ctx.jumps_taken, ctx.wedge_count), (0, 0));
+                assert!(ctx.last_error_at.is_none());
+            }
+        }
+    }
+
     #[test]
     fn recovered_error_skips_block_not_jump_pass_1() {
         // A recovered (marginal) read on Pass 1 must NOT trigger the damage-jump
