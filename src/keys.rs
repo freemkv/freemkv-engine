@@ -483,7 +483,7 @@ mod tests {
     fn transient_url_keeps_online_source() {
         let p = KeyParams {
             keydb_path: Some("keydb.cfg".into()),
-            key_url: Some("https://keys.freemkv-ku-e1.invalid/keys".into()),
+            key_url: Some("https://keys.freemkv-ku-e1.test/keys".into()),
             key_auth: None,
             online_only: false,
         };
@@ -491,7 +491,7 @@ mod tests {
         let rejected = freemkv_keysources::check_keyserver_url(url).unwrap_err();
         assert!(
             rejected.is_temporary(),
-            "`.invalid` never resolves: {rejected}"
+            "`.test` (RFC 2606) never resolves: {rejected}"
         );
         let labels: Vec<&str> = key_source_factory(&p)().iter().map(|s| s.label()).collect();
         assert_eq!(labels, ["keydb", "online"], "the online source is kept");
@@ -511,9 +511,9 @@ mod tests {
     /// without one; the host lookup runs at the first query.
     #[test]
     fn a_factory_build_does_no_dns_lookup() {
-        // `.invalid` never resolves: a build that looked it up could not keep the source.
+        // `.test` (RFC 2606) never resolves: a build that looked it up could not keep the source.
         let unresolvable = KeyParams {
-            key_url: Some("https://keys.ku-e1-build.invalid/keys".into()),
+            key_url: Some("https://keys.ku-e1-build.test/keys".into()),
             ..Default::default()
         };
         let labels: Vec<&str> = key_source_factory(&unresolvable)()
