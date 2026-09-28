@@ -529,3 +529,21 @@ fn an_up_front_key_refusal_reports_the_first_title_failed() {
     ];
     assert_eq!(*sink.0.lock().unwrap(), want);
 }
+
+/// D5 (judgement 6: an identity header that cannot be read is refused, never "no identity"):
+/// a sidecar mapfile that exists but does not load refuses the open; only a missing one is
+/// no identity.
+#[test]
+fn an_unreadable_sidecar_refuses_the_open() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    std::fs::write(mapfile_path_for(&iso), "# freemkv-vidfp: zz\n0x0 0x800 +\n").unwrap();
+    let calls = Calls::default();
+    let opts = OpenImageOptions::resolve(factory(&[(Answer::Keydb, &[K1])], &calls));
+    let err = open_image_with(&ImageSource::Iso(iso), opts)
+        .map(|_| ())
+        .unwrap_err();
+    assert!(matches!(err, Error::MapfileInvalid { .. }), "{err:?}");
+    assert_eq!(calls.len(), 0, "refused before any request");
+}
