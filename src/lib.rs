@@ -11,6 +11,7 @@
 
 pub mod drive_info;
 mod engine_halt;
+mod episodes;
 mod extract;
 mod image;
 mod job;

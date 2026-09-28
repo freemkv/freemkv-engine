@@ -33,6 +33,9 @@ pub enum Selection {
     Longest,
     /// An explicit set of canonical title indices.
     Titles(Vec<usize>),
+    /// A TV disc's episodes: the similar-length cluster, without the "play all"
+    /// title, extras, or duplicate angles.
+    Episodes,
 }
 
 /// A rip request. Front-ends construct this; the engine consumes it.

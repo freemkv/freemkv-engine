@@ -100,10 +100,10 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
                 }
             }
         }
-        // MainMovie / All / Longest carry no per-index reason to report; the
+        // MainMovie / All / Longest / Episodes carry no per-index reason to report; the
         // resolves-to-nothing gate below covers them. It is NOT true that they
         // always resolve — see that gate.
-        Selection::MainMovie | Selection::All | Selection::Longest => {}
+        Selection::MainMovie | Selection::All | Selection::Longest | Selection::Episodes => {}
     }
 
     // Does the selection resolve to a title? Ask the ONE function that decides

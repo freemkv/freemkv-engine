@@ -45,6 +45,7 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
             }
         }
         Selection::All => (0..n).collect(),
+        Selection::Episodes => crate::episodes::episode_titles(&disc.titles),
         // FIRST of the equal maxima, not the last: `Iterator::max_by` keeps the
         // LAST tied element, but playlist obfuscation authors decoys with the
         // SAME runtime as the feature, which is conventionally the lowest index.
