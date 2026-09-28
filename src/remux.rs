@@ -706,6 +706,21 @@ mod tests {
         assert!(pick_title(&disc, None).is_err());
     }
 
+    // D2 (KU §2.3 step 13): remux_iso's key top-up runs under the same cancel watcher and
+    // halt as its open. It resolves only on a title its open did not cover, so pin it here.
+    #[test]
+    fn remux_keys_for_runs_under_the_open_halt() {
+        let src = include_str!("remux.rs").replace("\r\n", "\n");
+        let start = src.find("pub(crate) fn remux_iso_with(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        let watcher = body.find("with_cancel_watcher(sink").unwrap();
+        let keys_for = body.find(".keys_for(&[idx], Some(&halt))");
+        assert!(
+            keys_for.is_some_and(|k| k < watcher),
+            "keys_for inside the watcher closure"
+        );
+    }
+
     #[test]
     fn plan_selection_defaults_to_every_stream() {
         let mut plan = MuxPlan::new(vec![0, 3]);
