@@ -5,12 +5,14 @@
 //! `read_error.rs`, `section_recover.rs`, `patch.rs`, and the private
 //! `sweep.rs` producer/consumer plumbing are unchanged in logic.
 
+use crate::engine_halt::{EngineHalt, EngineOutcome};
 use libfreemkv::disc::{bytes_bad_in_title, locate_ranges};
 use libfreemkv::error::{Error, Result};
 use libfreemkv::extract_scsi_context;
 use libfreemkv::sector::SectorSource;
 
-pub use patch::patch;
+pub(crate) use patch::patch_in;
+pub use patch::{patch, patch_with};
 
 /// A genuine read fault — the drive answered with a status/sense, or the
 /// transport died under it. Everything else (a decrypt refusal, a contract
@@ -120,11 +122,42 @@ mod pass_abort_tests {
     }
 }
 
+/// [`copy()`] under the op token `op` (stop design v5 §4.2): the token is observed at every
+/// read, pause and hand-off, OR'd with `opts.halt`. A Stop is [`EngineOutcome::Stopped`].
+pub fn copy_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &CopyOptions,
+) -> EngineOutcome<CopyResult> {
+    let halt = EngineHalt::new(op, opts.halt.clone());
+    let r = copy_in(disc, reader, path, opts, &halt);
+    EngineOutcome::from_result(r, &halt, |r| r.halted)
+}
+
 pub fn copy(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
     path: &std::path::Path,
     opts: &CopyOptions,
+) -> Result<CopyResult> {
+    copy_in(
+        disc,
+        reader,
+        path,
+        opts,
+        &EngineHalt::legacy(opts.halt.clone()),
+    )
+}
+
+// `copy` under `halt` (its `opts.halt` is already in it).
+pub(crate) fn copy_in(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &CopyOptions,
+    halt: &EngineHalt<'_>,
 ) -> Result<CopyResult> {
     // Pre-flight decrypt gate: without it, a decrypting copy of an encrypted disc
     // with no usable key would silently write ciphertext to the ISO and still
@@ -191,7 +224,7 @@ pub fn copy(
                 iso_len,
                 disc_size,
             );
-            return sweep_internal(disc, reader, path, opts, false);
+            return sweep_internal(disc, reader, path, opts, false, halt);
         }
         // `bytes_nontried == 0` is implied by `bad_bytes == 0` (subset), so inverting it is an
         // equivalent mutant — don't chase it.
@@ -217,7 +250,7 @@ pub fn copy(
                 map.total_size(),
                 disc_size,
             );
-            return sweep_internal(disc, reader, path, opts, false);
+            return sweep_internal(disc, reader, path, opts, false, halt);
         }
         // NonTried bytes mean a prior sweep was halted (Ctrl-C/crash) mid-way — route
         // to resume sweep FIRST, even with retryable bytes present, since patch only
@@ -229,7 +262,7 @@ pub fn copy(
                 stats.bytes_nontried,
                 stats.bytes_retryable,
             );
-            return sweep_internal(disc, reader, path, opts, true);
+            return sweep_internal(disc, reader, path, opts, true, halt);
         }
         // From here covers_disc=true and nontried=0: the whole disc was
         // attempted. Only the retry/patch decision differs by mode.
@@ -239,7 +272,7 @@ pub fn copy(
                     "copy dispatch: → patch (retryable={})",
                     stats.bytes_retryable,
                 );
-                return patch_internal(disc, reader, path, opts);
+                return patch_internal(disc, reader, path, opts, halt);
             }
             // Fallthrough: nontried=0, retryable=0 — all sectors attempted, remaining
             // bad bytes are already Unreadable. Resume sweep/patch would both be
@@ -273,7 +306,7 @@ pub fn copy(
             false,
         ));
     }
-    sweep_internal(disc, reader, path, opts, false)
+    sweep_internal(disc, reader, path, opts, false, halt)
 }
 
 // What goes in the mapfile's `# Rescue Logfile. Created by …` header — must name the crate that
@@ -283,6 +316,7 @@ pub(crate) const MAPFILE_CREATOR: &str = concat!("freemkv-engine v", env!("CARGO
 #[cfg(test)]
 mod sleep_secs_or_halt_tests {
     use super::sleep_secs_or_halt;
+    use crate::engine_halt::EngineHalt;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
@@ -293,7 +327,7 @@ mod sleep_secs_or_halt_tests {
     fn it_actually_sleeps_when_not_halted() {
         let halt = Arc::new(AtomicBool::new(false));
         let t0 = Instant::now();
-        sleep_secs_or_halt(1, Some(&halt));
+        sleep_secs_or_halt(1, &EngineHalt::legacy(Some(halt)));
         let e = t0.elapsed();
         // Generous lower bound: the point is "roughly a second", not precision.
         assert!(
@@ -309,7 +343,7 @@ mod sleep_secs_or_halt_tests {
     fn an_already_set_halt_returns_promptly() {
         let halt = Arc::new(AtomicBool::new(true));
         let t0 = Instant::now();
-        sleep_secs_or_halt(30, Some(&halt));
+        sleep_secs_or_halt(30, &EngineHalt::legacy(Some(halt.clone())));
         let e = t0.elapsed();
         assert!(
             e < Duration::from_millis(500),
@@ -328,7 +362,7 @@ mod sleep_secs_or_halt_tests {
             h.store(true, Ordering::Relaxed);
         });
         let t0 = Instant::now();
-        sleep_secs_or_halt(30, Some(&halt));
+        sleep_secs_or_halt(30, &EngineHalt::legacy(Some(halt.clone())));
         let e = t0.elapsed();
         assert!(
             e < Duration::from_secs(3),
@@ -345,7 +379,7 @@ mod sleep_secs_or_halt_tests {
     #[test]
     fn zero_seconds_returns_immediately() {
         let t0 = Instant::now();
-        sleep_secs_or_halt(0, None);
+        sleep_secs_or_halt(0, &EngineHalt::legacy(None));
         assert!(t0.elapsed() < Duration::from_millis(200));
     }
 }
@@ -461,9 +495,8 @@ pub(crate) fn sweep_batch_sectors(
     }
 }
 
-// Deadline for ONE producer→consumer handoff on a recovery pipeline. Reuses `JOIN_TIMEOUT_SECS`
-// (600s, the same budget `finish_with_halt` gives the consumer at join) rather than inventing a
-// second number.
+// Deadline for ONE producer→consumer handoff (T9): re-armed per send, so already stall-shaped.
+// Reuses `JOIN_TIMEOUT_SECS`, since ST-L2 `finish_with_halt`'s 600 s no-progress window (T7).
 const SEND_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(libfreemkv::io::pipeline::JOIN_TIMEOUT_SECS);
 
@@ -546,9 +579,8 @@ pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
     pipe: libfreemkv::io::pipeline::Pipeline<I, R>,
     halt: &libfreemkv::halt::Halt,
 ) -> Result<R> {
-    // `Some(halt)` even with no Stop bit wired (a never-cancelled default) still
-    // arms `JOIN_TIMEOUT_SECS`, the same 600s budget `SEND_DEADLINE` gives one
-    // handoff — the producer/joiner symmetry `SEND_DEADLINE`'s doc argues for.
+    // `Some(halt)` even with no Stop bit wired (a never-cancelled default) still arms the
+    // join's `JOIN_TIMEOUT_SECS` window: 600 s with no consumer progress, not a total (T7).
     pipe.finish_with_halt(Some(halt))
 }
 
@@ -579,6 +611,7 @@ fn sweep_internal(
     path: &std::path::Path,
     opts: &CopyOptions,
     resume: bool,
+    halt: &EngineHalt<'_>,
 ) -> Result<CopyResult> {
     let sweep_opts = SweepOptions {
         decrypt: opts.decrypt,
@@ -592,7 +625,7 @@ fn sweep_internal(
         key_fetch: opts.key_fetch.clone(),
         keys: opts.keys.clone(),
     };
-    sweep(disc, reader, path, &sweep_opts)
+    sweep_in(disc, reader, path, &sweep_opts, None, halt)
 }
 
 fn patch_internal(
@@ -600,6 +633,7 @@ fn patch_internal(
     reader: &mut dyn SectorSource,
     path: &std::path::Path,
     opts: &CopyOptions,
+    halt: &EngineHalt<'_>,
 ) -> Result<CopyResult> {
     let patch_opts = PatchOptions {
         keys: opts.keys.clone(),
@@ -610,7 +644,7 @@ fn patch_internal(
             opts.key_fetch.clone(),
         )
     };
-    let pr = patch(disc, reader, path, &patch_opts)?;
+    let pr = patch::patch_in(disc, reader, path, &patch_opts, halt)?;
     tracing::info!(
         target: "freemkv::disc",
         phase = "patch_done",
@@ -644,7 +678,27 @@ pub fn sweep(
     path: &std::path::Path,
     opts: &SweepOptions,
 ) -> Result<CopyResult> {
-    sweep_in(disc, reader, path, opts, None)
+    sweep_in(
+        disc,
+        reader,
+        path,
+        opts,
+        None,
+        &EngineHalt::legacy(opts.halt.clone()),
+    )
+}
+
+/// [`sweep()`] under the op token `op`, as [`copy_with`].
+pub fn sweep_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+) -> EngineOutcome<CopyResult> {
+    let halt = EngineHalt::new(op, opts.halt.clone());
+    let r = sweep_in(disc, reader, path, opts, None, &halt);
+    EngineOutcome::from_result(r, &halt, |r| r.halted)
 }
 
 /// [`sweep()`] over only `scope` (`(lba, sectors)`, e.g. from
@@ -661,7 +715,15 @@ pub fn sweep_scoped(
     opts: &SweepOptions,
     scope: &[(u32, u32)],
 ) -> Result<CopyResult> {
-    sweep_in(disc, reader, path, opts, Some(sector_scope_to_bytes(scope)))
+    let halt = EngineHalt::legacy(opts.halt.clone());
+    sweep_in(
+        disc,
+        reader,
+        path,
+        opts,
+        Some(sector_scope_to_bytes(scope)),
+        &halt,
+    )
 }
 
 /// Refuse the image at `path` as a whole-disc image (`iso://` copy, `dir://` extract)
@@ -719,12 +781,27 @@ pub(crate) fn sector_scope_to_bytes(scope: &[(u32, u32)]) -> Vec<(u64, u64)> {
         .collect()
 }
 
-fn sweep_in(
+// A sweep under `halt`, which already holds `opts.halt`.
+pub(crate) fn sweep_in(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
     path: &std::path::Path,
     opts: &SweepOptions,
     scope: Option<Vec<(u64, u64)>>,
+    halt: &EngineHalt<'_>,
+) -> Result<CopyResult> {
+    halt.linked(|lib| sweep_linked(disc, reader, path, opts, scope, halt, lib))
+}
+
+// `sweep_in` with `lib`, the libfreemkv token that follows `halt`.
+fn sweep_linked(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+    scope: Option<Vec<(u64, u64)>>,
+    halt: &EngineHalt<'_>,
+    lib: &libfreemkv::Halt,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
     use libfreemkv::sector::SectorSource;
@@ -750,7 +827,7 @@ fn sweep_in(
         disc,
         reader,
         opts.decrypt,
-        opts.halt.as_ref(),
+        halt.is_wired().then_some(lib),
         opts.key_fetch.as_ref(),
         opts.keys.as_ref(),
     )?;
@@ -877,14 +954,9 @@ fn sweep_in(
     let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
         Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
 
-    // Halt token for `send_bounded` below: `opts.halt` is adopted as-is; with none
-    // wired, a never-cancelled token keeps SEND_DEADLINE as the only bound. Every
-    // in-crate caller wires a real Stop bit; only an external caller could omit one.
-    let send_halt = opts
-        .halt
-        .clone()
-        .map(libfreemkv::halt::Halt::from_arc)
-        .unwrap_or_default();
+    // Halt token for `send_bounded` below: the op's; with none wired, a never-cancelled
+    // token keeps SEND_DEADLINE as the only bound.
+    let send_halt = lib.clone();
 
     let mut buf = vec![0u8; batch as usize * 2048];
     // POSITION: how far the producer's cursor has advanced, good bytes and
@@ -955,9 +1027,7 @@ fn sweep_in(
         );
 
         while pos < region_end {
-            if let Some(ref h) = opts.halt
-                && h.load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if halt.is_cancelled() {
                 halt_requested = true;
                 break 'outer;
             }
@@ -1040,7 +1110,10 @@ fn sweep_in(
 
                     match action {
                         read_error::ReadAction::Retry { pause_secs } => {
-                            sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
+                            if sleep_secs_or_halt(pause_secs, halt) {
+                                halt_requested = true;
+                                break 'outer;
+                            }
                         }
                         read_error::ReadAction::SkipBlock { pause_secs } => {
                             match send_bounded(
@@ -1062,7 +1135,10 @@ fn sweep_in(
                                 }
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
-                            sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
+                            if sleep_secs_or_halt(pause_secs, halt) {
+                                halt_requested = true;
+                                break 'outer;
+                            }
                             pos += block_bytes;
                         }
                         read_error::ReadAction::JumpAhead {
@@ -1141,7 +1217,10 @@ fn sweep_in(
                                 "damage-jump"
                             );
                             pos = jump_pos;
-                            sleep_secs_or_halt(pause_secs, opts.halt.as_ref());
+                            if sleep_secs_or_halt(pause_secs, halt) {
+                                halt_requested = true;
+                                break 'outer;
+                            }
                         }
                         read_error::ReadAction::AbortPass => {
                             producer_err = Some(classify_pass_abort(err, block_lba));
@@ -1483,6 +1562,7 @@ impl<'a> PatchOptions<'a> {
 }
 
 /// Result returned by [`patch()`].
+#[derive(Debug)]
 pub struct PatchOutcome {
     pub bytes_total: u64,
     pub bytes_good: u64,
@@ -1508,32 +1588,14 @@ pub(super) fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
     (start, end.saturating_sub(start))
 }
 
-// Sleep `secs` seconds, but break early if `halt` flips to true — used by
-// Pass 1's wedge-avoidance inter-error pause. Polling granularity 100 ms
-// bounds halt latency regardless of pause length.
-pub(crate) fn sleep_secs_or_halt(
-    secs: u64,
-    halt: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
-) {
+// Pass 1's wedge-avoidance pause: `secs`, cut short within one `WAIT_SLICE` of a cancel.
+// §4.2: "`sleep_secs_or_halt`'s `None` arm … is deleted" — every pause is halt-aware.
+// Returns `true` when a cancel cut the pause short.
+pub(crate) fn sleep_secs_or_halt(secs: u64, halt: &EngineHalt<'_>) -> bool {
     if secs == 0 {
-        return;
+        return false;
     }
-    let Some(h) = halt else {
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        return;
-    };
-    let total = std::time::Duration::from_secs(secs);
-    let slice = std::time::Duration::from_millis(100);
-    let start = std::time::Instant::now();
-    // `<=` is an equivalent mutant: it differs only at an exact-nanosecond match, and then only
-    // by one `remaining = 0` iteration.
-    while start.elapsed() < total {
-        if h.load(std::sync::atomic::Ordering::Relaxed) {
-            return;
-        }
-        let remaining = total.saturating_sub(start.elapsed());
-        std::thread::sleep(remaining.min(slice));
-    }
+    halt.wait(std::time::Duration::from_secs(secs))
 }
 
 const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;

@@ -209,6 +209,9 @@ impl PatchSink {
     }
 }
 
+// No `close_stopped` override (the default `close`): this sink renames nothing, and a
+// data-less mapfile flush would claim sectors not yet durable. T8: "halted: **Stopped**
+// (not a failure)" after one 5 s grace; the disowned mapfile keeps the resumable record.
 impl Sink<PatchItem> for PatchSink {
     type Output = PatchSummary;
 
@@ -279,6 +282,7 @@ impl Sink<PatchItem> for PatchSink {
 // cleaner-to-read file.
 
 use super::{PatchOptions, PatchOutcome};
+use crate::engine_halt::EngineHalt;
 use libfreemkv::disc::bytes_bad_in_title;
 use libfreemkv::io::pipeline::Pipeline;
 use libfreemkv::sector::SectorSource;
@@ -599,6 +603,9 @@ struct PatchCtx<'a, 'o> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
     shared: &'a Mutex<SharedPatchState>,
     opts: &'a PatchOptions<'o>,
+    // The op's cancellation (with `opts.halt`) and the libfreemkv token that follows it.
+    halt: &'a EngineHalt<'a>,
+    lib: &'a libfreemkv::halt::Halt,
     total_bytes: u64,
     state: PatchLoopState,
     /// Per-rip handler scorecard: grades handlers by recovery rate so the
@@ -900,6 +907,11 @@ impl PatchCtx<'_, '_> {
         final_tier: bool,
         flat: bool,
     ) -> Result<RegionOutcome> {
+        // A Stop before this range's first READ issues none (§5.4 ET5 "before the first READ").
+        if self.halt.is_cancelled() {
+            self.state.halted = true;
+            return Ok(RegionOutcome::Halted);
+        }
         tracing::info!(
             target: "freemkv::disc",
             phase = "patch.region.enter",
@@ -937,15 +949,13 @@ impl PatchCtx<'_, '_> {
         // budgets before cancelling. `Arc` so it doubles as a `Halt` when unset.
         let pass_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // Halt token for the sends below: the CALLER's external token when present,
-        // not the pass latch — a producer parked in `send` can't be reached by the
-        // tick-flipped latch, only by an externally-flipped bit like `opts.halt`.
-        let pass_halt = libfreemkv::halt::Halt::from_arc(
-            self.opts
-                .halt
-                .clone()
-                .unwrap_or_else(|| pass_cancel.clone()),
-        );
+        // Halt token for the sends below: the op's when wired, not the pass latch — a
+        // producer parked in `send` can't be reached by the tick-flipped latch.
+        let pass_halt = if self.halt.is_wired() {
+            self.lib.clone()
+        } else {
+            libfreemkv::halt::Halt::from_arc(pass_cancel.clone())
+        };
 
         let mut sink = PatchRecoverySink {
             pipe: self.pipe,
@@ -968,12 +978,11 @@ impl PatchCtx<'_, '_> {
             // and gets the progress bar moving at section start, not a quarter-second later.
             let last_tick: std::cell::Cell<Option<std::time::Instant>> = std::cell::Cell::new(None);
             let cancel = &pass_cancel;
-            let ext_halt = self.opts.halt.as_deref();
+            let ext_halt = self.halt;
             let mut tick = move || {
-                // Mirror an externally-supplied halt on EVERY read, not just on
-                // a throttled tick, so a caller that does wire `opts.halt` is
-                // not made less responsive by routing through this latch.
-                if ext_halt.is_some_and(|h| h.load(std::sync::atomic::Ordering::Relaxed)) {
+                // Mirror the op's cancel on EVERY read, not just on a throttled tick, so a
+                // wired caller is not made less responsive by routing through this latch.
+                if ext_halt.is_cancelled() {
                     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 let t = now_ptr();
@@ -1180,6 +1189,20 @@ pub fn bytes_bad_in_title_from_mapfile(
     bytes_bad_in_title(title, &bad_ranges)
 }
 
+/// [`patch()`] under the op token `op` (stop design v5 §4.2), OR'd with `opts.halt`; the
+/// pass latch stays exempt. A Stop is [`crate::EngineOutcome::Stopped`].
+pub fn patch_with(
+    op: &libfreemkv::Halt,
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &PatchOptions,
+) -> crate::EngineOutcome<PatchOutcome> {
+    let halt = crate::EngineHalt::new(op, opts.halt.clone());
+    let r = patch_in(disc, reader, path, opts, &halt);
+    crate::EngineOutcome::from_result(r, &halt, |r| r.halted)
+}
+
 /// Pass 2..N of a multipass rip: re-read the bad ranges recorded in the
 /// sidecar mapfile and try to recover them.
 ///
@@ -1194,6 +1217,35 @@ pub fn patch(
     reader: &mut dyn SectorSource,
     path: &std::path::Path,
     opts: &PatchOptions,
+) -> Result<PatchOutcome> {
+    patch_in(
+        disc,
+        reader,
+        path,
+        opts,
+        &EngineHalt::legacy(opts.halt.clone()),
+    )
+}
+
+// A patch pass under `halt`, which already holds `opts.halt`.
+pub(crate) fn patch_in(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &PatchOptions,
+    halt: &EngineHalt<'_>,
+) -> Result<PatchOutcome> {
+    halt.linked(|lib| patch_linked(disc, reader, path, opts, halt, lib))
+}
+
+// `patch_in` with `lib`, the libfreemkv token that follows `halt`.
+fn patch_linked(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &PatchOptions,
+    halt: &EngineHalt<'_>,
+    lib: &libfreemkv::halt::Halt,
 ) -> Result<PatchOutcome> {
     use libfreemkv::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
 
@@ -1262,7 +1314,7 @@ pub fn patch(
         disc,
         reader,
         opts.decrypt,
-        opts.halt.as_ref(),
+        halt.is_wired().then_some(lib),
         opts.key_fetch.as_ref(),
         opts.keys.as_ref(),
     )?;
@@ -1277,14 +1329,9 @@ pub fn patch(
     // checks consumer-published stats inline. Sweep's depth-4 default would let
     // recovered sectors queue between decisions, breaking this per-sector lockstep.
     let pipe = Pipeline::<PatchItem, _>::spawn(WRITE_THROUGH_DEPTH, sink)?;
-    // Halt token for the teardown below: adopts the caller's Stop bit as-is,
-    // exactly as `run`'s `pass_halt` does; a caller wiring none gets a never-
-    // cancelled token, leaving JOIN_TIMEOUT_SECS as the only bound on the join.
-    let finish_halt = opts
-        .halt
-        .clone()
-        .map(libfreemkv::halt::Halt::from_arc)
-        .unwrap_or_default();
+    // Halt token for the teardown below: the op's, as `run`'s `pass_halt`; with none wired,
+    // a never-cancelled token leaves the join's no-progress window as its only bound (T7).
+    let finish_halt = lib.clone();
 
     // Log ISO file size at patch start for write monitoring
     if let Ok(metadata) = std::fs::metadata(path) {
@@ -1333,6 +1380,8 @@ pub fn patch(
         pipe: &pipe,
         shared: &shared,
         opts,
+        halt,
+        lib,
         total_bytes,
         state: PatchLoopState::new(bytes_good_before, initial_batch, work_total),
         scoreboard: HandlerScoreboard::default(),

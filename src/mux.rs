@@ -415,12 +415,14 @@ fn with_mux_watcher<T>(
     }
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
     let (opened_tx, opened_rx) = mpsc::channel::<libfreemkv::DiscTitle>();
+    let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
     // MuxEvents impl that forwards write-progress and the output opening over channels.
     // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
+        flush: mpsc::Sender<(u64, u64)>,
     }
     impl libfreemkv::MuxEvents for ChannelEvents {
         fn on_write_progress(&self, bytes_written: u64, bytes_total: u64) {
@@ -428,6 +430,11 @@ fn with_mux_watcher<T>(
         }
         fn on_output_opened(&self, title: &libfreemkv::DiscTitle) {
             let _ = self.opened.send(title.clone());
+        }
+        // Stop design v5 §4.5: "`MuxEvents::on_flush_progress` … The engine's mux bridge
+        // turns that into `Sink::progress(pass: "sync")`" (one call per libfreemkv call).
+        fn on_flush_progress(&self, bytes_durable: u64, bytes_total: u64) {
+            let _ = self.flush.send((bytes_durable, bytes_total));
         }
     }
     let opened = |title: &libfreemkv::DiscTitle| {
@@ -470,6 +477,14 @@ fn with_mux_watcher<T>(
                     };
                     sink.progress(&p);
                 }
+                for (done_b, total_b) in flush_rx.try_iter() {
+                    sink.progress(&crate::sink::Progress {
+                        pass: std::borrow::Cow::Borrowed("sync"),
+                        bytes_done: done_b,
+                        bytes_total: total_b,
+                        ..Default::default()
+                    });
+                }
                 if sink.should_cancel() {
                     watcher_halt.cancel();
                 }
@@ -488,6 +503,7 @@ fn with_mux_watcher<T>(
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents {
             tx,
             opened: opened_tx,
+            flush: flush_tx,
         });
         // Same guard the recovery paths use: `mux_stream` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
@@ -516,8 +532,8 @@ fn scan_options(raw_copy: bool) -> libfreemkv::ScanOptions {
     }
 }
 
-/// Open a live optical drive and get it ready to rip: open the session, lock
-/// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
+/// Open a live optical drive and get it ready to rip: open the session, scan
+/// the disc, lock the tray, and resolve its AACS keys. Returns the scanned
 /// session (its `disc()` is populated and its drive is still owned, ready to
 /// be staged for a `MuxInput::Session` mux) plus the resolution trace.
 ///
@@ -558,7 +574,7 @@ pub fn open_scan_resolve_with(
     Ok((session, trace))
 }
 
-/// Open a live optical drive, lock its tray and scan the disc, with NO key call (KU §3.2):
+/// Open a live optical drive, scan the disc, then lock its tray, with NO key call (KU §3.2):
 /// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
 /// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
 /// `raw_copy` as in [`open_scan_resolve_with`].
@@ -567,10 +583,24 @@ pub fn open_scan(
     credentials: Option<libfreemkv::DriveCredentials>,
     raw_copy: bool,
 ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
-    let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
-    // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
-    session.lock_tray();
-    session.scan(scan_options(raw_copy))?;
+    let session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
+    scan_then_lock(
+        session,
+        |session| session.scan(scan_options(raw_copy)).map(drop),
+        // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
+        libfreemkv::DiscSession::lock_tray,
+    )
+}
+
+// Stop design v5 §4.2: `open_scan` "locks the tray after the scan (ET9)", so a scan that
+// fails or is stopped never leaves the tray locked.
+fn scan_then_lock<S>(
+    mut session: S,
+    scan: impl FnOnce(&mut S) -> Result<(), libfreemkv::Error>,
+    lock: impl FnOnce(&mut S),
+) -> Result<S, libfreemkv::Error> {
+    scan(&mut session)?;
+    lock(&mut session);
     Ok(session)
 }
 
@@ -802,6 +832,44 @@ mod tests {
         );
     }
 
+    // ET9 `open_scan_with_locks_tray_after_scan` — stop design v5 §4.2: "KU's `open_scan`
+    // (which replaces `open_scan_resolve*`, `raw_copy` preserved) locks the tray after the
+    // scan"; §5.4: "a Stop during the scan leaves the tray unlocked".
+    #[test]
+    fn open_scan_with_locks_tray_after_scan() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let stopped = scan_then_lock(
+            (),
+            |_| {
+                steps.borrow_mut().push("scan");
+                Err(libfreemkv::Error::Halted)
+            },
+            |_| steps.borrow_mut().push("lock"),
+        );
+        assert!(matches!(stopped, Err(libfreemkv::Error::Halted)));
+        assert_eq!(
+            *steps.borrow(),
+            ["scan"],
+            "a Stop during the scan locks nothing"
+        );
+        steps.borrow_mut().clear();
+        let ok = scan_then_lock(
+            (),
+            |_| {
+                steps.borrow_mut().push("scan");
+                Ok(())
+            },
+            |_| steps.borrow_mut().push("lock"),
+        );
+        assert!(ok.is_ok());
+        assert_eq!(*steps.borrow(), ["scan", "lock"]);
+        // `open_scan` needs a live drive: pin that it goes through the ordered helper.
+        let src = include_str!("mux.rs").replace("\r\n", "\n");
+        let start = src.find("pub fn open_scan(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("scan_then_lock(") && !body.contains("session.lock_tray()"));
+    }
+
     /// Wait for `cond` to hold, up to `secs`. Returns whether it held — a
     /// bounded wait, so a bridge that never fires fails the test instead of
     /// hanging the suite forever.
@@ -921,6 +989,35 @@ mod tests {
             *sink.0.lock().unwrap(),
             vec![("mpg:///o.mpg".to_string(), 0)]
         );
+    }
+
+    // ET23 `mux_close_flush_progress_reaches_sink` — stop design v5 §4.5: "The driver … forwards
+    // increases through a new **defaulted** `MuxEvents::on_flush_progress` … The engine's mux
+    // bridge turns that into `Sink::progress(pass: "sync")`"; no call when nothing moves.
+    #[test]
+    fn mux_close_flush_progress_reaches_sink() {
+        let sink = RecordingSink::default();
+        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            assert!(
+                sink.ticks.lock().unwrap().is_empty(),
+                "a call with no flush progress"
+            );
+            events.on_flush_progress(1 << 20, 4 << 20);
+            events.on_flush_progress(2 << 20, 4 << 20);
+            assert!(
+                wait_for(5, || sink.ticks.lock().unwrap().len() == 2),
+                "the flush progress did not reach the sink"
+            );
+        });
+        let ticks = sink.ticks.lock().unwrap();
+        assert!(
+            ticks
+                .iter()
+                .all(|p| p.pass == "sync" && p.bytes_total == 4 << 20)
+        );
+        assert_eq!(ticks[0].bytes_done, 1 << 20);
+        assert_eq!(ticks[1].bytes_done, 2 << 20);
     }
 
     // A panic inside the mux must still release the watcher, or an unwind skips storing `done`

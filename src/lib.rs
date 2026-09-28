@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 pub mod drive_info;
+mod engine_halt;
 mod extract;
 mod image;
 mod job;
@@ -30,8 +31,8 @@ mod recovery;
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for, vid_fingerprint};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
-    bytes_bad_in_title_from_mapfile, copy, ensure_titles_staged, ensure_whole_image, patch,
-    progress_snapshot_from_mapfile, sweep, sweep_scoped,
+    bytes_bad_in_title_from_mapfile, copy, copy_with, ensure_titles_staged, ensure_whole_image,
+    patch, patch_with, progress_snapshot_from_mapfile, sweep, sweep_scoped, sweep_with,
 };
 #[cfg(test)]
 mod ku_image_tests;
@@ -45,6 +46,7 @@ mod streams;
 mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
+pub use engine_halt::{EngineHalt, EngineOutcome};
 pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
     ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
@@ -56,8 +58,8 @@ pub use multipass::{
     MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
     end_of_recovery_promotion, loss_aborts, measured_scope_bad, mkv_staging_scope, multipass_rip,
-    multipass_rip_staged, pass_exit, patch_made_progress, patch_pass_decision, plan_passes,
-    scope_bad_bytes, scope_converged, should_abort_for_loss,
+    multipass_rip_staged, multipass_rip_with, pass_exit, patch_made_progress, patch_pass_decision,
+    plan_passes, scope_bad_bytes, scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
@@ -67,7 +69,8 @@ pub use mux::{
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
-    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_options, remux_iso, verify_mkv,
+    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
+    remux_iso, remux_iso_with, verify_mkv,
 };
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;

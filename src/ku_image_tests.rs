@@ -256,7 +256,7 @@ fn open_image_resolves_once_and_hands_the_set_to_every_title() {
         target: dir.path().join("remux.mkv"),
         replace: false,
     };
-    crate::remux::remux_iso_with(&job, f, &crate::NoopSink).unwrap();
+    crate::remux::remux_iso_sources(&job, f, &crate::NoopSink, &crate::Halt::new()).unwrap();
     assert_eq!(calls.len(), 1, "one request, for title 1's group");
     assert!(job.target.exists());
 }
@@ -461,7 +461,7 @@ fn a_stopped_remux_makes_no_key_request() {
         replace: false,
     };
     let f = factory(&[(Answer::Online, &[K1])], &calls);
-    let err = crate::remux::remux_iso_with(&job, f, &Stopped).unwrap_err();
+    let err = crate::remux::remux_iso_sources(&job, f, &Stopped, &crate::Halt::new()).unwrap_err();
     assert!(libfreemkv::is_halt(&err), "{err}");
     assert_eq!(calls.len(), 0, "the Stop reached the resolve");
 }
@@ -1161,7 +1161,9 @@ fn a_stop_after_the_remux_open_asks_nothing_more() {
         replace: false,
     };
     let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
-    let err = crate::remux::remux_iso_with(&job, f, &StopAfter(calls.clone(), 1)).unwrap_err();
+    let err =
+        crate::remux::remux_iso_sources(&job, f, &StopAfter(calls.clone(), 1), &crate::Halt::new())
+            .unwrap_err();
     assert!(libfreemkv::is_halt(&err), "{err}");
     assert_eq!(calls.len(), 1, "the open's one request, then nothing");
     assert!(!job.target.exists());
