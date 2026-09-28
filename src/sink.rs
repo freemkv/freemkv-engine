@@ -80,6 +80,12 @@ pub enum Event<'a> {
     },
     /// A verified file replaced the existing one at `path`.
     Replaced { path: &'a std::path::Path },
+    /// A mux's output `dest` opened for `title` as it will be written (libfreemkv's
+    /// `MuxEvents::on_output_opened`): where a front end prints the pre-mux notes.
+    OutputOpened {
+        dest: &'a str,
+        title: &'a libfreemkv::DiscTitle,
+    },
 }
 
 /// The engine→front-end seam. One trait, implemented once per front-end.

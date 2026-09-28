@@ -355,7 +355,7 @@ pub(crate) fn mux_iso_title(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let hint = title.size_bytes;
-    with_mux_watcher(sink, |halt, events| {
+    with_mux_watcher(sink, dest, |halt, events| {
         sink.log(
             Level::Info,
             &format!(
@@ -385,7 +385,7 @@ fn mux_with_input(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    with_mux_watcher(sink, |halt, events| {
+    with_mux_watcher(sink, dest, |halt, events| {
         sink.log(
             Level::Info,
             &format!(
@@ -401,6 +401,7 @@ fn mux_with_input(
 // testable against a closure without real media.
 fn with_mux_watcher<T>(
     sink: &dyn Sink,
+    dest: &str,
     f: impl FnOnce(&libfreemkv::Halt, Arc<dyn libfreemkv::MuxEvents>) -> T,
 ) -> T {
     use std::sync::mpsc;
@@ -413,17 +414,27 @@ fn with_mux_watcher<T>(
         halt.cancel();
     }
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
+    let (opened_tx, opened_rx) = mpsc::channel::<libfreemkv::DiscTitle>();
 
-    // MuxEvents impl that forwards write-progress over the channel. Owned +
-    // 'static (holds only a Sender), so it satisfies mux_stream's Arc bound.
+    // MuxEvents impl that forwards write-progress and the output opening over channels.
+    // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
+        opened: std::sync::Mutex<mpsc::Sender<libfreemkv::DiscTitle>>,
     }
     impl libfreemkv::MuxEvents for ChannelEvents {
         fn on_write_progress(&self, bytes_written: u64, bytes_total: u64) {
             let _ = self.tx.send((bytes_written, bytes_total));
         }
+        fn on_output_opened(&self, title: &libfreemkv::DiscTitle) {
+            if let Ok(tx) = self.opened.lock() {
+                let _ = tx.send(title.clone());
+            }
+        }
     }
+    let opened = |title: &libfreemkv::DiscTitle| {
+        sink.event(&crate::sink::Event::OutputOpened { dest, title });
+    };
 
     let done = Arc::new(AtomicBool::new(false));
 
@@ -438,6 +449,10 @@ fn with_mux_watcher<T>(
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
             loop {
+                // The opening first: it precedes every write-progress tick.
+                while let Ok(title) = opened_rx.try_recv() {
+                    opened(&title);
+                }
                 // Coalesce queued progress ticks to the LATEST, sample ONCE:
                 // sampling per-message would measure `dt` in microseconds
                 // against a ~100ms byte-delta, yielding absurd multi-GB/s speeds.
@@ -461,13 +476,20 @@ fn with_mux_watcher<T>(
                     watcher_halt.cancel();
                 }
                 if watcher_done.load(Ordering::Relaxed) {
+                    // A mux that returned before this poll: its opening is not lost.
+                    while let Ok(title) = opened_rx.try_recv() {
+                        opened(&title);
+                    }
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         });
 
-        let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents { tx });
+        let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents {
+            tx,
+            opened: std::sync::Mutex::new(opened_tx),
+        });
         // Same guard the recovery paths use: `mux_stream` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
         // it, leaving thread::scope joining a watcher that loops forever.
@@ -822,7 +844,8 @@ mod tests {
         let sink = CancelledOnce {
             asked: AtomicUsize::new(0),
         };
-        let halted_on_entry = with_mux_watcher(&sink, |halt, _events| halt.is_cancelled());
+        let halted_on_entry =
+            with_mux_watcher(&sink, "mkv:///o.mkv", |halt, _events| halt.is_cancelled());
         assert!(
             halted_on_entry,
             "a rip that was cancelled before it began must reach the muxer \
@@ -845,7 +868,7 @@ mod tests {
         let sink = CancelOnceStarted {
             started: AtomicBool::new(false),
         };
-        let saw_halt = with_mux_watcher(&sink, |halt, _events| {
+        let saw_halt = with_mux_watcher(&sink, "mkv:///o.mkv", |halt, _events| {
             sink.started.store(true, Ordering::SeqCst);
             wait_for(5, || halt.is_cancelled())
         });
@@ -861,7 +884,7 @@ mod tests {
     #[test]
     fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
         let sink = RecordingSink::default();
-        with_mux_watcher(&sink, |_halt, events| {
+        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
             events.on_write_progress(4096, 8192);
             assert!(
                 wait_for(5, || !sink.ticks.lock().unwrap().is_empty()),
@@ -909,7 +932,9 @@ mod tests {
         std::thread::spawn(move || {
             let sink = NoopSink;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_mux_watcher(&sink, |_halt, _events| panic!("mux blew up"))
+                with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, _events| {
+                    panic!("mux blew up")
+                })
             }));
             assert!(r.is_err(), "the panic must still propagate to the caller");
             let _ = tx.send(());
