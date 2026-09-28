@@ -2550,6 +2550,19 @@ mod ku_identity_tests {
         assert_eq!(again.vid_fingerprint(), Some(vid_fingerprint(&VID)));
     }
 
+    /// KU-X1, KU §4.4 rule 3: legacy key fingerprints are "checked **only if** the set proved
+    /// at least one base key". With no set nothing is proven: disc-banked keys never stand in.
+    /// Per spec; do not change without a spec citation proving otherwise.
+    #[test]
+    fn identity_without_a_set_reads_no_banked_keys() {
+        let (_d, p) = scratch("no_set");
+        let mut banked = disc_with(HASH_A, [0; 16]);
+        banked.aacs.as_mut().unwrap().unit_keys = vec![(1, K1)];
+        assert!(DiscIdentity::of(&banked, None).proven.is_empty());
+        let map = map_with(&p, None, None, &[K2]);
+        assert!(check_mapfile_identity(&map, &banked, None).is_ok());
+    }
+
     /// The new identity lines round-trip; a malformed one fails the load (dropping it would
     /// turn "names a disc" into "names none" and reopen the cross-disc resume splice).
     #[test]
