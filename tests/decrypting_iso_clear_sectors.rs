@@ -535,7 +535,7 @@ fn an_unreadable_stream_map_fails_loud() {
 }
 
 /// A UDF tree with no AACS content file while titles exist is inconsistent:
-/// refuse rather than trusting the title extents alone.
+/// refuse (E6003, naming the missing folder) rather than trust the title extents.
 #[test]
 fn an_empty_stream_map_with_titles_fails_loud() {
     let fx = bd(None);
@@ -547,7 +547,7 @@ fn an_empty_stream_map_with_titles_fails_loud() {
     d.capacity_bytes = image.len() as u64;
     let tmp = tempfile::tempdir().unwrap();
     let (iso, r) = sweep_to(&tmp, &d, &mut MemDisc::new(&image));
-    assert_refused_before_output(&iso, r, Error::DecryptFailed.code());
+    assert_refused_before_output(&iso, r, libfreemkv::error::E_UDF_NOT_FOUND);
 }
 
 /// #55, part two: a failure that is NOT a media read fault keeps its own code
