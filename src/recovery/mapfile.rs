@@ -209,18 +209,15 @@ pub struct Mapfile {
     /// Wall-clock timestamp of the last successful `write_to_disk` (or
     /// the moment the mapfile was constructed, whichever is later).
     last_flushed: Instant,
-    /// AACS Volume ID (16 bytes) for the disc, persisted as a
-    /// `# freemkv-vid:` comment header so it survives to deferred-mux /
-    /// resume without altering the ISO payload or breaking ddrescue
-    /// data-line parsing. `None` for unencrypted / non-AACS discs.
-    /// MUTUALLY EXCLUSIVE with `unit_keys`: set only when the disc did NOT
-    /// resolve its keys, as the retry-able "still need a key" marker; a
-    /// resolved disc persists `unit_keys` instead (see below).
-    vid: Option<[u8; 16]>,
-    /// Decrypted AACS unit keys `(CPS unit, key)`, persisted as `# freemkv-uk:`
-    /// comment headers when the disc was successfully keyed. Mutually exclusive
-    /// with `vid` (see above). Empty when unresolved.
-    unit_keys: Vec<(u32, [u8; 16])>,
+    /// SHA-1 of the disc's `Unit_Key_RO.inf` (40 lowercase hex), `# freemkv-disc:`: the
+    /// disc's identity (KU §4.1). `None` for a non-AACS disc or an anonymous import.
+    disc_hash: Option<String>,
+    /// [`vid_fingerprint`] of the disc's Volume ID, `# freemkv-vidfp:`. The raw VID is
+    /// never held or written (KU J6: memory only; it derives the keys, KS-16).
+    vidfp: Option<[u8; 32]>,
+    /// [`key_fingerprint`]s of the keys a pre-1.8 mapfile stored in its legacy key lines, kept as
+    /// `# freemkv-legacy-keyfp:` so an old capture keeps an identity (KU §4.1, decision b).
+    legacy_keyfps: Vec<[u8; 8]>,
     /// Byte ranges a SCOPED (MKV-staging) image was read over, persisted as a
     /// `# freemkv-scope:` header. Outside them nothing is read: the file is not a
     /// whole-disc image, and `stats()` leaves those unread bytes out of pending.
@@ -253,8 +250,9 @@ impl Mapfile {
             },
             dirty: false,
             last_flushed: Instant::now(),
-            vid: None,
-            unit_keys: Vec::new(),
+            disc_hash: None,
+            vidfp: None,
+            legacy_keyfps: Vec::new(),
             scope: None,
             disowned: Arc::new(AtomicBool::new(false)),
         };
@@ -271,8 +269,9 @@ impl Mapfile {
         let mut entries = Vec::new();
         let mut saw_current_line = false;
         let mut version = String::from("unknown");
-        let mut vid: Option<[u8; 16]> = None;
-        let mut unit_keys: Vec<(u32, [u8; 16])> = Vec::new();
+        let mut disc_hash: Option<String> = None;
+        let mut vidfp: Option<[u8; 32]> = None;
+        let mut legacy = LegacyIdentity::default();
         let mut scope: Option<Vec<(u64, u64)>> = None;
         for line in text.lines() {
             let t = line.trim();
@@ -284,26 +283,20 @@ impl Mapfile {
                 if let Some(v) = rest.strip_prefix("Rescue Logfile. Created by ") {
                     version = v.to_string();
                 }
-                // The two identity headers are not best-effort: dropping a malformed
-                // one downgrades to "no identity", trusted by the resume guard and
-                // letting disc A's ranges apply to disc B. Absent is fine; unparseable is refused.
-                if let Some(hex) = rest.strip_prefix("freemkv-vid:") {
-                    let Some(parsed) = parse_vid_hex(hex.trim()) else {
-                        let e: io::Error =
-                            libfreemkv::error::Error::MapfileInvalid { kind: "vid" }.into();
-                        return Err(e);
-                    };
-                    vid = Some(parsed);
+                // The identity headers are not best-effort: dropping a malformed one
+                // downgrades to "no identity", letting disc A's ranges apply to disc B.
+                if let Some(h) = rest.strip_prefix("freemkv-disc:") {
+                    disc_hash = Some(parse_disc_hash(h.trim()).ok_or_else(|| invalid("disc"))?);
                 }
-                if let Some(uk) = rest.strip_prefix("freemkv-uk:") {
-                    // `<cps>:<32hex>`.
-                    let Some(entry) = parse_uk_line(uk.trim()) else {
-                        let e: io::Error =
-                            libfreemkv::error::Error::MapfileInvalid { kind: "unit_key" }.into();
-                        return Err(e);
-                    };
-                    unit_keys.push(entry);
+                if let Some(h) = rest.strip_prefix("freemkv-vidfp:") {
+                    let fp = libfreemkv::hex::parse_hex_fixed::<32>(h.trim());
+                    vidfp = Some(fp.ok_or_else(|| invalid("vidfp"))?);
                 }
+                if let Some(h) = rest.strip_prefix("freemkv-legacy-keyfp:") {
+                    let fp = libfreemkv::hex::parse_hex_fixed::<8>(h.trim());
+                    legacy.keyfps.push(fp.ok_or_else(|| invalid("keyfp"))?);
+                }
+                parse_legacy_key_lines(rest, &mut legacy)?;
                 // Like the identity headers, a malformed scope is refused: dropping it
                 // would present a partial image as a whole-disc one.
                 if let Some(sc) = rest.strip_prefix("freemkv-scope:") {
@@ -412,12 +405,6 @@ impl Mapfile {
             .last()
             .map(|e| e.pos.saturating_add(e.size))
             .unwrap_or(0);
-        // Enforce the keys-XOR-vid invariant set_unit_keys() guarantees: a
-        // hand-edited file with both comment types would otherwise load with
-        // both set. Unit keys win here, matching the setter.
-        if !unit_keys.is_empty() {
-            vid = None;
-        }
         let stats = Self::compute_stats(&entries, total_size);
         Ok(Self {
             path: path.to_path_buf(),
@@ -427,8 +414,9 @@ impl Mapfile {
             stats,
             dirty: false,
             last_flushed: Instant::now(),
-            vid,
-            unit_keys,
+            disc_hash,
+            vidfp: vidfp.or(legacy.vidfp),
+            legacy_keyfps: legacy.keyfps,
             scope,
             disowned: Arc::new(AtomicBool::new(false)),
         })
@@ -549,39 +537,60 @@ impl Mapfile {
         Ok(())
     }
 
-    /// Record the disc's 16-byte AACS Volume ID so it persists in the
-    /// mapfile's comment header. Marks the mapfile dirty; the next
-    /// `flush()` / `Drop` writes the `# freemkv-vid:` line. Does not
-    /// touch the ISO payload or the ddrescue data lines.
+    /// Record the disc's Volume ID as its [`vid_fingerprint`] only (`# freemkv-vidfp:`);
+    /// the raw VID is never held or written (KU J6). Legacy setter, removed at KU-X1.
     pub fn set_vid(&mut self, vid: [u8; 16]) {
-        self.vid = Some(vid);
-        self.dirty = true;
-    }
-
-    /// The disc's AACS Volume ID, if one was set or parsed from a
-    /// `# freemkv-vid:` comment on load. `None` for unencrypted /
-    /// non-AACS discs.
-    pub fn vid(&self) -> Option<[u8; 16]> {
-        self.vid
-    }
-
-    /// Record the disc's decrypted AACS unit keys so they persist in the
-    /// mapfile header (`# freemkv-uk:` lines). The KEYED state: a deferred-mux /
-    /// resume decrypts directly from these with no key-service round-trip.
-    /// Setting keys clears any VID — the mapfile holds keys XOR VID, never both
-    /// (keys are the final answer; VID is only the "still unresolved" marker).
-    pub fn set_unit_keys(&mut self, keys: &[(u32, [u8; 16])]) {
-        self.unit_keys = keys.to_vec();
-        if !self.unit_keys.is_empty() {
-            self.vid = None;
+        if vid != [0u8; 16] {
+            self.set_vid_fingerprint(vid_fingerprint(&vid));
         }
-        self.dirty = true;
     }
 
-    /// The disc's decrypted AACS unit keys, if the disc was keyed (parsed from
-    /// `# freemkv-uk:` comments on load). Empty = unresolved (check `vid()`).
+    /// Always `None` from KU-E1: a mapfile holds no raw Volume ID (KU J6), only
+    /// [`Self::vid_fingerprint`]. Legacy accessor, removed at KU-X1.
+    pub fn vid(&self) -> Option<[u8; 16]> {
+        None
+    }
+
+    /// Ignored from KU-E1: a mapfile holds no key bytes (KU §4.1, "memory only"); the keys
+    /// live in the rip's in-memory key set. Legacy setter, removed at KU-X1.
+    pub fn set_unit_keys(&mut self, _keys: &[(u32, [u8; 16])]) {}
+
+    /// Always empty from KU-E1 (see [`Self::set_unit_keys`]). Legacy, removed at KU-X1.
     pub fn unit_keys(&self) -> &[(u32, [u8; 16])] {
-        &self.unit_keys
+        &[]
+    }
+
+    /// Record the disc hash (SHA-1 of `Unit_Key_RO.inf`, `0x` optional), written as
+    /// `# freemkv-disc:`. A value that is not 40 hex digits is ignored.
+    pub fn set_disc_hash(&mut self, hash: &str) {
+        let h = parse_disc_hash(hash);
+        if h.is_some() && h != self.disc_hash {
+            self.disc_hash = h;
+            self.dirty = true;
+        }
+    }
+
+    /// The disc hash this mapfile names (40 lowercase hex), if any.
+    pub fn disc_hash(&self) -> Option<&str> {
+        self.disc_hash.as_deref()
+    }
+
+    /// Record the disc's Volume ID fingerprint (`# freemkv-vidfp:`, KU §4.1).
+    pub fn set_vid_fingerprint(&mut self, fp: [u8; 32]) {
+        if self.vidfp != Some(fp) {
+            self.vidfp = Some(fp);
+            self.dirty = true;
+        }
+    }
+
+    /// The disc's Volume ID fingerprint (a converted legacy raw VID line included).
+    pub fn vid_fingerprint(&self) -> Option<[u8; 32]> {
+        self.vidfp
+    }
+
+    /// Fingerprints of the keys a pre-1.8 mapfile stored (KU §4.1, decision b).
+    pub fn legacy_key_fingerprints(&self) -> &[[u8; 8]] {
+        &self.legacy_keyfps
     }
 
     /// All map entries, sorted ascending by `pos` and (after load)
@@ -723,24 +732,16 @@ impl Mapfile {
                 let file = std::fs::File::create(tmp)?;
                 let mut w = std::io::BufWriter::new(file);
                 writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
-                // VID/key comments live in the header (`#`-prefixed, round-trips via load()).
-                // KEYS XOR VID: a keyed disc persists unit keys (final answer, for
-                // deferred-mux); an unresolved disc persists only the VID (retry marker).
-                use std::fmt::Write as _;
-                if !self.unit_keys.is_empty() {
-                    for (cps, key) in &self.unit_keys {
-                        let mut hex = String::with_capacity(32);
-                        for b in key {
-                            let _ = write!(hex, "{b:02x}");
-                        }
-                        writeln!(w, "# freemkv-uk: {cps}:{hex}")?;
-                    }
-                } else if let Some(vid) = self.vid {
-                    let mut hex = String::with_capacity(32);
-                    for b in vid {
-                        let _ = write!(hex, "{b:02x}");
-                    }
-                    writeln!(w, "# freemkv-vid: {hex}")?;
+                // Identity lines (KU §4.1): a disc hash and fingerprints only, never a key
+                // byte or a raw VID (J6); a legacy file is scrubbed on this first write.
+                if let Some(h) = &self.disc_hash {
+                    writeln!(w, "# freemkv-disc: {h}")?;
+                }
+                if let Some(fp) = &self.vidfp {
+                    writeln!(w, "# freemkv-vidfp: {}", hex_lower(fp))?;
+                }
+                for fp in &self.legacy_keyfps {
+                    writeln!(w, "# freemkv-legacy-keyfp: {}", hex_lower(fp))?;
                 }
                 if let Some(scope) = &self.scope {
                     let list: Vec<String> = scope
@@ -807,18 +808,88 @@ impl Drop for Mapfile {
     }
 }
 
+fn invalid(kind: &'static str) -> io::Error {
+    libfreemkv::error::Error::MapfileInvalid { kind }.into()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    bytes.iter().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02x}");
+        s
+    })
+}
+
+// 40 hex digits (SHA-1), `0x` optional → lowercase without the prefix.
+fn parse_disc_hash(s: &str) -> Option<String> {
+    libfreemkv::hex::parse_hex_fixed::<20>(s).map(|b| hex_lower(&b))
+}
+
+fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    h.update(tag);
+    h.update(bytes);
+    h.finalize().into()
+}
+
+/// `SHA-256("freemkv-vid-fp-v1" ‖ VID)`: the only form of a Volume ID a mapfile may hold
+/// (KU §4.1, `# freemkv-vidfp:`); equal to libfreemkv's `ResolvedKeySet::vid_fingerprint`.
+/// A fingerprint to compute or verify a `vidfp` with; the VID never leaves memory.
+pub fn vid_fingerprint(vid: &[u8; 16]) -> [u8; 32] {
+    sha256(b"freemkv-vid-fp-v1", vid)
+}
+
+/// `SHA-256("freemkv-key-fp-v1" ‖ key)[..8]`: a legacy key's identity (KU §4.1); equal to
+/// libfreemkv's `ResolvedKeySet::proven_key_fingerprints` for the same key.
+pub(crate) fn key_fingerprint(key: &[u8; 16]) -> [u8; 8] {
+    let d = sha256(b"freemkv-key-fp-v1", key);
+    let mut fp = [0u8; 8];
+    fp.copy_from_slice(&d[..8]);
+    fp
+}
+
+// KU §4.1: legacy-keyfp is written for base keys only, "CPS id < 2^24" (forensic tags sit above).
+const LEGACY_BASE_CPS_LIMIT: u32 = 1 << 24;
+
+/// What the pre-1.8 identity lines of one mapfile become.
+#[derive(Default)]
+struct LegacyIdentity {
+    vidfp: Option<[u8; 32]>,
+    keyfps: Vec<[u8; 8]>,
+}
+
+/// THE read-only parser of the pre-1.8 key and raw-VID comment lines (KU §2.2
+/// allow-path, §4.1): a key becomes its [`key_fingerprint`] (base keys only; a malformed
+/// line is dropped, never failing the load) and a raw VID its [`vid_fingerprint`] (a
+/// malformed VID still fails the load: it named a disc). Nothing raw is kept.
+fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result<()> {
+    if let Some(hex) = comment.strip_prefix("freemkv-vid:") {
+        let vid = parse_vid_hex(hex.trim()).ok_or_else(|| invalid("vid"))?;
+        out.vidfp = Some(vid_fingerprint(&vid));
+    } else if let Some(uk) = comment.strip_prefix("freemkv-uk:")
+        && let Some((cps, key)) = parse_uk_line(uk.trim())
+        && cps < LEGACY_BASE_CPS_LIMIT
+    {
+        let fp = key_fingerprint(&key);
+        if !out.keyfps.contains(&fp) {
+            out.keyfps.push(fp);
+        }
+    }
+    Ok(())
+}
+
 // Parse a 32-char hex VID string. `None` on malformation, which `load()`
 // turns into a hard `MapfileInvalid{kind:"vid"}` rather than "no identity" —
 // else corruption here would re-open the cross-disc resume splice.
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
-    // byte-based so a multi-byte `# freemkv-vid:` comment rejects, never panics).
+    // byte-based so a multi-byte legacy VID comment rejects, never panics).
     libfreemkv::hex::parse_hex_fixed::<16>(s)
 }
 
-/// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`.
-/// Returns `None` on any malformation; `load()` treats that as fatal, for the
-/// same reason as [`parse_vid_hex`].
+/// Parse a legacy key line's value `<cps>:<32hex>` into `(cps_unit, key)`; `None` on any
+/// malformation, which [`parse_legacy_key_lines`] drops (KU §4.1).
 fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let (cps, hex) = s.split_once(':')?;
     let cps: u32 = cps.trim().parse().ok()?;
@@ -1303,65 +1374,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_keys_round_trip_and_are_mutually_exclusive_with_vid() {
-        let p = tmpfile("uk_round_trips");
-        let _ = std::fs::remove_file(&p);
-        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
-        mf.record(0, 500, SectorStatus::Finished).unwrap();
-        // Set a VID first, then unit keys: keys must WIN and clear the VID.
-        mf.set_vid([0xAA; 16]);
-        let keys: Vec<(u32, [u8; 16])> = vec![
-            (
-                0,
-                [
-                    0x57, 0x60, 0xcc, 0x83, 0x3d, 0x86, 0x0e, 0x48, 0x92, 0x1f, 0x88, 0x16, 0xe1,
-                    0x35, 0x9b, 0xad,
-                ],
-            ),
-            (1, [0x11; 16]),
-        ];
-        mf.set_unit_keys(&keys);
-        assert_eq!(
-            mf.vid(),
-            None,
-            "set_unit_keys must clear vid (keys XOR vid)"
-        );
-        mf.flush().unwrap();
-
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert!(
-            text.contains("# freemkv-uk: 0:5760cc833d860e48921f8816e1359bad"),
-            "uk comment format mismatch: {text}"
-        );
-        assert!(
-            text.contains("# freemkv-uk: 1:11111111111111111111111111111111"),
-            "second uk missing: {text}"
-        );
-        assert!(
-            !text.contains("# freemkv-vid:"),
-            "VID must NOT be written when keys are present: {text}"
-        );
-
-        // load() recovers the unit keys (and no VID).
-        let loaded = Mapfile::load(&p).unwrap();
-        assert_eq!(loaded.unit_keys(), keys.as_slice());
-        assert_eq!(loaded.vid(), None);
-        assert_eq!(loaded.entries(), mf.entries());
-
-        // VID-only path (no keys) still persists the VID as the retry marker.
-        let p2 = tmpfile("uk_vid_only");
-        let _ = std::fs::remove_file(&p2);
-        let mut mf2 = Mapfile::create(&p2, 1000, "test").unwrap();
-        mf2.set_vid([0xBB; 16]);
-        mf2.flush().unwrap();
-        let loaded2 = Mapfile::load(&p2).unwrap();
-        assert_eq!(loaded2.vid(), Some([0xBB; 16]));
-        assert!(loaded2.unit_keys().is_empty());
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(&p2);
-    }
-
-    #[test]
     fn load_rejects_entry_whose_range_overflows_u64() {
         let p = tmpfile("load_overflow");
         let _ = std::fs::remove_file(&p);
@@ -1386,103 +1398,6 @@ mod tests {
             .expect_err("overflowing record must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn load_enforces_keys_xor_vid_on_malformed_file() {
-        let p = tmpfile("load_keys_xor_vid");
-        let _ = std::fs::remove_file(&p);
-        // Hand-craft a file carrying BOTH a vid comment and a uk comment
-        // (which write_to_disk would never emit together). load() must
-        // resolve to keys-only, matching set_unit_keys()'s invariant.
-        let body = "# freemkv-vid:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\
-                    # freemkv-uk: 0:11111111111111111111111111111111\n\
-                    0x0 0x200 +\n";
-        std::fs::write(&p, body).unwrap();
-        let loaded = Mapfile::load(&p).unwrap();
-        assert_eq!(
-            loaded.vid(),
-            None,
-            "load() must clear vid when unit keys are present"
-        );
-        assert_eq!(loaded.unit_keys(), &[(0u32, [0x11u8; 16])]);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    #[test]
-    fn vid_round_trips_and_data_lines_unaffected() {
-        let p = tmpfile("vid_round_trips");
-        let _ = std::fs::remove_file(&p);
-
-        // Build a mapfile with some data ranges, set a VID, persist.
-        let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
-        mf.record(100, 200, SectorStatus::Finished).unwrap();
-        mf.record(500, 100, SectorStatus::Unreadable).unwrap();
-        mf.record(700, 50, SectorStatus::NonTrimmed).unwrap();
-        let vid: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-            0xee, 0xff,
-        ];
-        mf.set_vid(vid);
-        mf.flush().unwrap();
-
-        // The saved file must contain the VID comment in lowercase hex.
-        let text = std::fs::read_to_string(&p).unwrap();
-        assert!(
-            text.contains("# freemkv-vid:"),
-            "saved mapfile missing VID comment: {text}"
-        );
-        assert!(
-            text.contains("# freemkv-vid: 00112233445566778899aabbccddeeff"),
-            "VID comment format mismatch: {text}"
-        );
-
-        // load() recovers the VID and the identical data ranges.
-        let loaded = Mapfile::load(&p).unwrap();
-        assert_eq!(loaded.vid(), Some(vid));
-        assert_eq!(loaded.entries(), mf.entries());
-
-        // A mapfile WITHOUT the VID comment must parse the same +/-/?
-        // data ranges as the one WITH it (comment ignored by parser).
-        let p2 = tmpfile("vid_round_trips_novid");
-        let _ = std::fs::remove_file(&p2);
-        let mut mf2 = Mapfile::create(&p2, 1000, "test").unwrap();
-        mf2.record(100, 200, SectorStatus::Finished).unwrap();
-        mf2.record(500, 100, SectorStatus::Unreadable).unwrap();
-        mf2.record(700, 50, SectorStatus::NonTrimmed).unwrap();
-        mf2.flush().unwrap();
-        let loaded_novid = Mapfile::load(&p2).unwrap();
-        assert_eq!(loaded_novid.vid(), None);
-        assert_eq!(loaded_novid.entries(), loaded.entries());
-
-        // A malformed VID comment fails the load; treating it as absent silently
-        // downgrades "names a disc" to "names no disc" (accepted by
-        // check_mapfile_identity) — see load_rejects_a_malformed_vid_header.
-        let mut bad = text.replace("00112233445566778899aabbccddeeff", "zzzz");
-        let pbad = tmpfile("vid_round_trips_bad");
-        let _ = std::fs::remove_file(&pbad);
-        std::fs::write(&pbad, &bad).unwrap();
-        assert!(
-            Mapfile::load(&pbad).is_err(),
-            "a corrupt VID header must not load as 'no identity'"
-        );
-
-        // A load->save cycle preserves the VID (the patch-pass path).
-        bad.clear();
-        let resaved = tmpfile("vid_round_trips_resave");
-        let _ = std::fs::remove_file(&resaved);
-        let mut reloaded = Mapfile::load(&p).unwrap();
-        // Repoint at a fresh path and flush; mark dirty via a no-op record.
-        reloaded.path = resaved.clone();
-        reloaded.dirty = true;
-        reloaded.flush().unwrap();
-        let again = Mapfile::load(&resaved).unwrap();
-        assert_eq!(again.vid(), Some(vid));
-
-        let _ = std::fs::remove_file(&p);
-        let _ = std::fs::remove_file(&p2);
-        let _ = std::fs::remove_file(&pbad);
-        let _ = std::fs::remove_file(&resaved);
     }
 
     #[test]
@@ -1660,9 +1575,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// A `# freemkv-uk:` line missing the `cps:hex` shape, with a bad cps,
-    /// or a wrong-length key, must parse to None. (`load()` turns that None
-    /// into a hard error — see `load_rejects_a_malformed_unit_key_header`.)
     // The scope survives a flush/load as a ddrescue-safe comment, and on load a scoped
     // map's never-read rest is not pending (it is not this image's job).
     #[test]
@@ -2013,97 +1925,31 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    // A malformed `# freemkv-vid:` header must FAIL the load, not drop
+    // A malformed legacy VID header must FAIL the load, not drop
     // silently — that would turn "carries an identity" into "carries none",
     // which reopens the cross-disc resume splice the identity guard stops.
     #[test]
     fn load_rejects_a_malformed_vid_header() {
         let p = tmpfile("load_bad_vid");
         let _ = std::fs::remove_file(&p);
+        // The legacy prefix is assembled so only `parse_legacy_key_lines` spells it (EK9).
+        let vid_line = format!("# {}vid: 00112233445566778899aabbccddeezz", "freemkv-");
         std::fs::write(
             &p,
-            "# Rescue Logfile. Created by test\n\
-             # freemkv-vid: 00112233445566778899aabbccddeezz\n\
-             0x0  ?  1  0\n\
-             0x0  0x800    +\n",
+            format!(
+                "# Rescue Logfile. Created by test\n{vid_line}\n0x0  ?  1  0\n0x0  0x800    +\n"
+            ),
         )
         .unwrap();
         let err = match Mapfile::load(&p) {
             Ok(mf) => panic!(
-                "a corrupt VID header must not load as 'no identity' (vid={:?})",
-                mf.vid()
+                "a corrupt VID header must not load as 'no identity' (vidfp={:?})",
+                mf.vid_fingerprint()
             ),
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         let _ = std::fs::remove_file(&p);
-    }
-
-    /// Same rule for a malformed `# freemkv-uk:` header — the KEYED half of
-    /// the keys-XOR-vid identity, and the half a normally-ripped AACS disc
-    /// actually writes (30 hex chars below, not 32).
-    #[test]
-    fn load_rejects_a_malformed_unit_key_header() {
-        let p = tmpfile("load_bad_uk");
-        let _ = std::fs::remove_file(&p);
-        std::fs::write(
-            &p,
-            "# Rescue Logfile. Created by test\n\
-             # freemkv-uk: 0:000102030405060708090a0b0c0d0e\n\
-             0x0  ?  1  0\n\
-             0x0  0x800    +\n",
-        )
-        .unwrap();
-        let err = match Mapfile::load(&p) {
-            Ok(mf) => panic!(
-                "a corrupt unit-key header must not load as 'no identity' (keys={})",
-                mf.unit_keys().len()
-            ),
-            Err(e) => e,
-        };
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The other side of the same rule: NO identity header at all still loads
-    /// (ddrescue imports, legacy files, unencrypted discs), and a WELL-FORMED
-    /// one still parses to the same 16 bytes it names.
-    #[test]
-    fn absent_identity_loads_and_a_wellformed_one_parses() {
-        let p = tmpfile("load_no_vid");
-        let _ = std::fs::remove_file(&p);
-        std::fs::write(
-            &p,
-            "# Rescue Logfile. Created by test\n\
-             0x0  ?  1  0\n\
-             0x0  0x800    +\n",
-        )
-        .unwrap();
-        let mf = Mapfile::load(&p).expect("no identity header at all is legal");
-        assert_eq!(mf.vid(), None);
-        assert!(mf.unit_keys().is_empty());
-        let _ = std::fs::remove_file(&p);
-
-        let p2 = tmpfile("load_ok_vid");
-        let _ = std::fs::remove_file(&p2);
-        std::fs::write(
-            &p2,
-            "# Rescue Logfile. Created by test\n\
-             # freemkv-vid: 00112233445566778899aabbccddeeff\n\
-             0x0  ?  1  0\n\
-             0x0  0x800    +\n",
-        )
-        .unwrap();
-        let mf2 = Mapfile::load(&p2).expect("a well-formed VID header must still load");
-        assert_eq!(
-            mf2.vid(),
-            Some([
-                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
-                0xee, 0xff
-            ])
-        );
-        assert_eq!(mf2.total_size(), 0x800);
-        let _ = std::fs::remove_file(&p2);
     }
 
     /// load() rejects an unknown status char (MapfileInvalid{kind:
@@ -2259,17 +2105,17 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// set_unit_keys with an EMPTY slice must NOT clear an existing VID —
-    /// the keys-XOR-vid invariant only flips when keys are actually present
-    /// (mapfile.rs: `if !self.unit_keys.is_empty() { self.vid = None }`).
+    /// KU §4.1: the legacy key setter is inert; it never clears the VID fingerprint the
+    /// legacy VID setter recorded, and neither keeps a raw byte.
     #[test]
-    fn set_unit_keys_empty_preserves_vid() {
-        let p = tmpfile("uk_empty_preserves_vid");
+    fn set_unit_keys_never_clears_the_vid_fingerprint() {
+        let p = tmpfile("uk_keeps_vidfp");
         let _ = std::fs::remove_file(&p);
         let mut mf = Mapfile::create(&p, 1000, "test").unwrap();
         mf.set_vid([0x7Au8; 16]);
-        mf.set_unit_keys(&[]); // empty — must not clear vid
-        assert_eq!(mf.vid(), Some([0x7Au8; 16]));
+        mf.set_unit_keys(&[(1, [0x11; 16])]);
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&[0x7Au8; 16])));
+        assert_eq!(mf.vid(), None);
         assert!(mf.unit_keys().is_empty());
         let _ = std::fs::remove_file(&p);
     }
@@ -2446,197 +2292,398 @@ mod load_if_present_tests {
     }
 }
 
-// Does this mapfile describe the disc currently in the drive? Identity is keys-XOR-vid
-// (matching how the mapfile stores it); carrying neither is `Ok` (legacy/unencrypted).
-pub(crate) fn check_mapfile_identity(map: &Mapfile, disc: &libfreemkv::Disc) -> io::Result<()> {
-    let mismatch = || -> io::Error {
-        libfreemkv::error::Error::MapfileInvalid {
-            kind: "disc-mismatch",
+/// Stamp `disc`'s identity on `map` (KU §4.1): its disc hash, and the fingerprint of its
+/// Volume ID (the scanned disc's own, else the rip's key set's, else a legacy caller's `vid`).
+pub(crate) fn stamp_identity(
+    map: &mut Mapfile,
+    disc: &libfreemkv::Disc,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    legacy_vid: Option<[u8; 16]>,
+) {
+    if let Some(a) = &disc.aacs {
+        map.set_disc_hash(&a.disc_hash);
+    }
+    if let Some(fp) = disc_vid_fingerprint(disc, keys) {
+        map.set_vid_fingerprint(fp);
+    } else if let Some(vid) = legacy_vid {
+        map.set_vid(vid);
+    }
+}
+
+// The VID fingerprint of the disc in hand: its scanned VID, else the key set's in-memory one.
+fn disc_vid_fingerprint(
+    disc: &libfreemkv::Disc,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+) -> Option<[u8; 32]> {
+    disc.aacs
+        .as_ref()
+        .map(|a| a.volume_id)
+        .filter(|v| *v != [0u8; 16])
+        .map(|v| vid_fingerprint(&v))
+        .or_else(|| keys.and_then(|k| k.vid_fingerprint()))
+}
+
+/// What the disc in hand offers the §4.4 identity check; `None` = unknown (not compared).
+pub(crate) struct DiscIdentity {
+    pub disc_hash: Option<String>,
+    pub vidfp: Option<[u8; 32]>,
+    /// Fingerprints of the proven base keys; empty = none proven (rule 3 cannot check).
+    pub proven: Vec<[u8; 8]>,
+}
+
+impl DiscIdentity {
+    /// `disc`'s identity with the rip's `keys` (their VID and proven keys); with no set, the
+    /// legacy disc-banked keys stand in as proven until KU-X1.
+    pub(crate) fn of(
+        disc: &libfreemkv::Disc,
+        keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    ) -> Self {
+        let proven = match keys {
+            Some(set) => set.proven_key_fingerprints(),
+            None => disc
+                .aacs
+                .iter()
+                .flat_map(|a| &a.unit_keys)
+                .filter(|(cps, _)| *cps < LEGACY_BASE_CPS_LIMIT)
+                .map(|(_, k)| key_fingerprint(k))
+                .collect(),
+        };
+        DiscIdentity {
+            disc_hash: disc
+                .aacs
+                .as_ref()
+                .and_then(|a| parse_disc_hash(&a.disc_hash)),
+            vidfp: disc_vid_fingerprint(disc, keys),
+            proven,
         }
-        .into()
+    }
+}
+
+/// Does `map` describe `disc`? [`check_identity`] over [`DiscIdentity::of`].
+pub(crate) fn check_mapfile_identity(
+    map: &Mapfile,
+    disc: &libfreemkv::Disc,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+) -> io::Result<()> {
+    check_identity(map, &DiscIdentity::of(disc, keys))
+}
+
+/// KU §4.4, over what is known on both sides:
+/// 1. disc hashes both known and different → mismatch;
+/// 2. VID fingerprints both known and different → mismatch;
+/// 3. legacy key fingerprints, only when base keys were proven: none matches → mismatch. A
+///    set that proved no base key cannot check them, and that is not a mismatch.
+pub(crate) fn check_identity(map: &Mapfile, disc: &DiscIdentity) -> io::Result<()> {
+    let mismatch = |rule: &str| -> io::Error {
+        tracing::warn!(
+            target: "freemkv::disc",
+            rule,
+            "mapfile identity does not match the disc in hand — refusing to resume"
+        );
+        invalid("disc-mismatch")
     };
-
-    let map_keys = map.unit_keys();
-    if !map_keys.is_empty() {
-        let disc_keys: &[(u32, [u8; 16])] = disc
-            .aacs
-            .as_ref()
-            .map(|a| a.unit_keys.as_slice())
-            .unwrap_or(&[]);
-        // Order is not significant — compare as sets.
-        let mut a: Vec<_> = map_keys.to_vec();
-        let mut b: Vec<_> = disc_keys.to_vec();
-        a.sort_unstable();
-        b.sort_unstable();
-        if a != b {
-            tracing::warn!(
-                target: "freemkv::disc",
-                "mapfile unit keys do not match the disc in the drive — refusing to resume",
-            );
-            return Err(mismatch());
-        }
-        return Ok(());
+    if let (Some(m), Some(d)) = (map.disc_hash(), disc.disc_hash.as_deref())
+        && m != d
+    {
+        return Err(mismatch("disc hash"));
     }
-
-    if let Some(map_vid) = map.vid() {
-        match disc.aacs.as_ref().map(|a| a.volume_id) {
-            Some(disc_vid) if disc_vid == map_vid => return Ok(()),
-            _ => {
-                tracing::warn!(
-                    target: "freemkv::disc",
-                    "mapfile volume id does not match the disc in the drive — refusing to resume",
-                );
-                return Err(mismatch());
-            }
-        }
+    if let (Some(m), Some(d)) = (map.vid_fingerprint(), disc.vidfp)
+        && m != d
+    {
+        return Err(mismatch("vidfp"));
     }
-
+    if !map.legacy_keyfps.is_empty()
+        && !disc.proven.is_empty()
+        && !map.legacy_keyfps.iter().any(|f| disc.proven.contains(f))
+    {
+        return Err(mismatch("legacy key fingerprints"));
+    }
     Ok(())
 }
 
 #[cfg(test)]
-mod check_mapfile_identity_tests {
-    use super::*;
+mod ku_identity_tests {
+    //! KU-E1 mapfile rules (KU §4.1, §4.4, §4.5; J6): no key bytes and no raw VID on disk,
+    //! legacy lines become fingerprints, and the identity check. The VID derives the keys
+    //! (KS-16: "Kvu = AES-G(Km, IDv)"), so it is secret-class and only its hash is kept.
 
-    // Every field `check_mapfile_identity` never reads gets a neutral value,
-    // so a minimal fixture keeps each test's intent legible — only `aacs`
-    // (and inside it, `unit_keys`/`volume_id`) varies per case.
-    fn disc_with_aacs(aacs: Option<libfreemkv::disc::AacsState>) -> libfreemkv::Disc {
-        libfreemkv::Disc {
-            volume_id: String::new(),
-            meta_title: None,
-            format: libfreemkv::DiscFormat::Uhd,
-            capacity_sectors: 1,
-            capacity_bytes: 2048,
-            layers: 1,
-            titles: Vec::new(),
-            region: libfreemkv::disc::DiscRegion::Free,
-            aacs,
-            css: None,
-            // `encrypted` plays no role in `check_mapfile_identity` (it only
-            // reads `disc.aacs`), so a fixed value is fine here.
-            encrypted: false,
-            aacs_error: None,
-            css_error: None,
-            content_format: libfreemkv::ContentFormat::BdTs,
+    use super::*;
+    use crate::test_fixtures::{Answer, Calls, K1, K2, VID, bd_image, resolve};
+    use libfreemkv::keys::{KeyScope, ResolveKeysOptions, ResolvedKeySet};
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn scratch(tag: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(format!("{tag}.mapfile"));
+        (dir, p)
+    }
+
+    /// The engine's fingerprints are exactly the set's (KU §4.1, J18): `SHA-256(
+    /// "freemkv-vid-fp-v1" ‖ VID)` and `SHA-256("freemkv-key-fp-v1" ‖ key)[..8]`.
+    #[test]
+    fn fingerprints_match_the_key_set() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let f = crate::test_fixtures::factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+        let set = ResolvedKeySet::resolve(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0]),
+            &f,
+            ResolveKeysOptions {
+                vid: Some(VID),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .keys;
+        assert_eq!(set.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+        assert_eq!(set.proven_key_fingerprints(), vec![key_fingerprint(&K1)]);
+    }
+
+    /// EK1 (KU §4.1, J6): "From KU-E1 the engine writes neither `# freemkv-uk:` nor a raw
+    /// `# freemkv-vid:` line": only `# freemkv-disc:` and `# freemkv-vidfp:`. A sweep handed
+    /// the legacy `vid` / `unit_keys` options still writes no key and no raw VID.
+    #[test]
+    fn mapfile_never_writes_key_or_raw_vid_lines() {
+        let mut fx = bd_image(&[Some(K1)], 1);
+        fx.disc.aacs.as_mut().unwrap().volume_id = VID;
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        let opts = crate::SweepOptions {
+            vid: Some(VID),
+            unit_keys: vec![(1, K1)],
+            ..Default::default()
+        };
+        crate::sweep(&fx.disc, &mut fx.source(), &iso, &opts).unwrap();
+        let text = std::fs::read_to_string(mapfile_path_for(&iso)).unwrap();
+        for banned in ["freemkv-uk", "freemkv-vid:", &hex(&K1), &hex(&VID)] {
+            assert!(!text.contains(banned), "{banned} on disk:\n{text}");
+        }
+        let disc_hash =
+            libfreemkv::hex::strip_hex_prefix(&fx.disc.aacs.as_ref().unwrap().disc_hash)
+                .to_ascii_lowercase();
+        assert!(
+            text.contains(&format!("# freemkv-disc: {disc_hash}\n")),
+            "{text}"
+        );
+        let fp = hex(&vid_fingerprint(&VID));
+        assert!(text.contains(&format!("# freemkv-vidfp: {fp}\n")), "{text}");
+
+        // The legacy setters (removed at KU-X1) write no key and no raw VID either.
+        let (_d, p) = scratch("setters");
+        let mut mf = Mapfile::create(&p, 4096, "test").unwrap();
+        mf.set_unit_keys(&[(1, K1)]);
+        mf.set_vid(VID);
+        mf.record(0, 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        for banned in ["freemkv-uk", "freemkv-vid:", &hex(&K1), &hex(&VID)] {
+            assert!(!text.contains(banned), "{banned} on disk:\n{text}");
+        }
+        assert!(text.contains(&format!("# freemkv-vidfp: {fp}\n")));
+        assert_eq!(mf.vid(), None, "no raw VID is held either");
+        assert!(mf.unit_keys().is_empty());
+    }
+
+    /// EK2 (KU §4.1, §4.5): legacy `# freemkv-uk:` / `# freemkv-vid:` lines load as
+    /// fingerprints through `parse_legacy_key_lines`; a load alone writes nothing, and the
+    /// first write scrubs them: no 32-hex key and no raw VID left in the file.
+    #[test]
+    fn legacy_lines_become_fingerprints_on_first_write() {
+        let (_d, p) = scratch("legacy");
+        let legacy = format!(
+            "# Rescue Logfile. Created by freemkv 1.7\n\
+             # freemkv-uk: 1:{}\n\
+             # freemkv-uk: 2:{}\n\
+             # freemkv-uk: 16777216:{}\n\
+             # freemkv-uk: not-a-line\n\
+             # freemkv-vid: {}\n\
+             0x0  ?  1  0\n\
+             0x0  0x1000    ?\n",
+            hex(&K1),
+            hex(&K2),
+            hex(&[0x77; 16]),
+            hex(&VID)
+        );
+        std::fs::write(&p, &legacy).unwrap();
+        let mut mf = Mapfile::load(&p).expect("a malformed uk line never fails the load");
+        assert_eq!(
+            mf.legacy_key_fingerprints(),
+            [key_fingerprint(&K1), key_fingerprint(&K2)],
+            "base keys only (CPS id < 2^24); the malformed line is dropped"
+        );
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+        assert_eq!(mf.vid(), None);
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            legacy,
+            "load wrote nothing"
+        );
+
+        mf.record(0, 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        let text = std::fs::read_to_string(&p).unwrap();
+        for banned in [
+            "freemkv-uk",
+            "freemkv-vid:",
+            &hex(&K1),
+            &hex(&K2),
+            &hex(&VID),
+        ] {
+            assert!(
+                !text.contains(banned),
+                "{banned} survived the scrub:\n{text}"
+            );
+        }
+        for k in [K1, K2] {
+            let line = format!("# freemkv-legacy-keyfp: {}\n", hex(&key_fingerprint(&k)));
+            assert!(text.contains(&line), "{text}");
+        }
+        let again = Mapfile::load(&p).unwrap();
+        assert_eq!(
+            again.legacy_key_fingerprints(),
+            mf.legacy_key_fingerprints()
+        );
+        assert_eq!(again.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+    }
+
+    /// The new identity lines round-trip; a malformed one fails the load (dropping it would
+    /// turn "names a disc" into "names none" and reopen the cross-disc resume splice).
+    #[test]
+    fn identity_lines_round_trip_and_a_malformed_one_is_refused() {
+        let (_d, p) = scratch("identity");
+        let mut mf = Mapfile::create(&p, 4096, "test").unwrap();
+        mf.set_disc_hash("0xAABBCCDDEEFF00112233445566778899AABBCCDD");
+        mf.set_vid_fingerprint(vid_fingerprint(&VID));
+        mf.record(0, 2048, SectorStatus::Finished).unwrap();
+        mf.flush().unwrap();
+        let back = Mapfile::load(&p).unwrap();
+        assert_eq!(
+            back.disc_hash(),
+            Some("aabbccddeeff00112233445566778899aabbccdd")
+        );
+        assert_eq!(back.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+        assert_eq!(back.entries(), mf.entries());
+        let text = std::fs::read_to_string(&p).unwrap();
+        for (prefix, kind) in [("freemkv-disc: ", "disc"), ("freemkv-vidfp: ", "vidfp")] {
+            let at = text.find(prefix).unwrap() + prefix.len();
+            let mut bad = text.clone();
+            bad.replace_range(at..at + 2, "zz");
+            std::fs::write(&p, &bad).unwrap();
+            let err = Mapfile::load(&p).map(|_| ()).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{kind}");
         }
     }
 
-    fn aacs_with(
-        unit_keys: Vec<(u32, [u8; 16])>,
-        volume_id: [u8; 16],
-    ) -> libfreemkv::disc::AacsState {
-        libfreemkv::test_util::aacs_state()
-            .version(2)
-            .bus_encryption(true)
-            .unit_keys(unit_keys)
-            .volume_id(volume_id)
-            .build()
+    fn disc_with(hash: &str, vid: [u8; 16]) -> libfreemkv::Disc {
+        let mut d = bd_image(&[Some(K1)], 1).disc;
+        let a = d.aacs.as_mut().unwrap();
+        a.disc_hash = hash.to_string();
+        a.volume_id = vid;
+        d
     }
 
-    fn tmpfile2(tag: &str) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static CTR: AtomicU64 = AtomicU64::new(0);
-        let n = CTR.fetch_add(1, Ordering::Relaxed);
-        let name = format!(
-            "libfreemkv-mapfile-identity-test-{}-{}-{}.mapfile",
-            std::process::id(),
-            tag,
-            n
+    fn map_with(p: &Path, hash: Option<&str>, vid: Option<[u8; 16]>, keys: &[[u8; 16]]) -> Mapfile {
+        let mut mf = Mapfile::create(p, 2048, "test").unwrap();
+        if let Some(h) = hash {
+            mf.set_disc_hash(h);
+        }
+        if let Some(v) = vid {
+            mf.set_vid_fingerprint(vid_fingerprint(&v));
+        }
+        mf.legacy_keyfps = keys.iter().map(key_fingerprint).collect();
+        mf
+    }
+
+    const HASH_A: &str = "0x1111111111111111111111111111111111111111";
+    const HASH_B: &str = "0x2222222222222222222222222222222222222222";
+
+    /// EK3 (KU §4.4): rule 1 disc hash, rule 2 `vidfp`, both only when both sides are known.
+    #[test]
+    fn identity_rules() {
+        let (_d, p) = scratch("rules");
+        let other_vid = [0x33; 16];
+        let ok = |mf: &Mapfile, d: &libfreemkv::Disc| check_mapfile_identity(mf, d, None).is_ok();
+        // Rule 1.
+        assert!(ok(
+            &map_with(&p, Some(HASH_A), None, &[]),
+            &disc_with(HASH_A, [0; 16])
+        ));
+        assert!(!ok(
+            &map_with(&p, Some(HASH_A), None, &[]),
+            &disc_with(HASH_B, [0; 16])
+        ));
+        assert!(ok(
+            &map_with(&p, None, None, &[]),
+            &disc_with(HASH_B, [0; 16])
+        ));
+        // Rule 2: the disc's own VID, else the set's.
+        assert!(ok(
+            &map_with(&p, None, Some(VID), &[]),
+            &disc_with(HASH_A, VID)
+        ));
+        assert!(!ok(
+            &map_with(&p, None, Some(VID), &[]),
+            &disc_with(HASH_A, other_vid)
+        ));
+        assert!(
+            ok(
+                &map_with(&p, None, Some(VID), &[]),
+                &disc_with(HASH_A, [0; 16])
+            ),
+            "no VID in hand: cannot compare, not a mismatch"
         );
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join(name)
+        // Neither side carries anything (a clear disc, a ddrescue import).
+        let mut clear = disc_with(HASH_A, [0; 16]);
+        clear.aacs = None;
+        assert!(ok(&map_with(&p, None, None, &[]), &clear));
     }
 
-    // Neither the mapfile nor the disc carries an AACS identity (legacy mapfiles, unencrypted
-    // discs, CSS DVDs). Deliberately permissive.
+    /// EK3 rule 3 (KU §4.4, coord 4): legacy key fingerprints are checked ONLY when the set
+    /// proved a base key; a set that proved none (every piece Lazy or Clear) cannot check
+    /// them, and that is not a mismatch.
     #[test]
-    fn neither_identity_present_is_ok() {
-        let p = tmpfile2("neither");
-        let mf = Mapfile::create(&p, 2048, "test").unwrap();
-        let disc = disc_with_aacs(None);
-        assert!(check_mapfile_identity(&mf, &disc).is_ok());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The keyed case: identical unit keys (even reordered — order is not
-    /// significant) must match.
-    #[test]
-    fn matching_unit_keys_in_any_order_is_ok() {
-        let p = tmpfile2("uk_match");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_unit_keys(&[(0, [0x11; 16]), (1, [0x22; 16])]);
-        let disc = disc_with_aacs(Some(aacs_with(
-            // Reordered relative to the mapfile.
-            vec![(1, [0x22; 16]), (0, [0x11; 16])],
-            [0u8; 16],
-        )));
-        assert!(check_mapfile_identity(&mf, &disc).is_ok());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The failure this function exists to catch: a mapfile from one disc
-    /// (box-set reprint / same title pressed twice) applied to a different
-    /// disc with different unit keys must be refused, not silently resumed.
-    #[test]
-    fn mismatched_unit_keys_is_refused() {
-        let p = tmpfile2("uk_mismatch");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_unit_keys(&[(0, [0x11; 16])]);
-        let disc = disc_with_aacs(Some(aacs_with(vec![(0, [0x99; 16])], [0u8; 16])));
-        let err = check_mapfile_identity(&mf, &disc).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The mapfile carries keys but the disc in the drive resolved none at
-    /// all — still a mismatch, not a pass-through.
-    #[test]
-    fn mapfile_keys_against_a_disc_with_no_aacs_state_is_refused() {
-        let p = tmpfile2("uk_no_disc_aacs");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_unit_keys(&[(0, [0x11; 16])]);
-        let disc = disc_with_aacs(None);
-        assert!(check_mapfile_identity(&mf, &disc).is_err());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The unresolved case: only a VID recorded (no unit keys yet). A
-    /// matching VID passes.
-    #[test]
-    fn matching_vid_is_ok() {
-        let p = tmpfile2("vid_match");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_vid([0x7A; 16]);
-        let disc = disc_with_aacs(Some(aacs_with(vec![], [0x7A; 16])));
-        assert!(check_mapfile_identity(&mf, &disc).is_ok());
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// The box-set-reprint scenario this whole function was written for: two
-    /// different physical discs, same size, different Volume ID.
-    #[test]
-    fn mismatched_vid_is_refused() {
-        let p = tmpfile2("vid_mismatch");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_vid([0x7A; 16]);
-        let disc = disc_with_aacs(Some(aacs_with(vec![], [0x7B; 16])));
-        let err = check_mapfile_identity(&mf, &disc).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        let _ = std::fs::remove_file(&p);
-    }
-
-    /// A recorded VID against a disc that never resolved any AACS state at
-    /// all (no keydb this run, or a non-AACS disc) is refused, not assumed
-    /// clean.
-    #[test]
-    fn mapfile_vid_against_a_disc_with_no_aacs_state_is_refused() {
-        let p = tmpfile2("vid_no_disc_aacs");
-        let mut mf = Mapfile::create(&p, 2048, "test").unwrap();
-        mf.set_vid([0x7A; 16]);
-        let disc = disc_with_aacs(None);
-        assert!(check_mapfile_identity(&mf, &disc).is_err());
-        let _ = std::fs::remove_file(&p);
+    fn identity_rules_legacy_fingerprints_need_a_proven_key() {
+        let (_d, p) = scratch("rule3");
+        let fx = bd_image(&[Some(K1)], 1);
+        let calls = Calls::default();
+        let proved_k1 = resolve(
+            &fx,
+            KeyScope::Titles(vec![0]),
+            &[(Answer::Keydb, &[K1])],
+            &calls,
+        )
+        .unwrap();
+        let clear = bd_image(&[None], 1);
+        let proved_none = resolve(
+            &clear,
+            KeyScope::Titles(vec![0]),
+            &[(Answer::Keydb, &[])],
+            &calls,
+        )
+        .unwrap();
+        assert!(proved_none.proven_key_fingerprints().is_empty());
+        let d = &fx.disc;
+        let check = |keys: &[[u8; 16]], set: Option<&ResolvedKeySet>| {
+            check_mapfile_identity(&map_with(&p, None, None, keys), d, set).is_ok()
+        };
+        assert!(
+            check(&[K1], Some(&proved_k1)),
+            "a stored fingerprint matches"
+        );
+        assert!(check(&[K2, K1], Some(&proved_k1)));
+        assert!(!check(&[K2], Some(&proved_k1)), "none matches a proven key");
+        assert!(
+            check(&[K2], Some(&proved_none)),
+            "no proven key: cannot check"
+        );
+        assert!(check(&[K2], Some(&ResolvedKeySet::none())));
+        assert!(
+            check(&[], Some(&proved_k1)),
+            "no stored fingerprint: nothing to check"
+        );
     }
 }

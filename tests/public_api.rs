@@ -106,3 +106,73 @@ fn sweep_and_patch_options_are_default() {
     assert!(p.block_sectors.is_none() && p.wedged_threshold == 0);
     assert!(p.progress.is_none() && p.halt.is_none() && p.key_fetch.is_none());
 }
+
+/// KU-E1 (KU §3.2, §12.2): the engine's key front door, nameable where the server and
+/// both shells call it.
+#[test]
+fn key_front_door_is_nameable() {
+    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    type ResolveForRip = fn(
+        &libfreemkv::Disc,
+        &mut dyn libfreemkv::SectorSource,
+        KeyScope,
+        &libfreemkv::KeySourceFactory,
+        Option<&ResolvedKeySet>,
+        Option<&libfreemkv::Halt>,
+    ) -> Result<ResolvedKeySet, libfreemkv::Error>;
+    let _: ResolveForRip = freemkv_engine::keys::resolve_for_rip;
+    let _: fn(&libfreemkv::Disc, &[usize], freemkv_engine::keys::RipOutput) -> KeyScope =
+        freemkv_engine::keys::rip_scope;
+    let _: fn(&libfreemkv::Disc, &ResolvedKeySet) -> libfreemkv::keys::DecryptStatus =
+        freemkv_engine::keys::key_status;
+    let _: fn(&freemkv_engine::KeyParams) -> libfreemkv::KeySourceFactory =
+        freemkv_engine::key_source_factory;
+    let _: fn(
+        libfreemkv::DeviceTarget,
+        Option<libfreemkv::DriveCredentials>,
+        bool,
+    ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = freemkv_engine::open_scan;
+}
+
+/// KU-E1 (KU §3.2, §12.1): the one image-open API the server calls, and what it returns.
+#[test]
+fn image_front_door_is_nameable() {
+    use freemkv_engine::{ImageSource, KeyInput, OpenImageOptions, OpenedImage};
+    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    let _: fn(&ImageSource, OpenImageOptions) -> Result<OpenedImage, libfreemkv::Error> =
+        freemkv_engine::open_image_with;
+    let _: fn(&ImageSource, &freemkv_engine::KeyParams) -> Result<OpenedImage, libfreemkv::Error> =
+        freemkv_engine::open_image;
+    let f: libfreemkv::KeySourceFactory = std::sync::Arc::new(Vec::new);
+    let set = ResolvedKeySet::none();
+    for keys in [
+        KeyInput::Resolve(f.clone()),
+        KeyInput::Known(set.clone()),
+        KeyInput::Seeded(f, set),
+    ] {
+        let opts = OpenImageOptions {
+            keys,
+            disc: None,
+            scope: Some(KeyScope::Titles(vec![0])),
+            vid: None,
+            halt: Some(libfreemkv::Halt::new()),
+        };
+        drop(opts);
+    }
+    fn _fields(o: &OpenedImage) -> (&ResolvedKeySet, Option<&libfreemkv::KeySourceFactory>, bool) {
+        (&o.keys, o.sources.as_ref(), o.prescanned)
+    }
+}
+
+/// KU §4.1: a consumer computes and verifies a mapfile `vidfp` with the engine's one
+/// fingerprint, `SHA-256("freemkv-vid-fp-v1" ‖ VID)` (a fingerprint, never the VID). The
+/// vector is computed independently (Python `hashlib`).
+#[test]
+fn vid_fingerprint_is_public_and_pinned() {
+    let fp: [u8; 32] = freemkv_engine::vid_fingerprint(&[0x5A; 16]);
+    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "298468a3589bccbcca31adc371cab3c0d1c7914c04a7036575476442ee849700"
+    );
+}

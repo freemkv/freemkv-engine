@@ -181,6 +181,7 @@ pub fn recover_to_iso(
                 .map(|a| a.unit_keys.clone())
                 .unwrap_or_default(),
             key_fetch: None,
+            keys: job.keys.clone(),
         };
 
         recovery::copy(disc, reader, iso_path, &opts)

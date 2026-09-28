@@ -25,10 +25,17 @@ pub(crate) fn is_read_fault(err: &Error) -> bool {
     )
 }
 
+/// The decrypting readers' on-arrival loud stop: a READ unit no held key opens (KU §2.4:
+/// "No held key opens U → loud stop: E7022 (title) or E7032 (image or folder)"). Fatal in
+/// every pass: never retried, skipped, zero-filled or counted as damage.
+pub(crate) fn is_key_stop(err: &Error) -> bool {
+    matches!(err, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing)
+}
+
 /// Whether a failed read may enter skip-on-error damage handling. `Halted`
 /// keeps its existing route there pending the unified stop redesign.
 pub(crate) fn is_damage_candidate(err: &Error) -> bool {
-    is_read_fault(err) || matches!(err, Error::Halted)
+    !is_key_stop(err) && (is_read_fault(err) || matches!(err, Error::Halted))
 }
 
 /// Label the error that aborted a pass at `block_lba`.
@@ -97,6 +104,11 @@ mod pass_abort_tests {
         assert!(is_damage_candidate(&Error::Halted));
         assert!(!is_damage_candidate(&Error::DecryptFailed));
         assert!(!is_damage_candidate(&Error::SourceTerminated));
+        assert!(!is_damage_candidate(&Error::WholeDiscKeyMissing));
+        let e7022 = Error::NoDiscKey {
+            disc_hash: String::new(),
+        };
+        assert!(!is_damage_candidate(&e7022));
     }
 
     #[test]
@@ -117,7 +129,7 @@ pub fn copy(
     // Pre-flight decrypt gate: without it, a decrypting copy of an encrypted disc
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
-    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    crate::resolve::ensure_decryptable_with(disc, !opts.decrypt, opts.keys.as_ref())?;
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
     // stream file". One the drive's bus map could not locate would land here still encrypted.
     libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
@@ -134,7 +146,7 @@ pub fn copy(
         // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
         // stream file is now located, so widen it and let the dispatch fill the rest.
         if map.scope().is_some() {
-            mapfile::check_mapfile_identity(&map, disc)
+            mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
                 .map_err(|e| Error::IoError { source: e })?;
             map.clear_scope();
             map.flush().map_err(|e| Error::IoError { source: e })?;
@@ -142,7 +154,8 @@ pub fn copy(
         // BEFORE any resume decision, including "already complete" below: a wrong
         // disc whose predecessor finished would otherwise report the job done
         // having never touched the disc actually in the drive.
-        mapfile::check_mapfile_identity(&map, disc).map_err(|e| Error::IoError { source: e })?;
+        mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
+            .map_err(|e| Error::IoError { source: e })?;
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
         let covers_disc = map.total_size() == disc_size;
@@ -577,6 +590,7 @@ fn sweep_internal(
         vid: opts.vid,
         unit_keys: opts.unit_keys.clone(),
         key_fetch: opts.key_fetch.clone(),
+        keys: opts.keys.clone(),
     };
     sweep(disc, reader, path, &sweep_opts)
 }
@@ -587,12 +601,15 @@ fn patch_internal(
     path: &std::path::Path,
     opts: &CopyOptions,
 ) -> Result<CopyResult> {
-    let patch_opts = PatchOptions::for_patch_pass(
-        opts.decrypt,
-        opts.progress,
-        opts.halt.clone(),
-        opts.key_fetch.clone(),
-    );
+    let patch_opts = PatchOptions {
+        keys: opts.keys.clone(),
+        ..PatchOptions::for_patch_pass(
+            opts.decrypt,
+            opts.progress,
+            opts.halt.clone(),
+            opts.key_fetch.clone(),
+        )
+    };
     let pr = patch(disc, reader, path, &patch_opts)?;
     tracing::info!(
         target: "freemkv::disc",
@@ -716,7 +733,7 @@ fn sweep_in(
     // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
     // direct `sweep` caller can't bypass it: a decrypting sweep of an encrypted
     // disc with no usable key would write ciphertext at exit 0. No-op for `--raw`.
-    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    crate::resolve::ensure_decryptable_with(disc, !opts.decrypt, opts.keys.as_ref())?;
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
     // stream file". One the drive's bus map could not locate would land here still encrypted.
     if scope.is_none() {
@@ -735,6 +752,7 @@ fn sweep_in(
         opts.decrypt,
         opts.halt.as_ref(),
         opts.key_fetch.as_ref(),
+        opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
 
@@ -750,7 +768,7 @@ fn sweep_in(
                 // Identity first, crucially BEFORE the unconditional set_vid/
                 // set_unit_keys overwrite below: that stamps the current job's
                 // identity onto the mapfile, so checking after never fires.
-                mapfile::check_mapfile_identity(&existing, disc)?;
+                mapfile::check_mapfile_identity(&existing, disc, opts.keys.as_ref())?;
                 if existing.total_size() != total_bytes {
                     tracing::info!(
                         "sweep: mapfile total_size {} != disc {}; forcing fresh sweep",
@@ -798,14 +816,9 @@ fn sweep_in(
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(|e| Error::IoError { source: e })?;
 
-    // Persist decryption state into the mapfile header (ddrescue-safe comment
-    // lines, no ISO payload touched) so it survives to deferred-mux/resume.
-    // KEYS XOR VID: a keyed disc writes unit keys; unresolved writes only VID.
-    if !opts.unit_keys.is_empty() {
-        map.set_unit_keys(&opts.unit_keys);
-    } else if let Some(vid) = opts.vid {
-        map.set_vid(vid);
-    }
+    // The disc's identity for a later resume (KU §4.1): its hash and VID fingerprint only,
+    // never a key byte or a raw VID (J6), whatever the legacy `vid`/`unit_keys` options hold.
+    mapfile::stamp_identity(&mut map, disc, opts.keys.as_ref(), opts.vid);
 
     // ISO file: resume + Finished ranges opens existing; otherwise creates fresh,
     // pre-sized to total_bytes. `is_regular` MUST come from the open handle, not a
@@ -1337,6 +1350,10 @@ pub struct CopyOptions<'a> {
     /// recovering an orphan CPS unit never sampled at resolve time. `None`
     /// disables it (the prior behaviour). Threaded into sweep + patch.
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
+    /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
+    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
+    /// (until KU-X1).
+    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1399,6 +1416,10 @@ pub struct SweepOptions<'a> {
     pub unit_keys: Vec<(u32, [u8; 16])>,
     /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]).
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
+    /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
+    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
+    /// (until KU-X1).
+    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 
 /// Options for [`patch()`] (Pass N retry pass over bad ranges).
@@ -1427,6 +1448,10 @@ pub struct PatchOptions<'a> {
     /// On-decrypt-miss key fetch (see [`CopyOptions::key_fetch`]). Lets Pass N
     /// recover an orphan CPS unit's key when re-reading its bad range.
     pub key_fetch: Option<libfreemkv::sector::KeyFetch>,
+    /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
+    /// reader and gates on it, with no lookup. `None` keeps the legacy disc-banked keys
+    /// (until KU-X1).
+    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 impl<'a> PatchOptions<'a> {
     /// THE tuning preset for a Pass-N patch pass, shared by both entry points
@@ -1452,6 +1477,7 @@ impl<'a> PatchOptions<'a> {
             progress,
             halt,
             key_fetch,
+            keys: None,
         }
     }
 }
@@ -1524,6 +1550,8 @@ pub(crate) fn ecc_sectors(format: libfreemkv::DiscFormat) -> u16 {
     }
 }
 
+#[cfg(test)]
+mod ku_tests;
 pub(crate) mod mapfile;
 mod patch;
 mod read_error;

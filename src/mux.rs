@@ -180,9 +180,18 @@ pub enum RipOutcome {
         /// The `io::ErrorKind`, which is where a passthrough OS error
         /// (`StorageFull`, `PermissionDenied`) keeps its meaning.
         kind: std::io::ErrorKind,
+        /// The coded error's data (`E<code>: <data>`, e.g. a disc hash), language-neutral;
+        /// empty for an uncoded error or one with no data.
+        data: String,
     },
     /// The rip was cancelled — a full stop, not a per-title cancel.
     Halted,
+}
+
+/// The data of a libfreemkv error's `E<code>: <data>` form; empty when it has none.
+pub(crate) fn error_data(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    crate::parse_error_code(&text).map_or_else(String::new, |(_, d)| d.to_string())
 }
 
 /// Drive the multi-title rip loop. `mux_one(idx) -> io::Result<()>` muxes a
@@ -221,11 +230,13 @@ where
         // the error into a coarse verdict, and the typed cause is gone after.
         let mut fail_code = None;
         let mut fail_kind = std::io::ErrorKind::Other;
+        let mut fail_data = String::new();
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
             Err(e) => {
                 fail_detail = e.to_string();
                 fail_code = crate::error_code(&e);
+                fail_data = error_data(&e);
                 fail_kind = e.kind();
                 classify_title_error(&e)
             }
@@ -262,6 +273,7 @@ where
                     title_index: idx,
                     code: fail_code,
                     kind: fail_kind,
+                    data: fail_data,
                 };
             }
         }
@@ -328,6 +340,38 @@ pub fn mux_title_session(
         title_index,
     };
     mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
+}
+
+/// Mux `title` (already scanned: the drive's, or the image's own) out of the ISO at `path`
+/// through the rip's key set, WITHOUT rescanning the image (KU J14): an unread UDF/MPLS
+/// area of a staged ISO does not matter. `mux_opts.selection` picks the streams.
+pub(crate) fn mux_iso_title(
+    path: &std::path::Path,
+    title: libfreemkv::DiscTitle,
+    format: libfreemkv::ContentFormat,
+    keys: &libfreemkv::keys::ResolvedKeySet,
+    dest: &str,
+    mux_opts: &libfreemkv::MuxOptions,
+    sink: &dyn Sink,
+) -> std::io::Result<libfreemkv::MuxOutcome> {
+    let hint = title.size_bytes;
+    with_mux_watcher(sink, |halt, events| {
+        sink.log(
+            Level::Info,
+            &format!(
+                "mux: iso://{} {} -> {dest} (~{})",
+                path.display(),
+                title.playlist,
+                human_bytes(hint)
+            ),
+        );
+        let source = libfreemkv::MuxSource::Iso {
+            path,
+            title,
+            format,
+        };
+        libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, halt, events)
+    })
 }
 
 // Shared scaffolding behind `mux_title` and `mux_title_session`: drives
@@ -488,12 +532,25 @@ pub fn open_scan_resolve_with(
     ),
     libfreemkv::Error,
 > {
+    let mut session = open_scan(target, credentials, raw_copy)?;
+    let trace = session.resolve_keys(factory)?;
+    Ok((session, trace))
+}
+
+/// Open a live optical drive, lock its tray and scan the disc, with NO key call (KU §3.2):
+/// the scan's in-memory VID and titles, for [`crate::keys::resolve_for_rip`] (one resolve
+/// per rip), a raw copy (no key at all), or an image mux that needs the disc's VID (E7034).
+/// `raw_copy` as in [`open_scan_resolve_with`].
+pub fn open_scan(
+    target: libfreemkv::DeviceTarget,
+    credentials: Option<libfreemkv::DriveCredentials>,
+    raw_copy: bool,
+) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
     let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
     // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
     session.lock_tray();
     session.scan(scan_options(raw_copy))?;
-    let trace = session.resolve_keys(factory)?;
-    Ok((session, trace))
+    Ok(session)
 }
 
 #[cfg(test)]
@@ -664,6 +721,7 @@ mod tests {
                 title_index: 3,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             },
             "the only title the rip was going to write came back a stub — that \
              is a failed rip, not a rip that skipped a bonus feature"
@@ -703,18 +761,23 @@ mod tests {
         // `session.scan` needs a live drive, so pin the source instead: the value
         // handed to it must be this function's answer, not a hardcoded default.
         let src = include_str!("mux.rs").replace("\r\n", "\n");
-        let start = src
-            .find("pub fn open_scan_resolve_with(")
-            .expect("open_scan_resolve_with definition present");
-        let end = start
-            + src[start..]
-                .find("\n}\n")
-                .expect("the function body still ends the definition");
-        let body = &src[start..end];
+        let body = |name: &str| {
+            let start = src.find(name).expect("definition present");
+            let end = start
+                + src[start..]
+                    .find("\n}\n")
+                    .expect("the function body still ends the definition");
+            src[start..end].to_string()
+        };
         assert!(
-            body.contains("session.scan(scan_options(raw_copy))"),
-            "open_scan_resolve_with must hand its own raw_copy parameter to the scan, \
+            body("pub fn open_scan(").contains("session.scan(scan_options(raw_copy))"),
+            "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
+        );
+        assert!(
+            body("pub fn open_scan_resolve_with(")
+                .contains("open_scan(target, credentials, raw_copy)"),
+            "open_scan_resolve_with must hand its raw_copy parameter on"
         );
     }
 
@@ -1021,6 +1084,7 @@ mod tests {
                 title_index: 0,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             }
         );
     }
@@ -1038,6 +1102,7 @@ mod tests {
                 title_index: 1,
                 code: libfreemkv::error_code(&stub_err()),
                 kind: stub_err().kind(),
+                data: error_data(&stub_err()),
             }
         );
     }
@@ -1056,6 +1121,7 @@ mod tests {
                 title_index: 1,
                 code: libfreemkv::error_code(&hard_err()),
                 kind: hard_err().kind(),
+                data: error_data(&hard_err()),
             }
         );
     }

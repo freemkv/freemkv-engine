@@ -24,6 +24,9 @@ tracing = "0.1"
 # language identity). `lowercase_names` enables case-insensitive name matching
 # (`from_name_lowercase`) so `-a english` works, not just `-a English`.
 isolang = { version = "2", features = ["lowercase_names"] }
+# SHA-256 mapfile fingerprints (keys-upfront KU §4.1): the VID and legacy keys are
+# kept only as `SHA-256(tag ‖ bytes)`, exactly as libfreemkv's key set computes them.
+sha2 = "0.11"
 
 [dev-dependencies]
 # Temp dirs / files for the relocated recovery regression suites (mirrors

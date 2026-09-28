@@ -288,6 +288,7 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
         progress: Some(&reporter),
         halt: Some(halt.clone()),
         key_fetch: None,
+        keys: None,
     };
 
     let outcome = freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts);

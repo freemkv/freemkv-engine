@@ -13,7 +13,7 @@ pub mod drive_info;
 mod extract;
 mod image;
 mod job;
-mod keys;
+pub mod keys;
 mod multipass;
 mod mux;
 mod outcome;
@@ -27,23 +27,28 @@ mod recovery;
 // Recovery primitives (relocated from libfreemkv). `multipass_rip` drives
 // sweep/patch for the common case; a consumer that must interleave its own
 // work between passes (autorip's staging/resume/watchdog) drives them directly.
-pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for};
+pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for, vid_fingerprint};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
     bytes_bad_in_title_from_mapfile, copy, ensure_titles_staged, ensure_whole_image, patch,
     progress_snapshot_from_mapfile, sweep, sweep_scoped,
 };
+#[cfg(test)]
+mod ku_image_tests;
 mod remux;
 mod resolve;
 mod run;
 mod sink;
 mod speed;
 mod streams;
+#[cfg(test)]
+mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
-pub use extract::extract_tree;
+pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
-    ImageSource, OpenedImage, build_key_fetch, error_code, open_image, parse_error_code, scan_image,
+    ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
+    open_image_with_traced, parse_error_code, scan_image,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
@@ -56,7 +61,8 @@ pub use multipass::{
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
-    mux_title_session, open_scan_resolve, open_scan_resolve_with, resolve_selection, run_titles,
+    mux_title_session, open_scan, open_scan_resolve, open_scan_resolve_with, resolve_selection,
+    run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};

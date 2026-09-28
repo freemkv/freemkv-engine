@@ -316,6 +316,12 @@ const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 /// `for_sweep`), since patch's job is to converge on bad sub-zones.
 pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 
+// Damage classifications on this thread (EK11: an on-arrival side read never lands here).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CLASSIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// THE single error-handling entry point. Updates `ctx`, returns the
 /// action the caller must apply.
 ///
@@ -323,6 +329,13 @@ pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 /// it once at the top. New retry policy = adjust the constants. No
 /// other read site needs to change.
 pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
+    // 0. KU §2.4 on-arrival key stop (E7022/E7032): the unit WAS read, so it is not
+    //    damage. Checked before any counter moves: no retry, skip, jump or zone entry.
+    if super::is_key_stop(err) {
+        return ReadAction::AbortPass;
+    }
+    #[cfg(test)]
+    CLASSIFIED.with(|c| c.set(c.get() + 1));
     ctx.consecutive_failures += 1;
     ctx.consecutive_good = 0;
     ctx.consecutive_outer_failures += 1;
@@ -611,6 +624,36 @@ mod tests {
                 asc: 0x17,
                 ascq: 0x01,
             }),
+        }
+    }
+
+    // KU §2.4: "No held key opens U → loud stop: E7022 (title) or E7032 (image or folder)".
+    // U was read, so the stop is never damage: no retry, skip, jump or count.
+    #[test]
+    fn a_key_stop_aborts_the_pass_and_leaves_the_damage_state_untouched() {
+        let stops = [
+            Error::NoDiscKey {
+                disc_hash: "ab".repeat(20),
+            },
+            Error::WholeDiscKeyMissing,
+        ];
+        for err in stops {
+            for mut ctx in [ReadCtx::for_sweep(32), ReadCtx::for_patch(32)] {
+                assert_eq!(
+                    handle_read_error(&err, &mut ctx),
+                    ReadAction::AbortPass,
+                    "{err}"
+                );
+                assert_eq!(ctx.total_errors, 0, "{err}: not counted as a read error");
+                assert_eq!(ctx.consecutive_failures, 0);
+                assert_eq!(ctx.consecutive_outer_failures, 0);
+                assert!(
+                    ctx.damage_window.is_empty(),
+                    "{err}: no damage-window entry"
+                );
+                assert_eq!((ctx.jumps_taken, ctx.wedge_count), (0, 0));
+                assert!(ctx.last_error_at.is_none());
+            }
         }
     }
 

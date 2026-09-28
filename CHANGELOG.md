@@ -4,6 +4,11 @@
 
 ### Changed
 
+- Mapfiles no longer store keys or the raw Volume ID: only the disc hash (`# freemkv-disc:`) and a Volume ID fingerprint (`# freemkv-vidfp:`). Key and VID lines in an older mapfile become fingerprints and are removed the next time it is written. `build_key_fetch` and `OpenedImage::key_fetch` are removed; `OpenedImage` carries `keys`, `sources` and `prescanned`.
+- A key service whose address lookup fails for a moment is kept and retried before the rip starts, instead of being dropped.
+- The on-arrival key stop (E7022, E7032) ends every pass: it is never retried, skipped or recorded as disc damage.
+- `RipOutcome::Failed` gains `data`: the failing error's language-neutral data (`E<code>: <data>`, e.g. a disc hash). A key refusal before any title is reported as the first title's `TitleStart` / `TitleDone(Err)` with the typed error.
+
 - Whole-disc decrypt (disc → ISO) uses libfreemkv's shared `whole_disc` reader, the same one as freemkv's image → ISO path. A stream file no title plays that is encrypted, with no held key opening it, refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. A key must open two probed units before it keys such a file. A file with no proven key on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why. An AACS disc with titles but no stream folder now fails with E6003, naming the folder, instead of E7013.
 
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
@@ -11,7 +16,10 @@
 ### Added
 
 - `multipass_rip_staged`, `mkv_staging_scope`, `sweep_scoped` and `ensure_whole_image`: an image staged for an MKV rip reads only UDF, nav/AACS files and the chosen titles (AACS BD Pre-recorded 0.953 §3.7: none of it bus-encrypted), so a disc with an unlocatable bus-encrypted stream file still rips to MKV. The scope is recorded in the mapfile (`# freemkv-scope:`), where `stats()` leaves the unread rest out of pending. `copy` and a whole-disc `sweep` over a scoped mapfile refuse with E6021 until every stream file is located, then fill the rest; `patch` re-reads only in-scope damage. `ensure_whole_image` refuses a staged image as a whole-disc source with E6022, and `ensure_titles_staged` refuses (E6022) muxing a title from it whose extents lie outside its scope. A staging image is whole only when it is kept and every stream file was located.
-- `ImageSource`, `scan_image`, `open_image` and `build_key_fetch`: one path to scan an ISO or disc folder, resolve its keys and fetch keys mid-mux over the full local-first key chain.
+- `ImageSource`, `scan_image` and `open_image`: one path to scan an ISO or disc folder and resolve its keys.
+- Keys up front, memory only: `keys::resolve_for_rip` resolves a rip's keys once, before any output, into an in-memory `ResolvedKeySet` that every pass and mux reads; nothing asks a key source after it. `keys::rip_scope`, `keys::key_status` and `open_scan` (a drive scan with no key call) go with it. `extract_tree_with` extracts a decrypted folder through the set. `Job`, `CopyOptions`, `SweepOptions` and `PatchOptions` gain `keys`; without one, the disc's banked keys still work.
+- `open_image_with(src, OpenImageOptions)`: open an image with a key set the caller already holds (`KeyInput::Known`, no key-service call), with a set plus a top-up (`Seeded`), or by resolving (`Resolve`), and with an already-scanned disc (`disc`), in which case an `iso://` image is not rescanned. A `dir://` folder is always scanned, so a pre-scanned disc given with one is refused (E7013). `open_image` calls it. `mux_image_titles` muxes each title from the disc the open already has instead of rescanning the image per title, so a staged ISO whose playlists were never read still muxes.
+- E7034: an image whose keys need the disc's Volume ID (its sidecar mapfile has a VID fingerprint) stops before writing anything and asks for the disc, instead of E7022.
 - `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
 - `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
 - `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.

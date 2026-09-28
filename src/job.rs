@@ -54,6 +54,9 @@ pub struct Job {
     /// always kept). One bundle so the two travel together. Default keeps
     /// everything (archival).
     pub streams: StreamChoice,
+    /// The rip's up-front key set ([`crate::keys::resolve_for_rip`], KU §2.1), in memory
+    /// only. `None` keeps the legacy disc-banked keys (until KU-X1).
+    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
 }
 
 /// The audio + subtitle stream choice for a rip — the two selections that
@@ -112,7 +115,14 @@ impl Job {
             mode: RipMode::default(),
             raw: false,
             streams: StreamChoice::default(),
+            keys: None,
         }
+    }
+
+    /// Builder: the rip's up-front key set, read by every decrypting pass and gate.
+    pub fn with_keys(mut self, keys: libfreemkv::keys::ResolvedKeySet) -> Self {
+        self.keys = Some(keys);
+        self
     }
 
     /// Builder: set the recovery mode.

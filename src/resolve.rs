@@ -83,7 +83,25 @@ pub fn resolve_keys(disc: &libfreemkv::Disc) -> KeyStatus {
     KeyStatus::unresolved(summary)
 }
 
-// The decrypt gate the executors use, layered on the library gate.
+// The executors' decrypt gate (KU §3.5): with the rip's key set, the library's
+// `check_decryptable` over the whole disc; without one, the legacy disc-banked keys (KU-X1).
+pub(crate) fn ensure_decryptable_with(
+    disc: &libfreemkv::Disc,
+    raw: bool,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+) -> crate::Result<()> {
+    match keys {
+        Some(set) => libfreemkv::keys::check_decryptable(
+            disc,
+            raw,
+            Some(set),
+            &libfreemkv::keys::KeyScope::WholeDisc,
+        ),
+        None => ensure_decryptable_strict(disc, raw),
+    }
+}
+
+// The legacy decrypt gate, layered on the library gate.
 pub(crate) fn ensure_decryptable_strict(disc: &libfreemkv::Disc, raw: bool) -> crate::Result<()> {
     disc.ensure_decryptable(raw)?;
     if disc.encrypted && !raw && !resolve_keys(disc).resolved {

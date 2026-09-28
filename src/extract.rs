@@ -9,13 +9,8 @@
 use crate::sink::Sink;
 use std::path::Path;
 
-/// Extract `disc`'s decrypted UDF file tree to `dest`.
-///
-/// `reader` is consumed for content reads (see [`libfreemkv::Disc::extract_tree`]). `force`
-/// mirrors the CLI's `--force`: without it, a non-empty `dest` is refused. `sink`'s
-/// [`Sink::should_cancel`] is polled by a watcher thread that cancels a fresh
-/// [`libfreemkv::Halt`]. Cancel can stop mid-file: the interrupted file stays
-/// `<name>.partial` (never renamed to its final name) and the result reports `halted`.
+/// Extract `disc`'s decrypted UDF file tree to `dest`, with the legacy disc-banked keys:
+/// [`extract_tree_with`] with no key set (until KU-F1 moves both shells to the set).
 pub fn extract_tree(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
@@ -23,16 +18,34 @@ pub fn extract_tree(
     force: bool,
     sink: &dyn Sink,
 ) -> crate::Result<libfreemkv::ExtractResult> {
-    // One should_cancel → halt bridge for the whole engine (see
-    // `with_cancel_watcher`), so cancelling even a small extraction is
-    // deterministic. No progress channel: both shells poll the final result.
+    extract_tree_with(disc, reader, dest, force, None, sink)
+}
+
+/// Extract `disc`'s decrypted UDF file tree to `dest`, reading every AACS file through
+/// `keys` (the rip's up-front set, scope `WholeDisc`, KU §3.1): proven files by its map,
+/// the rest proven on arrival; a readable unit no held key opens stops the run (E7032).
+///
+/// `reader` is consumed for content reads (see [`libfreemkv::Disc::extract_tree`]). `force`
+/// mirrors the CLI's `--force`: without it, a non-empty `dest` is refused. `sink`'s
+/// [`Sink::should_cancel`] is polled by a watcher thread that cancels a fresh
+/// [`libfreemkv::Halt`]. Cancel can stop mid-file: the interrupted file stays
+/// `<name>.partial` (never renamed to its final name) and the result reports `halted`.
+pub fn extract_tree_with(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    dest: &Path,
+    force: bool,
+    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    sink: &dyn Sink,
+) -> crate::Result<libfreemkv::ExtractResult> {
+    // One should_cancel → halt bridge for the whole engine (see `with_cancel_watcher`), so
+    // cancelling even a small extraction is deterministic. Both shells poll the result.
     crate::run::with_cancel_watcher(sink, |halt| {
-        // `..Default`: `ExtractOptions::keys` stays `None` here until KU-E1 hands in the set.
         let opts = libfreemkv::ExtractOptions {
             force,
             progress: None,
             halt: Some(libfreemkv::Halt::from_arc(halt.clone())),
-            ..Default::default()
+            keys,
         };
         disc.extract_tree(reader, dest, &opts)
     })
