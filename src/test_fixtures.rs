@@ -167,12 +167,12 @@ pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize)
             img.image[at..at + unit.len()].copy_from_slice(&unit);
         }
     }
-    for i in 0..n {
+    for (i, &(_, units)) in sized.iter().enumerate() {
         let clip = format!("{i:05}");
         let clip: [u8; 5] = clip.as_bytes().try_into().unwrap();
         for (f, bytes) in [
             (1 + i, one_item_mpls(&clip)),
-            (1 + n + i, minimal_clpi(sized[i].1 * 32)),
+            (1 + n + i, minimal_clpi(units * 32)),
         ] {
             let at = img.files[f].0 as usize * 2048;
             img.image[at..at + bytes.len()].copy_from_slice(&bytes);

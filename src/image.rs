@@ -321,23 +321,26 @@ impl TopUp {
     }
 }
 
-// A source failure a top-up remembers, to re-raise instead of E7022 (review B1).
-fn source_failure(e: &Error) -> bool {
+// What a top-up remembers, to re-raise for a later Missing instead of E7022 (review B1,
+// minor 2): a source failure, or E7034. A Stop is not remembered: it belongs to its call.
+fn remembered(e: &Error) -> bool {
     matches!(
         e,
         Error::KeyServiceUnavailable
             | Error::KeyServiceUnauthorized
             | Error::KeyServiceRateLimited
-            | Error::Halted
+            | Error::AacsVidNeedsDisc
     )
 }
 
 fn rebuild_failure(code: u16) -> Error {
-    use libfreemkv::error::{E_KEY_SERVICE_RATE_LIMITED, E_KEY_SERVICE_UNAUTHORIZED};
+    use libfreemkv::error::{
+        E_AACS_VID_NEEDS_DISC, E_KEY_SERVICE_RATE_LIMITED, E_KEY_SERVICE_UNAUTHORIZED,
+    };
     match code {
         E_KEY_SERVICE_UNAUTHORIZED => Error::KeyServiceUnauthorized,
         E_KEY_SERVICE_RATE_LIMITED => Error::KeyServiceRateLimited,
-        c if c == Error::Halted.code() => Error::Halted,
+        E_AACS_VID_NEEDS_DISC => Error::AacsVidNeedsDisc,
         _ => Error::KeyServiceUnavailable,
     }
 }
@@ -348,8 +351,8 @@ impl OpenedImage {
     /// resolve over the held titles plus `titles`, seeded with the held set, before the first
     /// output byte and stopped by `halt`. At most one top-up per opened image asks the
     /// sources, counted once it made a request; later ones use only held keys (0 requests)
-    /// and re-raise that top-up's source failure rather than E7022. The lock is held across
-    /// the top-up's reads: calls on one image run one at a time. Never re-scans the image.
+    /// and re-raise its source failure or E7034 rather than E7022 (never its Stop). The
+    /// lock is held across the top-up's reads: one call at a time. Never re-scans the image.
     pub(crate) fn keys_for(
         &self,
         titles: &[usize],
@@ -400,15 +403,16 @@ impl OpenedImage {
             }
             Err((e, help)) => {
                 tracing::info!(target: "freemkv::keys", error = %e, walk = ?walk.keys, "top-up refused");
-                if requested && source_failure(&e) {
-                    held.failure = Some(e.code());
-                }
                 let missing = matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing);
                 if let (false, true, Some(code)) = (ask, missing, held.failure) {
                     return Err(rebuild_failure(code));
                 }
                 let sidecar = load_sidecar(&self.source)?;
-                Err(vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref()))
+                let e = vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref());
+                if requested && remembered(&e) {
+                    held.failure = Some(e.code());
+                }
+                Err(e)
             }
         }
     }

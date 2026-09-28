@@ -23,7 +23,9 @@ pub struct KeyParams {
     /// The online key-service URL, or `None` to skip it. Checked here without DNS
     /// ([`freemkv_keysources::check_keyserver_url_static`]); a URL wrong on its face is
     /// silently dropped (the local source, if any, still applies). Its host is looked up and
-    /// SSRF-guarded at the first query (J10). The visible warning is the CLI's job.
+    /// SSRF-guarded at the first query (J10), on the source's worker; that query does not yet
+    /// see the rip's Stop (it runs under its own `Halt` until ST-K1b wires `ctx.halt()`).
+    /// The visible warning is the CLI's job.
     pub key_url: Option<String>,
     /// Bearer token for the online service, if any.
     pub key_auth: Option<String>,
@@ -37,8 +39,9 @@ pub struct KeyParams {
 /// permanently SSRF-rejected). Quiet: it emits no warnings.
 ///
 /// KU J10: no DNS lookup here (a factory build has no Stop). The host is looked up at the
-/// first query, halt-aware; a lookup that gives no answer is retried by `resolve` up front
-/// until 60 s pass with no answer (J13), one that finds a non-public address is refused.
+/// first query, which is not yet Stop-aware (ST-K1b wires `ctx.halt()` into it); `resolve`'s
+/// own retry waits are. A lookup with no answer is retried up front until 60 s pass with no
+/// answer (J13); one that finds a non-public address is refused.
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
@@ -505,17 +508,19 @@ mod tests {
 
     /// Stop rule (stall-based only; Stop can interrupt every wait): a factory build has no
     /// Halt, so it does no DNS lookup. keysources' static check drops a URL that is wrong
-    /// without one; the host lookup runs at the first query, halt-aware.
+    /// without one; the host lookup runs at the first query.
     #[test]
     fn a_factory_build_does_no_dns_lookup() {
-        let src = include_str!("keys.rs").replace("\r\n", "\n");
-        let start = src.find("pub fn key_sources(").unwrap();
-        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
-        assert!(body.contains("check_keyserver_url_static("), "{body}");
-        assert!(
-            !body.contains("check_keyserver_url("),
-            "no lookup at build time"
-        );
+        // `.invalid` never resolves: a build that looked it up could not keep the source.
+        let unresolvable = KeyParams {
+            key_url: Some("https://keys.ku-e1-build.invalid/keys".into()),
+            ..Default::default()
+        };
+        let labels: Vec<&str> = key_source_factory(&unresolvable)()
+            .iter()
+            .map(|s| s.label())
+            .collect();
+        assert_eq!(labels, ["online"], "kept, looked up at the first query");
         let blocked = KeyParams {
             key_url: Some("https://169.254.169.254/keys".into()),
             ..Default::default()
