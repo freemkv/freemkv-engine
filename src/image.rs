@@ -218,7 +218,16 @@ fn open_image_inner(
         }
         Some(disc) => {
             let mut reader = raw_reader(src)?;
-            check_prescanned(&disc, reader.as_mut(), sidecar.as_ref())?;
+            let held = match &keys {
+                KeyInput::Known(set) | KeyInput::Seeded(_, set) => Some(set),
+                KeyInput::Resolve(_) => None,
+            };
+            let in_hand = in_hand_vid_fingerprint(&disc, vid, held);
+            let proven = held
+                .map(|s| s.proven_key_fingerprints())
+                .unwrap_or_default();
+            let map = sidecar.as_ref();
+            check_prescanned(&disc, reader.as_mut(), map, in_hand, &proven)?;
             (disc, reader)
         }
         None => scan_image(src)?,
@@ -440,11 +449,13 @@ fn raw_reader(src: &ImageSource) -> crate::Result<Box<dyn libfreemkv::SectorSour
 
 // KU §3.2: a pre-scanned disc must be this image's: capacity equal, and the disc hash equal
 // ("checked when the image's `Unit_Key_RO.inf` is readable"). A key file the sidecar marks
-// unread is left to its identity (§4.4); with no sidecar identity, unchecked is refused.
+// unread is left to the §4.4 identity, if the sidecar identifies the disc; else refused.
 fn check_prescanned(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
     sidecar: Option<&Mapfile>,
+    vid_in_hand: Option<[u8; 32]>,
+    proven: &[[u8; 8]],
 ) -> crate::Result<()> {
     let have = reader.capacity_sectors();
     if have < disc.capacity_sectors {
@@ -455,7 +466,8 @@ fn check_prescanned(
     }
     let norm = |h: &str| libfreemkv::hex::strip_hex_prefix(h).to_ascii_lowercase();
     let disc_hash = disc.aacs.as_ref().map(|a| norm(&a.disc_hash));
-    let image_hash = if sidecar.is_some_and(|m| key_file_unread(m, reader)) {
+    let unread = key_file_unread(sidecar, reader);
+    let image_hash = if unread {
         None
     } else {
         let inf = libfreemkv::read_filesystem(reader)
@@ -466,11 +478,9 @@ fn check_prescanned(
         };
         inf.map(|inf| norm(&hash(inf)))
     };
-    let identified =
-        sidecar.is_some_and(|m| m.disc_hash().is_some() || m.vid_fingerprint().is_some());
     let hash_ok = match (&image_hash, &disc_hash) {
         (Some(i), Some(d)) => i == d,
-        (None, Some(_)) => identified,
+        (None, Some(_)) => unread && sidecar.is_some_and(|m| identifies(m, vid_in_hand, proven)),
         (_, None) => true,
     };
     if have != disc.capacity_sectors || !hash_ok {
@@ -488,27 +498,39 @@ fn check_prescanned(
     Ok(())
 }
 
+// Whether `map` can stand in for the key-file hash (§4.4): a disc hash; a `vidfp` with a VID
+// in hand to compare; or legacy key fingerprints one of the set's proven keys matches.
+fn identifies(map: &Mapfile, vid_in_hand: Option<[u8; 32]>, proven: &[[u8; 8]]) -> bool {
+    let legacy = map.legacy_key_fingerprints();
+    map.disc_hash().is_some()
+        || (map.vid_fingerprint().is_some() && vid_in_hand.is_some())
+        || legacy.iter().any(|f| proven.contains(f))
+}
+
 const KEY_FILE: &str = "/AACS/Unit_Key_RO.inf";
 
-// Whether the sidecar marks any sector of `/AACS/Unit_Key_RO.inf` as not read (a sweep
-// zero-fills those). An image whose UDF cannot locate the file counts as unread.
-fn key_file_unread(map: &Mapfile, reader: &mut dyn libfreemkv::SectorSource) -> bool {
+// Whether the sidecar marks any sector of `/AACS/Unit_Key_RO.inf` not read (a sweep zero-
+// fills those). If the UDF cannot locate the file, only when the sidecar marks any sector so.
+fn key_file_unread(map: Option<&Mapfile>, reader: &mut dyn libfreemkv::SectorSource) -> bool {
     use crate::SectorStatus as S;
+    let Some(map) = map else {
+        return false;
+    };
+    let unread = map.ranges_with(&[S::NonTried, S::NonTrimmed, S::NonScraped, S::Unreadable]);
     let extents =
         libfreemkv::read_filesystem(reader).and_then(|fs| fs.file_extents(reader, KEY_FILE));
     let Ok(extents) = extents else {
-        return true;
+        return !unread.is_empty();
     };
     let file: Vec<(u64, u64)> = extents
         .iter()
         .map(|&(s, n)| (s as u64 * 2048, n as u64 * 2048))
         .collect();
-    let unread = map.ranges_with(&[S::NonTried, S::NonTrimmed, S::NonScraped, S::Unreadable]);
     !crate::recovery::mapfile::intersect(&unread, &file).is_empty()
 }
 
-// The image's sidecar mapfile, read-only. Absent is no identity; one that exists but does
-// not load is refused (MapfileInvalid), never taken for "no identity" (judgement 6).
+// The image's sidecar mapfile, read-only. Absent is no identity; an unparseable one is
+// refused (MapfileInvalid, judgement 6), and one that cannot be read is an I/O error.
 fn load_sidecar(src: &ImageSource) -> crate::Result<Option<Mapfile>> {
     let path = crate::mapfile_path_for(src.path());
     match Mapfile::load(&path) {
@@ -516,9 +538,11 @@ fn load_sidecar(src: &ImageSource) -> crate::Result<Option<Mapfile>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "sidecar mapfile unreadable");
+            let parse = e.kind() == std::io::ErrorKind::InvalidData;
             Err(match Error::from(e) {
                 invalid @ Error::MapfileInvalid { .. } => invalid,
-                _ => Error::MapfileInvalid { kind: "sidecar" },
+                _ if parse => Error::MapfileInvalid { kind: "sidecar" },
+                io => io,
             })
         }
     }
