@@ -175,20 +175,18 @@ pub(crate) fn copy_in(
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
-        let mut map = mapfile::Mapfile::load(&mf_path).map_err(|e| Error::IoError { source: e })?;
+        let mut map = mapfile::Mapfile::load(&mf_path).map_err(Error::from)?;
         // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
         // stream file is now located, so widen it and let the dispatch fill the rest.
         if map.scope().is_some() {
-            mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
-                .map_err(|e| Error::IoError { source: e })?;
+            mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).map_err(Error::from)?;
             map.clear_scope();
-            map.flush().map_err(|e| Error::IoError { source: e })?;
+            map.flush().map_err(Error::from)?;
         }
         // BEFORE any resume decision, including "already complete" below: a wrong
         // disc whose predecessor finished would otherwise report the job done
         // having never touched the disc actually in the drive.
-        mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
-            .map_err(|e| Error::IoError { source: e })?;
+        mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).map_err(Error::from)?;
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
         let covers_disc = map.total_size() == disc_size;
@@ -426,7 +424,7 @@ pub(crate) fn iso_len_from_metadata(m: std::io::Result<std::fs::Metadata>) -> Re
     match m {
         Ok(md) => Ok(IsoLen::Len(md.len())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(IsoLen::Missing),
-        Err(e) => Err(Error::IoError { source: e }),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -476,7 +474,7 @@ pub(crate) fn stale_mapfile_removed(r: std::io::Result<()>) -> Result<()> {
     match r {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::IoError { source: e }),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -728,7 +726,7 @@ pub fn ensure_whole_image(path: &std::path::Path) -> Result<()> {
         }),
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::IoError { source: e }),
+        Err(e) => Err(Error::from(e)),
     }
 }
 
@@ -744,7 +742,7 @@ pub fn ensure_titles_staged(
     let map = match mapfile::Mapfile::load(&mapfile::mapfile_path_for(path)) {
         Ok(map) => map,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::IoError { source: e }),
+        Err(e) => return Err(Error::from(e)),
     };
     let Some(scope) = map.scope() else {
         return Ok(());
@@ -881,7 +879,7 @@ fn sweep_linked(
         stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
     }
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
-        .map_err(|e| Error::IoError { source: e })?;
+        .map_err(Error::from)?;
 
     // The disc's identity for a later resume (KU §4.1): its hash and VID fingerprint only,
     // never a key byte or a raw VID (J6).
@@ -898,15 +896,14 @@ fn sweep_linked(
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
-            .map_err(|e| Error::IoError { source: e })?;
+            .map_err(Error::from)?;
         let reg = output_is_regular(f.metadata());
         (f, reg)
     } else {
-        let f = std::fs::File::create(path).map_err(|e| Error::IoError { source: e })?;
+        let f = std::fs::File::create(path).map_err(Error::from)?;
         let reg = output_is_regular(f.metadata());
         if reg {
-            f.set_len(total_bytes)
-                .map_err(|e| Error::IoError { source: e })?;
+            f.set_len(total_bytes).map_err(Error::from)?;
         }
         (f, reg)
     };
@@ -914,8 +911,7 @@ fn sweep_linked(
     // Wrap the raw `File` in our bounded-cache `WritebackFile` (drains dirty
     // pages continuously instead of bursting; see `libfreemkv::io`). It moves
     // into the consumer thread.
-    let file =
-        libfreemkv::io::WritebackFile::new(file).map_err(|e| Error::IoError { source: e })?;
+    let file = libfreemkv::io::WritebackFile::new(file).map_err(Error::from)?;
     let batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
     // A scoped sweep reads only its scope (plus any earlier staging's); a whole-disc
@@ -2219,7 +2215,7 @@ mod finish_bounded_tests {
             // rewrites the whole mapfile.
             self.map
                 .record(0, 2048, mapfile::SectorStatus::Unreadable)
-                .map_err(|e| Error::IoError { source: e })?;
+                .map_err(Error::from)?;
             Ok(Flow::Continue)
         }
         fn close(self) -> std::result::Result<u32, Error> {

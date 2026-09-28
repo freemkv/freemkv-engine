@@ -188,7 +188,7 @@ fn run(
 ) -> io::Result<RemuxReport> {
     let halt = EngineHalt::new(op, None).with_sink(sink);
     let j = job(target.to_path_buf(), true);
-    land_verified(&j, 0, &title(600.0), sink, &halt, rio, mux)
+    land_verified(&j, 0, &title(600.0), sink, &halt, rio, None, mux)
 }
 
 fn good() -> Vec<u8> {
@@ -647,14 +647,6 @@ fn remux_verify_stall_goes_silent_then_fails() {
         "verify progress after the block"
     );
     untouched(&target, mtime);
-}
-
-// ET15 `engine_mux_options_have_no_frame_deadline` — T27: "`Some(60 s)` → none (ST-F1, ST-E1)".
-#[test]
-fn engine_mux_options_have_no_frame_deadline() {
-    assert_eq!(mux_options(false).send_deadline, None);
-    assert_eq!(mux_options(true).send_deadline, None);
-    assert_eq!(MuxPlan::new(vec![0]).mux.send_deadline, None);
 }
 
 // §4.2: "ST-E1 adds … `mux_image_titles_with(.., &Halt)`; the old functions call them with a

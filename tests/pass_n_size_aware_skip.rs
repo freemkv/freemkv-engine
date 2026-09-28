@@ -21,7 +21,7 @@ struct PatternedSectorReader {
     capacity: u32,
     bad_lbas: HashSet<u32>,
     /// Trace every read so tests can assert what was actually attempted.
-    trace: Arc<Mutex<Vec<(u32, u16)>>>,
+    trace: ReadTrace,
     /// Optional WORK-budget watchdog: raise this halt flag once the pass has
     /// issued `budget` reads. A deterministic stand-in for a wall-clock
     /// watchdog thread — a loop that fails to advance burns reads at whatever
@@ -31,6 +31,7 @@ struct PatternedSectorReader {
     halt_after_reads: Option<(u64, Arc<std::sync::atomic::AtomicBool>)>,
 }
 
+/// Shared `(lba, count)` read trace of a `PatternedSectorReader`.
 type ReadTrace = Arc<Mutex<Vec<(u32, u16)>>>;
 
 impl PatternedSectorReader {
@@ -128,17 +129,13 @@ fn prep_iso_and_mapfile(
     finished_ranges: &[(u64, u64)],
     nontrimmed_ranges: &[(u64, u64)],
 ) {
-    use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
-    let mut f = OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(iso_path)
         .unwrap();
     f.set_len(total_bytes).unwrap();
-    f.seek(SeekFrom::Start(0)).unwrap();
-    f.write_all(&[]).unwrap();
 
     let map_path = freemkv_engine::mapfile_path_for(iso_path);
     let mut mf = Mapfile::create(&map_path, total_bytes, "test").unwrap();
@@ -147,6 +144,26 @@ fn prep_iso_and_mapfile(
     }
     for &(pos, size) in nontrimmed_ranges {
         mf.record(pos, size, SectorStatus::NonTrimmed).unwrap();
+    }
+}
+
+/// Scratch ISO path inside a `TempDir`; the dir (ISO + mapfile sibling) is
+/// removed when the guard drops, including on a failed assertion.
+fn scratch_iso() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let iso_path = dir.path().join("disc.iso");
+    (dir, iso_path)
+}
+
+/// No scripted-bad LBA may end up in the final `Finished` set: recording an
+/// unreadable sector as good is the worst possible outcome.
+fn assert_bad_lbas_not_finished(finished: &[(u64, u64)], bad_lbas: &HashSet<u32>) {
+    for &lba in bad_lbas {
+        let pos = lba as u64 * SECTOR_SIZE as u64;
+        assert!(
+            !finished.iter().any(|&(p, sz)| pos >= p && pos < p + sz),
+            "scripted-bad LBA {lba} was recorded Finished"
+        );
     }
 }
 
@@ -166,12 +183,10 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         bad_lbas.insert(lba);
     }
 
-    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas);
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
 
     // Pre-populate: 0..100 already Finished from an imagined Pass 1,
     //               100..200 NonTrimmed (the range we want patch to retry),
@@ -201,6 +216,7 @@ fn patch_recovers_good_middle_of_a_bad_range() {
     // is not enabled, patch would skip 32+ sectors after a few failures
     // and leap clean over LBA 125 → middle stays NonTrimmed.
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
     let total_finished_in_middle: u64 = finished_ranges
         .iter()
         .map(|&(pos, sz)| {
@@ -211,14 +227,9 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         .sum();
 
     // Allow 2 sectors (4 KB) of boundary slop — bisection may not converge
-    // exactly on the good/bad boundary in one pass. Pre-fix behaviour would
-    // have left the entire good middle NonTrimmed (~0 bytes recovered).
+    // exactly on the good/bad boundary in one pass.
     let good_middle_bytes: u64 = 50 * 2048;
     let min_acceptable: u64 = good_middle_bytes - 2 * 2048;
-
-    // Cleanup before assertions
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
 
     assert!(
         total_finished_in_middle >= min_acceptable,
@@ -253,9 +264,7 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     let mut reader = reader.halt_after_reads(READ_BUDGET, halt.clone());
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
 
     let finished = [
         (0, 100 * 2048),
@@ -290,13 +299,8 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
         keys: None,
     };
 
-    let outcome = freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts);
-
-    let map_path = freemkv_engine::mapfile_path_for(&iso_path);
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
-
-    let outcome = outcome.expect("patch returns Ok");
+    let outcome =
+        freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts).expect("patch returns Ok");
     let reads = trace.lock().unwrap().clone();
     assert!(
         !outcome.halted,
@@ -353,12 +357,10 @@ fn patch_recovers_multiple_good_middles() {
     for lba in 1200..1225 {
         bad_lbas.insert(lba);
     }
-    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas);
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
 
     let finished = [
         (0, 1000 * 2048),
@@ -377,6 +379,7 @@ fn patch_recovers_multiple_good_middles() {
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
     let recovered: u64 = finished_ranges
         .iter()
         .map(|&(pos, sz)| {
@@ -385,9 +388,6 @@ fn patch_recovers_multiple_good_middles() {
             end.saturating_sub(start)
         })
         .sum();
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
 
     // Three good middles of 75 sectors each = 225 good sectors in the
     // bad range. Total bad = 75. So we want at least most of 225 sectors
@@ -404,7 +404,7 @@ fn patch_recovers_multiple_good_middles() {
     );
 }
 
-// 0.18 Pass N pipeline split: exercises the producer/consumer path end-to-end, verifying
+// Pass N producer/consumer pipeline, end to end: verifies
 // bytes_good, Finished/NonTrimmed status, and byte-exact writes.
 #[test]
 fn patch_pipeline_split_recovers_and_records_correctly() {
@@ -421,9 +421,7 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
     let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
 
     let finished = [
         (0, 200 * 2048),
@@ -471,12 +469,7 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
             "good LBA {lba} should be Finished after pipeline patch run"
         );
     }
-    for lba in 200..205 {
-        assert!(
-            !in_finished(lba),
-            "bad LBA {lba} should NOT be Finished after pipeline patch run"
-        );
-    }
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
 
     // Verify the consumer wrote the producer's bytes at the right offsets:
     // PatternedSectorReader fills each sector with `(lba & 0xff) as u8`, so
@@ -487,9 +480,6 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
     let mut sector = [0u8; 2048];
     iso.read_exact(&mut sector).unwrap();
     let expected_byte = (220u32 & 0xff) as u8;
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
 
     assert!(
         sector.iter().all(|&b| b == expected_byte),

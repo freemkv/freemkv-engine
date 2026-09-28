@@ -18,7 +18,7 @@ use libfreemkv::Halt;
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
 use libfreemkv::io::ArtifactLock;
 use libfreemkv::keys::{KeyScope, ResolvedKeySet};
-use std::io::{self, Read, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,13 +28,13 @@ use std::time::{Duration, Instant};
 pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
     libfreemkv::MuxOptions {
         skip_errors: false,
-        batch_sectors: 64,
+        batch_sectors: libfreemkv::mux::resolve::ISO_MUX_BATCH_SECTORS,
         raw,
         // Per title from `MuxPlan::streams` (an `iso://` title) or `InputOptions` (`dir://`).
         selection: libfreemkv::StreamSelection::default(),
-        // Stop design v5 T27: the per-frame send deadline is "retired in freemkv and the
-        // engine"; "a halt-aware send only, and the user's Stop is the bound" (§2.10).
-        send_deadline: None,
+        // Stop v5 ST-X1a: `send_deadline` is retired (T27); `Default` is the
+        // halt-aware-only send every front end now gets.
+        ..Default::default()
     }
 }
 
@@ -190,7 +190,7 @@ fn mux_opened_title(
                 batch_sectors: mux.batch_sectors,
                 raw: mux.raw,
                 selection,
-                send_deadline: mux.send_deadline,
+                ..Default::default()
             };
             let format = opened.disc.content_format;
             mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)
@@ -304,6 +304,24 @@ pub fn remux_iso_with(
     remux_iso_sources(job, key_source_factory(keys), sink, halt)
 }
 
+/// Remux to a local partial file, then copy a verified result to a partial
+/// beside the target before the atomic replacement. The caller owns the
+/// staging location; the engine removes both partial files on every exit.
+pub fn remux_iso_staged(
+    job: &RemuxJob,
+    keys: &KeyParams,
+    sink: &dyn Sink,
+    staged_partial: &Path,
+) -> io::Result<RemuxReport> {
+    remux_iso_sources_at(
+        job,
+        key_source_factory(keys),
+        sink,
+        &Halt::new(),
+        Some(staged_partial),
+    )
+}
+
 // `remux_iso_with` over any key sources: one open, one resolution round for the job's title
 // (KU §3.2), then its mux through that set.
 pub(crate) fn remux_iso_sources(
@@ -311,6 +329,16 @@ pub(crate) fn remux_iso_sources(
     sources: libfreemkv::KeySourceFactory,
     sink: &dyn Sink,
     halt: &Halt,
+) -> io::Result<RemuxReport> {
+    remux_iso_sources_at(job, sources, sink, halt, None)
+}
+
+fn remux_iso_sources_at(
+    job: &RemuxJob,
+    sources: libfreemkv::KeySourceFactory,
+    sink: &dyn Sink,
+    halt: &Halt,
+    staged_partial: Option<&Path>,
 ) -> io::Result<RemuxReport> {
     // §4.2: "cancellation is `EngineHalt::is_cancelled() = op.is_cancelled() || extra ||
     // sink.should_cancel()`".
@@ -345,17 +373,17 @@ pub(crate) fn remux_iso_sources(
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
     };
-    land_verified(job, idx, title, sink, &halt, &OsRemuxIo, |dest| {
-        mux_opened_title(
-            &opened,
-            &keys,
-            idx,
-            selection,
-            dest,
-            &mux_options(false),
-            sink,
-        )
-    })
+    let options = mux_options(false);
+    land_verified(
+        job,
+        idx,
+        title,
+        sink,
+        &halt,
+        &OsRemuxIo,
+        staged_partial,
+        |dest| mux_opened_title(&opened, &keys, idx, selection, dest, &options, sink),
+    )
 }
 
 // Only NotFound means absent: EIO/ESTALE/permission errors surface, so a flaky
@@ -397,6 +425,14 @@ fn partial_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".partial");
     target.with_file_name(name)
+}
+
+fn remove_stale_partial(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 // §4.2: remux keeps no resumable state, "so the sidecar is **deleted while held on every
@@ -483,6 +519,7 @@ impl RemuxIo for OsRemuxIo {
 }
 
 // Mux (via `mux`, given the partial file's sink URL), verify, and move into place.
+#[allow(clippy::too_many_arguments)]
 fn land_verified(
     job: &RemuxJob,
     idx: usize,
@@ -490,18 +527,27 @@ fn land_verified(
     sink: &dyn Sink,
     halt: &EngineHalt<'_>,
     rio: &dyn RemuxIo,
+    staged_partial: Option<&Path>,
     mux: impl FnOnce(&str) -> io::Result<libfreemkv::MuxOutcome>,
 ) -> io::Result<RemuxReport> {
     let timing = rio.timing();
     sink.title_opened(title);
-    let partial = partial_path(&job.target);
+    let target_partial = partial_path(&job.target);
+    let partial = staged_partial.unwrap_or(&target_partial);
+    if partial == job.target || (staged_partial.is_some() && partial == target_partial) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid remux staging path",
+        ));
+    }
     // §4.2: "`land_verified` … takes `<target>.lock` (the §2.5 acquire loop) **before**
     // creating `.partial`"; "deleted while held on every exit" (dropped last).
     // libfreemkv's lock watches `<target>.partial` as the holder's T10 progress.
-    let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &[], h))?;
+    let watch: Vec<&Path> = staged_partial.into_iter().collect();
+    let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &watch, h))?;
     let _lock = DeleteOnDrop(Some(lock));
-    let _ = std::fs::remove_file(&partial);
-    let mut guard = PartialFile(&partial, false);
+    remove_stale_partial(partial)?;
+    let mut guard = PartialFile(partial, false);
 
     sink.event(&Event::Phase { name: "mux" });
     let dest = format!("mkv://{}", partial.display());
@@ -520,14 +566,14 @@ fn land_verified(
             io::Error::other(format!("mux of title {} did not complete", idx + 1))
         });
     }
-    durable_sync(rio, &partial, halt, sink, timing)?;
+    durable_sync(rio, partial, halt, sink, timing)?;
 
     sink.event(&Event::Phase { name: "verify" });
-    let verified = verify_watched(&partial, title, halt, sink, rio, timing);
+    let verified = verify_watched(partial, title, halt, sink, rio, timing);
     let stopped = verified.as_ref().is_err_and(libfreemkv::is_halt);
     if !stopped {
         sink.event(&Event::Verify {
-            path: &partial,
+            path: partial,
             ok: verified.is_ok(),
             runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
             expected_secs: title.duration_secs,
@@ -535,12 +581,32 @@ fn land_verified(
     }
     let verified = verified?;
 
+    let mut remote_guard = None;
+    if staged_partial.is_some() {
+        sink.event(&Event::Phase { name: "copy" });
+        remove_stale_partial(&target_partial)?;
+        remote_guard = Some(PartialFile(&target_partial, false));
+        copy_staged(partial, &target_partial, halt, sink, timing)?;
+        durable_sync(rio, &target_partial, halt, sink, timing)?;
+        // Check the NAS copy itself before replacing an existing library file.
+        verify_watched(&target_partial, title, halt, sink, rio, timing)?;
+    }
+
     sink.event(&Event::Phase { name: "replace" });
     // Re-checked: the target may have appeared while the title muxed.
     refuse_existing(job)?;
     let replaced = target_present(&job.target)?;
-    std::fs::rename(&partial, &job.target)?;
-    guard.1 = true;
+    let landing = if staged_partial.is_some() {
+        &target_partial
+    } else {
+        partial
+    };
+    std::fs::rename(landing, &job.target)?;
+    if let Some(g) = &mut remote_guard {
+        g.1 = true;
+    } else {
+        guard.1 = true;
+    }
     // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`": the rename
     // committed, so a Stop during the folder sync cuts only the sync short (§4.4).
     match sync_parent(rio, &job.target, halt) {
@@ -559,6 +625,51 @@ fn land_verified(
         verified,
         replaced,
     })
+}
+
+fn copy_staged(
+    source: &Path,
+    destination: &Path,
+    halt: &EngineHalt<'_>,
+    sink: &dyn Sink,
+    timing: RemuxTiming,
+) -> io::Result<()> {
+    let mut src = std::fs::File::open(source)?;
+    let total = src.metadata()?.len();
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let mut buf = vec![0u8; 1024 * 1024];
+    let mut done = 0u64;
+    let mut every = Activity::new(timing.activity_every);
+    let started = Instant::now();
+    loop {
+        if halt.is_cancelled() {
+            return Err(libfreemkv::Error::Halted.into());
+        }
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_all(&buf[..n])?;
+        done += n as u64;
+        if every.due(done, done == total) {
+            let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+            sink.progress(&crate::sink::Progress {
+                speed_bps: speed,
+                eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
+                ..activity("copy", done, total)
+            });
+        }
+    }
+    if done != total || dst.metadata()?.len() != total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remux copy size mismatch",
+        ));
+    }
+    Ok(())
 }
 
 // A `Sink::progress` of `pass` (§4.4 "`Progress.pass` values are stable keys").
@@ -734,7 +845,116 @@ mod tests {
         mux: impl FnOnce(&str) -> io::Result<libfreemkv::MuxOutcome>,
     ) -> io::Result<RemuxReport> {
         let halt = EngineHalt::new(&Halt::new(), None).with_sink(sink);
-        land_verified(job, idx, title, sink, &halt, &OsRemuxIo, mux)
+        land_verified(job, idx, title, sink, &halt, &OsRemuxIo, None, mux)
+    }
+
+    #[test]
+    fn staged_remux_replaces_only_after_copy_and_verification() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("ssd");
+        let nas = dir.path().join("nas");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&nas).unwrap();
+        let target = nas.join("Movie.mkv");
+        let local_partial = stage.join("1.mkv.partial");
+        std::fs::write(&target, b"old").unwrap();
+        let new = mkv(600.0, Some(598), 2);
+        let sink = Events::default();
+        let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+        let report = land_verified(
+            &job(target.clone(), true),
+            0,
+            &title(600.0),
+            &sink,
+            &halt,
+            &OsRemuxIo,
+            Some(&local_partial),
+            writes(new.clone(), true),
+        )
+        .unwrap();
+        assert!(report.replaced);
+        assert_eq!(std::fs::read(&target).unwrap(), new);
+        assert!(!local_partial.exists());
+        assert!(!partial_path(&target).exists());
+        assert!(sink.0.lock().unwrap().contains(&"phase:copy".to_string()));
+    }
+
+    #[test]
+    fn staged_remux_failure_preserves_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        let local_partial = dir.path().join("1.mkv.partial");
+        std::fs::write(&target, b"old").unwrap();
+        let sink = Events::default();
+        let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+        let result = land_verified(
+            &job(target.clone(), true),
+            0,
+            &title(600.0),
+            &sink,
+            &halt,
+            &OsRemuxIo,
+            Some(&local_partial),
+            writes(mkv(600.0, Some(598), 2), false),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(!local_partial.exists());
+        assert!(!partial_path(&target).exists());
+    }
+
+    #[test]
+    fn staged_copy_refuses_to_overwrite_an_existing_partial() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.mkv");
+        let destination = dir.path().join("target.mkv.partial");
+        std::fs::write(&source, b"new").unwrap();
+        std::fs::write(&destination, b"other writer").unwrap();
+        let token = Halt::new();
+        let sink = Events::default();
+        let halt = EngineHalt::new(&token, None).with_sink(&sink);
+        let err =
+            copy_staged(&source, &destination, &halt, &sink, RemuxTiming::default()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
+    }
+
+    #[test]
+    fn stop_during_staged_copy_keeps_old_target() {
+        struct StopOnCopy(std::sync::atomic::AtomicBool);
+        impl Sink for StopOnCopy {
+            fn event(&self, event: &Event<'_>) {
+                if matches!(event, Event::Phase { name: "copy" }) {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+
+            fn should_cancel(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        let local_partial = dir.path().join("1.mkv.partial");
+        std::fs::write(&target, b"old").unwrap();
+        let sink = StopOnCopy(std::sync::atomic::AtomicBool::new(false));
+        let token = Halt::new();
+        let halt = EngineHalt::new(&token, None).with_sink(&sink);
+        let result = land_verified(
+            &job(target.clone(), true),
+            0,
+            &title(600.0),
+            &sink,
+            &halt,
+            &OsRemuxIo,
+            Some(&local_partial),
+            writes(mkv(600.0, Some(598), 2), true),
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(!local_partial.exists());
+        assert!(!partial_path(&target).exists());
     }
 
     // ── A hand-built MKV: EBML header, Segment, Info, one track, Cues ──────

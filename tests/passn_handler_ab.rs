@@ -42,24 +42,20 @@ struct ScriptedSectorReader {
     /// Full read trace: every (lba, count, result_was_ok) tuple in
     /// call order. Lets the test assert that adaptive-batch dropped
     /// to count=1, bisection happened, etc.
-    trace: Arc<Mutex<Vec<(u32, u16, bool)>>>,
+    trace: ReadTrace,
 }
 
-/// A `ScriptedSectorReader` plus the handle recording its `(lba, count, ok)` trace.
-type ScriptedHarness = (ScriptedSectorReader, Arc<Mutex<Vec<(u32, u16, bool)>>>);
+/// Shared `(lba, count, ok)` read trace of a `ScriptedSectorReader`.
+type ReadTrace = Arc<Mutex<Vec<(u32, u16, bool)>>>;
 
 impl ScriptedSectorReader {
-    fn new(capacity: u32) -> ScriptedHarness {
-        let trace = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                capacity,
-                script: std::collections::HashMap::new(),
-                attempt_idx: Mutex::new(std::collections::HashMap::new()),
-                trace: trace.clone(),
-            },
-            trace,
-        )
+    fn new(capacity: u32) -> Self {
+        Self {
+            capacity,
+            script: std::collections::HashMap::new(),
+            attempt_idx: Mutex::new(std::collections::HashMap::new()),
+            trace: Arc::new(Mutex::new(Vec::new())),
+        }
     }
 
     /// Set a single-step script for `lba`: every attempt yields `step`.
@@ -160,17 +156,13 @@ fn prep_iso_and_mapfile(
     finished_ranges: &[(u64, u64)],
     nontrimmed_ranges: &[(u64, u64)],
 ) {
-    use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
-    let mut f = OpenOptions::new()
+    let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(iso_path)
         .unwrap();
     f.set_len(total_bytes).unwrap();
-    f.seek(SeekFrom::Start(0)).unwrap();
-    f.write_all(&[]).unwrap();
 
     let map_path = freemkv_engine::mapfile_path_for(iso_path);
     let mut mf = Mapfile::create(&map_path, total_bytes, "test").unwrap();
@@ -180,6 +172,14 @@ fn prep_iso_and_mapfile(
     for &(pos, size) in nontrimmed_ranges {
         mf.record(pos, size, SectorStatus::NonTrimmed).unwrap();
     }
+}
+
+/// Scratch ISO path inside a `TempDir`; the dir (ISO + mapfile sibling) is
+/// removed when the guard drops, including on a failed assertion.
+fn scratch_iso() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let iso_path = dir.path().join("disc.iso");
+    (dir, iso_path)
 }
 
 /// Observable outcome of a patch run. Goldens for each profile pin
@@ -200,22 +200,29 @@ struct Golden {
     max_reads: usize,
 }
 
+/// Final state of a profile run.
+struct ProfileRun {
+    result: freemkv_engine::CopyResult,
+    stats: freemkv_engine::MapStats,
+    /// Byte ranges the final mapfile records as `Finished`.
+    finished: Vec<(u64, u64)>,
+    trace_len: usize,
+}
+
 /// Common helper: prep ISO + mapfile, run `freemkv_engine::copy` (multipass),
-/// return (PatchOutcome ↔ CopyResult, final-map stats, trace length).
+/// return the final map state and read count.
 fn run_profile(
     profile_name: &str,
     capacity_sectors: u32,
     nontrimmed: &[(u64, u64)],
     finished: &[(u64, u64)],
     scripted: ScriptedSectorReader,
-    trace: Arc<Mutex<Vec<(u32, u16, bool)>>>,
-) -> (freemkv_engine::CopyResult, freemkv_engine::MapStats, usize) {
+) -> ProfileRun {
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
     let disc = synthetic_disc(capacity_sectors);
+    let trace = scripted.trace.clone();
 
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
 
     prep_iso_and_mapfile(&iso_path, total_bytes, finished, nontrimmed);
 
@@ -231,14 +238,39 @@ fn run_profile(
 
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
-    let stats = map.stats();
-
     let trace_len = trace.lock().unwrap().len();
 
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
+    ProfileRun {
+        result: pr,
+        stats: map.stats(),
+        finished: map.ranges_with(&[SectorStatus::Finished]),
+        trace_len,
+    }
+}
 
-    (pr, stats, trace_len)
+/// Bytes `Finished` beyond the pre-seeded baseline. Checked: a run that loses
+/// seeded Finished bytes must fail, not wrap to a huge "recovered" value.
+fn recovered_over_baseline(profile: &str, bytes_good: u64, baseline_sectors: u64) -> u64 {
+    let baseline = baseline_sectors * SECTOR_SIZE as u64;
+    bytes_good.checked_sub(baseline).unwrap_or_else(|| {
+        panic!("[{profile}] bytes_good={bytes_good} fell below the seeded baseline {baseline}")
+    })
+}
+
+/// Every scripted-bad LBA must be absent from the final `Finished` set:
+/// recording an unreadable sector as good is the worst possible outcome.
+fn assert_bad_lbas_not_finished(
+    profile: &str,
+    finished: &[(u64, u64)],
+    bad_lbas: impl IntoIterator<Item = u32>,
+) {
+    for lba in bad_lbas {
+        let pos = lba as u64 * SECTOR_SIZE as u64;
+        assert!(
+            !finished.iter().any(|&(p, sz)| pos >= p && pos < p + sz),
+            "[{profile}] scripted-bad LBA {lba} was recorded Finished"
+        );
+    }
 }
 
 // ─────────────────────────── Profile 1: CLEAN ────────────────────────────
@@ -248,7 +280,7 @@ fn run_profile(
 #[test]
 fn profile_01_clean_all_recoverable() {
     let capacity_sectors: u32 = 256;
-    let (reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let reader = ScriptedSectorReader::new(capacity_sectors);
     // No scripted errors → all reads succeed.
 
     let nontrimmed = [(100 * 2048, 16 * 2048)]; // 16-sector NonTrimmed range
@@ -257,14 +289,12 @@ fn profile_01_clean_all_recoverable() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
-        "01_clean",
-        capacity_sectors,
-        &nontrimmed,
-        &finished,
-        reader,
-        trace,
-    );
+    let ProfileRun {
+        result: pr,
+        stats,
+        trace_len,
+        ..
+    } = run_profile("01_clean", capacity_sectors, &nontrimmed, &finished, reader);
 
     let expected = Golden {
         bytes_good: capacity_sectors as u64 * 2048,
@@ -291,12 +321,12 @@ fn profile_01_clean_all_recoverable() {
 
 // ─────────────────────────── Profile 2: ALL MEDIUM ───────────────────────
 // Every LBA in the range returns MEDIUM_ERROR every attempt. The handler
-// chain fails to recover; bytes stay NonTrimmed, not Unreadable (2026-05-11).
+// chain fails to recover; bytes stay NonTrimmed, not Unreadable.
 
 #[test]
 fn profile_02_all_medium_error() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     for lba in 100..116 {
         reader.always(
             lba,
@@ -314,18 +344,21 @@ fn profile_02_all_medium_error() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        finished: done,
+        trace_len,
+    } = run_profile(
         "02_all_medium",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
-    // GOLDEN: the 16-sector bad range stays NonTrimmed (bytes_pending).
-    // Pre-2026-05-11 patch would mark Unreadable here; current code
-    // preserves NonTrimmed so subsequent passes get another shot.
+    // GOLDEN: the 16-sector bad range stays NonTrimmed (bytes_pending), not
+    // Unreadable, so subsequent passes get another shot.
     assert_eq!(
         stats.bytes_good,
         (capacity_sectors as u64 - 16) * 2048,
@@ -340,6 +373,7 @@ fn profile_02_all_medium_error() {
         16 * 2048,
         "02_all_medium bytes_pending (NonTrimmed retained across passes)"
     );
+    assert_bad_lbas_not_finished("02_all_medium", &done, 100..116);
     assert!(!pr.halted, "02_all_medium halted");
     // Upper bound: per-sector probes + batch-drop/skip-escalation attempts
     // + scatter-recovery retries per hard sector. Guards against an
@@ -357,7 +391,7 @@ fn profile_02_all_medium_error() {
 #[test]
 fn profile_03_alternating_good_bad() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     for lba in (100..116).step_by(2) {
         reader.always(
             lba,
@@ -375,34 +409,38 @@ fn profile_03_alternating_good_bad() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        finished: done,
+        trace_len,
+    } = run_profile(
         "03_alternating",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
-    // GOLDEN: 8 good sectors interleaved should mostly be Finished; 8 bad
-    // stay NonTrimmed. Allow 2 sectors of slop — the bisect cursor doesn't
-    // always converge exactly at boundaries with the size-aware skip cap.
-    let good_total = stats.bytes_good;
-    let baseline_good = (capacity_sectors as u64 - 16) * 2048;
-    let middle_recovered = good_total - baseline_good;
-    assert!(
-        middle_recovered >= 6 * 2048,
-        "03_alternating recovered only {middle_recovered} bytes of 8 good sectors"
+    // GOLDEN: exactly the 8 good interleaved sectors land Finished (the reader is
+    // deterministic); the 8 bad never Finished, stay NonTrimmed.
+    let middle_recovered = recovered_over_baseline(
+        "03_alternating",
+        stats.bytes_good,
+        capacity_sectors as u64 - 16,
     );
-    assert!(
-        middle_recovered <= 9 * 2048,
-        "03_alternating recovered MORE than scripted good sectors: {middle_recovered}"
+    assert_eq!(
+        middle_recovered,
+        8 * 2048,
+        "03_alternating must recover exactly the 8 good sectors"
     );
+    assert_bad_lbas_not_finished("03_alternating", &done, (100..116).step_by(2));
     assert_eq!(stats.bytes_unreadable, 0, "03_alternating bytes_unreadable");
     // Remaining must be NonTrimmed (pending), not lost.
-    assert!(
-        stats.bytes_pending > 0,
-        "03_alternating expected NonTrimmed remainder, got bytes_pending=0"
+    assert_eq!(
+        stats.bytes_good + stats.bytes_pending,
+        capacity_sectors as u64 * 2048,
+        "03_alternating conservation"
     );
     assert!(!pr.halted, "03_alternating halted");
     // Efficiency guard (catches runaway, not the tier-2 roster). The 8 bad
@@ -421,7 +459,7 @@ fn profile_03_alternating_good_bad() {
 #[test]
 fn profile_04_edge_bad_good_middle() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     for lba in 100..104 {
         reader.always(
             lba,
@@ -449,26 +487,36 @@ fn profile_04_edge_bad_good_middle() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        finished: done,
+        trace_len,
+    } = run_profile(
         "04_edge_bad",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
-    // GOLDEN: the 8 good middle sectors should land Finished (allowing
-    // 2 sectors of bisection slop at boundaries).
-    let middle_recovered = stats.bytes_good - (capacity_sectors as u64 - 16) * 2048;
-    assert!(
-        middle_recovered >= 6 * 2048,
-        "04_edge_bad recovered only {middle_recovered} bytes of 8 good middle sectors"
+    // GOLDEN: exactly the 8 good middle sectors land Finished; the 8 bad never do.
+    let middle_recovered = recovered_over_baseline(
+        "04_edge_bad",
+        stats.bytes_good,
+        capacity_sectors as u64 - 16,
     );
+    assert_eq!(
+        middle_recovered,
+        8 * 2048,
+        "04_edge_bad must recover exactly the 8 good middle sectors"
+    );
+    assert_bad_lbas_not_finished("04_edge_bad", &done, (100..104).chain(112..116));
     assert_eq!(stats.bytes_unreadable, 0, "04_edge_bad bytes_unreadable");
-    assert!(
-        stats.bytes_pending > 0,
-        "04_edge_bad bytes_pending expected > 0"
+    assert_eq!(
+        stats.bytes_good + stats.bytes_pending,
+        capacity_sectors as u64 * 2048,
+        "04_edge_bad conservation"
     );
     assert!(!pr.halted, "04_edge_bad halted");
     assert!(
@@ -484,7 +532,7 @@ fn profile_04_edge_bad_good_middle() {
 #[test]
 fn profile_05_single_bad_sector() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     reader.always(
         108,
         ScriptStep::Err {
@@ -500,13 +548,17 @@ fn profile_05_single_bad_sector() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        finished: done,
+        trace_len,
+    } = run_profile(
         "05_single_bad",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
     // GOLDEN: 15 of 16 sectors recovered. 1 sector stays NonTrimmed
@@ -518,6 +570,7 @@ fn profile_05_single_bad_sector() {
     );
     assert_eq!(stats.bytes_unreadable, 0, "05_single_bad bytes_unreadable");
     assert_eq!(stats.bytes_pending, 2048, "05_single_bad bytes_pending");
+    assert_bad_lbas_not_finished("05_single_bad", &done, [108]);
     assert!(!pr.halted, "05_single_bad halted");
     assert!(
         trace_len <= 80,
@@ -532,7 +585,7 @@ fn profile_05_single_bad_sector() {
 #[test]
 fn profile_06_deep_pit() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     for lba in 108..116 {
         reader.always(
             lba,
@@ -551,26 +604,37 @@ fn profile_06_deep_pit() {
         (124 * 2048, (capacity_sectors as u64 - 124) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        finished: done,
+        trace_len,
+    } = run_profile(
         "06_deep_pit",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
-    // GOLDEN: 16 good (8 on each side of the pit) recovered, 8 bad
-    // stay NonTrimmed.
-    let recovered_in_range = stats.bytes_good - (capacity_sectors as u64 - 24) * 2048;
-    assert!(
-        recovered_in_range >= 14 * 2048,
-        "06_deep_pit recovered only {recovered_in_range} bytes of 16 good sectors"
+    // GOLDEN: exactly the 16 good (8 on each side of the pit) recovered, 8 bad
+    // never Finished, stay NonTrimmed.
+    let recovered_in_range = recovered_over_baseline(
+        "06_deep_pit",
+        stats.bytes_good,
+        capacity_sectors as u64 - 24,
     );
+    assert_eq!(
+        recovered_in_range,
+        16 * 2048,
+        "06_deep_pit must recover exactly the 16 good sectors"
+    );
+    assert_bad_lbas_not_finished("06_deep_pit", &done, 108..116);
     assert_eq!(stats.bytes_unreadable, 0, "06_deep_pit bytes_unreadable");
-    assert!(
-        stats.bytes_pending > 0,
-        "06_deep_pit bytes_pending expected > 0"
+    assert_eq!(
+        stats.bytes_good + stats.bytes_pending,
+        capacity_sectors as u64 * 2048,
+        "06_deep_pit conservation"
     );
     assert!(!pr.halted, "06_deep_pit halted");
     // Bounded as in profile 02: the pit's hard single sectors each get
@@ -589,7 +653,7 @@ fn profile_06_deep_pit() {
 #[test]
 fn profile_07_medium_then_good() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     // Sectors 105..110: fail twice, then succeed.
     for lba in 105..110 {
         reader.sequence(
@@ -616,13 +680,17 @@ fn profile_07_medium_then_good() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        trace_len,
+        ..
+    } = run_profile(
         "07_medium_then_good",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
     // GOLDEN: with script "fail, fail, ok" per bad sector, the handler
@@ -656,7 +724,7 @@ fn profile_07_medium_then_good() {
 #[test]
 fn profile_08_batch_fail_singles_ok() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     // Sector 108: fail on first call (which is the batch read), succeed
     // on second call (the drop-to-count=1 retry at the same position).
     reader.sequence(
@@ -677,13 +745,17 @@ fn profile_08_batch_fail_singles_ok() {
         (116 * 2048, (capacity_sectors as u64 - 116) * 2048),
     ];
 
-    let (pr, stats, trace_len) = run_profile(
+    let ProfileRun {
+        result: pr,
+        stats,
+        trace_len,
+        ..
+    } = run_profile(
         "08_batch_fail",
         capacity_sectors,
         &nontrimmed,
         &finished,
         reader,
-        trace,
     );
 
     // GOLDEN: the second attempt succeeds → all 16 sectors recovered.
@@ -704,14 +776,12 @@ fn profile_08_batch_fail_singles_ok() {
 // Patch a 256-sector disc with one unreadable sector at LBA 130 and report final map stats.
 fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats {
     let capacity_sectors: u32 = 256;
-    let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     reader.always(130, step);
 
     let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
     let disc = synthetic_disc(capacity_sectors);
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
     let nontrimmed = [(128 * 2048, 64 * 2048)];
     let finished = [
         (0, 128 * 2048),
@@ -724,10 +794,7 @@ fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats 
         .expect("patch must not error on a per-sector failure sense");
 
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
-    let stats = Mapfile::load(&map_path).unwrap().stats();
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
-    stats
+    Mapfile::load(&map_path).unwrap().stats()
 }
 
 /// A persistent sense that never clears must obey the pass contract: nothing
@@ -795,7 +862,7 @@ fn patch_not_ready_then_recovers_fully() {
     // NOT_READY (sense_key=0x02, asc=0x04) that clears after two attempts must
     // recover the sector in-pass — no residual loss, no Unreadable, no hang.
     let capacity_sectors: u32 = 256;
-    let (mut reader, _trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     reader.sequence(
         130,
         vec![
@@ -815,9 +882,7 @@ fn patch_not_ready_then_recovers_fully() {
 
     let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
     let disc = synthetic_disc(capacity_sectors);
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
     let nontrimmed = [(128 * 2048, 64 * 2048)];
     let finished = [
         (0, 128 * 2048),
@@ -844,8 +909,6 @@ fn patch_not_ready_then_recovers_fully() {
         capacity_sectors as u64 * 2048,
         "every sector recovers once NOT_READY clears"
     );
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
 }
 
 // ──────── Handler chain recovers re-readable sectors inside a bad block ────────
@@ -855,7 +918,7 @@ fn patch_not_ready_then_recovers_fully() {
 #[test]
 fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
     let capacity_sectors: u32 = 256;
-    let (mut reader, trace) = ScriptedSectorReader::new(capacity_sectors);
+    let mut reader = ScriptedSectorReader::new(capacity_sectors);
     // One bad sector at LBA 130 — inside the LOW 32-sector block of the range.
     reader.always(
         130,
@@ -868,9 +931,7 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
 
     let total_bytes = capacity_sectors as u64 * SECTOR_SIZE as u64;
     let disc = synthetic_disc(capacity_sectors);
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let (_dir, iso_path) = scratch_iso();
     // 64-sector NonTrimmed range [128,192); everything else already Finished.
     let nontrimmed = [(128 * 2048, 64 * 2048)];
     let finished = [
@@ -902,9 +963,4 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
         255 * 2048,
         "every sector except the one dead LBA is recovered"
     );
-
-    let _ = trace; // read trace retained by the fixture; no ordering assertion here
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(&map_path);
 }

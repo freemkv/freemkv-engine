@@ -1489,8 +1489,14 @@ fn mapfile_from_a_different_disc_is_refused() {
     };
     let r = freemkv_engine::copy(&disc_b, &mut reader, &iso_path, &opts);
     assert!(
-        r.is_err(),
-        "resuming disc A's mapfile against disc B must be refused, not spliced"
+        matches!(
+            r,
+            Err(libfreemkv::Error::MapfileInvalid {
+                kind: "disc-mismatch"
+            })
+        ),
+        "resuming disc A's mapfile against disc B must be refused as a disc mismatch, got {:?}",
+        r.err()
     );
 
     // The same guard must hold for a DIRECT patch() call: `patch` is half of
@@ -1499,8 +1505,14 @@ fn mapfile_from_a_different_disc_is_refused() {
     let patch_opts = freemkv_engine::PatchOptions::for_patch_pass(false, None, None);
     let r = freemkv_engine::patch(&disc_b, &mut reader, &iso_path, &patch_opts);
     assert!(
-        r.is_err(),
-        "patch() must refuse disc A's mapfile against disc B, exactly as copy() does"
+        matches!(
+            r,
+            Err(libfreemkv::Error::MapfileInvalid {
+                kind: "disc-mismatch"
+            })
+        ),
+        "patch() must refuse disc A's mapfile against disc B exactly as copy() does, got {:?}",
+        r.err()
     );
 }
 
