@@ -163,3 +163,16 @@ fn image_front_door_is_nameable() {
         (&o.keys, o.sources.as_ref(), o.prescanned)
     }
 }
+
+/// KU §4.1: a consumer computes and verifies a mapfile `vidfp` with the engine's one
+/// fingerprint, `SHA-256("freemkv-vid-fp-v1" ‖ VID)` (a fingerprint, never the VID). The
+/// vector is computed independently (Python `hashlib`).
+#[test]
+fn vid_fingerprint_is_public_and_pinned() {
+    let fp: [u8; 32] = freemkv_engine::vid_fingerprint(&[0x5A; 16]);
+    let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(
+        hex,
+        "298468a3589bccbcca31adc371cab3c0d1c7914c04a7036575476442ee849700"
+    );
+}
