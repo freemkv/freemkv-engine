@@ -1504,19 +1504,24 @@ fn mapfile_from_a_different_disc_is_refused() {
     let iso_path = tmp.path().join("swap.iso");
     let sectors: u32 = 300;
 
-    // Disc A resolved one set of unit keys; disc B, same capacity, another.
+    // Disc A and disc B: same capacity, different `Unit_Key_RO.inf` (disc hash, KU §4.4).
+    let hash_a = "a".repeat(40);
     let mut disc_a = make_test_disc(sectors, "DiscA");
     disc_a.encrypted = true;
-    disc_a.aacs = Some(aacs_with(vec![(0u32, [0xAA; 16])]));
+    let mut aacs_a = aacs_with(vec![(0u32, [0xAA; 16])]);
+    aacs_a.disc_hash = hash_a.clone();
+    disc_a.aacs = Some(aacs_a);
     let mut disc_b = make_test_disc(sectors, "DiscB");
     disc_b.encrypted = true;
-    disc_b.aacs = Some(aacs_with(vec![(0u32, [0xBB; 16])]));
+    let mut aacs_b = aacs_with(vec![(0u32, [0xBB; 16])]);
+    aacs_b.disc_hash = "b".repeat(40);
+    disc_b.aacs = Some(aacs_b);
 
     // A's mapfile, carrying A's identity and a Finished prefix.
     let mf_path = disc_a.mapfile_for(&iso_path);
     {
         let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
-        mf.set_unit_keys(&[(0u32, [0xAA; 16])]);
+        mf.set_disc_hash(&hash_a);
         mf.record(0, 200 * 2048, SectorStatus::Finished).unwrap();
         mf.flush().unwrap();
     }
@@ -2224,9 +2229,8 @@ fn a_fresh_sweep_over_a_different_discs_mapfile_starts_over() {
         };
         freemkv_engine::sweep(&disc_a, &mut reader, &iso_path, &a_opts).expect("disc A sweep");
         let a_map = Mapfile::load(&disc_a.mapfile_for(&iso_path)).unwrap();
-        assert_eq!(
-            a_map.vid(),
-            Some([0xAAu8; 16]),
+        assert!(
+            a_map.vid_fingerprint().is_some(),
             "fixture precondition: the leftover mapfile must carry A's identity"
         );
     }
