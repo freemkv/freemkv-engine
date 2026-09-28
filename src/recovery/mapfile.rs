@@ -834,8 +834,9 @@ fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
 }
 
 /// `SHA-256("freemkv-vid-fp-v1" ‖ VID)`: the only form of a Volume ID a mapfile may hold
-/// (KU §4.1); equal to libfreemkv's `ResolvedKeySet::vid_fingerprint`.
-pub(crate) fn vid_fingerprint(vid: &[u8; 16]) -> [u8; 32] {
+/// (KU §4.1, `# freemkv-vidfp:`); equal to libfreemkv's `ResolvedKeySet::vid_fingerprint`.
+/// A fingerprint to compute or verify a `vidfp` with; the VID never leaves memory.
+pub fn vid_fingerprint(vid: &[u8; 16]) -> [u8; 32] {
     sha256(b"freemkv-vid-fp-v1", vid)
 }
 
