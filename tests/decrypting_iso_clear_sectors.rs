@@ -24,8 +24,9 @@ const SECOND_KEY: [u8; 16] = [0x33; 16];
 const FOREIGN_KEY: [u8; 16] = [0x77; 16];
 
 /// The plaintext of every encrypted content unit: zeroes but for a TS sync byte
-/// at offset 4 of each 192-byte BD-TS packet, plus the CPI bits on byte 0 (which
-/// decryption never rewrites, so the unit still reads as "flagged encrypted").
+/// at offset 4 of each 192-byte BD-TS packet, plus CPI 11₂ on packet 0, flagged
+/// before `encrypt_unit`. Decryption may clear that CPI (KU §5.4), so a decrypted
+/// image is compared CPI-masked ([`cpi_masked_eq`]).
 fn clear_content_unit() -> Vec<u8> {
     let mut unit = vec![0u8; libfreemkv::aacs::content::ALIGNED_UNIT_LEN];
     let mut off = 4;
@@ -124,6 +125,8 @@ struct Fixture {
     source: Vec<u8>,
     expected: Vec<u8>,
     files: Vec<(u32, u32)>,
+    /// Start LBAs of the units a correct read yields as plaintext.
+    decrypted_units: Vec<u32>,
 }
 
 impl Fixture {
@@ -150,8 +153,30 @@ impl Fixture {
             self.source[at..at + unit_len].copy_from_slice(&enc);
             let out = if decrypts { clear_content_unit() } else { enc };
             self.expected[at..at + unit_len].copy_from_slice(&out);
+            if decrypts {
+                self.decrypted_units.push(start + u * UNIT_SECTORS);
+            }
         }
     }
+}
+
+/// `got == fx.expected` except the CPI bits of each decrypted unit's source packets.
+/// Per spec; do not change without a spec citation proving otherwise.
+fn cpi_masked_eq(fx: &Fixture, got: &[u8]) -> bool {
+    // KS-6 AACS BD §3.10.2 Table 3-34: "TP_extra_header { Copy_permission_indicator 2
+    // uimsbf Arrival_time_stamp 30 uimsbf }": mask only the 2 CPI bits (byte0 & 0x3F).
+    let mask = |img: &[u8]| {
+        let mut img = img.to_vec();
+        for &lba in &fx.decrypted_units {
+            let at = lba as usize * SECTOR;
+            let end = (at + libfreemkv::aacs::content::ALIGNED_UNIT_LEN).min(img.len());
+            for off in (at..end).step_by(192) {
+                img[off] &= 0x3F;
+            }
+        }
+        img
+    };
+    got.len() == fx.expected.len() && mask(got) == mask(&fx.expected)
 }
 
 /// Lay `paths` (each `FILE_SECTORS` long, 1 sector for `*.bdmv`) out as a UDF image.
@@ -199,6 +224,7 @@ fn tree(paths: &[&str]) -> Fixture {
         expected: source.clone(),
         source,
         files,
+        decrypted_units: Vec::new(),
     }
 }
 
@@ -303,8 +329,8 @@ fn assert_sweeps_to_expected(fx: &Fixture, d: &Disc) {
     let result = r.unwrap_or_else(|e| panic!("the disc must sweep, got {e}"));
     assert_eq!(result.bytes_good, fx.source.len() as u64);
     assert!(
-        std::fs::read(&iso).unwrap() == fx.expected,
-        "the ISO must equal the decrypted image exactly"
+        cpi_masked_eq(fx, &std::fs::read(&iso).unwrap()),
+        "the ISO must equal the decrypted image exactly (CPI-masked)"
     );
 }
 
@@ -319,6 +345,52 @@ fn assert_refused_before_output(
     assert!(
         !freemkv_engine::mapfile_path_for(iso).exists(),
         "refusal must precede creating the mapfile"
+    );
+}
+
+/// The mask hides only the CPI bits of decrypted units' packets: a cleared CPI still
+/// matches, but an ATS bit, a payload byte, or the #55 clear unit's CPI does not.
+/// Per spec; do not change without a spec citation proving otherwise.
+#[test]
+fn the_cpi_mask_ignores_only_the_cpi_bits_of_decrypted_units() {
+    let fx = bd(None);
+    let unit = fx.decrypted_units[3] as usize * SECTOR;
+    assert_eq!(
+        fx.decrypted_units.len(),
+        (FILE_SECTORS / UNIT_SECTORS) as usize
+    );
+    // KS-5 AACS BD §3.10.2: "… or shall be set to 00₂ if the data is not encrypted".
+    let mut cleared = fx.expected.clone();
+    cleared[unit] &= 0x3F;
+    cleared[unit + 31 * 192] |= 0xC0;
+    assert!(
+        cpi_masked_eq(&fx, &cleared),
+        "CPI-only differences are masked"
+    );
+    let poisoned = POISONED_UNIT_LBA as usize * SECTOR;
+    let (orphan, pkt) = (fx.files[ORPHAN].0 as usize * SECTOR, unit + 192);
+    for (at, bit) in [
+        (pkt, 0x20),
+        (pkt + 1, 0x01),
+        (pkt + 4, 0x01),
+        (poisoned, 0xC0),
+    ] {
+        let mut other = fx.expected.clone();
+        other[at] ^= bit;
+        assert!(
+            !cpi_masked_eq(&fx, &other),
+            "byte {at} bit {bit:#x} must count"
+        );
+    }
+    let mut clear_file = fx.expected.clone();
+    clear_file[orphan] |= 0xC0;
+    assert!(
+        !cpi_masked_eq(&fx, &clear_file),
+        "a unit left clear stays exact"
+    );
+    assert!(
+        !cpi_masked_eq(&fx, &fx.expected[..SECTOR]),
+        "length must count"
     );
 }
 
@@ -633,8 +705,8 @@ fn assert_patches_to_expected(fx: &Fixture, d: &Disc, bad: &[(u32, u32)]) {
         .unwrap_or_else(|e| panic!("the disc must patch, got {e}"));
     assert_eq!(out.bytes_pending, 0, "every bad range must be recovered");
     assert!(
-        std::fs::read(&iso).unwrap() == fx.expected,
-        "the patched ISO must equal the decrypted image exactly"
+        cpi_masked_eq(fx, &std::fs::read(&iso).unwrap()),
+        "the patched ISO must equal the decrypted image exactly (CPI-masked)"
     );
 }
 
