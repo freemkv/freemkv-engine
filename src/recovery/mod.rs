@@ -118,6 +118,9 @@ pub fn copy(
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". One the drive's bus map could not locate would land here still encrypted.
+    libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
     // A zero-capacity disc (READ CAPACITY failed during scan, swallowed to 0) drives
     // every resume/complete decision below off `capacity_bytes == 0` and writes a
     // 0-byte ISO reported as done. Reject it here, before dispatch, as `Error::EmptyImage`.
@@ -623,6 +626,9 @@ pub fn sweep(
     // direct `sweep` caller can't bypass it: a decrypting sweep of an encrypted
     // disc with no usable key would write ciphertext at exit 0. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". One the drive's bus map could not locate would land here still encrypted.
+    libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
 
     // A zero-capacity disc would size the read domain at 0 and write a 0-byte
     // ISO reported as complete; `image_read_sectors` turns it into an

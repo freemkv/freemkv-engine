@@ -1198,6 +1198,9 @@ pub fn patch(
     // direct `patch` caller can't bypass it): a decrypting pass with no usable
     // key would write ciphertext into recovered ranges. No-op for `--raw`.
     crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
+    // stream file". One the drive's bus map could not locate would land here still encrypted.
+    libfreemkv::sector::bus_removal::ensure_image_debussable(reader)?;
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
