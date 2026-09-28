@@ -541,7 +541,15 @@ fn land_verified(
     let replaced = target_present(&job.target)?;
     std::fs::rename(&partial, &job.target)?;
     guard.1 = true;
-    sync_parent(rio, &job.target, halt)?;
+    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`": the rename
+    // committed, so a Stop during the folder sync cuts only the sync short (§4.4).
+    match sync_parent(rio, &job.target, halt) {
+        Err(e) if libfreemkv::is_halt(&e) => sink.log(
+            Level::Warn,
+            "stopped during the folder sync after the target was replaced; the rename may not be durable yet",
+        ),
+        r => r?,
+    }
     if replaced {
         sink.event(&Event::Replaced { path: &job.target });
     }
