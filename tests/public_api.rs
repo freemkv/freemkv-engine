@@ -77,3 +77,32 @@ fn forced_subtitle_selection_is_nameable_and_constructible() {
     ) -> Result<freemkv_engine::StreamSelection, freemkv_engine::StreamSelError> =
         freemkv_engine::resolve_stream_selection_forced;
 }
+
+// KU-E0, keys-upfront-design §8.2: "`Default` for `SweepOptions`, `PatchOptions`".
+// Per spec; do not change without a spec citation proving otherwise. It is the
+// `..Default` prep ST-E1 and the library server (§12.1) build their literals on.
+#[test]
+fn sweep_and_patch_options_are_default() {
+    fn _is_default<T: Default>() {}
+    _is_default::<freemkv_engine::SweepOptions<'static>>();
+    _is_default::<freemkv_engine::PatchOptions<'static>>();
+
+    // The §12.1 raw-sweep shape, minus `keys` (a KU-E1 field): a default names
+    // nothing to decrypt, resume, or persist. Keys are memory only (§2.1).
+    let s = freemkv_engine::SweepOptions {
+        decrypt: false,
+        ..Default::default()
+    };
+    assert!(!s.decrypt && !s.resume && !s.skip_on_error);
+    assert!(s.batch_sectors.is_none());
+    assert!(s.progress.is_none() && s.halt.is_none());
+    assert!(s.vid.is_none() && s.unit_keys.is_empty() && s.key_fetch.is_none());
+
+    let p = freemkv_engine::PatchOptions {
+        decrypt: false,
+        ..Default::default()
+    };
+    assert!(!p.decrypt && !p.full_recovery && !p.reverse);
+    assert!(p.block_sectors.is_none() && p.wedged_threshold == 0);
+    assert!(p.progress.is_none() && p.halt.is_none() && p.key_fetch.is_none());
+}

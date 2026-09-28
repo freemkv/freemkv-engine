@@ -1269,6 +1269,8 @@ impl CopyResult {
 ///
 /// Named `Disc::sweep` before 1.6.0, when recovery moved out of libfreemkv
 /// and the receiver became a `&Disc` argument.
+// KU-E0 (keys-upfront-design §8.2): "`Default` for `SweepOptions`, `PatchOptions`".
+#[derive(Default)]
 pub struct SweepOptions<'a> {
     pub decrypt: bool,
     pub resume: bool,
@@ -1288,6 +1290,8 @@ pub struct SweepOptions<'a> {
 }
 
 /// Options for [`patch()`] (Pass N retry pass over bad ranges).
+// KU-E0 (keys-upfront-design §8.2): "`Default` for `SweepOptions`, `PatchOptions`".
+#[derive(Default)]
 pub struct PatchOptions<'a> {
     pub decrypt: bool,
     /// Labels the reported [`PassKind`](libfreemkv::progress::PassKind) only
