@@ -492,5 +492,13 @@ mod tests {
             Option<libfreemkv::DriveCredentials>,
             bool,
         ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = crate::mux::open_scan;
+        type OpenScanWith = fn(
+            libfreemkv::DeviceTarget,
+            Option<libfreemkv::DriveCredentials>,
+            bool,
+            &libfreemkv::Halt,
+            &libfreemkv::halt::Progress,
+        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error>;
+        let _: OpenScanWith = crate::mux::open_scan_with;
     }
 }

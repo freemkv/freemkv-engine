@@ -544,13 +544,37 @@ pub fn open_scan(
     credentials: Option<libfreemkv::DriveCredentials>,
     raw_copy: bool,
 ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
-    let session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
+    let (halt, progress) = (libfreemkv::Halt::new(), libfreemkv::halt::Progress::new());
+    open_scan_with(target, credentials, raw_copy, &halt, &progress)
+}
+
+/// [`open_scan`] under an open's token (stop design v5 §4.3, "The open token"): `halt`
+/// ends the bring-up and the scan `Halted`, and the drive bumps `progress` per CDB and
+/// holds it `busy()` while one is in flight (T29). A Stop leaves the tray unlocked.
+pub fn open_scan_with(
+    target: libfreemkv::DeviceTarget,
+    credentials: Option<libfreemkv::DriveCredentials>,
+    raw_copy: bool,
+    halt: &libfreemkv::Halt,
+    progress: &libfreemkv::halt::Progress,
+) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
+    let mut session = libfreemkv::DiscSession::open_with(target, build_keyspec(credentials), halt)?;
+    session.attach_progress(progress);
+    let opts = scan_options_with(raw_copy, halt);
     scan_then_lock(
         session,
-        |session| session.scan(scan_options(raw_copy)).map(drop),
+        |session| session.scan_with(opts).map(drop),
         // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
         libfreemkv::DiscSession::lock_tray,
     )
+}
+
+// `scan_options` under the open's token (the `ScanOptions.halt` alias of `open_with`'s).
+fn scan_options_with(raw_copy: bool, halt: &libfreemkv::Halt) -> libfreemkv::ScanOptions {
+    libfreemkv::ScanOptions {
+        halt: Some(halt.clone()),
+        ..scan_options(raw_copy)
+    }
 }
 
 // Stop design v5 §4.2: `open_scan` "locks the tray after the scan (ET9)", so a scan that
@@ -777,7 +801,8 @@ mod tests {
             src[start..end].to_string()
         };
         assert!(
-            body("pub fn open_scan(").contains("session.scan(scan_options(raw_copy))"),
+            body("pub fn open_scan_with(").contains("scan_options_with(raw_copy, halt)")
+                && scan_options_with(true, &libfreemkv::Halt::new()).raw_copy,
             "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
         );
@@ -816,7 +841,7 @@ mod tests {
         assert_eq!(*steps.borrow(), ["scan", "lock"]);
         // `open_scan` needs a live drive: pin that it goes through the ordered helper.
         let src = include_str!("mux.rs").replace("\r\n", "\n");
-        let start = src.find("pub fn open_scan(").unwrap();
+        let start = src.find("pub fn open_scan_with(").unwrap();
         let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
         assert!(body.contains("scan_then_lock(") && !body.contains("session.lock_tray()"));
     }
