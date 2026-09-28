@@ -215,7 +215,7 @@ pub struct Mapfile {
     /// [`vid_fingerprint`] of the disc's Volume ID, `# freemkv-vidfp:`. The raw VID is
     /// never held or written (KU J6: memory only; it derives the keys, KS-16).
     vidfp: Option<[u8; 32]>,
-    /// [`key_fingerprint`]s of the keys a pre-1.8 mapfile stored (`# freemkv-uk:`), kept as
+    /// [`key_fingerprint`]s of the keys a pre-1.8 mapfile stored in its legacy key lines, kept as
     /// `# freemkv-legacy-keyfp:` so an old capture keeps an identity (KU §4.1, decision b).
     legacy_keyfps: Vec<[u8; 8]>,
     /// Byte ranges a SCOPED (MKV-staging) image was read over, persisted as a
@@ -858,7 +858,7 @@ struct LegacyIdentity {
     keyfps: Vec<[u8; 8]>,
 }
 
-/// THE read-only parser of the pre-1.8 `# freemkv-uk:` / `# freemkv-vid:` lines (KU §2.2
+/// THE read-only parser of the pre-1.8 key and raw-VID comment lines (KU §2.2
 /// allow-path, §4.1): a key becomes its [`key_fingerprint`] (base keys only; a malformed
 /// line is dropped, never failing the load) and a raw VID its [`vid_fingerprint`] (a
 /// malformed VID still fails the load: it named a disc). Nothing raw is kept.
@@ -883,13 +883,12 @@ fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result
 // else corruption here would re-open the cross-disc resume splice.
 fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
-    // byte-based so a multi-byte `# freemkv-vid:` comment rejects, never panics).
+    // byte-based so a multi-byte legacy VID comment rejects, never panics).
     libfreemkv::hex::parse_hex_fixed::<16>(s)
 }
 
-/// Parse a `# freemkv-uk:` value `<cps>:<32hex>` into `(cps_unit, key)`.
-/// Returns `None` on any malformation; `load()` treats that as fatal, for the
-/// same reason as [`parse_vid_hex`].
+/// Parse a legacy key line's value `<cps>:<32hex>` into `(cps_unit, key)`; `None` on any
+/// malformation, which [`parse_legacy_key_lines`] drops (KU §4.1).
 fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let (cps, hex) = s.split_once(':')?;
     let cps: u32 = cps.trim().parse().ok()?;
