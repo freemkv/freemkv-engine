@@ -68,6 +68,7 @@ fn opts(skip_on_error: bool) -> SweepOptions<'static> {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 

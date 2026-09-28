@@ -316,6 +316,12 @@ const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 /// `for_sweep`), since patch's job is to converge on bad sub-zones.
 pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 
+// Damage classifications on this thread (EK11: an on-arrival side read never lands here).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CLASSIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// THE single error-handling entry point. Updates `ctx`, returns the
 /// action the caller must apply.
 ///
@@ -328,6 +334,8 @@ pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     if super::is_key_stop(err) {
         return ReadAction::AbortPass;
     }
+    #[cfg(test)]
+    CLASSIFIED.with(|c| c.set(c.get() + 1));
     ctx.consecutive_failures += 1;
     ctx.consecutive_good = 0;
     ctx.consecutive_outer_failures += 1;

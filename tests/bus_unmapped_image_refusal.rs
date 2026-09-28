@@ -82,6 +82,7 @@ fn sweep_opts() -> SweepOptions<'static> {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 

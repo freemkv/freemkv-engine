@@ -144,6 +144,7 @@ fn sweep_to_dev_null_no_enodev() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .expect("a multipass copy over bad sectors is a reported result, not an Err");
@@ -188,6 +189,7 @@ fn copy_decrypting_aacs_no_key_errors_and_writes_nothing() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let err = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .expect_err("decrypting copy of AACS-no-key disc must error pre-flight");
@@ -229,6 +231,7 @@ fn copy_raw_aacs_no_key_proceeds() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .expect("--raw copy of an encrypted disc must proceed (the encrypted image is the goal)");
@@ -268,6 +271,7 @@ fn sweep_to_dev_null_real() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
         .expect("sweep to /dev/null must not fail with ENODEV");
@@ -315,6 +319,7 @@ fn sweep_marks_bad_region_nontrimmed_and_engages_damage_jump() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
 
@@ -417,6 +422,7 @@ fn sweep_resume_downgrades_on_size_mismatch() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     freemkv_engine::sweep(&small_disc, &mut small_reader, &iso_path, &opts0)
         .expect("initial small sweep");
@@ -486,6 +492,7 @@ fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts0).expect("initial clean sweep");
     let mf = disc.mapfile_for(&iso_path);
@@ -581,6 +588,7 @@ fn sweep_resume_downgrades_on_corrupt_mapfile() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
         .expect("resume sweep on corrupt mapfile");
@@ -633,6 +641,7 @@ fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts);
     assert!(
@@ -672,6 +681,7 @@ fn sweep_dev_null_full_good() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts);
     assert!(
@@ -758,6 +768,7 @@ fn resume_sweeps_nontried_tail_even_with_retryable_present() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
     assert!(result.is_ok(), "resume copy failed: {:?}", result.err());
@@ -853,6 +864,7 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
     assert!(
@@ -906,6 +918,7 @@ fn patch_dev_null_after_sweep() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let sweep_result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &sweep_opts);
     assert!(
@@ -927,6 +940,7 @@ fn patch_dev_null_after_sweep() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let patch_result = freemkv_engine::copy(&disc, &mut reader2, &iso_path, &patch_opts);
     assert!(
@@ -967,6 +981,7 @@ fn patch_dev_null_direct() {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     };
 
     // Pass 1: three dead sectors, so the sweep leaves real damage behind.
@@ -1030,6 +1045,7 @@ fn sweep_pipeline_full_good_100_batches() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
     let r = result.expect("100-batch clean sweep should succeed");
@@ -1094,6 +1110,7 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
         unit_keys: Vec::new(),
 
         key_fetch: None,
+        keys: None,
     };
 
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
@@ -1579,6 +1596,7 @@ fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     };
 
     let err = freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts)
@@ -1644,6 +1662,7 @@ fn a_resume_does_not_truncate_the_already_recovered_prefix() {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     };
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("resume sweep");
 
@@ -1784,6 +1803,7 @@ fn plain_sweep_opts(resume: bool, skip_on_error: bool) -> SweepOptions<'static> 
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 
@@ -1796,6 +1816,7 @@ fn multipass_copy_opts() -> CopyOptions<'static> {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 

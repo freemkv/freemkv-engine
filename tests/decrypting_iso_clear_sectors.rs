@@ -306,6 +306,7 @@ fn sweep_opts<'a>() -> SweepOptions<'a> {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 

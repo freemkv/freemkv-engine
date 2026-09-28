@@ -125,22 +125,28 @@ fn side_read_failures_never_reach_the_damage_classifier() {
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("disc.iso");
     CLASSIFIED.with(|c| c.set(0));
-    let r = super::sweep(&fx.disc, &mut drive.clone(), &iso, &sweep_opts(Some(set)));
+    let opts = sweep_opts(Some(set.clone()));
+    let r = super::sweep(&fx.disc, &mut drive.clone(), &iso, &opts);
     let r = r.expect("a readable unit is never a read error");
     assert!(r.complete, "nothing withheld");
+    assert_eq!(
+        set.proof_cache().len(),
+        1,
+        "proven on arrival despite dead side reads"
+    );
     assert_eq!(CLASSIFIED.with(|c| c.get()), 0, "no damage classification");
     assert_image_is_plain(&fx, &iso, 1);
 }
 
 /// EK10 (KU §2.4, KS-1 "encryption is applied to every Aligned Unit in the file", KS-7):
-/// pass 1 reads one unit of a Lazy piece whose neighbours are dead → decrypted on a
-/// provisional one-unit proof, never `NonTrimmed`; pass 2 recovers the rest and confirms
-/// the proof from the set's `ProofCache`.
+/// pass 1 reads the first unit of a Lazy piece whose every neighbour is dead → decrypted
+/// on a provisional one-unit proof, never `NonTrimmed`; pass 2 recovers the rest and
+/// confirms the proof from the set's `ProofCache`.
 #[test]
 fn decrypting_copy_patch_pass_proves_lazy_piece() {
     let (fx, drive, set) = lazy_fixture();
     let (s, n) = fx.clip(1);
-    let u = s + 5 * 3;
+    let u = s;
     drive.set(Damage::RangeExcept(s, s + n, u, u + 3));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("disc.iso");

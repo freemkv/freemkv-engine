@@ -133,10 +133,17 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         reasons.push(Reason::new("multipass-requires-raw"));
     }
 
-    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key.
-    // Delegate to `resolve_keys` — the ONE place that judges it — so preflight
-    // can't disagree with the key-status report (unlike a bare `aacs.is_some()`).
-    if disc.encrypted && !job.raw && !crate::resolve::resolve_keys(disc).resolved {
+    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key. The rip's key
+    // set decides (KU §3.5); without one, `resolve_keys` over the disc-banked keys, so
+    // preflight can't disagree with the key-status report.
+    let keyed = match &job.keys {
+        Some(set) => matches!(
+            crate::keys::key_status(disc, set),
+            libfreemkv::keys::DecryptStatus::Ready | libfreemkv::keys::DecryptStatus::NotEncrypted
+        ),
+        None => crate::resolve::resolve_keys(disc).resolved,
+    };
+    if disc.encrypted && !job.raw && !keyed {
         reasons.push(Reason::new("encrypted-no-key"));
     }
 

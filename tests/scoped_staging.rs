@@ -97,6 +97,7 @@ fn sweep_opts(resume: bool) -> SweepOptions<'static> {
         vid: None,
         unit_keys: Vec::new(),
         key_fetch: None,
+        keys: None,
     }
 }
 

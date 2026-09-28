@@ -594,6 +594,7 @@ fn multipass_rip_inner(
             vid,
             unit_keys,
             key_fetch: None,
+            keys: job.keys.clone(),
         };
         let cr = match scope {
             // A scoped single pass resumes its own staging; `copy` is the iso:// path.
@@ -608,6 +609,7 @@ fn multipass_rip_inner(
                     vid,
                     unit_keys: copy_opts.unit_keys.clone(),
                     key_fetch: None,
+                    keys: copy_opts.keys.clone(),
                 };
                 crate::recovery::sweep_scoped(disc, reader, iso_path, &sweep_opts, scope)?
             }
@@ -659,6 +661,7 @@ fn multipass_rip_inner(
             vid,
             unit_keys: unit_keys.clone(),
             key_fetch: None,
+            keys: job.keys.clone(),
         };
         let sr = match scope {
             Some(scope) => {

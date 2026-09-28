@@ -1200,7 +1200,7 @@ pub fn patch(
     // Pre-flight decrypt gate (also enforced in `copy`; re-checked here so a
     // direct `patch` caller can't bypass it): a decrypting pass with no usable
     // key would write ciphertext into recovered ranges. No-op for `--raw`.
-    crate::resolve::ensure_decryptable_strict(disc, !opts.decrypt)?;
+    crate::resolve::ensure_decryptable_with(disc, !opts.decrypt, opts.keys.as_ref())?;
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
@@ -1214,7 +1214,8 @@ pub fn patch(
     // Same reasoning as the decrypt gate: `copy`/`sweep` verify the mapfile
     // describes THIS disc, and `patch` must not skip that — otherwise a leftover
     // mapfile from disc B patches its ranges into disc A's ISO as "Finished".
-    mapfile::check_mapfile_identity(&map, disc, None).map_err(|e| Error::IoError { source: e })?;
+    mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
+        .map_err(|e| Error::IoError { source: e })?;
     // COVERAGE. `total_bytes` (the denominator every reported figure derives
     // from) comes wholly from the untrusted mapfile, never checked against the
     // drive. `copy` forces a fresh sweep on mismatch; `patch` refuses instead.
@@ -1263,6 +1264,7 @@ pub fn patch(
         opts.decrypt,
         opts.halt.as_ref(),
         opts.key_fetch.as_ref(),
+        opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
 
