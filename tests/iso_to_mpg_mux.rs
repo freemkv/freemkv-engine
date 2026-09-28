@@ -214,15 +214,34 @@ fn iso_dvd_source_muxes_to_mpg_through_the_engine() {
     let source_url = format!("iso://{}", iso_path.display());
     let dest_url = format!("mpg://{}", mpg_path.display());
     let mux_opts = freemkv_engine::mux_options(false);
+    // D4: the output opening reaches the front end's Sink, where both shells print the note.
+    #[derive(Default)]
+    struct Opened(std::sync::Mutex<Vec<(String, usize)>>);
+    impl freemkv_engine::Sink for Opened {
+        fn event(&self, e: &freemkv_engine::Event<'_>) {
+            if let freemkv_engine::Event::OutputOpened { dest, title } = e {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((dest.to_string(), title.streams.len()));
+            }
+        }
+    }
+    let sink = Opened::default();
     let outcome = freemkv_engine::mux_title(
         &source_url,
         &dest_url,
         InputOptions::default(),
         &mux_opts,
         0,
-        &freemkv_engine::NoopSink,
+        &sink,
     )
     .unwrap_or_else(|e| panic!("iso:// -> mpg:// mux must succeed, got {e}"));
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec![(dest_url.clone(), 2)],
+        "one OutputOpened, with the dest and the title as written"
+    );
 
     assert!(outcome.completed, "the mux job must complete");
     assert_eq!(outcome.streams, 2, "one video + one audio stream");
