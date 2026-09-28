@@ -177,6 +177,7 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
         vid,
         halt,
     } = opts;
+    let sidecar = load_sidecar(src)?;
     let prescanned = disc.is_some();
     let (disc, mut reader) = match disc {
         Some(disc) => {
@@ -186,7 +187,6 @@ pub fn open_image_with(src: &ImageSource, opts: OpenImageOptions) -> crate::Resu
         }
         None => scan_image(src)?,
     };
-    let sidecar = load_sidecar(src);
     let scope = scope.unwrap_or_else(|| {
         KeyScope::Titles(crate::resolve_selection(
             &disc,
@@ -277,7 +277,7 @@ impl OpenedImage {
             None,
             halt,
         );
-        let sidecar = load_sidecar(&self.source);
+        let sidecar = load_sidecar(&self.source)?;
         let keys = r
             .map_err(|e| vid_needs_disc(e, vid_in_hand, sidecar.as_ref()))?
             .keys;
@@ -341,15 +341,19 @@ fn intact(inf: &[u8]) -> bool {
     !inf.is_empty() && inf.chunks(2048).all(|c| c.iter().any(|&b| b != 0))
 }
 
-// The image's sidecar mapfile, read-only; an unreadable one is not an identity.
-fn load_sidecar(src: &ImageSource) -> Option<Mapfile> {
+// The image's sidecar mapfile, read-only. Absent is no identity; one that exists but does
+// not load is refused (MapfileInvalid), never taken for "no identity" (judgement 6).
+fn load_sidecar(src: &ImageSource) -> crate::Result<Option<Mapfile>> {
     let path = crate::mapfile_path_for(src.path());
     match Mapfile::load(&path) {
-        Ok(map) => Some(map),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(map) => Ok(Some(map)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "sidecar mapfile unreadable");
-            None
+            Err(match Error::from(e) {
+                invalid @ Error::MapfileInvalid { .. } => invalid,
+                _ => Error::MapfileInvalid { kind: "sidecar" },
+            })
         }
     }
 }
