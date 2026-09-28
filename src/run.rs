@@ -27,12 +27,13 @@ pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
 }
 
 // Sets `done` on every exit path, including a panic unwind, since a plain `store(true)` placed
-// after the call is skipped by an unwind and the join would hang forever.
+// after the call is skipped by an unwind and the join would hang forever. Release: a watcher
+// that Acquire-loads `true` sees everything the work sent before it returned.
 pub(crate) struct SignalDone<'a>(pub(crate) &'a std::sync::atomic::AtomicBool);
 
 impl Drop for SignalDone<'_> {
     fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -58,7 +59,7 @@ pub(crate) fn with_cancel_watcher<T>(
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
         s.spawn(move || {
-            while !watcher_done.load(Ordering::Relaxed) {
+            while !watcher_done.load(Ordering::Acquire) {
                 if sink.should_cancel() {
                     watcher_halt.store(true, Ordering::Relaxed);
                     return;

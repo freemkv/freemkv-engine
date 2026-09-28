@@ -2298,6 +2298,7 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
         // the pack start code plus the flag bits — byte 0x14 alone isn't
         // sufficient to authorise descrambling in an IFO or UDF sector.
         s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
+        s[4] = 0x44; // '01': a 13818-1 pack (an 11172-1 pack cannot be CSS)
         // Bits 4-5 of the sub-header byte are the CSS scramble flag.
         s[0x14] &= !0x30;
         if scrambled {

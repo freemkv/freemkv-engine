@@ -501,6 +501,7 @@ mod tests {
                 Event::TitleDone { idx, result, .. } => format!("done:{idx}:{}", result.is_ok()),
                 Event::Verify { ok, .. } => format!("verify:{ok}"),
                 Event::Replaced { .. } => "replaced".into(),
+                Event::OutputOpened { .. } => "opened".into(),
             };
             self.0.lock().unwrap().push(s);
         }
