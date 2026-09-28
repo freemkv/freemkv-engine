@@ -334,6 +334,32 @@ impl OpenedImage {
     }
 }
 
+#[cfg(test)]
+impl OpenedImage {
+    // An opened `iso` over `disc` holding `keys`, as `open_image_with` builds it (tests of
+    // states a file image cannot produce, e.g. forensic keys left Pending at the drive).
+    pub(crate) fn for_test(
+        iso: &Path,
+        disc: libfreemkv::Disc,
+        keys: ResolvedKeySet,
+        sources: Option<KeySourceFactory>,
+        titles: Vec<usize>,
+    ) -> Self {
+        let _ = &titles;
+        OpenedImage {
+            source: ImageSource::Iso(iso.to_path_buf()),
+            disc,
+            reader: raw_reader(&ImageSource::Iso(iso.to_path_buf())).unwrap(),
+            top_up: std::sync::Mutex::new((keys.clone(), false)),
+            keys,
+            sources,
+            prescanned: true,
+            trace: Default::default(),
+            won: None,
+        }
+    }
+}
+
 // A raw reader over the image, for a caller-scanned disc (no scan).
 fn raw_reader(src: &ImageSource) -> crate::Result<Box<dyn libfreemkv::SectorSource>> {
     Ok(match src {

@@ -893,3 +893,116 @@ fn the_front_doors_return_the_trace_on_a_refusal() {
     let (r, trace) = crate::open_image_with_traced(&src, OpenImageOptions::resolve(f));
     assert_eq!(r.unwrap().trace, trace);
 }
+
+// Online and keydb calls so far.
+fn who_counts(calls: &Calls) -> (usize, usize) {
+    let all = calls.all();
+    let n = |w: &str| all.iter().filter(|c| c.who == w).count();
+    (n("keydb"), n("online"))
+}
+
+// The code each `TitleDone(Err)` carried, in order.
+#[derive(Default)]
+struct DoneCodes(std::sync::Mutex<Vec<Option<u16>>>);
+impl crate::Sink for DoneCodes {
+    fn event(&self, e: &crate::Event<'_>) {
+        if let crate::Event::TitleDone { result: Err(e), .. } = e {
+            self.0.lock().unwrap().push(crate::error_code(e));
+        }
+    }
+}
+
+/// B1: a first top-up whose request failed (E7028) spends the ask, and a later uncovered
+/// title re-raises THAT failure instead of E7022, which would claim every source answered.
+#[test]
+fn a_failed_top_up_is_remembered_not_reported_as_no_key() {
+    let fx = bd_image(&[Some(K1), Some(K2), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let calls = Calls::default();
+    let f = factory(
+        &[(Answer::Keydb, &[K1]), (Answer::Unavailable, &[])],
+        &calls,
+    );
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    let plan = |t: usize| MuxPlan::new(vec![t]);
+    let sink = DoneCodes::default();
+    mux_image_titles(&opened, &plan(1), &mkv_dest(dir.path()), &sink);
+    let asked = calls.len();
+    mux_image_titles(&opened, &plan(2), &mkv_dest(dir.path()), &sink);
+    let e7028 = Some(libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE);
+    assert_eq!(*sink.0.lock().unwrap(), [e7028, e7028], "not E7022");
+    assert_eq!(calls.len(), asked, "the ask was spent: not asked again");
+}
+
+/// B1: a top-up that made no request (a Stop before it, or an image that would not open)
+/// has not spent the ask: the next call asks and succeeds.
+#[test]
+fn a_top_up_that_made_no_request_is_not_spent() {
+    struct Stopped;
+    impl crate::Sink for Stopped {
+        fn should_cancel(&self) -> bool {
+            true
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    let calls = Calls::default();
+    let f = factory(
+        &[(Answer::Keydb, &[K1]), (Answer::Online, &[K1, K2])],
+        &calls,
+    );
+    let opened =
+        open_image_with(&ImageSource::Iso(iso.clone()), OpenImageOptions::resolve(f)).unwrap();
+    let plan = MuxPlan::new(vec![1]);
+    let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &Stopped);
+    assert_eq!(out, RipOutcome::Halted);
+    let away = dir.path().join("away.iso");
+    std::fs::rename(&iso, &away).unwrap();
+    let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &crate::NoopSink);
+    assert!(matches!(out, RipOutcome::Failed { .. }), "{out:?}");
+    std::fs::rename(&away, &iso).unwrap();
+    assert_eq!(who_counts(&calls), (1, 0), "no top-up request so far");
+    mux_all(&opened, vec![1], dir.path());
+    assert_eq!(who_counts(&calls), (2, 1), "the one top-up");
+}
+
+/// Minor 2: a top-up resolves the union of the held scope and the new titles, so muxing
+/// [0], [1], [0] resolves once.
+#[test]
+fn a_top_up_keeps_the_held_scope() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let f = factory(&[(Answer::Online, &[K1, K2])], &Calls::default());
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    let held = opened.keys_for(&[1], None).unwrap();
+    assert!(held.covers(&KeyScope::Titles(vec![0, 1])), "{held:?}");
+}
+
+/// Minor 3: when the only gap is forensic keys left Pending at the drive, a top-up over a
+/// scope the set already covers cannot fill it: the held set comes back, nothing is asked.
+#[test]
+fn a_pending_only_gap_is_not_re_resolved() {
+    let fx = fmts_image();
+    let (clip, _) = fx.img.files[1];
+    let drive = Drive::new(&fx.img.image);
+    drive.set(Damage::Range(clip, clip + 16 * 3));
+    let calls = Calls::default();
+    let f = fmts_factory(&[(Answer::Keydb, &[K1, K2])], &[F1, F2], &calls);
+    let scope = KeyScope::Titles(vec![0, 1]);
+    let pending =
+        ResolvedKeySet::resolve(&fx.disc, &mut drive.clone(), scope, &f, Default::default())
+            .unwrap()
+            .keys;
+    assert!(pending.forensic_pending());
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "uhd.iso");
+    let asked = calls.len();
+    let opened =
+        crate::OpenedImage::for_test(&iso, fmts_image().disc, pending, Some(f), vec![0, 1]);
+    let held = opened.keys_for(&[1], None).unwrap();
+    assert!(held.forensic_pending());
+    assert_eq!(calls.len(), asked, "keydb not re-asked");
+}

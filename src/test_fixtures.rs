@@ -232,6 +232,8 @@ pub(crate) enum Answer {
     /// A keydb that matched the disc and holds its Media Key but got no VID: no key, the
     /// "matched > no VID" miss path (KU J23: a Km path, so the VID would help).
     KeydbKmNoVid,
+    /// An online service that answers with a failure (a 5xx): E7028, not transport class.
+    Unavailable,
 }
 
 struct Fake {
@@ -257,8 +259,11 @@ impl KeySource for Fake {
             vid,
             forensic: false,
         });
+        if self.answer == Answer::Unavailable {
+            return Err(libfreemkv::Error::KeyServiceUnavailable);
+        }
         let keys: Vec<[u8; 16]> = match self.answer {
-            Answer::Keydb => self.keys.clone(),
+            Answer::Keydb | Answer::Unavailable => self.keys.clone(),
             Answer::KeydbKmNoVid => Vec::new(),
             Answer::OnlineNeedsVid if vid.is_none() => Vec::new(),
             Answer::Online | Answer::OnlineNeedsVid => {
@@ -312,10 +317,16 @@ impl KeySource for Fake {
         })
     }
     fn answer_depends_on_samples(&self) -> bool {
-        matches!(self.answer, Answer::Online | Answer::OnlineNeedsVid)
+        matches!(
+            self.answer,
+            Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
+        )
     }
     fn uses_vid(&self) -> bool {
-        matches!(self.answer, Answer::Online | Answer::OnlineNeedsVid)
+        matches!(
+            self.answer,
+            Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
+        )
     }
 }
 
@@ -338,7 +349,10 @@ pub(crate) fn fmts_factory(
             .iter()
             .map(|(answer, keys)| {
                 Box::new(Fake {
-                    who: if matches!(answer, Answer::Online | Answer::OnlineNeedsVid) {
+                    who: if matches!(
+                        answer,
+                        Answer::Online | Answer::OnlineNeedsVid | Answer::Unavailable
+                    ) {
                         "online"
                     } else {
                         "keydb"
