@@ -35,7 +35,7 @@ fn engine_halt_is_op_or_extra() {
     assert!(h.is_cancelled(), "the Sink probe alone cancels");
 }
 
-// §4.2: "The op token is always observed" — also with no narrower flag wired.
+// §4.2: the op token is always observed, also with no narrower flag wired.
 #[test]
 fn the_op_token_is_observed_without_extra() {
     let op = Halt::new();
@@ -73,7 +73,7 @@ fn linked_follows_op_extra_and_sink() {
     let sink = Cancels(AtomicBool::new(false));
     let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
     within(&|| sink.0.store(true, Ordering::SeqCst), &h);
-    // The legacy view hands the narrower flag over exactly (§4.2 "`from_arc` bridge sites").
+    // The legacy view hands the narrower flag over exactly: the `from_arc` bridges stay exact.
     let flag = Arc::new(AtomicBool::new(false));
     EngineHalt::legacy(Some(flag.clone())).linked(|lh| assert!(Arc::ptr_eq(lh.as_arc(), &flag)));
 }

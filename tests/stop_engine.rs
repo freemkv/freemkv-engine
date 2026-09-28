@@ -200,7 +200,6 @@ fn rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 fn mapfile_is_sane(iso: &std::path::Path) {
     let map = Mapfile::load(&mapfile_path_for(iso)).expect("the mapfile parses");
     let len = std::fs::metadata(iso).map(|m| m.len()).unwrap_or(0);
-    assert!(map.total_size() <= len.max(map.total_size()));
     let s = map.stats();
     assert!(s.bytes_good <= len, "good {} > file {len}", s.bytes_good);
 }
