@@ -446,27 +446,30 @@ pub(crate) fn resolve(
     seed: Option<&ResolvedKeySet>,
     vid: Option<[u8; 16]>,
     halt: Option<&libfreemkv::Halt>,
-) -> crate::Result<libfreemkv::keys::KeyResolution> {
+) -> Result<libfreemkv::keys::KeyResolution, (Error, bool)> {
+    let help = std::sync::atomic::AtomicBool::new(false);
     let opts = ResolveKeysOptions {
         halt,
         seed,
         vid,
-        vid_would_help: None,
+        vid_would_help: Some(&help),
     };
     ResolvedKeySet::resolve(disc, reader, scope.clone(), sources, opts)
+        .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))
 }
 
-/// KU §4.2 J11: a Missing piece (E7022/E7032) becomes E7034 when no VID is in hand and the
-/// sidecar has a `vidfp`: the disc's VID could derive the key ("Kvu = AES-G(Km, IDv)",
-/// KS-16), and it is read only from the disc (KS-29). Any other error is unchanged.
+/// KU §4.2 J11, J23: a Missing piece (E7022/E7032) becomes E7034 when no VID is in hand,
+/// the sidecar has a `vidfp`, and `resolve` found that the VID would help (a Km path or a
+/// VID-consuming source): only then could the disc's VID derive the key ("Kvu = AES-G(Km,
+/// IDv)", KS-16), read only from the disc (KS-29). Any other error is unchanged.
 pub(crate) fn vid_needs_disc(
-    e: Error,
+    (e, vid_would_help): (Error, bool),
     vid_in_hand: Option<[u8; 32]>,
     sidecar: Option<&Mapfile>,
 ) -> Error {
     let missing = matches!(e, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing);
     let disc_has_vid = sidecar.is_some_and(|m| m.vid_fingerprint().is_some());
-    if missing && vid_in_hand.is_none() && disc_has_vid {
+    if missing && vid_in_hand.is_none() && disc_has_vid && vid_would_help {
         tracing::info!(
             target: "freemkv::keys",
             code = libfreemkv::error::E_AACS_VID_NEEDS_DISC,
