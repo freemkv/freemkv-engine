@@ -24,6 +24,21 @@ fn damage_metadata(fx: &Fx, iso: &Path) {
     std::fs::write(iso, bytes).unwrap();
 }
 
+// The staged image's sidecar mapfile: the disc's hash, every sector Finished except
+// `unread` (`(lba, sectors)`), which the sweep left NonTrimmed.
+fn staged_sidecar(fx: &Fx, iso: &Path, unread: &[(u32, u32)]) {
+    let total = fx.img.image.len() as u64;
+    let mut map = Mapfile::create(&mapfile_path_for(iso), total, "t").unwrap();
+    map.record(0, total, crate::SectorStatus::Finished).unwrap();
+    for &(s, n) in unread {
+        let (pos, len) = (s as u64 * 2048, n as u64 * 2048);
+        map.record(pos, len, crate::SectorStatus::NonTrimmed)
+            .unwrap();
+    }
+    map.set_disc_hash(&fx.disc.aacs.as_ref().unwrap().disc_hash);
+    map.flush().unwrap();
+}
+
 fn mkv_dest(dir: &Path) -> impl Fn(usize) -> String {
     let dir = dir.to_path_buf();
     move |idx| format!("mkv://{}", dir.join(format!("t{idx}.mkv")).display())
@@ -63,6 +78,7 @@ fn staged_iso_with_damaged_udf_muxes_from_drive_scanned_title() {
     let whole = ImageSource::Iso(fx.write(dir.path(), "whole.iso"));
     let staged = fx.write(dir.path(), "staged.iso");
     damage_metadata(&fx, &staged);
+    staged_sidecar(&fx, &staged, &fx.metadata);
     assert!(
         crate::scan_image(&ImageSource::Iso(staged.clone()))
             .map_or(true, |(d, _)| d.titles.is_empty()),
@@ -546,4 +562,57 @@ fn an_unreadable_sidecar_refuses_the_open() {
         .unwrap_err();
     assert!(matches!(err, Error::MapfileInvalid { .. }), "{err:?}");
     assert_eq!(calls.len(), 0, "refused before any request");
+}
+
+/// D4 (KU §3.2 "the disc hash is checked when the image's `Unit_Key_RO.inf` is readable";
+/// §4.4 decides otherwise): with no sidecar identity an image whose key file cannot be
+/// checked is refused, since a same-capacity wrong image would decrypt its Keyed pieces
+/// to garbage. With a sidecar, only sectors it marks unread are exempt.
+#[test]
+fn a_prescanned_disc_refuses_an_image_it_cannot_identify() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let inf = *fx.metadata.last().unwrap();
+    let open = |iso: &Path| {
+        let opts = OpenImageOptions {
+            disc: Some(bd_image(&[Some(K1)], 1).disc),
+            ..OpenImageOptions::known(set.clone())
+        };
+        open_image_with(&ImageSource::Iso(iso.to_path_buf()), opts).map(|_| ())
+    };
+    let zero_inf = |iso: &Path| {
+        let mut b = std::fs::read(iso).unwrap();
+        b[inf.0 as usize * 2048..(inf.0 + inf.1) as usize * 2048].fill(0);
+        std::fs::write(iso, b).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // No sidecar, key file unreadable: refused.
+    let bare = fx.write(dir.path(), "bare.iso");
+    zero_inf(&bare);
+    let err = open(&bare).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::MapfileInvalid {
+                kind: "disc-mismatch"
+            }
+        ),
+        "{err:?}"
+    );
+    // A sidecar that says the key file WAS read: its zero bytes are the image's; refused.
+    let finished = fx.write(dir.path(), "finished.iso");
+    zero_inf(&finished);
+    staged_sidecar(&fx, &finished, &[]);
+    assert!(matches!(open(&finished), Err(Error::MapfileInvalid { .. })));
+    // A sidecar marking the key file unread, with the disc's identity: rules 1-2 decide.
+    let staged = fx.write(dir.path(), "staged.iso");
+    zero_inf(&staged);
+    staged_sidecar(&fx, &staged, &[inf]);
+    open(&staged).expect("a sweep-zeroed key file with sidecar identity passes");
 }
