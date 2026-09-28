@@ -420,16 +420,14 @@ fn with_mux_watcher<T>(
     // Owned + 'static (holds only Senders), so it satisfies mux_stream's Arc bound.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
-        opened: std::sync::Mutex<mpsc::Sender<libfreemkv::DiscTitle>>,
+        opened: mpsc::Sender<libfreemkv::DiscTitle>,
     }
     impl libfreemkv::MuxEvents for ChannelEvents {
         fn on_write_progress(&self, bytes_written: u64, bytes_total: u64) {
             let _ = self.tx.send((bytes_written, bytes_total));
         }
         fn on_output_opened(&self, title: &libfreemkv::DiscTitle) {
-            if let Ok(tx) = self.opened.lock() {
-                let _ = tx.send(title.clone());
-            }
+            let _ = self.opened.send(title.clone());
         }
     }
     let opened = |title: &libfreemkv::DiscTitle| {
@@ -475,7 +473,8 @@ fn with_mux_watcher<T>(
                 if sink.should_cancel() {
                     watcher_halt.cancel();
                 }
-                if watcher_done.load(Ordering::Relaxed) {
+                // Acquire pairs with SignalDone's Release: the drain below sees every send.
+                if watcher_done.load(Ordering::Acquire) {
                     // A mux that returned before this poll: its opening is not lost.
                     while let Ok(title) = opened_rx.try_recv() {
                         opened(&title);
@@ -488,7 +487,7 @@ fn with_mux_watcher<T>(
 
         let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents {
             tx,
-            opened: std::sync::Mutex::new(opened_tx),
+            opened: opened_tx,
         });
         // Same guard the recovery paths use: `mux_stream` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
