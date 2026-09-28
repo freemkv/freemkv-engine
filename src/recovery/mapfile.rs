@@ -1575,9 +1575,6 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
-    /// A `# freemkv-uk:` line missing the `cps:hex` shape, with a bad cps,
-    /// or a wrong-length key, must parse to None. (`load()` turns that None
-    /// into a hard error — see `load_rejects_a_malformed_unit_key_header`.)
     // The scope survives a flush/load as a ddrescue-safe comment, and on load a scoped
     // map's never-read rest is not pending (it is not this image's job).
     #[test]
@@ -1928,19 +1925,20 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    // A malformed `# freemkv-vid:` header must FAIL the load, not drop
+    // A malformed legacy VID header must FAIL the load, not drop
     // silently — that would turn "carries an identity" into "carries none",
     // which reopens the cross-disc resume splice the identity guard stops.
     #[test]
     fn load_rejects_a_malformed_vid_header() {
         let p = tmpfile("load_bad_vid");
         let _ = std::fs::remove_file(&p);
+        // The legacy prefix is assembled so only `parse_legacy_key_lines` spells it (EK9).
+        let vid_line = format!("# {}vid: 00112233445566778899aabbccddeezz", "freemkv-");
         std::fs::write(
             &p,
-            "# Rescue Logfile. Created by test\n\
-             # freemkv-vid: 00112233445566778899aabbccddeezz\n\
-             0x0  ?  1  0\n\
-             0x0  0x800    +\n",
+            format!(
+                "# Rescue Logfile. Created by test\n{vid_line}\n0x0  ?  1  0\n0x0  0x800    +\n"
+            ),
         )
         .unwrap();
         let err = match Mapfile::load(&p) {

@@ -1138,3 +1138,31 @@ fn an_unreadable_sidecar_is_an_io_error() {
         .unwrap_err();
     assert!(matches!(err, Error::IoError { .. }), "{err:?}");
 }
+
+/// D2 (review minor 9, behaviour): `remux_iso` runs its open, title pick and key top-up
+/// under one Stop. A Stop that lands once the open's one request is made reaches everything
+/// after it: the remux ends Halted and no further key request is made.
+#[test]
+fn a_stop_after_the_remux_open_asks_nothing_more() {
+    struct StopAfter(Calls, usize);
+    impl crate::Sink for StopAfter {
+        fn should_cancel(&self) -> bool {
+            self.0.len() >= self.1
+        }
+    }
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let calls = Calls::default();
+    let job = crate::RemuxJob {
+        iso: ImageSource::Iso(fx.write(dir.path(), "d.iso")),
+        title: Some(1),
+        streams: crate::StreamChoice::default(),
+        target: dir.path().join("remux.mkv"),
+        replace: false,
+    };
+    let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+    let err = crate::remux::remux_iso_with(&job, f, &StopAfter(calls.clone(), 1)).unwrap_err();
+    assert!(libfreemkv::is_halt(&err), "{err}");
+    assert_eq!(calls.len(), 1, "the open's one request, then nothing");
+    assert!(!job.target.exists());
+}
