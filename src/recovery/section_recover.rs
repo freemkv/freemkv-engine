@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::patch::{SubRanges, recovery_read};
+use libfreemkv::error::Error;
 use libfreemkv::scsi::SenseFamily;
 use libfreemkv::sector::SectorSource;
 
@@ -170,8 +171,6 @@ pub(super) struct HandlerCtx<'a> {
     /// inline, so tests advance a fake clock deterministically.
     pub now: &'a dyn Fn() -> Instant,
     pub halt: Option<&'a AtomicBool>,
-    /// Widen mid-unit reads to the aligned AACS unit (see [`recovery_read`]).
-    pub decrypt_is_aacs: bool,
     /// Progress heartbeat. Handlers call [`HandlerCtx::progress`] frequently (it
     /// is internally throttled); this pushes a fresh progress snapshot to the
     /// caller's reporter DURING a handler, not just at range boundaries — so the
@@ -194,6 +193,9 @@ pub(super) struct HandlerCtx<'a> {
     /// handler. Seeded to max — the caller resets the drive to max before the
     /// chain runs.
     pub cur_speed: u16,
+    /// A non-read error (e.g. a decrypt refusal) that ended the chain; the
+    /// caller must surface it instead of recording the section as damage.
+    pub fatal: Option<Error>,
 }
 
 impl HandlerCtx<'_> {
@@ -275,15 +277,7 @@ fn read_span(
     }
     let recovery = params.timeout.recovery();
     let read_started = (ctx.now)();
-    let hit = match recovery_read(
-        ctx.reader,
-        ctx.decrypt_is_aacs,
-        lba,
-        count,
-        buf,
-        recovery,
-        params.fua,
-    ) {
+    let hit = match recovery_read(ctx.reader, lba, count, buf, recovery, params.fua) {
         Ok(n) if n == bytes => {
             ctx.sink.recovered(pos, &buf[..bytes]);
             ReadHit::Good
@@ -296,6 +290,19 @@ fn read_span(
             ReadHit::Bad
         }
         Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
+        // Not disc damage: stop the chain now (as a transport fault would) and
+        // hand the real error to the caller via `ctx.fatal`.
+        Err(e) if !super::is_damage_candidate(&e) => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "section_recover.fatal",
+                lba,
+                code = e.code(),
+                "non-read error during recovery; aborting the pass with it"
+            );
+            ctx.fatal = Some(e);
+            ReadHit::Transport
+        }
         Err(e) => {
             // Wedge watch: only a wedge-family sense AND a fast return (<
             // WEDGE_FASTFAIL_MS) count toward the streak. The latency gate keeps a
@@ -1018,6 +1025,8 @@ pub(super) fn run_handlers(
             bad_bytes_after = after,
             recovered = before.saturating_sub(after),
             outcome = ?outcome,
+            // Set when `outcome` is TransportFault only because a non-read error ended it.
+            fatal_code = ctx.fatal.as_ref().map(|e| e.code()),
             "handler finished; remaining bad bytes carry to the next handler"
         );
         match outcome {
@@ -1279,9 +1288,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1317,9 +1326,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1370,9 +1379,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1409,9 +1418,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1446,9 +1455,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1484,9 +1493,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1545,9 +1554,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1590,9 +1599,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1623,9 +1632,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1655,9 +1664,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1717,9 +1726,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: None,
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1775,9 +1784,9 @@ mod tests {
                 sink: &mut sink,
                 now: &now,
                 halt: None,
-                decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
+                fatal: None,
                 wedge_streak: carried,
                 cur_speed: SPEED_MAX_KBS,
             };
@@ -1827,9 +1836,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1910,9 +1919,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -1987,9 +1996,9 @@ mod tests {
             sink: &mut sink,
             now: &now,
             halt: Some(&halt),
-            decrypt_is_aacs: false,
             tick: None,
             unproductive: 0,
+            fatal: None,
             wedge_streak: 0,
             cur_speed: SPEED_MAX_KBS,
         };
@@ -2063,9 +2072,9 @@ mod tests {
                 sink: &mut $sink,
                 now: &$now,
                 halt: None,
-                decrypt_is_aacs: false,
                 tick: None,
                 unproductive: 0,
+                fatal: None,
                 wedge_streak: 0,
                 cur_speed: SPEED_MAX_KBS,
             }

@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Whole-disc decrypt (disc → ISO) uses libfreemkv's shared `whole_disc` reader, the same one as freemkv's image → ISO path. A stream file no title plays that is encrypted, with no held key opening it, refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. A key must open two probed units before it keys such a file. A file with no proven key on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why. An AACS disc with titles but no stream folder now fails with E6003, naming the folder, instead of E7013.
+
+### Added
+
+- `ImageSource`, `scan_image`, `open_image` and `build_key_fetch`: one path to scan an ISO or disc folder, resolve its keys and fetch keys mid-mux over the full local-first key chain.
+- `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
+- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
+- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
+- `open_scan_resolve_with(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
+
 ## [1.7.7] — 2026-09-26
 
 ### Maintenance

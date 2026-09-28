@@ -53,6 +53,35 @@ pub struct Progress {
     pub eta_secs: Option<u64>,
 }
 
+/// A typed milestone of an engine operation, for a front-end that drives state
+/// (a daemon's job record, a webhook) without parsing log text. Borrowed: an
+/// impl copies out what it keeps.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Event<'a> {
+    /// A stage of the operation began: `"open"`, `"mux"`, `"verify"`, `"replace"`.
+    Phase { name: &'static str },
+    /// Title `idx` (0-based) starts muxing into `dest` (a sink URL).
+    TitleStart { idx: usize, dest: &'a str },
+    /// Title `idx` finished muxing: the outcome (`completed = false` on a stop)
+    /// or the error it failed with.
+    TitleDone {
+        idx: usize,
+        dest: &'a str,
+        result: Result<&'a libfreemkv::MuxOutcome, &'a std::io::Error>,
+    },
+    /// A written MKV was checked against its title. `runtime_secs` is what the
+    /// file showed, `expected_secs` the title's duration.
+    Verify {
+        path: &'a std::path::Path,
+        ok: bool,
+        runtime_secs: Option<f64>,
+        expected_secs: f64,
+    },
+    /// A verified file replaced the existing one at `path`.
+    Replaced { path: &'a std::path::Path },
+}
+
 /// The engine→front-end seam. One trait, implemented once per front-end.
 ///
 /// Every method has a default no-op so a front-end can implement only what it
@@ -72,6 +101,9 @@ pub trait Sink: Send + Sync {
 
     /// The job finished (success, partial, or failure — see the outcome).
     fn completed(&self, _outcome: &crate::Outcome) {}
+
+    /// A typed milestone (see [`Event`]). Default ignores it.
+    fn event(&self, _e: &Event<'_>) {}
 
     /// Cooperative cancellation. The engine polls this in every long loop; a
     /// front-end returns `true` to stop the job (Cancel button, Ctrl-C, service

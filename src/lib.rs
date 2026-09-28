@@ -11,6 +11,7 @@
 
 pub mod drive_info;
 mod extract;
+mod image;
 mod job;
 mod keys;
 mod multipass;
@@ -31,6 +32,7 @@ pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,
     bytes_bad_in_title_from_mapfile, copy, patch, progress_snapshot_from_mapfile, sweep,
 };
+mod remux;
 mod resolve;
 mod run;
 mod sink;
@@ -39,6 +41,9 @@ mod streams;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
 pub use extract::extract_tree;
+pub use image::{
+    ImageSource, OpenedImage, build_key_fetch, error_code, open_image, parse_error_code, scan_image,
+};
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_disc_keys, won_source};
 pub use multipass::{
@@ -50,13 +55,16 @@ pub use multipass::{
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
-    mux_title_session, open_scan_resolve, resolve_selection, run_titles,
+    mux_title_session, open_scan_resolve, open_scan_resolve_with, resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use preflight::{Preflight, Reason, preflight};
+pub use remux::{
+    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_options, remux_iso, verify_mkv,
+};
 pub use resolve::resolve_keys;
 pub use run::recover_to_iso;
-pub use sink::{Level, NoopSink, Progress, Sink};
+pub use sink::{Event, Level, NoopSink, Progress, Sink};
 pub use speed::SpeedEstimator;
 pub use streams::{
     StreamSelError, SubtitleFilter, UnmatchedClass, resolve_stream_selection,

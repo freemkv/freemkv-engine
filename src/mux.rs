@@ -225,7 +225,7 @@ where
             Ok(()) => TitleResult::Ok,
             Err(e) => {
                 fail_detail = e.to_string();
-                fail_code = libfreemkv::error_code(&e);
+                fail_code = crate::error_code(&e);
                 fail_kind = e.kind();
                 classify_title_error(&e)
             }
@@ -442,6 +442,15 @@ fn build_keyspec(credentials: Option<libfreemkv::DriveCredentials>) -> libfreemk
     }
 }
 
+// `raw_copy` scans past an unreadable AACS key file (E7031 recorded, keys refused);
+// only a copy that never decrypts may set it.
+fn scan_options(raw_copy: bool) -> libfreemkv::ScanOptions {
+    libfreemkv::ScanOptions {
+        raw_copy,
+        ..Default::default()
+    }
+}
+
 /// Open a live optical drive and get it ready to rip: open the session, lock
 /// the tray, scan the disc, and resolve its AACS keys. Returns the scanned
 /// session (its `disc()` is populated and its drive is still owned, ready to
@@ -462,10 +471,27 @@ pub fn open_scan_resolve(
     ),
     libfreemkv::Error,
 > {
+    open_scan_resolve_with(target, credentials, factory, false)
+}
+
+/// [`open_scan_resolve`] with the scan's `raw_copy` set: pass `true` only for a
+/// raw (never-decrypting) disc→ISO copy, matching the CLI's `--raw`.
+pub fn open_scan_resolve_with(
+    target: libfreemkv::DeviceTarget,
+    credentials: Option<libfreemkv::DriveCredentials>,
+    factory: libfreemkv::KeySourceFactory,
+    raw_copy: bool,
+) -> Result<
+    (
+        libfreemkv::DiscSession,
+        libfreemkv::aacs::trace::ResolutionTrace,
+    ),
+    libfreemkv::Error,
+> {
     let mut session = libfreemkv::DiscSession::open(target, build_keyspec(credentials))?;
     // Lock the tray so the disc can't eject mid-rip; Drive::drop unlocks it.
     session.lock_tray();
-    session.scan(libfreemkv::ScanOptions::default())?;
+    session.scan(scan_options(raw_copy))?;
     let trace = session.resolve_keys(factory)?;
     Ok((session, trace))
 }
@@ -665,6 +691,36 @@ mod tests {
             build_keyspec(Some(creds)).credentials.is_some(),
             "the host certs the shell supplied are the only input to the AACS \
              handshake — dropping them authenticates as no-one"
+        );
+    }
+
+    // The GUI raw disc→ISO copy must scan like the CLI `--raw`: on past an unreadable key file.
+    #[test]
+    fn raw_copy_reaches_the_scan_options() {
+        assert!(
+            scan_options(true).raw_copy,
+            "a raw copy must scan with raw_copy"
+        );
+        assert!(
+            !scan_options(false).raw_copy,
+            "a decrypting rip keeps the fatal E7031"
+        );
+
+        // `session.scan` needs a live drive, so pin the source instead: the value
+        // handed to it must be this function's answer, not a hardcoded default.
+        let src = include_str!("mux.rs").replace("\r\n", "\n");
+        let start = src
+            .find("pub fn open_scan_resolve_with(")
+            .expect("open_scan_resolve_with definition present");
+        let end = start
+            + src[start..]
+                .find("\n}\n")
+                .expect("the function body still ends the definition");
+        let body = &src[start..end];
+        assert!(
+            body.contains("session.scan(scan_options(raw_copy))"),
+            "open_scan_resolve_with must hand its own raw_copy parameter to the scan, \
+             not a hardcoded default"
         );
     }
 
