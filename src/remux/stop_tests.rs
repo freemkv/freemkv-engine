@@ -33,10 +33,21 @@ struct ReadPlan {
     block_after: Option<u64>,
 }
 
+// What the folder sync after the rename does.
+#[derive(Default)]
+enum DirSync {
+    #[default]
+    Ok,
+    // Cancels this op token, then waits for the cancel to reach the sync.
+    Stop(Halt),
+    Fail,
+}
+
 struct FakeIo {
     timing: RemuxTiming,
     sync: SyncPlan,
     read: ReadPlan,
+    dir_sync: DirSync,
     in_sync: AtomicBool,
     returned: Arc<AtomicU64>,
     release: Arc<AtomicBool>,
@@ -51,6 +62,7 @@ impl FakeIo {
             },
             sync,
             read,
+            dir_sync: DirSync::default(),
             in_sync: AtomicBool::new(false),
             returned: Arc::default(),
             release: Arc::default(),
@@ -64,6 +76,24 @@ impl Drop for FakeIo {
     }
 }
 
+impl FakeIo {
+    fn sync_dir(&self, halt: &Halt) -> io::Result<()> {
+        match &self.dir_sync {
+            DirSync::Ok => Ok(()),
+            DirSync::Fail => Err(io::Error::from_raw_os_error(5)),
+            DirSync::Stop(op) => {
+                op.cancel();
+                let t0 = Instant::now();
+                while t0.elapsed() < STOP_LATENCY {
+                    halt.check()?;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl RemuxIo for FakeIo {
     fn sync(
         &self,
@@ -72,6 +102,9 @@ impl RemuxIo for FakeIo {
         on: &mut dyn FnMut(u64, u64),
     ) -> io::Result<()> {
         let m = file.metadata()?;
+        if m.is_dir() {
+            return self.sync_dir(halt);
+        }
         if !m.is_file() || self.sync.pieces == 0 {
             return Ok(());
         }
@@ -731,10 +764,10 @@ fn artifact_lock_survives_real_mapfile_flush() {
     assert_eq!(lock.path(), sidecar_for(&iso));
 }
 
-// §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`" — a Stop that
-// lands once the rename has replaced the target (during the folder sync) is Done, not Halted.
+// §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`" — the rename is
+// the commit, so a Stop that lands before it is Halted with the target untouched.
 #[test]
-fn a_stop_after_the_rename_is_done() {
+fn a_stop_before_the_rename_leaves_the_target() {
     struct CancelAtReplace(AtomicBool);
     impl Sink for CancelAtReplace {
         fn event(&self, e: &Event<'_>) {
@@ -747,17 +780,54 @@ fn a_stop_after_the_rename_is_done() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let (target, _) = old_target(dir.path());
+    let (target, mtime) = old_target(dir.path());
     let sink = CancelAtReplace(AtomicBool::new(false));
-    let r = run(
+    let e = run(
         &target,
         &sink,
         &Halt::new(),
         &OsRemuxIo,
         writes(good(), true),
     )
-    .expect("the target was replaced before the Stop: Done");
+    .unwrap_err();
+    assert!(libfreemkv::is_halt(&e), "{e}");
+    untouched(&target, mtime);
+}
+
+// §2.6 and §4.4: a Stop during the folder sync lands after the rename committed, so it cuts
+// only the sync short and the remux is Done.
+#[cfg(unix)]
+#[test]
+fn a_stop_after_the_rename_is_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let op = Halt::new();
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Stop(op.clone());
+    let sink = Events::default();
+    let r = run(&target, &sink, &op, &rio, writes(good(), true))
+        .expect("the target was replaced before the Stop: Done");
+    assert!(op.is_cancelled(), "the Stop reached the folder sync");
     assert!(r.replaced);
+    assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
+    assert_eq!(std::fs::read(&target).unwrap(), good());
+    assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
+}
+
+// Once the rename committed, a failed folder sync cannot undo it: the caller is told the
+// target was replaced (Done, with `Event::Replaced`), not that the remux failed.
+#[cfg(unix)]
+#[test]
+fn a_failed_folder_sync_after_the_rename_still_reports_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Fail;
+    let sink = Events::default();
+    let r = run(&target, &sink, &Halt::new(), &rio, writes(good(), true))
+        .expect("the rename committed: Done");
+    assert!(r.replaced);
+    assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
     assert_eq!(std::fs::read(&target).unwrap(), good());
     assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
 }

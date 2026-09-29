@@ -601,20 +601,29 @@ fn land_verified(
     } else {
         partial
     };
+    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`"; the rename
+    // is the commit, so a Stop that arrived before it leaves the target untouched.
+    if halt.is_cancelled() {
+        return Err(libfreemkv::Error::Halted.into());
+    }
     std::fs::rename(landing, &job.target)?;
     if let Some(g) = &mut remote_guard {
         g.1 = true;
     } else {
         guard.1 = true;
     }
-    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`": the rename
-    // committed, so a Stop during the folder sync cuts only the sync short (§4.4).
+    // The rename committed: a Stop or a failure during the folder sync cuts only the sync
+    // short (§2.6, §4.4), and the caller is still told the target was replaced.
     match sync_parent(rio, &job.target, halt) {
         Err(e) if libfreemkv::is_halt(&e) => sink.log(
             Level::Warn,
             "stopped during the folder sync after the target was replaced; the rename may not be durable yet",
         ),
-        r => r?,
+        Err(e) => sink.log(
+            Level::Warn,
+            &format!("the target was replaced but its folder sync failed: {e}"),
+        ),
+        Ok(()) => {}
     }
     if replaced {
         sink.event(&Event::Replaced { path: &job.target });
