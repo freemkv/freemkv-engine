@@ -210,14 +210,8 @@ mod tests {
     fn clean_synthetic_disc_extracts_complete_with_no_loss() {
         let contents = b"hello from a synthetic disc".to_vec();
         let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
-        let out_dir = std::env::temp_dir().join(format!(
-            "fmkv-engine-extract-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
 
         let res = extract_tree(&disc, &mut reader, &out_dir, false, &NoopSink)
             .expect("extraction of a clean synthetic disc should succeed");
@@ -229,8 +223,6 @@ mod tests {
         assert_eq!(res.bytes_good, contents.len() as u64);
         let written = std::fs::read(out_dir.join("HELLO.TXT")).expect("file written");
         assert_eq!(written, contents);
-
-        let _ = std::fs::remove_dir_all(&out_dir);
     }
 
     #[test]
@@ -243,19 +235,16 @@ mod tests {
         }
         let contents = vec![0u8; 8192];
         let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
-        let out_dir = std::env::temp_dir().join(format!(
-            "fmkv-engine-extract-cancel-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
 
         let res = extract_tree(&disc, &mut reader, &out_dir, false, &CancelSink)
             .expect("a cancelled extraction still returns Ok (halted, not errored)");
         assert!(res.halted, "should_cancel()==true must halt the extraction");
-
-        let _ = std::fs::remove_dir_all(&out_dir);
+        assert!(!res.complete, "a halted extraction is not complete");
+        assert!(
+            !out_dir.join("HELLO.TXT").exists(),
+            "a halted file never gets its final name"
+        );
     }
 }
