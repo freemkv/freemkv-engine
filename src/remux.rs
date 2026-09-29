@@ -1024,7 +1024,12 @@ mod tests {
             Some(&local_partial),
             writes(mkv(600.0, Some(598), 2), false),
         );
-        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(
+            !libfreemkv::is_halt(&e),
+            "an incomplete mux is a failure: {e}"
+        );
+        assert_eq!(e.kind(), io::ErrorKind::Other);
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!local_partial.exists());
         assert!(!partial_path(&target).exists());
@@ -1078,7 +1083,11 @@ mod tests {
             Some(&local_partial),
             writes(mkv(600.0, Some(598), 2), true),
         );
-        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(
+            libfreemkv::is_halt(&e),
+            "a Stop is Halted, not a failure: {e}"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!local_partial.exists());
         assert!(!partial_path(&target).exists());

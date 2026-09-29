@@ -1018,3 +1018,68 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
     untouched(&target, mtime);
     assert!(!stage.exists());
 }
+
+// A staged copy that lands short fails before its sync, and the old target stays.
+#[test]
+fn remux_staged_copy_size_mismatch_keeps_old_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.short = true;
+    let sink = Events::default();
+    let e = run_staged(
+        &target,
+        &stage,
+        &sink,
+        &Halt::new(),
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+    let events = sink.0.lock().unwrap().clone();
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("phase:copy"),
+        "{events:?}"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+}
+
+// The library copy is verified itself: a copy that fails verify never replaces the target.
+#[test]
+fn remux_staged_copy_that_fails_verify_keeps_old_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.zeros = true;
+    let sink = Events::default();
+    let e = run_staged(
+        &target,
+        &stage,
+        &sink,
+        &Halt::new(),
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    assert!(!libfreemkv::is_halt(&e), "{e}");
+    let events = sink.0.lock().unwrap().clone();
+    let tail: Vec<&str> = events
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tail,
+        ["verify:true", "phase:copy", "phase:sync"],
+        "{events:?}"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+}
