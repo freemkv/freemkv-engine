@@ -6,7 +6,8 @@
 //! that downcast and turns every typed refusal into a generic I/O (transport) failure.
 //!
 //! Every Rust file under `src/` (`#[cfg(test)]` included) is scanned for the pass-through
-//! shape `IoError\s*\{\s*source\s*:\s*[a-z_]\w*\s*\}`. Use `?` or `Error::from(e)` instead.
+//! shape `IoError\s*\{\s*source\s*(:\s*[a-z_]\w*\s*)?,?\s*\}` (field shorthand included).
+//! Use `?` or `Error::from(e)` instead.
 //! A fresh `io::Error` construction (`source: std::io::Error::new(..)`) and a `{ .. }`
 //! pattern are not flagged.
 
@@ -21,7 +22,7 @@ fn ws(s: &str) -> &str {
     s.trim_start()
 }
 
-/// Whether `rest` (text right after `IoError`) matches `\s*\{\s*source\s*:\s*[a-z_]\w*\s*\}`.
+/// Whether `rest` (text right after `IoError`) matches `\s*\{\s*source\s*(:\s*[a-z_]\w*\s*)?,?\s*\}`.
 fn is_pass_through(rest: &str) -> bool {
     let Some(r) = ws(rest).strip_prefix('{') else {
         return false;
@@ -29,14 +30,23 @@ fn is_pass_through(rest: &str) -> bool {
     let Some(r) = ws(r).strip_prefix("source") else {
         return false;
     };
-    let Some(r) = ws(r).strip_prefix(':') else {
+    let r = ws(r);
+    if closes(r) {
+        return true;
+    }
+    let Some(r) = r.strip_prefix(':') else {
         return false;
     };
     let r = ws(r);
     if !r.starts_with(|c: char| c.is_ascii_lowercase() || c == '_') {
         return false;
     }
-    ws(r.trim_start_matches(is_word)).starts_with('}')
+    closes(ws(r.trim_start_matches(is_word)))
+}
+
+/// Whether `r` is `,?\s*\}`: the end of the literal, trailing comma allowed.
+fn closes(r: &str) -> bool {
+    ws(r.strip_prefix(',').unwrap_or(r)).starts_with('}')
 }
 
 /// 1-based line numbers of every pass-through match in `text`.
@@ -70,7 +80,14 @@ fn the_matcher_flags_only_the_pass_through_shape() {
     assert!(pass_through_lines("Error::IoError { .. }").is_empty());
     assert!(pass_through_lines("IoError { source: std::io::Error::other(\"x\") }").is_empty());
     assert!(pass_through_lines("IoError { source: io::Error::from(k) }").is_empty());
-    assert!(pass_through_lines("IoError { source }").is_empty());
+    assert_eq!(
+        pass_through_lines(".map_err(|source| Error::IoError { source })"),
+        [1]
+    );
+    assert_eq!(pass_through_lines("IoError {\n    source: err,\n}"), [1]);
+    assert_eq!(pass_through_lines("IoError {\n    source,\n}"), [1]);
+    assert!(pass_through_lines("IoError { sources }").is_empty());
+    assert!(pass_through_lines("IoError { source: std::io::Error::new(k, \"x\") }").is_empty());
 }
 
 #[test]

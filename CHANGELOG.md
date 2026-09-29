@@ -11,7 +11,7 @@
 
 - Whole-disc decrypt (disc → ISO) uses libfreemkv's shared `whole_disc` reader, the same one as freemkv's image → ISO path. A stream file no title plays that is encrypted, with no held key opening it, refuses before the copy with E7032 (rip to MKV or make a raw copy) instead of E7013. A key must open two probed units before it keys such a file. A file with no proven key on a multi-key disc stops the pass at its first encrypted unit with the same E7032, and the scan log says why. An AACS disc with titles but no stream folder now fails with E6003, naming the folder, instead of E7013.
 
-- `copy`, `sweep`, `patch`, `ensure_whole_image` and `ensure_titles_staged` return libfreemkv's typed error instead of the generic I/O error (E5000) when an I/O error carries one: a mapfile for another disc is E6011 (`disc-mismatch`), a damaged mapfile E6011, a stalled output flush E9056 and a stopped one E6010. An output flush stall is no longer read as a drive transport failure.
+- `copy`, `sweep`, `patch`, `ensure_whole_image` and `ensure_titles_staged` return libfreemkv's typed error instead of the generic I/O error (E5000) when an I/O error carries one: a mapfile for another disc is E6011 (`disc-mismatch`), a damaged mapfile E6011, and a stalled or lost output flush E9056/E9057. An output flush stall is no longer read as a drive transport failure.
 
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
 
