@@ -465,6 +465,8 @@ pub(crate) struct RemuxTiming {
     pub(crate) verify_stall: Duration,
     /// §4.4: "rate-limited to one call per 250 ms".
     pub(crate) activity_every: Duration,
+    /// How often real sync/verify progress refreshes the file's mtime for a lock waiter (T10).
+    pub(crate) lock_beat: Duration,
 }
 
 impl Default for RemuxTiming {
@@ -472,6 +474,7 @@ impl Default for RemuxTiming {
         Self {
             verify_stall: Duration::from_secs(60),
             activity_every: Duration::from_millis(250),
+            lock_beat: libfreemkv::io::artifact_lock::ARTIFACT_LOCK_WINDOW / 10,
         }
     }
 }
@@ -721,6 +724,35 @@ impl Activity {
     }
 }
 
+// T10 (§2.5): a waiter on `<target>.lock` sees the holder live only while the `.partial`
+// changes size or mtime. Sync and verify change neither, so their real progress bumps the
+// mtime of the file they work on, at most once per `every` (best effort).
+struct LockBeat {
+    file: Option<std::fs::File>,
+    every: Duration,
+    last: Option<Instant>,
+}
+
+impl LockBeat {
+    fn new(file: Option<std::fs::File>, every: Duration) -> Self {
+        Self {
+            file,
+            every,
+            last: None,
+        }
+    }
+
+    fn progressed(&mut self) {
+        if self.last.is_some_and(|t| t.elapsed() < self.every) {
+            return;
+        }
+        if let Some(f) = &self.file {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        self.last = Some(Instant::now());
+    }
+}
+
 // T12b: the `.partial`'s durable sync, preceded by `Event::Phase { name: "sync" }` (§4.4).
 fn durable_sync(
     rio: &dyn RemuxIo,
@@ -736,8 +768,10 @@ fn durable_sync(
         .write(true)
         .open(partial)?;
     let mut every = Activity::new(timing.activity_every);
+    let mut beat = LockBeat::new(file.try_clone().ok(), timing.lock_beat);
     halt.linked(|h| {
         rio.sync(&file, h, &mut |done, total| {
+            beat.progressed();
             if every.due(done, done >= total) {
                 sink.progress(&activity("sync", done, total));
             }
@@ -811,12 +845,15 @@ fn verify_watched(
     let progress = libfreemkv::halt::Progress::new();
     let mut timer = StallTimer::new(timing.verify_stall, &progress);
     let (mut every, mut seen) = (Activity::new(timing.activity_every), 0);
+    let beat_file = std::fs::OpenOptions::new().write(true).open(path).ok();
+    let mut beat = LockBeat::new(beat_file, timing.lock_beat);
     loop {
         let done = rx.recv_timeout(WAIT_SLICE);
         let now = read.load(Ordering::Relaxed);
         if now > seen {
             seen = now;
             progress.bump();
+            beat.progressed();
         }
         if every.due(now, done.is_ok()) {
             sink.progress(&activity("verify", now, total));

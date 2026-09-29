@@ -59,6 +59,7 @@ impl FakeIo {
             timing: RemuxTiming {
                 verify_stall: WINDOW,
                 activity_every: Duration::from_millis(10),
+                lock_beat: Duration::from_millis(10),
             },
             sync,
             read,
@@ -830,4 +831,50 @@ fn a_failed_folder_sync_after_the_rename_still_reports_replaced() {
     assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
     assert_eq!(std::fs::read(&target).unwrap(), good());
     assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
+}
+
+// T10 (§2.5, §3.1): a waiter on `<target>.lock` reads the holder's progress as the size or
+// mtime of `<target>.partial`, so a slow but healthy sync and verify must keep changing it.
+#[test]
+fn remux_holder_stays_observable_during_sync_and_verify() {
+    struct Stamps {
+        partial: PathBuf,
+        at: Mutex<Vec<(String, std::time::SystemTime)>>,
+    }
+    impl Sink for Stamps {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::Phase { name } = e {
+                let m = std::fs::metadata(&self.partial).and_then(|m| m.modified());
+                if let Ok(m) = m {
+                    self.at.lock().unwrap().push((name.to_string(), m));
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let slow_sync = SyncPlan {
+        pieces: 10,
+        gap: Duration::from_millis(20),
+        stall_at: None,
+    };
+    let slow_read = ReadPlan {
+        chunk: 8,
+        delay: Duration::from_millis(5),
+        block_after: None,
+    };
+    let rio = FakeIo::new(slow_sync, slow_read);
+    let sink = Stamps {
+        partial: partial_path(&target),
+        at: Mutex::default(),
+    };
+    run(&target, &sink, &Halt::new(), &rio, writes(good(), true)).unwrap();
+    let at = sink.at.lock().unwrap().clone();
+    let names: Vec<&str> = at.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["sync", "verify", "replace"]);
+    assert_ne!(
+        at[0].1, at[1].1,
+        "no holder progress visible during the sync"
+    );
+    assert_ne!(at[1].1, at[2].1, "no holder progress visible during verify");
 }
