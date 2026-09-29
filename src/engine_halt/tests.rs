@@ -121,11 +121,11 @@ fn engine_outcome_mapping() {
     );
 }
 
-// ET8, last case — §2.6: "Otherwise it `debug_assert!`s and maps to `Failed`."
+// ET8, last case — §2.6: "Otherwise it … maps to `Failed`", in every build profile. A
+// non-sticky `should_cancel` or a source's own `Halted` reach it, so it must not panic.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Halted with no cancel")]
-fn halted_without_a_cancel_is_a_debug_panic() {
+fn halted_without_a_cancel_is_failed() {
     let h = EngineHalt::new(&Halt::new(), None);
-    let _ = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    assert!(matches!(r, EngineOutcome::Failed(Error::Halted)), "{r:?}");
 }

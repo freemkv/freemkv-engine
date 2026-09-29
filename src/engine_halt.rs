@@ -157,7 +157,8 @@ impl<T> EngineOutcome<T> {
     /// Map a `_with` entry's result. `halted` reads an artifact result's own Stop flag.
     ///
     /// §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when the op token is
-    /// cancelled. Otherwise it `debug_assert!`s and maps to `Failed`."
+    /// cancelled. Otherwise it … maps to `Failed`." It warns instead of the spec's
+    /// `debug_assert!`: a non-sticky `should_cancel` or a source's own `Halted` reach it.
     pub(crate) fn from_result(
         r: crate::Result<T>,
         halt: &EngineHalt<'_>,
@@ -168,7 +169,7 @@ impl<T> EngineOutcome<T> {
             Ok(t) => EngineOutcome::Done(t),
             Err(libfreemkv::Error::Halted) if halt.is_cancelled() => EngineOutcome::Stopped(None),
             Err(libfreemkv::Error::Halted) => {
-                debug_assert!(false, "Halted with no cancel (stop design §2.6)");
+                tracing::warn!(target: "freemkv::disc", "Halted with no cancel: Failed");
                 EngineOutcome::Failed(libfreemkv::Error::Halted)
             }
             Err(e) => EngineOutcome::Failed(e),
