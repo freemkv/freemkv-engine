@@ -135,12 +135,16 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
 
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key. The rip's key
     // set decides (KU §3.5); without one, the executors' gate over no set (KU-X1: never the
-    // disc-banked keys), so preflight can't pass a rip the passes refuse.
+    // disc-banked keys), so preflight can't pass a rip the passes refuse. A set keys only
+    // the titles it was resolved over; a title outside it fails mid-rip.
     let keyed = match &job.keys {
-        Some(set) => matches!(
-            crate::keys::key_status(disc, set),
-            libfreemkv::keys::DecryptStatus::Ready | libfreemkv::keys::DecryptStatus::NotEncrypted
-        ),
+        Some(set) => {
+            matches!(
+                crate::keys::key_status(disc, set),
+                libfreemkv::keys::DecryptStatus::Ready
+                    | libfreemkv::keys::DecryptStatus::NotEncrypted
+            ) && set.covers(&libfreemkv::keys::KeyScope::Titles(resolved))
+        }
         None => crate::resolve::ensure_decryptable_with(disc, false, None).is_ok(),
     };
     if disc.encrypted && !job.raw && !keyed {
@@ -328,6 +332,31 @@ mod tests {
         );
         let banked = preflight(&disc_with(2, true, true), &j);
         assert!(banked.reasons().iter().any(|r| r.key == "encrypted-no-key"));
+    }
+
+    // A set resolved for title 0 does not key title 1: the executors refuse a title outside
+    // the set's scope, so preflight must not report Ready for it.
+    #[test]
+    fn a_set_that_does_not_cover_the_selection_is_not_keyed() {
+        use crate::test_fixtures::{Answer, Calls, K1, K2, bd_image, resolve};
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let scope = libfreemkv::keys::KeyScope::Titles(vec![0]);
+        let set = resolve(&fx, scope, &[(Answer::Keydb, &[K1])], &Calls::default()).unwrap();
+        let job = |sel| Job {
+            selection: sel,
+            ..Job::new("iso://x.iso", "/out").with_keys(set.clone())
+        };
+        assert_eq!(
+            preflight(&fx.disc, &job(Selection::Titles(vec![0]))),
+            Preflight::Ready
+        );
+        for sel in [Selection::Titles(vec![1]), Selection::All] {
+            let pf = preflight(&fx.disc, &job(sel.clone()));
+            assert!(
+                pf.reasons().iter().any(|r| r.key == "encrypted-no-key"),
+                "{sel:?} reaches a title the set does not key: {pf:?}"
+            );
+        }
     }
 
     // `is_ready` is the accessor a front-end greys out Start on; assert both directions against
