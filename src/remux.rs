@@ -307,18 +307,27 @@ pub fn remux_iso_with(
 /// Remux to a local partial file, then copy a verified result to a partial
 /// beside the target before the atomic replacement. The caller owns the
 /// staging location; the engine removes both partial files on every exit.
+/// `batch_sectors` controls the size of each ISO read (2048 bytes per sector).
 pub fn remux_iso_staged(
     job: &RemuxJob,
     keys: &KeyParams,
     sink: &dyn Sink,
     staged_partial: &Path,
+    batch_sectors: u16,
 ) -> io::Result<RemuxReport> {
+    if batch_sectors == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "zero remux batch size",
+        ));
+    }
     remux_iso_sources_at(
         job,
         key_source_factory(keys),
         sink,
         &Halt::new(),
         Some(staged_partial),
+        Some(batch_sectors),
     )
 }
 
@@ -330,7 +339,7 @@ pub(crate) fn remux_iso_sources(
     sink: &dyn Sink,
     halt: &Halt,
 ) -> io::Result<RemuxReport> {
-    remux_iso_sources_at(job, sources, sink, halt, None)
+    remux_iso_sources_at(job, sources, sink, halt, None, None)
 }
 
 fn remux_iso_sources_at(
@@ -339,6 +348,7 @@ fn remux_iso_sources_at(
     sink: &dyn Sink,
     halt: &Halt,
     staged_partial: Option<&Path>,
+    batch_sectors: Option<u16>,
 ) -> io::Result<RemuxReport> {
     // §4.2: "cancellation is `EngineHalt::is_cancelled() = op.is_cancelled() || extra ||
     // sink.should_cancel()`".
@@ -373,6 +383,10 @@ fn remux_iso_sources_at(
         )
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
     };
+    let mut options = mux_options(false);
+    if let Some(batch_sectors) = batch_sectors {
+        options.batch_sectors = batch_sectors;
+    }
     land_verified(
         job,
         idx,
@@ -381,17 +395,7 @@ fn remux_iso_sources_at(
         &halt,
         &OsRemuxIo,
         staged_partial,
-        |dest| {
-            mux_opened_title(
-                &opened,
-                &keys,
-                idx,
-                selection,
-                dest,
-                &mux_options(false),
-                sink,
-            )
-        },
+        |dest| mux_opened_title(&opened, &keys, idx, selection, dest, &options, sink),
     )
 }
 
