@@ -13,19 +13,35 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Human-readable byte count for a diagnostic line — GB/MB/KB, so a rip size
-/// reads "~51.6 GB" instead of "~55460235264 bytes".
+/// reads "~51.7 GB" instead of "~55460235264 bytes". A value that would round
+/// to 1024 of a unit reads in the next one ("1 MB", not "1024 KB").
 fn human_bytes(b: u64) -> String {
     const K: f64 = 1024.0;
     let f = b as f64;
-    if f >= K * K * K {
+    let (mb, kb) = (f / (K * K), f / K);
+    if f >= K * K * K || mb.round() >= K {
         format!("{:.1} GB", f / (K * K * K))
-    } else if f >= K * K {
-        format!("{:.0} MB", f / (K * K))
+    } else if f >= K * K || kb.round() >= K {
+        format!("{mb:.0} MB")
     } else if f >= K {
-        format!("{:.0} KB", f / K)
+        format!("{kb:.0} KB")
     } else {
         format!("{b} B")
     }
+}
+
+/// `s` for a log line: control characters (newlines, terminal escapes) escaped, so
+/// disc- or error-borne text cannot forge lines or drive a terminal.
+pub(crate) fn log_safe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Resolve a [`Selection`] to concrete 0-based title indices against a scanned
@@ -268,7 +284,11 @@ where
                 // front-end as a bare title index with no diagnostic anywhere.
                 sink.log(
                     Level::Error,
-                    &format!("title {} failed — stopping the rip: {fail_detail}", idx + 1),
+                    &format!(
+                        "title {} failed — stopping the rip: {}",
+                        idx + 1,
+                        log_safe(&fail_detail)
+                    ),
                 );
                 return RipOutcome::Failed {
                     title_index: idx,
@@ -357,14 +377,10 @@ pub(crate) fn mux_iso_title(
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let hint = title.size_bytes;
     with_mux_watcher(sink, dest, |halt, events| {
+        let line = iso_mux_line(path, &title.playlist);
         sink.log(
             Level::Info,
-            &format!(
-                "mux: iso://{} {} -> {dest} (~{})",
-                path.display(),
-                title.playlist,
-                human_bytes(hint)
-            ),
+            &format!("{line} -> {dest} (~{})", human_bytes(hint)),
         );
         let source = libfreemkv::MuxSource::Iso {
             path,
@@ -373,6 +389,11 @@ pub(crate) fn mux_iso_title(
         };
         libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, halt, events)
     })
+}
+
+// The source half of an ISO title's mux log line.
+fn iso_mux_line(path: &std::path::Path, playlist: &str) -> String {
+    log_safe(&format!("mux: iso://{} {playlist}", path.display()))
 }
 
 // Shared scaffolding behind `mux_title` and `mux_title_session`: drives
@@ -456,6 +477,9 @@ fn with_mux_watcher<T>(
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
             loop {
+                // Read `done` BEFORE draining (Acquire pairs with SignalDone's Release): once
+                // it reads true, the drain below sees every send, and the loop ends after it.
+                let finished = watcher_done.load(Ordering::Acquire);
                 // The opening first: it precedes every write-progress tick.
                 while let Ok(title) = opened_rx.try_recv() {
                     opened(&title);
@@ -487,16 +511,11 @@ fn with_mux_watcher<T>(
                         ..Default::default()
                     });
                 }
+                if finished {
+                    break;
+                }
                 if sink.should_cancel() {
                     watcher_halt.cancel();
-                }
-                // Acquire pairs with SignalDone's Release: the drain below sees every send.
-                if watcher_done.load(Ordering::Acquire) {
-                    // A mux that returned before this poll: its opening is not lost.
-                    while let Ok(title) = opened_rx.try_recv() {
-                        opened(&title);
-                    }
-                    break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -1022,6 +1041,56 @@ mod tests {
         assert_eq!(ticks[1].bytes_done, 2 << 20);
     }
 
+    // A tick sent while the watcher sits between its drain and its `done` check still
+    // arrives: its cancel poll (in that window) lets the mux send its last tick and return.
+    #[test]
+    fn a_last_tick_sent_as_the_mux_returns_reaches_the_sink() {
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        struct Gate {
+            ticks: std::sync::Mutex<Vec<crate::sink::Progress>>,
+            polls: AtomicUsize,
+            in_poll: std::sync::Mutex<Option<Sender<()>>>,
+            sent: std::sync::Mutex<Option<Receiver<()>>>,
+        }
+        impl Sink for Gate {
+            fn progress(&self, p: &crate::sink::Progress) {
+                self.ticks.lock().unwrap().push(p.clone());
+            }
+            // Poll 0 is the caller's pre-check; poll 1 is the watcher's first.
+            fn should_cancel(&self) -> bool {
+                if self.polls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    let _ = self.in_poll.lock().unwrap().take().map(|t| t.send(()));
+                    if let Some(rx) = self.sent.lock().unwrap().take() {
+                        let _ = rx.recv_timeout(std::time::Duration::from_secs(5));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                false
+            }
+        }
+        let (in_poll, polled) = channel();
+        let (sent, got) = channel();
+        let sink = Gate {
+            ticks: Default::default(),
+            polls: AtomicUsize::new(0),
+            in_poll: std::sync::Mutex::new(Some(in_poll)),
+            sent: std::sync::Mutex::new(Some(got)),
+        };
+        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
+            let _ = polled.recv_timeout(std::time::Duration::from_secs(5));
+            events.on_write_progress(4 << 20, 4 << 20);
+            events.on_flush_progress(4 << 20, 4 << 20);
+            let _ = sent.send(());
+        });
+        let ticks = sink.ticks.lock().unwrap();
+        let passes: Vec<&str> = ticks.iter().map(|p| p.pass.as_ref()).collect();
+        assert_eq!(
+            passes,
+            ["mux", "sync"],
+            "the last mux and sync ticks were dropped"
+        );
+    }
+
     // A panic inside the mux must still release the watcher, or an unwind skips storing `done`
     // and the watcher loops forever — a hang, not a failure. Bounded here for that reason.
     #[test]
@@ -1053,8 +1122,17 @@ mod tests {
         assert_eq!(human_bytes(1024), "1 KB");
         assert_eq!(human_bytes(1024 * 1024), "1 MB");
         assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GB");
-        // The user's ~51.6 GB rip: GB, one decimal, not 55460235264 B.
+        // The user's ~51.7 GB rip: GB, one decimal, not 55460235264 B.
         assert_eq!(human_bytes(55_460_235_264), "51.7 GB");
+    }
+
+    /// A value just under a threshold that rounds up to it reads in the next unit.
+    #[test]
+    fn human_bytes_never_renders_1024_of_a_unit() {
+        assert_eq!(human_bytes(1_048_575), "1 MB");
+        assert_eq!(human_bytes(1_073_741_823), "1.0 GB");
+        assert_eq!(human_bytes(1_048_000), "1023 KB");
+        assert_eq!(human_bytes(1023 * 1024 * 1024), "1023 MB");
     }
 
     /// Each threshold is a PRODUCT of 1024s, and the values BETWEEN two
@@ -1145,10 +1223,8 @@ mod tests {
         );
 
         // (b) A non-empty selection whose every title is a skippable stub.
-        let d = disc(3, false, false);
         let sink = LogSink::default();
         let outcome = run_titles(&[1, 2], false, &sink, |_| Err(stub_err()));
-        let _ = &d;
         assert_eq!(
             outcome,
             RipOutcome::Ok { titles_written: 0 },
@@ -1254,6 +1330,52 @@ mod tests {
                 data: error_data(&stub_err()),
             }
         );
+    }
+
+    // `-t 2 -t 3`: a stub on an explicitly chosen non-feature title of a multi-title rip is
+    // fatal, not skipped; only a non-explicit rip skips it.
+    #[test]
+    fn explicit_multi_title_stub_is_fatal() {
+        let d = disc(3, false, false);
+        let indices = resolve_selection(&d, &Selection::Titles(vec![1, 2]));
+        let outcome = run_titles(&indices, true, &NoopSink, |idx| {
+            if idx == 1 { Err(stub_err()) } else { Ok(()) }
+        });
+        assert!(
+            matches!(outcome, RipOutcome::Failed { title_index: 1, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            decide_title(&TitleResult::SkippableStub, false, true, true),
+            TitleAction::StopFatal
+        );
+        assert_eq!(
+            decide_title(&TitleResult::SkippableStub, false, true, false),
+            TitleAction::Skip
+        );
+    }
+
+    // N9: disc-controlled text (a playlist name, an error's data) reaches `Sink::log` with
+    // its control characters escaped, so it cannot inject lines or terminal escapes.
+    #[test]
+    fn disc_text_in_a_log_line_has_no_control_characters() {
+        #[derive(Default)]
+        struct Lines(std::sync::Mutex<Vec<String>>);
+        impl Sink for Lines {
+            fn log(&self, _level: Level, msg: &str) {
+                self.0.lock().unwrap().push(msg.to_string());
+            }
+        }
+        let evil = "x\u{1b}[2J\nE0000 forged line\r";
+        let sink = Lines::default();
+        run_titles(&[0], false, &sink, |_| Err(std::io::Error::other(evil)));
+        let path = std::path::Path::new("/r/d.iso");
+        let mut lines = sink.0.into_inner().unwrap();
+        lines.push(iso_mux_line(path, evil));
+        for l in &lines {
+            assert!(!l.chars().any(char::is_control), "{l:?}");
+        }
+        assert!(lines.iter().all(|l| l.contains("forged line")), "{lines:?}");
     }
 
     #[test]
