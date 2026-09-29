@@ -37,6 +37,16 @@ impl Drop for SignalDone<'_> {
     }
 }
 
+// Wakes a parked watcher on every exit path. Declare it BEFORE the `SignalDone` guard: locals
+// drop in reverse, so `done` is already set when the watcher wakes.
+pub(crate) struct WakeOnDrop(pub(crate) std::thread::Thread);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.unpark();
+    }
+}
+
 // Wires a halt token, not just the progress callback, so Stop is honoured even during a retry
 // cooldown when no progress tick fires.
 pub(crate) fn with_cancel_watcher<T>(
@@ -58,16 +68,17 @@ pub(crate) fn with_cancel_watcher<T>(
     std::thread::scope(|s| {
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
-        s.spawn(move || {
+        let watcher = s.spawn(move || {
             while !watcher_done.load(Ordering::Acquire) {
                 if sink.should_cancel() {
                     watcher_halt.store(true, Ordering::Relaxed);
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
             }
         });
 
+        let _wake = WakeOnDrop(watcher.thread().clone());
         let _signal_done = SignalDone(&done);
         f(&halt)
     })
@@ -310,7 +321,7 @@ mod tests {
             asks: AtomicUsize::new(0),
         };
         let observed = with_cancel_watcher(&sink, |halt| {
-            // Give the watcher time to poll at least once (it sleeps 100 ms); the
+            // Give the watcher time to poll at least once (every 100 ms); the
             // loop returns the instant the flag goes up, costing nothing on the
             // happy path. This is a liveness backstop, not a timing measurement.
             for _ in 0..400 {
@@ -442,6 +453,25 @@ mod tests {
             &[3],
             "7048 bad bytes is 3 whole bad sectors — unreadable and retryable \
              are summed, then converted once, rounding down"
+        );
+    }
+
+    // The watcher is woken when the work ends: a quick call must not wait out a poll interval.
+    #[test]
+    fn a_finished_call_returns_without_waiting_for_the_next_poll() {
+        struct NeverCancel;
+        impl Sink for NeverCancel {}
+        let t0 = std::time::Instant::now();
+        // Each call outlives the watcher's first poll, so the watcher is asleep when it ends.
+        for _ in 0..5 {
+            with_cancel_watcher(&NeverCancel, |_halt| {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            });
+        }
+        let took = t0.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "5 short calls took {took:?}: each waited out the watcher's 100 ms sleep"
         );
     }
 

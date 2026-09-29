@@ -78,6 +78,21 @@ fn linked_follows_op_extra_and_sink() {
     EngineHalt::legacy(Some(flag.clone())).linked(|lh| assert!(Arc::ptr_eq(lh.as_arc(), &flag)));
 }
 
+// A bridged call returns when its work ends, not after the bridge's next poll slice.
+#[test]
+fn a_bridged_call_returns_without_waiting_for_the_next_slice() {
+    let h = EngineHalt::new(&Halt::new(), Some(Arc::new(AtomicBool::new(false))));
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        h.linked(|_| std::thread::sleep(Duration::from_millis(2)));
+    }
+    let took = t0.elapsed();
+    assert!(
+        took < WAIT_SLICE * 5,
+        "10 short calls took {took:?}: each waited out a {WAIT_SLICE:?} slice"
+    );
+}
+
 // ET8 `engine_outcome_mapping` — §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when
 // the op token is cancelled"; "`TimedOut` → **Failed** always".
 #[test]

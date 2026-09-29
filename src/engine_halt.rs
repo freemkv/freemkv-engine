@@ -125,15 +125,16 @@ impl<'a> EngineHalt<'a> {
         }
         let done = AtomicBool::new(false);
         std::thread::scope(|s| {
-            s.spawn(|| {
+            let bridge = s.spawn(|| {
                 while !done.load(Ordering::Acquire) {
                     if self.is_cancelled() {
                         child.cancel();
                         return;
                     }
-                    std::thread::sleep(WAIT_SLICE);
+                    std::thread::park_timeout(WAIT_SLICE);
                 }
             });
+            let _wake = crate::run::WakeOnDrop(bridge.thread().clone());
             let _done = crate::run::SignalDone(&done);
             f(&child)
         })
