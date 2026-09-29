@@ -10,10 +10,11 @@ on:
     branches: [main, dev, qa]
   pull_request:
 
-# Rapid dev pushes supersede their own in-progress runs instead of stacking.
+# Rapid dev/PR pushes supersede their own in-progress runs instead of
+# stacking; qa/main runs (release candidates and release commits) always finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_name == 'dev' || github.event_name == 'pull_request' }}
 
 # Least privilege: no job here writes to the repo (Codecov uses its own secret).
 permissions:
