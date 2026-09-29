@@ -162,7 +162,7 @@ impl Sink<WorkItem> for SweepSink {
         if let Err(e) = self.file.sync_all()
             && self.is_regular
         {
-            return Err(Error::IoError { source: e });
+            return Err(Error::from(e));
         }
         // Non-regular outputs (/dev/null, pipes) always fail
         // sync_all; that's not a real error.
@@ -375,6 +375,20 @@ mod tests {
             reloaded.ranges_with(&[SectorStatus::Finished]),
             vec![(0, 2048)]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A typed failure from the writeback flusher (SyncTimeout, Halted) must reach the
+    // caller typed, not re-wrapped as IoError (read downstream as a dead USB bridge).
+    #[test]
+    fn a_typed_sync_failure_surfaces_typed_not_as_io_error() {
+        let dir = scratch("synctyped");
+        let (mut sink, _iso) = sink_over(&dir, 8192);
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        let err = sink.close().err().expect("a halted fsync must fail");
+        assert!(matches!(err, Error::Halted), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

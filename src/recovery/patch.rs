@@ -165,8 +165,7 @@ impl PatchSink {
         is_regular: bool,
         title: Option<libfreemkv::DiscTitle>,
     ) -> Result<(Self, Arc<Mutex<SharedPatchState>>)> {
-        let file =
-            libfreemkv::io::WritebackFile::open(path).map_err(|e| Error::IoError { source: e })?;
+        let file = libfreemkv::io::WritebackFile::open(path).map_err(Error::from)?;
         let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map, title.as_ref())));
         let shared_clone = shared.clone();
         Ok((
@@ -219,25 +218,21 @@ impl Sink<PatchItem> for PatchSink {
         match item {
             PatchItem::Recovered { pos, buf } => {
                 let len = buf.len() as u64;
-                self.file
-                    .seek(SeekFrom::Start(pos))
-                    .map_err(|e| Error::IoError { source: e })?;
-                self.file
-                    .write_all(&buf)
-                    .map_err(|e| Error::IoError { source: e })?;
+                self.file.seek(SeekFrom::Start(pos)).map_err(Error::from)?;
+                self.file.write_all(&buf).map_err(Error::from)?;
                 self.map
                     .record(pos, len, SectorStatus::Finished)
-                    .map_err(|e| Error::IoError { source: e })?;
+                    .map_err(Error::from)?;
             }
             PatchItem::Unreadable { pos, len } => {
                 self.map
                     .record(pos, len, SectorStatus::Unreadable)
-                    .map_err(|e| Error::IoError { source: e })?;
+                    .map_err(Error::from)?;
             }
             PatchItem::NonTrimmed { pos, len } => {
                 self.map
                     .record(pos, len, SectorStatus::NonTrimmed)
-                    .map_err(|e| Error::IoError { source: e })?;
+                    .map_err(Error::from)?;
             }
         }
         self.republish(false);
@@ -257,7 +252,7 @@ impl Sink<PatchItem> for PatchSink {
                     error_kind = ?e.kind(),
                     "patch: sync_all failed"
                 );
-                return Err(Error::IoError { source: e });
+                return Err(Error::from(e));
             }
             tracing::debug!(
                 target: "freemkv::disc",
@@ -266,7 +261,7 @@ impl Sink<PatchItem> for PatchSink {
                 "patch: sync_all failed for non-regular file; ignoring"
             );
         }
-        self.map.flush().map_err(|e| Error::IoError { source: e })?;
+        self.map.flush().map_err(Error::from)?;
         // Final republish so anyone reading the shared snapshot after
         // `Pipeline::finish` sees the post-flush state; the snapshot's
         // contract is that it stays current through close.
@@ -308,7 +303,7 @@ pub(super) fn compute_initial_state(
     u64,
     bool,
 )> {
-    let map = mapfile::Mapfile::load(mapfile_path).map_err(|e| Error::IoError { source: e })?;
+    let map = mapfile::Mapfile::load(mapfile_path).map_err(Error::from)?;
     let total_bytes = map.total_size();
     let initial_stats = map.stats();
     let initial_entries: Vec<_> = map.entries().to_vec();
@@ -1266,8 +1261,7 @@ fn patch_linked(
     // Same reasoning as the decrypt gate: `copy`/`sweep` verify the mapfile
     // describes THIS disc, and `patch` must not skip that — otherwise a leftover
     // mapfile from disc B patches its ranges into disc A's ISO as "Finished".
-    mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref())
-        .map_err(|e| Error::IoError { source: e })?;
+    mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).map_err(Error::from)?;
     // COVERAGE. `total_bytes` (the denominator every reported figure derives
     // from) comes wholly from the untrusted mapfile, never checked against the
     // drive. `copy` forces a fresh sweep on mismatch; `patch` refuses instead.
@@ -2020,6 +2014,22 @@ mod tests {
         assert_eq!(s.ranges(), &[(0, 1024), (2048, 2048)]);
         s.remove(512, 2048); // covers tail of first + head of second
         assert_eq!(s.ranges(), &[(0, 512), (2560, 1536)]);
+    }
+
+    // A typed failure from the writeback flusher (SyncTimeout, Halted) must reach the
+    // caller typed, not re-wrapped as IoError (read downstream as a dead USB bridge).
+    #[test]
+    fn a_typed_sync_failure_surfaces_typed_not_as_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+        let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
+        let (mut sink, _shared) = PatchSink::new(&iso, map, true, None).unwrap();
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        let err = sink.close().err().expect("a halted fsync must fail");
+        assert!(matches!(err, Error::Halted), "got {err:?}");
     }
 }
 
