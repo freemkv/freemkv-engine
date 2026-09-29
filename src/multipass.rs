@@ -367,6 +367,16 @@ fn interrupted_severity(unreadable_bytes: u64, pending_bytes: u64) -> crate::Dam
     measured
 }
 
+// The loss figure for a run that stopped before the gate measured it: genuinely 0.0 only when
+// nothing is unreadable or pending, else NaN (unmeasured), as single-pass reports it.
+fn interrupted_lost_ms(unreadable_bytes: u64, pending_bytes: u64) -> f64 {
+    if unreadable_bytes == 0 && pending_bytes == 0 {
+        0.0
+    } else {
+        f64::NAN
+    }
+}
+
 // A recovery is complete only when the abort-on-loss gate did NOT fire and the mapfile shows
 // zero unreadable and zero pending bytes. `aborted_for_loss` is load-bearing on its own.
 fn recovery_is_complete(aborted_for_loss: bool, unreadable_bytes: u64, pending_bytes: u64) -> bool {
@@ -815,7 +825,7 @@ fn multipass_rip_inner(
                     unreadable_bytes: last_unreadable,
                     pending_bytes: last_pending,
                     good_bytes: last_good,
-                    main_lost_ms: 0.0,
+                    main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
                     severity: interrupted_severity(last_unreadable, last_pending),
                     passes,
                     aborted_for_loss: false,
@@ -849,12 +859,11 @@ fn multipass_rip_inner(
     if halted {
         // Severity comes from damage actually recorded — hard-coding Clean here
         // made a cancelled rip with 300 MB unreadable show a "Clean" badge.
-        // main_lost_ms stays 0.0 (uncomputable mid-recovery); `halted` marks it partial.
         return Ok(MultipassResult {
             unreadable_bytes: last_unreadable,
             pending_bytes: last_pending,
             good_bytes: last_good,
-            main_lost_ms: 0.0,
+            main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
             severity: interrupted_severity(last_unreadable, last_pending),
             passes,
             aborted_for_loss: false,
@@ -911,13 +920,15 @@ fn multipass_rip_inner(
                     end_of_recovery_bad_sectors(&stats),
                 )
             }
-            Err(_) => {
-                // Fail-safe (mirrors autorip): the mapfile — the rip's only
-                // damage record — couldn't be read at the abort-decision point.
-                // NaN makes `loss_aborts` fire instead of shipping this as a perfect rip.
+            Err(e) => {
+                // Fail-safe: the mapfile — the rip's only damage record — couldn't be read at
+                // the abort-decision point. NaN makes `loss_aborts` fire instead of shipping
+                // this as a perfect rip.
                 sink.log(
                     Level::Error,
-                    "multipass_rip: mapfile could not be loaded to verify loss — forcing abort",
+                    &format!(
+                        "multipass_rip: mapfile could not be loaded to verify loss — forcing abort ({e})"
+                    ),
                 );
                 // No `MapStats` to split, so the score keeps the whole in-flight
                 // aggregate deliberately — this fail-safe path must over-report,
@@ -1614,6 +1625,11 @@ mod tests {
         assert!(
             sink.logged(Level::Warn, "transport fault"),
             "the operator has to be told the drive needs a power-cycle"
+        );
+        assert!(
+            result.main_lost_ms.is_nan(),
+            "nothing measured the loss beside {} pending bytes; 0.0 claims none was lost",
+            result.pending_bytes
         );
     }
 
@@ -2703,6 +2719,15 @@ mod tests {
             "the gate must say it is failing safe: {:?}",
             sink.logs.lock().unwrap()
         );
+        let cause = Mapfile::load(&mapfile)
+            .err()
+            .expect("still unreadable")
+            .to_string();
+        assert!(
+            sink.logged(Level::Error, &cause),
+            "the fail-safe log must carry the load error ({cause}): {:?}",
+            sink.logs.lock().unwrap()
+        );
         assert!(
             result.main_lost_ms.is_nan(),
             "an unreadable damage record is unquantifiable loss, got {}",
@@ -2868,6 +2893,11 @@ mod tests {
             !result.aborted_for_loss,
             "the abort gate is not reached on the halted path"
         );
+        assert!(
+            result.main_lost_ms.is_nan(),
+            "a cancel measured no loss beside {} pending bytes; 0.0 claims none was lost",
+            result.pending_bytes
+        );
     }
 
     // The halted exit must score damage it MEASURED, not work not got to — a wide unrecovered
@@ -2921,6 +2951,13 @@ mod tests {
             result.unreadable_bytes,
             result.pending_bytes
         );
+    }
+
+    #[test]
+    fn an_interrupted_loss_is_zero_only_when_nothing_is_outstanding() {
+        assert_eq!(interrupted_lost_ms(0, 0), 0.0);
+        assert!(interrupted_lost_ms(2048, 0).is_nan());
+        assert!(interrupted_lost_ms(0, 2048).is_nan());
     }
 
     #[test]
