@@ -3,6 +3,9 @@ name: comment-guard
 # Thin caller → the canonical reusable guard in freemkv/.github (one definition
 # for every repo). Fork PRs still run it; same-repo pushes aren't double-run.
 on: [push, pull_request]
+# Least privilege: the reusable guard only reads the repo.
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
