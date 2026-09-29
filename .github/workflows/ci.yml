@@ -51,10 +51,13 @@ jobs:
   # `stable` (lint debt is caught against current Rust; dependents float highest).
   resolve-msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       v: ${{ steps.msrv.outputs.v }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - id: msrv
         shell: bash
         run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*\"([^\"]+)\".*/\1/')" >> "$GITHUB_OUTPUT"
@@ -67,8 +70,11 @@ jobs:
   # in-progress dev/qa branch whose entry isn't written yet is not blocked.
   changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
       - name: Require a CHANGELOG entry for the crate version on main
         shell: bash
         run: |
@@ -88,9 +94,11 @@ jobs:
   lint:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
@@ -101,14 +109,15 @@ jobs:
       # stable makes new-lint debt a BLOCKING gate the pinned version would hide.
       # The MSRV pin is installed second so it stays the default (fmt uses it
       # implicitly); clippy is invoked explicitly with `+stable`.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: clippy
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
       - run: cargo fmt --check
@@ -120,19 +129,21 @@ jobs:
   test:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
       - run: cargo test --tests
@@ -144,17 +155,21 @@ jobs:
   # exactly like the real build.
   deny:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories bans licenses sources
           manifest-path: freemkv-engine/Cargo.toml
@@ -169,19 +184,21 @@ jobs:
   test-release:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
       - run: cargo test --release --tests
@@ -205,19 +222,21 @@ jobs:
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: macos-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
       - run: cargo build --tests
@@ -238,19 +257,21 @@ jobs:
     needs: resolve-msrv
     if: github.ref_name == 'qa' || github.ref_name == 'main'
     runs-on: windows-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
       - run: cargo build --tests
@@ -260,10 +281,10 @@ jobs:
   #
   # Every other job here proves the ENGINE still builds. None of them proves
   # its CONSUMERS do, and that gap is not theoretical: a signature change to
-  # `end_of_recovery_promotion` landed at 22:37 and broke autorip, whose last
-  # CI run had been at 21:06. Nothing rebuilt autorip against the new engine,
+  # `end_of_recovery_promotion` once broke autorip (then a consumer; it has
+  # since left the release) and nothing rebuilt it against the new engine,
   # so the breakage sat undetected — consumer CI only fires on a push to that
-  # consumer, and nobody had pushed one.
+  # consumer. freemkv is the one consumer checked below.
   #
   # Making each repo build its own branch tip fixed the first version of this
   # problem; this fixes the same blind spot one level up, at the seam between
@@ -276,9 +297,11 @@ jobs:
   # which is exactly the failure that went unnoticed.
   consumers:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
@@ -306,8 +329,10 @@ jobs:
       # the binaries always float to the highest supported Rust. Build them on
       # `stable` so this job satisfies that floor; the engine's own lower MSRV
       # (verified by the `test` job) cannot compile them.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             freemkv
@@ -324,26 +349,30 @@ jobs:
   coverage:
     needs: resolve-msrv
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v5
         with:
+          persist-credentials: false
           path: freemkv-engine
       - uses: freemkv/.github/.github/actions/checkout-siblings@v1
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: freemkv-engine
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-llvm-cov
       - run: cargo llvm-cov --workspace --ignore-run-fail --lcov --output-path lcov.info
         working-directory: freemkv-engine
-      - uses: codecov/codecov-action@v7
+      - uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: freemkv-engine/lcov.info
