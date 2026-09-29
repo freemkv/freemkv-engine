@@ -3285,4 +3285,36 @@ mod tests {
             "no title -> unmeasurable, never clean"
         );
     }
+
+    // Multipass implies raw, enforced by the engine itself (preflight is skippable): a
+    // decrypting multipass job is refused before any pass reads or writes anything.
+    #[test]
+    fn a_decrypting_multipass_job_is_refused_before_any_read() {
+        let (_dir, iso) = scratch_iso("multipass-needs-raw");
+        let disc = test_disc(256, vec![]);
+        let (mut reader, reads) = stamp_reader(0xA1);
+        let job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        assert!(!job.raw, "fixture check: the job must be decrypting");
+        let opts = MultipassOpts {
+            max_passes: 5,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        let err = multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect_err("a decrypting multipass rip must be refused");
+        let want = crate::run::multipass_requires_raw().to_string();
+        assert_eq!(err.to_string(), want);
+        assert!(
+            reads.lock().unwrap().is_empty(),
+            "the refused rip read the disc"
+        );
+        assert!(!iso.exists(), "the refused rip created its output");
+    }
 }
