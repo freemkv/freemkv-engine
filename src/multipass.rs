@@ -429,6 +429,77 @@ pub fn end_of_recovery_lost_ms(
     (main_title_lost_ms(title, main_bad_bytes), None)
 }
 
+// The titles this rip delivers (`Job::selection`), whose damage the loop measures. Never empty:
+// with none, the extent-less `empty` title makes any damage unmeasurable, not clean.
+fn measured_titles<'a>(
+    disc: &'a libfreemkv::Disc,
+    job: &Job,
+    empty: &'a libfreemkv::DiscTitle,
+) -> Vec<&'a libfreemkv::DiscTitle> {
+    let picked: Vec<_> = crate::mux::resolve_selection(disc, &job.selection)
+        .into_iter()
+        .filter_map(|i| disc.titles.get(i))
+        .collect();
+    if picked.is_empty() {
+        vec![empty]
+    } else {
+        picked
+    }
+}
+
+// [`measured_scope_bad`] over every measured title: `None` if any is unscopable. ISO scope is
+// whole-disc (the same count for each title), so it is taken once, not summed.
+fn titles_scope_bad(
+    is_iso: bool,
+    bad_ranges: &[(u64, u64)],
+    titles: &[&libfreemkv::DiscTitle],
+) -> Option<u64> {
+    let mut total = 0u64;
+    for t in titles {
+        let bad = measured_scope_bad(is_iso, bad_ranges, t)?;
+        total = if is_iso {
+            bad
+        } else {
+            total.saturating_add(bad)
+        };
+    }
+    Some(total)
+}
+
+// [`abort_lost_bytes`] over every measured title, with the same ISO rule as `titles_scope_bad`.
+fn titles_abort_lost_bytes(
+    is_iso: bool,
+    titles: &[&libfreemkv::DiscTitle],
+    bad_ranges: &[(u64, u64)],
+) -> u64 {
+    titles.iter().fold(0u64, |total, t| {
+        let bad = abort_lost_bytes(is_iso, t, bad_ranges);
+        if is_iso {
+            bad
+        } else {
+            total.saturating_add(bad)
+        }
+    })
+}
+
+// [`end_of_recovery_lost_ms`] summed over every measured title; the first unquantifiable one
+// makes the whole figure NaN.
+fn titles_lost_ms(
+    promotion_intact: bool,
+    titles: &[&libfreemkv::DiscTitle],
+    bad_ranges: &[(u64, u64)],
+) -> (f64, Option<&'static str>) {
+    let mut total = 0.0;
+    for t in titles {
+        let (ms, why) = end_of_recovery_lost_ms(promotion_intact, t, bad_ranges);
+        if why.is_some() {
+            return (ms, why);
+        }
+        total += ms;
+    }
+    (total, None)
+}
+
 /// The result of a multipass run.
 #[derive(Clone, Debug)]
 pub struct MultipassResult {
@@ -438,9 +509,10 @@ pub struct MultipassResult {
     pub pending_bytes: u64,
     /// Good bytes recovered across all passes.
     pub good_bytes: u64,
-    /// Main-title playback milliseconds lost (NaN if unquantifiable).
+    /// Playback milliseconds lost in the ripped titles (NaN if unquantifiable): those
+    /// [`Job::selection`] resolves to, summed per title (title 0 for the default `MainMovie`).
     ///
-    /// ALWAYS scoped to the main title's own extents, even on an ISO rip whose
+    /// ALWAYS scoped to those titles' own extents, even on an ISO rip whose
     /// abort gate counts bytes across the whole disc — an unreadable menu or
     /// trailer is not lost feature playback, and reporting it as such once
     /// stamped `Serious` on a movie the drive had read perfectly.
@@ -476,8 +548,8 @@ pub struct MultipassOpts {
     /// `recovery::copy` dispatch (sweep-or-resume), no sweep/patch split, no
     /// convergence loop, no abort-on-loss gate.
     pub max_passes: u32,
-    /// Seconds of main-title playback loss tolerated once patch retries are
-    /// exhausted. `0` requires a perfect rip (any residual loss aborts).
+    /// Seconds of playback loss in the ripped titles ([`Job::selection`]) tolerated once
+    /// patch retries are exhausted. `0` requires a perfect rip (any residual loss aborts).
     /// Forced to `0` when `is_iso_output` regardless of the configured value
     /// (see [`effective_abort_secs`]) — an ISO deliverable is a whole-disc
     /// backup and always requires 100%.
@@ -485,7 +557,7 @@ pub struct MultipassOpts {
     /// True when the deliverable is a whole-disc ISO image. Scopes both the
     /// per-pass convergence check ([`scope_bad_bytes`]) and the end-of-
     /// recovery abort gate's BYTE count ([`abort_lost_bytes`]) to the whole
-    /// disc instead of just the muxed title's extents, and forces
+    /// disc instead of just the ripped titles' extents, and forces
     /// `abort_on_lost_secs` to `0` via [`effective_abort_secs`].
     ///
     /// It does NOT widen the MILLISECOND figure — [`MultipassResult::main_lost_ms`] stays
@@ -500,8 +572,9 @@ pub struct MultipassOpts {
 /// copy of the loop.
 ///
 /// `opts.max_passes == 0` takes the single-pass branch: one `recovery::copy`
-/// dispatch, no retry loop. Otherwise Pass 1 is a fresh `recovery::sweep`,
-/// followed by up to `opts.max_passes` `recovery::patch` passes.
+/// dispatch, no retry loop. Otherwise Pass 1 is a `recovery::sweep` (resuming the
+/// image's mapfile when one exists), followed by up to `opts.max_passes`
+/// `recovery::patch` passes. Damage is measured over the titles `job.selection` picks.
 pub fn multipass_rip(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
@@ -593,7 +666,7 @@ fn multipass_rip_inner(
         return Err(crate::run::multipass_requires_raw());
     }
     let empty_title = libfreemkv::DiscTitle::empty();
-    let main_title = disc.titles.first().unwrap_or(&empty_title);
+    let titles = measured_titles(disc, job, &empty_title);
     if !plan.multipass {
         // Single-pass: one `copy` dispatch (sweep-or-resume via mapfile
         // state), no retry loop, no ISO-multipass semantics, no abort gate —
@@ -693,7 +766,7 @@ fn multipass_rip_inner(
             let mux_scope_bad = match Mapfile::load(&mapfile_path) {
                 Ok(map) => {
                     let bad = map.ranges_with(&bad_sector_statuses());
-                    measured_scope_bad(opts.is_iso_output, &bad, main_title)
+                    titles_scope_bad(opts.is_iso_output, &bad, &titles)
                 }
                 Err(e) => {
                     sink.log(
@@ -820,12 +893,12 @@ fn multipass_rip_inner(
                 }
                 let stats = map.stats();
                 let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-                let lost_bytes = abort_lost_bytes(opts.is_iso_output, main_title, &bad_ranges);
+                let lost_bytes = titles_abort_lost_bytes(opts.is_iso_output, &titles, &bad_ranges);
                 // Fail-safe: an incomplete damage record makes loss NaN, so
                 // `loss_aborts` fires regardless of threshold. Deliberately
                 // asymmetric: `lost_bytes` is whole-disc; the ms below stays title-scoped.
                 let (lost_ms, unquantifiable) =
-                    end_of_recovery_lost_ms(promotion_intact, main_title, &bad_ranges);
+                    titles_lost_ms(promotion_intact, &titles, &bad_ranges);
                 if let Some(why) = unquantifiable {
                     sink.log(Level::Error, why);
                 }
@@ -3074,5 +3147,105 @@ mod tests {
         )
         .expect("run 2");
         assert_resumed(&finished, &reads, &iso, &second);
+    }
+
+    // Loss is measured over the titles being ripped (`Job::selection`), not `disc.titles[0]`.
+    #[test]
+    fn loss_is_measured_over_the_selected_titles_not_the_first_one() {
+        let rip = |bad_lba: u32, tag: &str| {
+            let (_dir, iso) = scratch_iso(tag);
+            // Title 0 is a short intro at [0, 100); the chosen title 1 spans [2000, 4096).
+            let disc = test_disc(4096, vec![test_title(0, 100), test_title(2000, 2096)]);
+            let mut reader = MultiSpotReader {
+                capacity: 4096,
+                spots: vec![Spot {
+                    lba: bad_lba,
+                    heal_after: u32::MAX,
+                    attempts: 0,
+                }],
+            };
+            let job = raw_job(&iso).with_selection(crate::Selection::Titles(vec![1]));
+            let opts = MultipassOpts {
+                max_passes: 5,
+                abort_on_lost_secs: 0,
+                is_iso_output: false,
+            };
+            multipass_rip(
+                &disc,
+                &mut reader,
+                &iso,
+                &job,
+                &opts,
+                &crate::sink::NoopSink,
+            )
+            .expect("permanent loss is a reported result")
+        };
+
+        let in_chosen = rip(3000, "selected-title-damaged");
+        assert!(
+            in_chosen.passes > 1,
+            "damage inside the chosen title must earn patch passes: {in_chosen:?}"
+        );
+        assert!(
+            in_chosen.aborted_for_loss,
+            "loss inside the chosen title must abort a perfect-rip job: {in_chosen:?}"
+        );
+        assert!(
+            in_chosen.main_lost_ms > 0.0,
+            "the chosen title's lost playback must be reported: {in_chosen:?}"
+        );
+
+        let in_intro = rip(50, "unselected-title-damaged");
+        assert_eq!(
+            in_intro.passes, 1,
+            "damage only in a title nobody is ripping earns no patch pass: {in_intro:?}"
+        );
+        assert!(
+            !in_intro.aborted_for_loss,
+            "damage only in an unselected title must not abort: {in_intro:?}"
+        );
+        assert_eq!(in_intro.main_lost_ms, 0.0, "{in_intro:?}");
+    }
+
+    #[test]
+    fn the_title_set_folds_count_every_ripped_title() {
+        let a = test_title(0, 100);
+        let b = test_title(1000, 100);
+        let bad = [(10 * 2048, 2048), (1010 * 2048, 4096), (5000 * 2048, 2048)];
+        assert_eq!(titles_scope_bad(false, &bad, &[&a, &b]), Some(6144));
+        assert_eq!(titles_abort_lost_bytes(false, &[&a, &b], &bad), 6144);
+        // Whole-disc scope is one count, not one per title.
+        assert_eq!(titles_scope_bad(true, &bad, &[&a, &b]), Some(8192));
+        assert_eq!(titles_abort_lost_bytes(true, &[&a, &b], &bad), 8192);
+        // One extent-less title makes the set unmeasured, whatever the others say.
+        let empty = libfreemkv::DiscTitle::empty();
+        assert_eq!(titles_scope_bad(false, &bad, &[&a, &empty]), None);
+        let (ms, why) = titles_lost_ms(true, &[&a, &empty], &bad);
+        assert!(ms.is_nan() && why.is_some());
+        let (ms, why) = titles_lost_ms(true, &[&a, &b], &bad);
+        let one = |t, n| end_of_recovery_lost_ms(true, t, &bad[n..=n]).0;
+        assert!(why.is_none());
+        assert!((ms - (one(&a, 0) + one(&b, 1))).abs() < 1e-6, "{ms}");
+    }
+
+    #[test]
+    fn measured_titles_follow_the_selection_and_never_come_back_empty() {
+        let empty = libfreemkv::DiscTitle::empty();
+        let disc = test_disc(4096, vec![test_title(0, 10), test_title(100, 10)]);
+        let job = |sel| raw_job(std::path::Path::new("x.iso")).with_selection(sel);
+        let got = measured_titles(&disc, &job(crate::Selection::Titles(vec![1])), &empty);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].extents[0].start_lba, 100);
+        let main = measured_titles(&disc, &job(crate::Selection::MainMovie), &empty);
+        assert_eq!(
+            main[0].extents[0].start_lba, 0,
+            "MainMovie is title 0, as before"
+        );
+        let none = measured_titles(&disc, &job(crate::Selection::Titles(vec![9])), &empty);
+        assert_eq!(none.len(), 1);
+        assert!(
+            none[0].extents.is_empty(),
+            "no title -> unmeasurable, never clean"
+        );
     }
 }
