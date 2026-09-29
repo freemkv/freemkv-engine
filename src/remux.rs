@@ -519,6 +519,7 @@ impl RemuxIo for OsRemuxIo {
 }
 
 // Mux (via `mux`, given the partial file's sink URL), verify, and move into place.
+#[allow(clippy::too_many_arguments)]
 fn land_verified(
     job: &RemuxJob,
     idx: usize,
@@ -546,7 +547,7 @@ fn land_verified(
     let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &watch, h))?;
     let _lock = DeleteOnDrop(Some(lock));
     remove_stale_partial(partial)?;
-    let mut guard = PartialFile(&partial, false);
+    let mut guard = PartialFile(partial, false);
 
     sink.event(&Event::Phase { name: "mux" });
     let dest = format!("mkv://{}", partial.display());
@@ -565,14 +566,14 @@ fn land_verified(
             io::Error::other(format!("mux of title {} did not complete", idx + 1))
         });
     }
-    durable_sync(rio, &partial, halt, sink, timing)?;
+    durable_sync(rio, partial, halt, sink, timing)?;
 
     sink.event(&Event::Phase { name: "verify" });
-    let verified = verify_watched(&partial, title, halt, sink, rio, timing);
+    let verified = verify_watched(partial, title, halt, sink, rio, timing);
     let stopped = verified.as_ref().is_err_and(libfreemkv::is_halt);
     if !stopped {
         sink.event(&Event::Verify {
-            path: &partial,
+            path: partial,
             ok: verified.is_ok(),
             runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
             expected_secs: title.duration_secs,
@@ -585,7 +586,7 @@ fn land_verified(
         sink.event(&Event::Phase { name: "copy" });
         remove_stale_partial(&target_partial)?;
         remote_guard = Some(PartialFile(&target_partial, false));
-        copy_staged(&partial, &target_partial, halt, sink, timing)?;
+        copy_staged(partial, &target_partial, halt, sink, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
         verify_watched(&target_partial, title, halt, sink, rio, timing)?;
