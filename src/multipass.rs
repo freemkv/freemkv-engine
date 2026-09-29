@@ -654,27 +654,23 @@ fn multipass_rip_inner(
         });
     }
 
-    // ── Pass 1: the forward sweep. ──
+    // ── Pass 1: the forward sweep, resuming an existing mapfile (a re-run after Stop, a
+    // wedge or an abort): the sweep re-reads only NonTried and refuses another disc's map. ──
     let mut passes = 0u32;
     let (mut last_good, mut last_unreadable, mut last_pending, mut halted);
     {
         let bridge = ProgressBridge::new(sink);
         let sweep_opts = SweepOptions {
             decrypt: pass_should_decrypt(job.raw),
-            resume: false,
+            resume: disc.mapfile_for(iso_path).exists(),
             batch_sectors: None,
             skip_on_error: true,
             progress: Some(&bridge),
             halt: None,
             keys: job.keys.clone(),
         };
-        let sr = match scope {
-            Some(scope) => {
-                let scope = Some(crate::recovery::sector_scope_to_bytes(scope));
-                crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, scope, halt)?
-            }
-            None => crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, None, halt)?,
-        };
+        let scope = scope.map(crate::recovery::sector_scope_to_bytes);
+        let sr = crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, scope, halt)?;
         passes += 1;
         last_good = sr.bytes_good;
         last_unreadable = sr.bytes_unreadable;
@@ -2867,5 +2863,216 @@ mod tests {
         );
         assert!(!recovery_is_complete(false, 0, 1), "pending bytes remain");
         assert!(!recovery_is_complete(true, 1, 1));
+    }
+
+    // ── Re-running multipass on the same image resumes from its mapfile ──
+
+    /// Stamps every sector with `marker` (byte 4) and its LBA (bytes 0..4), records each LBA it
+    /// is asked for, fails `bad` while `heal_after` touches remain, and cancels `halt_at`'s token
+    /// once the read head reaches its LBA.
+    struct StampReader {
+        capacity: u32,
+        marker: u8,
+        bad: Option<Spot>,
+        halt_at: Option<(u32, libfreemkv::Halt)>,
+        reads: std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+    }
+    impl libfreemkv::SectorSource for StampReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let end = lba + count as u32;
+            self.reads.lock().unwrap().extend(lba..end);
+            if let Some((at, halt)) = &self.halt_at
+                && end > *at
+            {
+                halt.cancel();
+            }
+            if let Some(spot) = &mut self.bad
+                && lba <= spot.lba
+                && spot.lba < end
+            {
+                spot.attempts += 1;
+                if spot.attempts <= spot.heal_after {
+                    return Err(libfreemkv::Error::DiscRead {
+                        sector: spot.lba as u64,
+                        status: Some(2),
+                        sense: Some(libfreemkv::scsi::ScsiSense {
+                            sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
+                            asc: 0x17,
+                            ascq: 0x01,
+                        }),
+                    });
+                }
+            }
+            let n = ((count as usize) * 2048).min(buf.len());
+            for (i, chunk) in buf[..n].chunks_mut(2048).enumerate() {
+                chunk.fill(self.marker);
+                chunk[..4].copy_from_slice(&(lba + i as u32).to_le_bytes());
+            }
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.capacity
+        }
+    }
+
+    fn stamp_reader(marker: u8) -> (StampReader, std::sync::Arc<std::sync::Mutex<Vec<u32>>>) {
+        let reads = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let r = StampReader {
+            capacity: 4096,
+            marker,
+            bad: None,
+            halt_at: None,
+            reads: reads.clone(),
+        };
+        (r, reads)
+    }
+
+    // The sectors a re-run must neither re-read nor overwrite: every Finished range run 1 left.
+    fn finished_lbas(mapfile: &std::path::Path) -> Vec<u32> {
+        let map = Mapfile::load(mapfile).expect("run 1 left a mapfile");
+        map.ranges_with(&[SectorStatus::Finished])
+            .iter()
+            .flat_map(|&(pos, size)| (pos / 2048) as u32..((pos + size) / 2048) as u32)
+            .collect()
+    }
+
+    fn marker_at(iso: &std::path::Path, lba: u32) -> u8 {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(iso).unwrap();
+        f.seek(SeekFrom::Start(lba as u64 * 2048 + 4)).unwrap();
+        let mut b = [0u8; 1];
+        f.read_exact(&mut b).unwrap();
+        b[0]
+    }
+
+    // Run 2 must touch nothing run 1 already recovered, and must recover the rest.
+    fn assert_resumed(
+        finished: &[u32],
+        reads: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+        iso: &std::path::Path,
+        r: &MultipassResult,
+    ) {
+        assert!(
+            finished.len() > 100,
+            "fixture check: run 1 must have recovered something, got {} sectors",
+            finished.len()
+        );
+        let reads = reads.lock().unwrap();
+        let reread: Vec<u32> = finished
+            .iter()
+            .copied()
+            .filter(|l| reads.contains(l))
+            .take(5)
+            .collect();
+        assert!(
+            reread.is_empty(),
+            "run 2 re-read sectors run 1 had already recovered, e.g. {reread:?}"
+        );
+        for &lba in [
+            finished[0],
+            finished[finished.len() / 2],
+            finished[finished.len() - 1],
+        ]
+        .iter()
+        {
+            assert_eq!(
+                marker_at(iso, lba),
+                0xA1,
+                "LBA {lba} recovered by run 1 was wiped or overwritten by run 2"
+            );
+        }
+        assert!(r.complete, "run 2 must finish the recovery: {r:?}");
+        assert_eq!(r.good_bytes, 4096 * 2048, "{r:?}");
+    }
+
+    #[test]
+    fn a_rerun_after_an_abort_for_loss_resumes_instead_of_wiping_the_image() {
+        let (_dir, iso) = scratch_iso("rerun-after-abort");
+        let disc = test_disc(4096, vec![test_title(0, 4096)]);
+        let opts = MultipassOpts {
+            max_passes: 3,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        let (mut r1, _) = stamp_reader(0xA1);
+        r1.bad = Some(Spot {
+            lba: 1000,
+            heal_after: u32::MAX,
+            attempts: 0,
+        });
+        let first = multipass_rip(
+            &disc,
+            &mut r1,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("run 1");
+        assert!(
+            first.aborted_for_loss,
+            "fixture check: run 1 must abort: {first:?}"
+        );
+        let finished = finished_lbas(&disc.mapfile_for(&iso));
+
+        // The drive now reads the spot (cleaned disc, better drive): a re-run must retry it.
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let second = multipass_rip(
+            &disc,
+            &mut r2,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("run 2");
+        assert_resumed(&finished, &reads, &iso, &second);
+    }
+
+    #[test]
+    fn a_rerun_after_a_stop_mid_sweep_resumes_instead_of_wiping_the_image() {
+        let (_dir, iso) = scratch_iso("rerun-after-stop");
+        let disc = test_disc(4096, vec![test_title(0, 4096)]);
+        let opts = MultipassOpts {
+            max_passes: 3,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        let op = libfreemkv::Halt::new();
+        let (mut r1, _) = stamp_reader(0xA1);
+        r1.halt_at = Some((2000, op.clone()));
+        let first = multipass_rip_with(
+            &op,
+            &disc,
+            &mut r1,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            &crate::sink::NoopSink,
+        );
+        let first = first.value().expect("run 1's partial result");
+        assert!(
+            first.halted,
+            "fixture check: run 1 must stop mid-sweep: {first:?}"
+        );
+        let finished = finished_lbas(&disc.mapfile_for(&iso));
+
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let second = multipass_rip(
+            &disc,
+            &mut r2,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            &crate::sink::NoopSink,
+        )
+        .expect("run 2");
+        assert_resumed(&finished, &reads, &iso, &second);
     }
 }
