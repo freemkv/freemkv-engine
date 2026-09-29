@@ -935,6 +935,29 @@ fn a_failed_top_up_is_remembered_not_reported_as_no_key() {
     assert_eq!(calls.len(), asked, "the ask was spent: not asked again");
 }
 
+/// A top-up refused for a cause other than Missing (E7028) keeps that refusal when the
+/// sidecar has since turned unreadable (only a Missing reads it, for E7034), and remembers it.
+#[test]
+fn an_unreadable_sidecar_does_not_replace_a_top_up_refusal() {
+    let fx = bd_image(&[Some(K1), Some(K2), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    let f = factory(
+        &[(Answer::Keydb, &[K1]), (Answer::Unavailable, &[])],
+        &Calls::default(),
+    );
+    let opened =
+        open_image_with(&ImageSource::Iso(iso.clone()), OpenImageOptions::resolve(f)).unwrap();
+    std::fs::write(mapfile_path_for(&iso), "# freemkv-vidfp: zz\n0x0 0x800 +\n").unwrap();
+    let code = |t: usize| opened.keys_for(&[t], None).map(|_| ()).unwrap_err().code();
+    let e7028 = libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE;
+    assert_eq!(
+        (code(1), code(2)),
+        (e7028, e7028),
+        "not MapfileInvalid, then E7022"
+    );
+}
+
 /// B1: a top-up that made no request (a Stop before it, or an image that would not open)
 /// has not spent the ask: the next call asks and succeeds.
 #[test]
