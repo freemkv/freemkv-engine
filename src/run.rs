@@ -287,9 +287,8 @@ mod tests {
 
     #[test]
     fn single_pass_recovers_a_clean_synthetic_disc_to_iso() {
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-run-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("out.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
 
         let sectors = 256u32;
         let disc = clean_disc(sectors);
@@ -308,8 +307,6 @@ mod tests {
         assert!(!result.halted);
         // The engine logged the recovery start (the bridge/sink is wired).
         assert!(sink.logs.load(Ordering::Relaxed) >= 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Exercises the WATCHER, not the check-before-starting: a sink that stays uncancelled for
@@ -353,18 +350,16 @@ mod tests {
 
     #[test]
     fn cancel_via_sink_halts_recovery() {
-        // A sink whose should_cancel is always true must make the library halt.
-        // The sweep's progress reporter is called on EVERY batch iteration, so
-        // a tick — and the halt — is guaranteed on the first disc iteration.
+        // A sink cancelled before the call: the pre-start check halts it. The watcher and
+        // `report`'s return are pinned by their own tests.
         struct CancelSink;
         impl Sink for CancelSink {
             fn should_cancel(&self) -> bool {
                 true
             }
         }
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("c.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("c.iso");
         let sectors = 4096u32;
         let disc = clean_disc(sectors);
         let mut reader = ZeroReader { capacity: sectors };
@@ -376,7 +371,6 @@ mod tests {
         // wiring a halt token would legitimately change them.
         assert!(r.halted, "a cancelling sink must halt the rip");
         assert!(!r.complete, "a halted rip is not complete");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `sectors_bad` must count DAMAGE, not un-swept territory: deriving it from
@@ -565,14 +559,12 @@ mod tests {
         impl Sink for NeverCancel {}
 
         let (tx, rx) = std::sync::mpsc::channel();
+        // The panic message is expected in the log: the hook is process-global, so swapping
+        // it here would race every other test thread.
         std::thread::spawn(move || {
-            // The panic is deliberate; keep it off the test log.
-            let prev = std::panic::take_hook();
-            std::panic::set_hook(Box::new(|_| {}));
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_cancel_watcher(&NeverCancel, |_halt| panic!("boom"));
+                with_cancel_watcher(&NeverCancel, |_halt| panic!("deliberate test panic"));
             }));
-            std::panic::set_hook(prev);
             let _ = tx.send(caught.is_err());
         });
 
@@ -628,9 +620,8 @@ mod tests {
                 self.start.elapsed() > std::time::Duration::from_millis(50)
             }
         }
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-cooldown-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("cd.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("cd.iso");
         let sectors = 4096u32;
         let disc = clean_disc(sectors);
         let mut reader = NotReadyReader { capacity: sectors };
@@ -662,6 +653,5 @@ mod tests {
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
              token is polled every 100 ms and must break the pause"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
