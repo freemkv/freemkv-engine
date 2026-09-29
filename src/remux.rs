@@ -21,7 +21,7 @@ use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The mux options every front-end rips with; `raw` passes ciphertext through.
@@ -463,6 +463,8 @@ impl Drop for PartialFile<'_> {
 pub(crate) struct RemuxTiming {
     /// T30: §3.1 "60 s with no bytes read (HR1)".
     pub(crate) verify_stall: Duration,
+    /// The staged copy's bound, as T30: 60 s with no bytes written (HR1).
+    pub(crate) copy_stall: Duration,
     /// §4.4: "rate-limited to one call per 250 ms".
     pub(crate) activity_every: Duration,
     /// How often real sync/verify progress refreshes the file's mtime for a lock waiter (T10).
@@ -473,6 +475,7 @@ impl Default for RemuxTiming {
     fn default() -> Self {
         Self {
             verify_stall: Duration::from_secs(60),
+            copy_stall: Duration::from_secs(60),
             activity_every: Duration::from_millis(250),
             lock_beat: libfreemkv::io::artifact_lock::ARTIFACT_LOCK_WINDOW / 10,
         }
@@ -494,6 +497,8 @@ pub(crate) trait RemuxIo: Sync {
     ) -> io::Result<()>;
     /// Open `path` for the verify reads.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>>;
+    /// Create `path` for the staged copy; an existing file is refused, never truncated.
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>>;
     fn timing(&self) -> RemuxTiming;
 }
 
@@ -514,6 +519,14 @@ impl RemuxIo for OsRemuxIo {
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
         Ok(Box::new(std::fs::File::open(path)?))
+    }
+
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Box::new(file))
     }
 
     fn timing(&self) -> RemuxTiming {
@@ -589,7 +602,7 @@ fn land_verified(
         sink.event(&Event::Phase { name: "copy" });
         remove_stale_partial(&target_partial)?;
         remote_guard = Some(PartialFile(&target_partial, false));
-        copy_staged(partial, &target_partial, halt, sink, timing)?;
+        copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
         verify_watched(&target_partial, title, halt, sink, rio, timing)?;
@@ -639,25 +652,75 @@ fn land_verified(
     })
 }
 
+// The staged copy on a worker, waited on as verify is: Stop within a slice, and
+// `TimedOut { op: "copy" }` after `copy_stall` with no bytes written (§3.1 HR1).
 fn copy_staged(
     source: &Path,
     destination: &Path,
     halt: &EngineHalt<'_>,
     sink: &dyn Sink,
+    rio: &dyn RemuxIo,
     timing: RemuxTiming,
 ) -> io::Result<()> {
     let mut src = std::fs::File::open(source)?;
     let total = src.metadata()?.len();
-    let mut dst = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    let mut dst = rio.create_new(destination)?;
+    let copied = Arc::new(AtomicU64::new(0));
+    let quit = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (count, stop) = (copied.clone(), quit.clone());
+    std::thread::Builder::new()
+        .name("freemkv-remux-copy".into())
+        .spawn(move || {
+            let result = copy_all(&mut src, &mut *dst, &count, &stop);
+            drop((src, dst));
+            let _ = tx.send(result);
+        })?;
+    let started = Instant::now();
+    let report = |done: u64| {
+        let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+        crate::sink::Progress {
+            speed_bps: speed,
+            eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
+            ..activity("copy", done, total)
+        }
+    };
+    let beat = LockBeat::new(None, timing.lock_beat);
+    let watched = watch_worker(
+        &rx,
+        &copied,
+        "copy",
+        timing.copy_stall,
+        halt,
+        sink,
+        timing,
+        beat,
+        &report,
+    );
+    if watched.is_err() {
+        quit.store(true, Ordering::Relaxed);
+    }
+    let done = watched??;
+    if done != total || std::fs::metadata(destination)?.len() != total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remux copy size mismatch",
+        ));
+    }
+    Ok(())
+}
+
+// The copy worker's loop; `copied` is its progress, `quit` set once the caller gave up.
+fn copy_all(
+    src: &mut std::fs::File,
+    dst: &mut dyn Write,
+    copied: &AtomicU64,
+    quit: &AtomicBool,
+) -> io::Result<u64> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut done = 0u64;
-    let mut every = Activity::new(timing.activity_every);
-    let started = Instant::now();
     loop {
-        if halt.is_cancelled() {
+        if quit.load(Ordering::Relaxed) {
             return Err(libfreemkv::Error::Halted.into());
         }
         let n = src.read(&mut buf)?;
@@ -666,22 +729,10 @@ fn copy_staged(
         }
         dst.write_all(&buf[..n])?;
         done += n as u64;
-        if every.due(done, done == total) {
-            let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
-            sink.progress(&crate::sink::Progress {
-                speed_bps: speed,
-                eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
-                ..activity("copy", done, total)
-            });
-        }
+        copied.store(done, Ordering::Relaxed);
     }
-    if done != total || dst.metadata()?.len() != total {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "remux copy size mismatch",
-        ));
-    }
-    Ok(())
+    dst.flush()?;
+    Ok(done)
 }
 
 // A `Sink::progress` of `pass` (§4.4 "`Progress.pass` values are stable keys").
@@ -842,26 +893,56 @@ fn verify_watched(
         .spawn(move || {
             let _ = tx.send(libfreemkv::probe_mkv_with_cues(reader));
         })?;
-    let progress = libfreemkv::halt::Progress::new();
-    let mut timer = StallTimer::new(timing.verify_stall, &progress);
-    let (mut every, mut seen) = (Activity::new(timing.activity_every), 0);
     let beat_file = std::fs::OpenOptions::new().write(true).open(path).ok();
-    let mut beat = LockBeat::new(beat_file, timing.lock_beat);
+    let beat = LockBeat::new(beat_file, timing.lock_beat);
+    let report = |done| activity("verify", done, total);
+    let probe = watch_worker(
+        &rx,
+        &read,
+        "verify",
+        timing.verify_stall,
+        halt,
+        sink,
+        timing,
+        beat,
+        &report,
+    )?;
+    check_probe(path, title, probe?)
+}
+
+// Waits halt-aware on a worker whose forward progress is the byte count `moved`, reported
+// through `report` and `beat`: `Halted` on a cancel, `TimedOut { op }` after `stall` with no
+// progress. Either return leaks the worker.
+#[allow(clippy::too_many_arguments)]
+fn watch_worker<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    moved: &AtomicU64,
+    op: &'static str,
+    stall: Duration,
+    halt: &EngineHalt<'_>,
+    sink: &dyn Sink,
+    timing: RemuxTiming,
+    mut beat: LockBeat,
+    report: &dyn Fn(u64) -> crate::sink::Progress,
+) -> io::Result<T> {
+    let progress = libfreemkv::halt::Progress::new();
+    let mut timer = StallTimer::new(stall, &progress);
+    let (mut every, mut seen) = (Activity::new(timing.activity_every), 0);
     loop {
         let done = rx.recv_timeout(WAIT_SLICE);
-        let now = read.load(Ordering::Relaxed);
+        let now = moved.load(Ordering::Relaxed);
         if now > seen {
             seen = now;
             progress.bump();
             beat.progressed();
         }
         if every.due(now, done.is_ok()) {
-            sink.progress(&activity("verify", now, total));
+            sink.progress(&report(now));
         }
         match done {
-            Ok(probe) => return check_probe(path, title, probe?),
+            Ok(result) => return Ok(result),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("verify worker lost"));
+                return Err(io::Error::other(format!("{op} worker lost")));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -869,7 +950,7 @@ fn verify_watched(
             return Err(libfreemkv::Error::Halted.into());
         }
         if timer.poll(&progress) == Stall::Expired {
-            return Err(libfreemkv::Error::TimedOut { op: "verify" }.into());
+            return Err(libfreemkv::Error::TimedOut { op }.into());
         }
     }
 }
@@ -959,8 +1040,8 @@ mod tests {
         let token = Halt::new();
         let sink = Events::default();
         let halt = EngineHalt::new(&token, None).with_sink(&sink);
-        let err =
-            copy_staged(&source, &destination, &halt, &sink, RemuxTiming::default()).unwrap_err();
+        let timing = RemuxTiming::default();
+        let err = copy_staged(&source, &destination, &halt, &sink, &OsRemuxIo, timing).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
     }

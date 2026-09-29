@@ -43,10 +43,21 @@ enum DirSync {
     Fail,
 }
 
+#[derive(Default)]
+struct WritePlan {
+    // Bytes accepted before every later write blocks until `release`.
+    block_after: Option<u64>,
+    // Reports each write whole but drops its last byte.
+    short: bool,
+    // Writes zeros in place of the data.
+    zeros: bool,
+}
+
 struct FakeIo {
     timing: RemuxTiming,
     sync: SyncPlan,
     read: ReadPlan,
+    write: WritePlan,
     dir_sync: DirSync,
     in_sync: AtomicBool,
     returned: Arc<AtomicU64>,
@@ -58,11 +69,13 @@ impl FakeIo {
         Self {
             timing: RemuxTiming {
                 verify_stall: WINDOW,
+                copy_stall: WINDOW,
                 activity_every: Duration::from_millis(10),
                 lock_beat: Duration::from_millis(10),
             },
             sync,
             read,
+            write: WritePlan::default(),
             dir_sync: DirSync::default(),
             in_sync: AtomicBool::new(false),
             returned: Arc::default(),
@@ -142,8 +155,64 @@ impl RemuxIo for FakeIo {
         }))
     }
 
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Box::new(Faulty {
+            inner: file,
+            block_after: self.write.block_after,
+            short: self.write.short,
+            zeros: self.write.zeros,
+            written: 0,
+            release: self.release.clone(),
+        }))
+    }
+
     fn timing(&self) -> RemuxTiming {
         self.timing
+    }
+}
+
+// A copy destination per `WritePlan`.
+struct Faulty {
+    inner: std::fs::File,
+    block_after: Option<u64>,
+    short: bool,
+    zeros: bool,
+    written: u64,
+    release: Arc<AtomicBool>,
+}
+
+impl Write for Faulty {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.block_after.is_some_and(|b| self.written >= b) {
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let n = match self.block_after {
+            Some(b) => buf.len().min(
+                usize::try_from(b.saturating_sub(self.written))
+                    .unwrap()
+                    .max(1),
+            ),
+            None => buf.len(),
+        };
+        let data = if self.zeros {
+            vec![0; n]
+        } else {
+            buf[..n].to_vec()
+        };
+        let kept = if self.short { n - 1 } else { n };
+        self.inner.write_all(&data[..kept])?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -877,4 +946,75 @@ fn remux_holder_stays_observable_during_sync_and_verify() {
         "no holder progress visible during the sync"
     );
     assert_ne!(at[1].1, at[2].1, "no holder progress visible during verify");
+}
+
+// `run` for the staged path: mux into `stage`, copy beside the target, then replace.
+fn run_staged(
+    target: &Path,
+    stage: &Path,
+    sink: &dyn Sink,
+    op: &Halt,
+    rio: &dyn RemuxIo,
+    mux: impl FnOnce(&str) -> io::Result<libfreemkv::MuxOutcome>,
+) -> io::Result<RemuxReport> {
+    let halt = EngineHalt::new(op, None).with_sink(sink);
+    let j = job(target.to_path_buf(), true);
+    land_verified(&j, 0, &title(600.0), sink, &halt, rio, Some(stage), mux)
+}
+
+// The staged copy to the library share is a wait like every other (§3.1 HR1, §4.2): a Stop
+// ends a copy blocked in a write within the Stop latency, a copy with no bytes written for
+// the window fails E9073, and the target is untouched either way.
+#[test]
+fn remux_staged_copy_is_stall_based_and_stoppable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.block_after = Some(16);
+    // Unblocks the write long after the Stop, so a copy that ignores Stop still ends.
+    let release = rio.release.clone();
+    cancel_later(
+        move || release.store(true, Ordering::SeqCst),
+        STOP_LATENCY * 3,
+    );
+    let op = Halt::new();
+    let o = op.clone();
+    cancel_later(move || o.cancel(), Duration::from_millis(100));
+    let t0 = Instant::now();
+    let e = run_staged(
+        &target,
+        &stage,
+        &Events::default(),
+        &op,
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    assert!(libfreemkv::is_halt(&e), "{e}");
+    assert!(
+        t0.elapsed() < STOP_LATENCY,
+        "the Stop waited out the blocked write"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.block_after = Some(16);
+    let never = Halt::new();
+    let t0 = Instant::now();
+    let e = run_staged(
+        &target,
+        &stage,
+        &Events::default(),
+        &never,
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    let stalled = libfreemkv::Error::TimedOut { op: "copy" };
+    assert_eq!(e.to_string(), stalled.to_string());
+    assert!(t0.elapsed() < WINDOW + STOP_LATENCY);
+    untouched(&target, mtime);
+    assert!(!stage.exists());
 }
