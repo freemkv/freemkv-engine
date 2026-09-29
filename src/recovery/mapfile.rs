@@ -196,7 +196,7 @@ pub struct Mapfile {
     /// (after any `record()`) with no two adjacent entries sharing a status. Deliberately
     /// uncapped — that invariant IS the bound, and the length is exactly the number of status
     /// runs the disc's damage actually has (it shrinks as damage is recovered, not just grows).
-    /// `record()` is O(entries).
+    /// `record()` is O(log entries + touched runs), plus a tail shift when the run count changes.
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
@@ -476,52 +476,7 @@ impl Mapfile {
             let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
             return Err(e);
         };
-        let mut new_entries = Vec::with_capacity(self.entries.len() + 2);
-
-        for e in self.entries.drain(..) {
-            let e_end = e.pos.saturating_add(e.size);
-            if e_end <= pos || e.pos >= end {
-                // entirely before or after — keep
-                new_entries.push(e);
-                continue;
-            }
-            // Overlap — keep portions outside [pos, end)
-            if e.pos < pos {
-                new_entries.push(MapEntry {
-                    pos: e.pos,
-                    size: pos - e.pos,
-                    status: e.status,
-                });
-            }
-            if e_end > end {
-                new_entries.push(MapEntry {
-                    pos: end,
-                    size: e_end - end,
-                    status: e.status,
-                });
-            }
-        }
-        new_entries.push(MapEntry { pos, size, status });
-        new_entries.sort_by_key(|e| e.pos);
-
-        // Coalesce adjacent same-status entries.
-        let mut merged: Vec<MapEntry> = Vec::with_capacity(new_entries.len());
-        for e in new_entries {
-            if let Some(last) = merged.last_mut()
-                && last.pos.saturating_add(last.size) == e.pos
-                && last.status == e.status
-            {
-                last.size = last.size.saturating_add(e.size);
-                continue;
-            }
-            merged.push(e);
-        }
-
-        // Recompute stats from merged entries; record() is already O(n) so this is
-        // constant-factor overhead. The win is stats() becomes O(1), important
-        // since it's called millions of times in the sweep/patch hot path.
-        self.stats = Self::compute_stats(&merged, self.total_size);
-        self.entries = merged;
+        self.splice(pos, end, status);
         self.dirty = true;
         if self.last_flushed.elapsed() >= FLUSH_INTERVAL {
             self.write_to_disk()?;
@@ -693,27 +648,82 @@ impl Mapfile {
         }
     }
 
+    // Replaces the entries overlapping or touching `[pos, end)` with their split remainders,
+    // the new run and merged neighbours; stats move by the window's delta. Given the
+    // maximal-run invariant nothing outside the window can merge, so this equals a full rebuild.
+    fn splice(&mut self, pos: u64, end: u64, status: SectorStatus) {
+        let run_end = |e: &MapEntry| e.pos.saturating_add(e.size);
+        let lo = self.entries.partition_point(|e| run_end(e) < pos);
+        let hi = self.entries.partition_point(|e| e.pos <= end);
+        let window = &self.entries[lo..hi];
+        let mut pieces: Vec<MapEntry> = Vec::with_capacity(window.len().min(4) + 1);
+        let mut placed = false;
+        let new_run = MapEntry {
+            pos,
+            size: end - pos,
+            status,
+        };
+        for e in window {
+            let e_end = run_end(e);
+            if e_end <= pos {
+                pieces.push(e.clone());
+                continue;
+            }
+            if e.pos < pos {
+                pieces.push(MapEntry {
+                    pos: e.pos,
+                    size: pos - e.pos,
+                    status: e.status,
+                });
+            }
+            if e_end > end && !placed {
+                pieces.push(new_run.clone());
+                placed = true;
+            }
+            if e.pos >= end {
+                pieces.push(e.clone());
+            } else if e_end > end {
+                pieces.push(MapEntry {
+                    pos: end,
+                    size: e_end - end,
+                    status: e.status,
+                });
+            }
+        }
+        if !placed {
+            pieces.push(new_run);
+        }
+        let mut merged: Vec<MapEntry> = Vec::with_capacity(pieces.len());
+        for e in pieces {
+            if let Some(last) = merged.last_mut()
+                && run_end(last) == e.pos
+                && last.status == e.status
+            {
+                last.size = last.size.saturating_add(e.size);
+                continue;
+            }
+            merged.push(e);
+        }
+        for e in window {
+            tally(&mut self.stats, e, false);
+        }
+        for e in &merged {
+            tally(&mut self.stats, e, true);
+        }
+        if merged.len() == hi - lo {
+            self.entries[lo..hi].clone_from_slice(&merged);
+        } else {
+            self.entries.splice(lo..hi, merged);
+        }
+    }
+
     fn compute_stats(entries: &[MapEntry], total_size: u64) -> MapStats {
         let mut s = MapStats {
             bytes_total: total_size,
             ..Default::default()
         };
         for e in entries {
-            match e.status {
-                SectorStatus::Finished => s.bytes_good += e.size,
-                SectorStatus::Unreadable => {
-                    s.bytes_unreadable += e.size;
-                    s.num_bad_ranges += 1;
-                }
-                SectorStatus::NonTried => {
-                    s.bytes_pending += e.size;
-                    s.bytes_nontried += e.size;
-                }
-                SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
-                    s.bytes_pending += e.size;
-                    s.bytes_retryable += e.size;
-                }
-            }
+            tally(&mut s, e, true);
         }
         s
     }
@@ -822,6 +832,37 @@ impl Drop for Mapfile {
 
 fn invalid(kind: &'static str) -> io::Error {
     libfreemkv::error::Error::MapfileInvalid { kind }.into()
+}
+
+// Adds (or removes) one entry's contribution to `s`. Saturating: `record()` only removes
+// what an earlier tally added, so this never actually clamps.
+fn tally(s: &mut MapStats, e: &MapEntry, add: bool) {
+    let f = |v: &mut u64| {
+        *v = if add {
+            v.saturating_add(e.size)
+        } else {
+            v.saturating_sub(e.size)
+        }
+    };
+    match e.status {
+        SectorStatus::Finished => f(&mut s.bytes_good),
+        SectorStatus::Unreadable => {
+            f(&mut s.bytes_unreadable);
+            s.num_bad_ranges = if add {
+                s.num_bad_ranges.saturating_add(1)
+            } else {
+                s.num_bad_ranges.saturating_sub(1)
+            };
+        }
+        SectorStatus::NonTried => {
+            f(&mut s.bytes_pending);
+            f(&mut s.bytes_nontried);
+        }
+        SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
+            f(&mut s.bytes_pending);
+            f(&mut s.bytes_retryable);
+        }
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -1078,6 +1119,142 @@ mod tests {
             mf.total_size(),
             "partition must cover the whole image"
         );
+    }
+
+    // R14: a record that does not change the run count (a sweep extending its Finished run
+    // into NonTried) edits `entries` in place instead of rebuilding the whole Vec.
+    #[test]
+    fn a_record_that_keeps_the_run_count_edits_in_place() {
+        const SEC: u64 = 2048;
+        let p = tmpfile("record_in_place");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 20_000 * SEC, "test").unwrap();
+        // Runs `* + ?` per 4-sector group: `*` at 4i, `+` at 4i+1, `?` over 4i+2..4i+4.
+        for i in 0..5_000u64 {
+            mf.record(i * 4 * SEC, SEC, SectorStatus::NonTrimmed)
+                .unwrap();
+            mf.record((i * 4 + 1) * SEC, SEC, SectorStatus::Finished)
+                .unwrap();
+        }
+        let (ptr, len) = (mf.entries().as_ptr(), mf.entries().len());
+        for i in 0..5_000u64 {
+            // Grows each `+` run by one sector into the `?` run after it.
+            mf.record((i * 4 + 2) * SEC, SEC, SectorStatus::Finished)
+                .unwrap();
+            assert_eq!(mf.entries().as_ptr(), ptr, "record() rebuilt the entry Vec");
+        }
+        assert_eq!(mf.entries().len(), len);
+        assert_canonical(&mf);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // The pre-R14 `record()` (full rebuild, sort, global coalesce): the reference the
+    // localized splice must agree with.
+    fn reference_record(
+        entries: &[MapEntry],
+        pos: u64,
+        size: u64,
+        status: SectorStatus,
+    ) -> Vec<MapEntry> {
+        if size == 0 {
+            return entries.to_vec();
+        }
+        let end = pos + size;
+        let mut out = Vec::new();
+        for e in entries.iter().cloned() {
+            let e_end = e.pos + e.size;
+            if e_end <= pos || e.pos >= end {
+                out.push(e);
+                continue;
+            }
+            if e.pos < pos {
+                out.push(MapEntry {
+                    pos: e.pos,
+                    size: pos - e.pos,
+                    status: e.status,
+                });
+            }
+            if e_end > end {
+                out.push(MapEntry {
+                    pos: end,
+                    size: e_end - end,
+                    status: e.status,
+                });
+            }
+        }
+        out.push(MapEntry { pos, size, status });
+        out.sort_by_key(|e| e.pos);
+        let mut merged: Vec<MapEntry> = Vec::new();
+        for e in out {
+            if let Some(last) = merged.last_mut()
+                && last.pos + last.size == e.pos
+                && last.status == e.status
+            {
+                last.size += e.size;
+                continue;
+            }
+            merged.push(e);
+        }
+        merged
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const ALL_STATUSES: [SectorStatus; 5] = [
+        SectorStatus::NonTried,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+        SectorStatus::Finished,
+    ];
+
+    // R14 equivalence: random records (inside, straddling and past the end, leaving gaps;
+    // zero-size too) give exactly the old algorithm's entries, and the delta-maintained
+    // stats equal a full recount after every step.
+    #[test]
+    fn localized_record_matches_the_full_rebuild() {
+        let p = tmpfile("record_equivalence");
+        let _ = std::fs::remove_file(&p);
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200 {
+            let total = 1 + rng.below(400);
+            let mut mf = Mapfile::create(&p, total, "test").unwrap();
+            let mut reference = mf.entries().to_vec();
+            for step in 0..60 {
+                let pos = rng.below(total + 40);
+                let size = match rng.below(6) {
+                    0 => 0,
+                    1 => rng.below(total + 40) + 1,
+                    _ => rng.below(12) + 1,
+                };
+                let status = ALL_STATUSES[rng.below(5) as usize];
+                mf.record(pos, size, status).unwrap();
+                reference = reference_record(&reference, pos, size, status);
+                assert_eq!(
+                    mf.entries(),
+                    reference.as_slice(),
+                    "round {round} step {step}: record({pos}, {size}, {status:?})"
+                );
+                assert_eq!(
+                    mf.stats(),
+                    Mapfile::compute_stats(&reference, total),
+                    "round {round} step {step}: stats drifted"
+                );
+            }
+            mf.dirty = false;
+        }
+        let _ = std::fs::remove_file(&p);
     }
 
     // The `Mapfile.entries` bound, measured rather than asserted from a doc.
