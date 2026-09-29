@@ -71,9 +71,9 @@ pub fn abort_lost_bytes(
 /// with no extents makes that measurement indistinguishable from "clean".
 /// Whole-disc (ISO) scope needs no extents, so it is never unscopable.
 ///
-/// Shared so the two loss paths ([`abort_lost_ms`] and the live gate in `multipass_rip_inner`)
-/// cannot drift.
-pub fn loss_is_unscopable(
+/// Shared by [`abort_lost_ms`], [`measured_scope_bad`] and the live gate's
+/// [`end_of_recovery_lost_ms`] so they cannot drift.
+pub(crate) fn loss_is_unscopable(
     is_iso: bool,
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
@@ -113,9 +113,8 @@ pub fn abort_lost_ms(
     lost_bytes as f64 / title_bytes_per_sec * MILLIS_PER_SEC
 }
 
-// MULTIPASS STRATEGY DECISIONS — relocated verbatim from autorip's `rip_disc`.
-// Pure pass-ordering/convergence/exhaustion/promotion decisions, characterized
-// byte-for-byte in autorip's `char_*` tests before the move (behavior-preserving).
+// MULTIPASS STRATEGY DECISIONS: pure pass-ordering, convergence, exhaustion and
+// promotion rules the loop below composes.
 
 /// The pass plan for a rip, derived purely from `max_retries`.
 ///
@@ -242,7 +241,7 @@ pub fn patch_pass_decision(mux_scope_bad: u64, recovered: Option<u64>) -> PatchD
 /// therefore ENDS the recovery on the strength of a read that failed. Unknown
 /// converges never; the no-progress rule still applies, since "the last pass
 /// recovered nothing" is measured from the pass itself, not from the mapfile.
-pub fn patch_pass_decision_measured(
+pub(crate) fn patch_pass_decision_measured(
     mux_scope_bad: Option<u64>,
     recovered: Option<u64>,
 ) -> PatchDecision {
@@ -406,7 +405,7 @@ fn main_title_lost_ms(title: &libfreemkv::DiscTitle, main_bad_bytes: u64) -> f64
 /// SCOPE — ALWAYS main-title-scoped, whatever the deliverable is: it derives its own byte count
 /// from `title` + `bad_ranges` rather than accepting the ABORT GATE's count
 /// ([`abort_lost_bytes`]), which is whole-disc for an ISO deliverable.
-pub fn end_of_recovery_lost_ms(
+pub(crate) fn end_of_recovery_lost_ms(
     promotion_intact: bool,
     title: &libfreemkv::DiscTitle,
     bad_ranges: &[(u64, u64)],
@@ -544,17 +543,17 @@ pub struct MultipassResult {
     /// unreached ranges RETRYABLE, so the end-of-recovery promotion must not run on them. The
     /// front-end's cue to power-cycle the drive and resume from the mapfile.
     pub wedged: bool,
-    /// True when the disc (or the scoped muxable portion of it, per
-    /// [`MultipassOpts::is_iso_output`]) ended with zero unreadable and zero
-    /// pending bytes, and the run was neither halted nor aborted for loss.
+    /// True when the image ended with zero unreadable and zero pending bytes (the whole disc,
+    /// or a staged image's scope), and the run was neither halted nor aborted for loss.
+    /// NOT narrowed to the ripped titles by [`MultipassOpts::is_iso_output`].
     pub complete: bool,
 }
 
 /// Options controlling a [`multipass_rip`] run.
 #[derive(Clone, Copy, Debug)]
 pub struct MultipassOpts {
-    /// Patch-retry pass cap — autorip's `max_retries` analogue, fed straight
-    /// into [`plan_passes`]. `0` selects single-pass mode: one
+    /// Patch-retry pass cap, fed into [`plan_passes`] clamped to 255 (values above
+    /// run 255 patch passes). `0` selects single-pass mode: one
     /// `recovery::copy` dispatch (sweep-or-resume), no sweep/patch split, no
     /// convergence loop, no abort-on-loss gate.
     pub max_passes: u32,
@@ -578,13 +577,12 @@ pub struct MultipassOpts {
 /// Drive the full multipass STRATEGY LOOP: sweep, then patch passes until the
 /// muxable scope is clean, a pass makes no progress, or `opts.max_passes` is
 /// reached, then apply the end-of-recovery promotion and the abort-on-loss
-/// gate — the shared composition every front-end drives instead of its own
-/// copy of the loop.
+/// gate. Damage is measured over the titles `job.selection` picks.
 ///
 /// `opts.max_passes == 0` takes the single-pass branch: one `recovery::copy`
 /// dispatch, no retry loop. Otherwise Pass 1 is a `recovery::sweep` (resuming the
 /// image's mapfile when one exists), followed by up to `opts.max_passes`
-/// `recovery::patch` passes. Damage is measured over the titles `job.selection` picks.
+/// `recovery::patch` passes.
 pub fn multipass_rip(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
@@ -1311,7 +1309,7 @@ mod tests {
     }
 
     // `end_of_recovery_lost_ms` must scope BOTH the bad-byte count AND its ms divisor to the
-    // passed `title`, never to `disc.titles.first()` — pins the round-2 fix.
+    // passed `title`, never to `disc.titles.first()`.
     #[test]
     fn end_of_recovery_lost_ms_scopes_divisor_to_the_passed_title() {
         let mut title = test_title(0, 100);
