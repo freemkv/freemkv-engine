@@ -477,6 +477,39 @@ impl Mapfile {
             return Err(e);
         };
         self.splice(pos, end, status);
+        self.changed()
+    }
+
+    /// Re-mark every run whose status is in `from` as `to`, in one O(entries) pass: the same
+    /// map as calling [`Mapfile::record`] over each such range (the end-of-recovery promotion),
+    /// without the per-range cost. Flushes like `record()`.
+    pub fn promote(&mut self, from: &[SectorStatus], to: SectorStatus) -> io::Result<()> {
+        let mut hit = false;
+        let mut merged: Vec<MapEntry> = Vec::with_capacity(self.entries.len());
+        for mut e in self.entries.drain(..) {
+            if from.contains(&e.status) {
+                e.status = to;
+                hit = true;
+            }
+            if let Some(last) = merged.last_mut()
+                && last.pos.saturating_add(last.size) == e.pos
+                && last.status == e.status
+            {
+                last.size = last.size.saturating_add(e.size);
+                continue;
+            }
+            merged.push(e);
+        }
+        self.entries = merged;
+        if !hit {
+            return Ok(());
+        }
+        self.stats = Self::compute_stats(&self.entries, self.total_size);
+        self.changed()
+    }
+
+    // Marks in-memory state dirty and persists it once `FLUSH_INTERVAL` has elapsed.
+    fn changed(&mut self) -> io::Result<()> {
         self.dirty = true;
         if self.last_flushed.elapsed() >= FLUSH_INTERVAL {
             self.write_to_disk()?;
@@ -1255,6 +1288,38 @@ mod tests {
             mf.dirty = false;
         }
         let _ = std::fs::remove_file(&p);
+    }
+
+    // P6: `promote()` is the per-range `record()` loop in one pass: same entries, same stats.
+    #[test]
+    fn promote_matches_recording_each_range() {
+        let p = tmpfile("promote_equivalence");
+        let q = tmpfile("promote_equivalence_ref");
+        let from = [SectorStatus::NonTrimmed, SectorStatus::NonScraped];
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        for round in 0..100 {
+            let total = 1 + rng.below(300);
+            let mut mf = Mapfile::create(&p, total, "test").unwrap();
+            for _ in 0..40 {
+                let pos = rng.below(total);
+                let size = (rng.below(10) + 1).min(total - pos);
+                mf.record(pos, size, ALL_STATUSES[rng.below(5) as usize])
+                    .unwrap();
+            }
+            let to = ALL_STATUSES[rng.below(5) as usize];
+            let mut looped = Mapfile::create(&q, total, "test").unwrap();
+            looped.entries = mf.entries.clone();
+            looped.stats = mf.stats;
+            for (pos, size) in looped.ranges_with(&from) {
+                looped.record(pos, size, to).unwrap();
+            }
+            mf.promote(&from, to).unwrap();
+            assert_eq!(mf.entries(), looped.entries(), "round {round} to {to:?}");
+            assert_eq!(mf.stats(), looped.stats(), "round {round} to {to:?}");
+            assert_canonical(&mf);
+        }
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
     }
 
     // The `Mapfile.entries` bound, measured rather than asserted from a doc.
