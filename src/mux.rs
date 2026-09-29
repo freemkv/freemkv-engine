@@ -1,4 +1,5 @@
-//! ISO/disc → MKV muxing and the multi-title rip loop.
+//! ISO/disc → MKV muxing, the multi-title rip loop, and the drive bring-up
+//! ([`open_scan`]) the disc path starts from.
 //!
 //! Resolves which titles to rip, muxes each through `libfreemkv::mux_with_keys`,
 //! and decides when a failure is fatal vs skippable. Three load-bearing
@@ -825,6 +826,24 @@ mod tests {
             "open_scan must hand its own raw_copy parameter to the scan, \
              not a hardcoded default"
         );
+    }
+
+    /// `open_scan` (KU §3.2): the raw drive bring-up, no key call; signature pinned.
+    #[test]
+    fn open_scan_signature() {
+        let _: fn(
+            libfreemkv::DeviceTarget,
+            Option<libfreemkv::DriveCredentials>,
+            bool,
+        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = open_scan;
+        type OpenScanWith = fn(
+            libfreemkv::DeviceTarget,
+            Option<libfreemkv::DriveCredentials>,
+            bool,
+            &libfreemkv::Halt,
+            &libfreemkv::halt::Progress,
+        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error>;
+        let _: OpenScanWith = open_scan_with;
     }
 
     // ET9 `open_scan_with_locks_tray_after_scan` — stop design v5 §4.2: "KU's `open_scan`
