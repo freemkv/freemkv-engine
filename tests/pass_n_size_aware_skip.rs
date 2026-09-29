@@ -155,6 +155,18 @@ fn scratch_iso() -> (tempfile::TempDir, std::path::PathBuf) {
     (dir, iso_path)
 }
 
+/// No scripted-bad LBA may end up in the final `Finished` set: recording an
+/// unreadable sector as good is the worst possible outcome.
+fn assert_bad_lbas_not_finished(finished: &[(u64, u64)], bad_lbas: &HashSet<u32>) {
+    for &lba in bad_lbas {
+        let pos = lba as u64 * SECTOR_SIZE as u64;
+        assert!(
+            !finished.iter().any(|&(p, sz)| pos >= p && pos < p + sz),
+            "scripted-bad LBA {lba} was recorded Finished"
+        );
+    }
+}
+
 // THE critical test: a 100-sector "bad" range hides 50 good sectors in the middle (LBAs
 // 125-174); the recovered middle is the contract.
 #[test]
@@ -171,7 +183,7 @@ fn patch_recovers_good_middle_of_a_bad_range() {
         bad_lbas.insert(lba);
     }
 
-    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas);
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
     let disc = synthetic_disc(capacity_sectors);
 
     let (_dir, iso_path) = scratch_iso();
@@ -204,6 +216,7 @@ fn patch_recovers_good_middle_of_a_bad_range() {
     // is not enabled, patch would skip 32+ sectors after a few failures
     // and leap clean over LBA 125 → middle stays NonTrimmed.
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
     let total_finished_in_middle: u64 = finished_ranges
         .iter()
         .map(|&(pos, sz)| {
@@ -344,7 +357,7 @@ fn patch_recovers_multiple_good_middles() {
     for lba in 1200..1225 {
         bad_lbas.insert(lba);
     }
-    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas);
+    let (mut reader, _trace) = PatternedSectorReader::new(capacity_sectors, bad_lbas.clone());
     let disc = synthetic_disc(capacity_sectors);
 
     let (_dir, iso_path) = scratch_iso();
@@ -366,6 +379,7 @@ fn patch_recovers_multiple_good_middles() {
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
     let finished_ranges = map.ranges_with(&[SectorStatus::Finished]);
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
     let recovered: u64 = finished_ranges
         .iter()
         .map(|&(pos, sz)| {
@@ -390,7 +404,7 @@ fn patch_recovers_multiple_good_middles() {
     );
 }
 
-// Pass N producer/consumer pipeline: exercises the producer/consumer path end-to-end, verifying
+// Pass N producer/consumer pipeline, end to end: verifies
 // bytes_good, Finished/NonTrimmed status, and byte-exact writes.
 #[test]
 fn patch_pipeline_split_recovers_and_records_correctly() {
@@ -455,12 +469,7 @@ fn patch_pipeline_split_recovers_and_records_correctly() {
             "good LBA {lba} should be Finished after pipeline patch run"
         );
     }
-    for lba in 200..205 {
-        assert!(
-            !in_finished(lba),
-            "bad LBA {lba} should NOT be Finished after pipeline patch run"
-        );
-    }
+    assert_bad_lbas_not_finished(&finished_ranges, &bad_lbas);
 
     // Verify the consumer wrote the producer's bytes at the right offsets:
     // PatternedSectorReader fills each sector with `(lba & 0xff) as u8`, so

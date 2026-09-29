@@ -422,16 +422,17 @@ fn profile_03_alternating_good_bad() {
         reader,
     );
 
-    // GOLDEN: 8 good sectors interleaved should mostly be Finished (2 sectors
-    // of bisection slop allowed); the 8 bad never Finished, stay NonTrimmed.
+    // GOLDEN: exactly the 8 good interleaved sectors land Finished (the reader is
+    // deterministic); the 8 bad never Finished, stay NonTrimmed.
     let middle_recovered = recovered_over_baseline(
         "03_alternating",
         stats.bytes_good,
         capacity_sectors as u64 - 16,
     );
-    assert!(
-        (6 * 2048..=8 * 2048).contains(&middle_recovered),
-        "03_alternating recovered {middle_recovered} bytes; expected 6..=8 of 8 good sectors"
+    assert_eq!(
+        middle_recovered,
+        8 * 2048,
+        "03_alternating must recover exactly the 8 good sectors"
     );
     assert_bad_lbas_not_finished("03_alternating", &done, (100..116).step_by(2));
     assert_eq!(stats.bytes_unreadable, 0, "03_alternating bytes_unreadable");
@@ -499,16 +500,16 @@ fn profile_04_edge_bad_good_middle() {
         reader,
     );
 
-    // GOLDEN: the 8 good middle sectors should land Finished (allowing
-    // 2 sectors of bisection slop at boundaries); the 8 bad never Finished.
+    // GOLDEN: exactly the 8 good middle sectors land Finished; the 8 bad never do.
     let middle_recovered = recovered_over_baseline(
         "04_edge_bad",
         stats.bytes_good,
         capacity_sectors as u64 - 16,
     );
-    assert!(
-        (6 * 2048..=8 * 2048).contains(&middle_recovered),
-        "04_edge_bad recovered {middle_recovered} bytes; expected 6..=8 of 8 good middle sectors"
+    assert_eq!(
+        middle_recovered,
+        8 * 2048,
+        "04_edge_bad must recover exactly the 8 good middle sectors"
     );
     assert_bad_lbas_not_finished("04_edge_bad", &done, (100..104).chain(112..116));
     assert_eq!(stats.bytes_unreadable, 0, "04_edge_bad bytes_unreadable");
@@ -616,16 +617,17 @@ fn profile_06_deep_pit() {
         reader,
     );
 
-    // GOLDEN: 16 good (8 on each side of the pit) recovered, 8 bad
+    // GOLDEN: exactly the 16 good (8 on each side of the pit) recovered, 8 bad
     // never Finished, stay NonTrimmed.
     let recovered_in_range = recovered_over_baseline(
         "06_deep_pit",
         stats.bytes_good,
         capacity_sectors as u64 - 24,
     );
-    assert!(
-        (14 * 2048..=16 * 2048).contains(&recovered_in_range),
-        "06_deep_pit recovered {recovered_in_range} bytes; expected 14..=16 of 16 good sectors"
+    assert_eq!(
+        recovered_in_range,
+        16 * 2048,
+        "06_deep_pit must recover exactly the 16 good sectors"
     );
     assert_bad_lbas_not_finished("06_deep_pit", &done, 108..116);
     assert_eq!(stats.bytes_unreadable, 0, "06_deep_pit bytes_unreadable");
