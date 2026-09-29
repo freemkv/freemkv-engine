@@ -188,7 +188,7 @@ fn run(
 ) -> io::Result<RemuxReport> {
     let halt = EngineHalt::new(op, None).with_sink(sink);
     let j = job(target.to_path_buf(), true);
-    land_verified(&j, 0, &title(600.0), sink, &halt, rio, mux)
+    land_verified(&j, 0, &title(600.0), sink, &halt, rio, None, mux)
 }
 
 fn good() -> Vec<u8> {
