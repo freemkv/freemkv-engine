@@ -42,8 +42,9 @@ codegen-units = 1
 
 # Resolve libfreemkv + freemkv-keysources from their GIT TAGS (both OFF
 # crates.io — see libfreemkv/Cargo.toml). This committed [patch.crates-io] is
-# the CI resolution path; the release script rewrites the tags on bump. Local
-# dev overrides it with a path patch via the gitignored .cargo/config.toml.
+# the CI resolution path; freemkv's release-orchestrate.yml rewrites the tags
+# on bump. Local dev overrides it with a path patch via the gitignored
+# .cargo/config.toml.
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.7.7" }
 freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.7.7" }
