@@ -108,6 +108,13 @@ impl<'a> ProgressBridge<'a> {
 
 impl libfreemkv::progress::Progress for ProgressBridge<'_> {
     fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+        self.report_at(std::time::Instant::now(), p)
+    }
+}
+
+impl ProgressBridge<'_> {
+    // `report` at an injected `now`, so the speed derivation is testable.
+    fn report_at(&self, now: std::time::Instant, p: &libfreemkv::progress::PassProgress) -> bool {
         // Borrowed, not allocated: this runs once per batch.
         let pass: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(match p.kind {
             libfreemkv::progress::PassKind::Sweep => "sweep",
@@ -118,11 +125,16 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
         });
         // Derive speed/ETA ONCE, here — the front-end just formats it. Sweep's
         // work_done/work_total are the authoritative progress denominator.
-        let (speed_bps, eta_secs) = self
-            .speed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sample(p.work_done, p.work_total);
+        let (speed_bps, eta_secs) = {
+            let mut speed = self.speed.lock().unwrap_or_else(|e| e.into_inner());
+            // Patch passes read in bursts: a fixed window shows a burst instead of diluting it.
+            speed.set_responsive(matches!(
+                p.kind,
+                libfreemkv::progress::PassKind::Scrape { .. }
+                    | libfreemkv::progress::PassKind::Trim { .. }
+            ));
+            speed.sample_at(now, p.work_done, p.work_total)
+        };
         let progress = Progress {
             pass,
             bytes_done: p.work_done,
@@ -473,6 +485,76 @@ mod tests {
             took < std::time::Duration::from_millis(250),
             "5 short calls took {took:?}: each waited out the watcher's 100 ms sleep"
         );
+    }
+
+    fn tick(kind: libfreemkv::progress::PassKind, done: u64) -> libfreemkv::progress::PassProgress {
+        libfreemkv::progress::PassProgress {
+            kind,
+            work_done: done,
+            work_total: 1 << 40,
+            bytes_good_total: done,
+            bytes_unreadable_total: 0,
+            bytes_pending_total: 0,
+            bytes_retryable_total: 0,
+            bytes_total_disc: 1 << 40,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 0,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located: libfreemkv::progress::LocatedProgress::default(),
+        }
+    }
+
+    // Patch passes read in bursts: their displayed speed uses the fixed 10 s window, while
+    // the steady sweep's window has grown (to 20 s at 120 s), diluting the same burst.
+    #[test]
+    fn patch_passes_show_a_burst_over_the_fixed_window() {
+        use libfreemkv::progress::PassKind;
+        #[derive(Default)]
+        struct Speeds(std::sync::Mutex<Vec<u64>>);
+        impl Sink for Speeds {
+            fn progress(&self, p: &Progress) {
+                self.0.lock().unwrap().push(p.speed_bps);
+            }
+        }
+        let mib = 1024 * 1024;
+        let last_speed = |kind: PassKind| {
+            let sink = Speeds::default();
+            let bridge = ProgressBridge::new(&sink);
+            let t0 = std::time::Instant::now();
+            for (secs, done) in [(0, 0), (100, 0), (112, 0), (120, 100 * mib)] {
+                bridge.report_at(t0 + std::time::Duration::from_secs(secs), &tick(kind, done));
+            }
+            let last = *sink.0.lock().unwrap().last().unwrap();
+            last / mib
+        };
+        let scrape = PassKind::Scrape { reverse: false };
+        assert_eq!(
+            last_speed(scrape),
+            12,
+            "100 MiB over the last 8 s of a 10 s window"
+        );
+        assert_eq!(last_speed(PassKind::Sweep), 5, "100 MiB over a 20 s window");
+    }
+
+    // `report`'s return is the library's keep-going flag: false exactly when the sink cancels.
+    #[test]
+    fn report_returns_false_once_the_sink_cancels() {
+        use libfreemkv::progress::{PassKind, Progress as _};
+        struct Flag(std::sync::atomic::AtomicBool);
+        impl Sink for Flag {
+            fn should_cancel(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let sink = Flag(std::sync::atomic::AtomicBool::new(false));
+        let bridge = ProgressBridge::new(&sink);
+        assert!(
+            bridge.report(&tick(PassKind::Sweep, 0)),
+            "no cancel: keep going"
+        );
+        sink.0.store(true, Ordering::SeqCst);
+        assert!(!bridge.report(&tick(PassKind::Sweep, 0)), "cancel: halt");
     }
 
     // A panic inside the watched call must PROPAGATE, not hang the join. The failure mode is a
