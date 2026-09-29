@@ -1500,7 +1500,7 @@ mod tests {
             }
         }
 
-        let (dir, iso) = scratch_iso("wedged-patch-pass");
+        let (_dir, iso) = scratch_iso("wedged-patch-pass");
         let sectors = 8192u32;
         let disc = test_disc(sectors, vec![test_title(0, sectors)]);
         let mut reader = WedgeOnPatchReader {
@@ -1518,7 +1518,6 @@ mod tests {
         let sink = HookSink::new("never-logged-trigger", false, Box::new(|| {}));
         let result = multipass_rip(&disc, &mut reader, &iso, &raw_job(&iso), &opts, &sink)
             .expect("a wedged pass is a partial result, not an Err");
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
             result.wedged,
@@ -1727,16 +1726,14 @@ mod tests {
         }
     }
 
-    /// A fresh scratch dir + `out.iso` path for one test, so parallel test
-    /// threads never collide on the same mapfile.
-    fn scratch_iso(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!(
-            "fmkv-engine-multipass-rip-{}-{tag}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("out.iso");
+    /// A fresh scratch dir + `out.iso` path for one test. The dir is removed when the returned
+    /// guard drops, so a failing assertion cannot leak the image.
+    fn scratch_iso(tag: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("fmkv-engine-multipass-rip-{tag}-"))
+            .tempdir()
+            .unwrap();
+        let iso = dir.path().join("out.iso");
         (dir, iso)
     }
 
@@ -1745,7 +1742,7 @@ mod tests {
     // nothing measured.
     #[test]
     fn single_pass_reports_loss_as_unquantified_on_a_damaged_disc() {
-        let (dir, iso) = scratch_iso("single-damaged");
+        let (_dir, iso) = scratch_iso("single-damaged");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![test_title(0, sectors)]);
         let total = sectors as u64 * 2048;
@@ -1814,14 +1811,13 @@ mod tests {
         assert!(!r.aborted_for_loss, "single-pass has no abort gate");
 
         let _ = std::fs::remove_file(&mapfile_path);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn multipass_rip_single_pass_mode_is_one_dispatch_no_retry_loop() {
         // max_passes == 0 -> plan_passes(0).multipass == false: one
         // `recovery::copy` dispatch, no sweep/patch split, no abort gate.
-        let (dir, iso) = scratch_iso("single-pass");
+        let (_dir, iso) = scratch_iso("single-pass");
         let sectors = 256u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = ZeroReader { capacity: sectors };
@@ -1855,8 +1851,6 @@ mod tests {
         // No mapfile-driven patch pass ever ran — no NonTrimmed/Unreadable
         // promotion logic touched, no bad_ranges built.
         assert_eq!(result.main_lost_ms, 0.0);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1864,7 +1858,7 @@ mod tests {
         // A fully-readable disc: Pass 1 sweep finds nothing bad, so the
         // patch loop's very first top-of-loop `scope_bad_bytes` check is
         // already 0 -> Converged -> break before any `recovery::patch` call.
-        let (dir, iso) = scratch_iso("clean");
+        let (_dir, iso) = scratch_iso("clean");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = ZeroReader { capacity: sectors };
@@ -1896,8 +1890,6 @@ mod tests {
         assert!(!result.halted);
         assert!(!result.aborted_for_loss);
         assert_eq!(result.main_lost_ms, 0.0);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1905,7 +1897,7 @@ mod tests {
         // Counters can't tell right-bytes-at-right-LBA from zeros-at-wrong-LBA.
         // Stamp each sector with its LBA, then read the output ISO back: a
         // wrong-offset or stale cursor in the loop would mismatch the stamp.
-        let (dir, iso) = scratch_iso("lba-pattern");
+        let (_dir, iso) = scratch_iso("lba-pattern");
         let sectors = 256u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = PatternReader { capacity: sectors };
@@ -1942,7 +1934,6 @@ mod tests {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             mismatches.is_empty(),
             "each LBA's stamp must land at byte LBA*2048; (expected, got) \
@@ -1955,7 +1946,7 @@ mod tests {
         // One sector fails Pass 1's touch, then reads clean from Pass 2 on:
         // the patch pass recovers it, muxable scope hits 0 bad bytes, and the
         // NEXT loop-top check (Converged) stops early, well under the 5-pass cap.
-        let (dir, iso) = scratch_iso("recoverable");
+        let (_dir, iso) = scratch_iso("recoverable");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = MultiSpotReader {
@@ -1992,8 +1983,6 @@ mod tests {
         assert!(result.complete);
         assert!(!result.halted);
         assert!(!result.aborted_for_loss);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2015,7 +2004,7 @@ mod tests {
     // damage. That must not pass as "converged" and skip the pass that recovers it.
     #[test]
     fn multipass_rip_unscopable_mkv_loss_still_runs_patch_passes() {
-        let (dir, iso) = scratch_iso("unscopable-mkv");
+        let (_dir, iso) = scratch_iso("unscopable-mkv");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = MultiSpotReader {
@@ -2051,8 +2040,6 @@ mod tests {
         assert_eq!(result.unreadable_bytes, 0, "the patch pass recovered it");
         assert!(!result.aborted_for_loss, "nothing is lost once recovered");
         assert!(result.complete);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2060,7 +2047,7 @@ mod tests {
         // A sector that NEVER heals: Pass 1 marks it NonTrimmed, the patch
         // pass recovers nothing (NoProgress -> stop early), promotion turns it
         // Unreadable, and — whole-disc ISO scope + zero tolerance — the gate fires.
-        let (dir, iso) = scratch_iso("permanent-loss");
+        let (_dir, iso) = scratch_iso("permanent-loss");
         let sectors = 4096u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = MultiSpotReader {
@@ -2117,8 +2104,6 @@ mod tests {
             "zero tolerance + confirmed loss must abort"
         );
         assert!(!result.complete);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2126,8 +2111,8 @@ mod tests {
         // Two bad sectors: one heals next touch (progress, so NoProgress never
         // fires); the other never heals (scope never hits 0, so Converged never
         // fires). With max_passes == 1 the loop must stop purely on budget.
-        let (dir, iso) = scratch_iso("max-passes-bound");
-        let sectors = 200_000u32;
+        let (_dir, iso) = scratch_iso("max-passes-bound");
+        let sectors = 8_192u32;
         let disc = test_disc(sectors, vec![]);
         let mut reader = MultiSpotReader {
             capacity: sectors,
@@ -2138,7 +2123,7 @@ mod tests {
                     attempts: 0,
                 },
                 Spot {
-                    lba: 100_000,
+                    lba: 6_000,
                     heal_after: u32::MAX,
                     attempts: 0,
                 },
@@ -2172,8 +2157,6 @@ mod tests {
             "the permanent spot is still bad — never converged"
         );
         assert!(result.unreadable_bytes > 0);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2182,15 +2165,15 @@ mod tests {
         // scope sees 0 bad bytes and converges immediately, without calling
         // `recovery::patch`; ISO's whole-disc scope grinds a pass, then aborts.
         let title = test_title(0, 2_000); // extents [0, 2000)
-        let bad_lba = 50_000; // outside the title's extents
-        let sectors = 200_000u32;
+        let bad_lba = 6_000; // outside the title's extents
+        let sectors = 8_192u32;
         // Multipass implies raw (enforced in `multipass_rip`).
         let mut job = Job::new("disc:///dev/null", "placeholder");
         job.raw = true;
 
         // MKV/M2TS scope: out-of-title damage doesn't earn a retry pass.
         {
-            let (dir, iso) = scratch_iso("scope-mkv");
+            let (_dir, iso) = scratch_iso("scope-mkv");
             let disc = test_disc(sectors, vec![title.clone()]);
             let mut reader = MultiSpotReader {
                 capacity: sectors,
@@ -2219,12 +2202,11 @@ mod tests {
                 "muxable scope was already 0 bad bytes — no patch pass ran"
             );
             assert!(!result.aborted_for_loss, "loss is entirely out of scope");
-            let _ = std::fs::remove_dir_all(&dir);
         }
 
         // ISO scope: the SAME out-of-title byte counts whole-disc and aborts.
         {
-            let (dir, iso) = scratch_iso("scope-iso");
+            let (_dir, iso) = scratch_iso("scope-iso");
             let disc = test_disc(sectors, vec![title.clone()]);
             let mut reader = MultiSpotReader {
                 capacity: sectors,
@@ -2260,7 +2242,6 @@ mod tests {
                 result.aborted_for_loss,
                 "ISO scope counts every byte — this loss must abort"
             );
-            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 
@@ -2481,7 +2462,7 @@ mod tests {
     fn in_title_damage_fixture(
         tag: &str,
     ) -> (
-        std::path::PathBuf,
+        tempfile::TempDir,
         std::path::PathBuf,
         std::path::PathBuf,
         libfreemkv::Disc,
@@ -2521,7 +2502,7 @@ mod tests {
     // Must NOT abort, or the sabotage tests could pass for the wrong reason.
     #[test]
     fn multipass_rip_accepts_a_measurable_loss_under_a_generous_tolerance() {
-        let (dir, iso, _mapfile, disc) = in_title_damage_fixture("gate-control");
+        let (_dir, iso, _mapfile, disc) = in_title_damage_fixture("gate-control");
         let mut reader = never_healing_reader();
         let job = raw_job(&iso);
         let opts = MultipassOpts {
@@ -2555,8 +2536,6 @@ mod tests {
             "{} ms of loss is well inside a {GENEROUS_TOLERANCE_SECS}s tolerance",
             result.main_lost_ms
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // On an ISO rip, damage entirely OUTSIDE the main title must not be reported as main-title
@@ -2564,7 +2543,7 @@ mod tests {
     // title's size/duration).
     #[test]
     fn iso_damage_outside_the_main_title_is_not_reported_as_main_title_loss() {
-        let (dir, iso) = scratch_iso("iso-off-title-loss");
+        let (_dir, iso) = scratch_iso("iso-off-title-loss");
         let sectors = 4096u32;
         // The title occupies sectors 0..100 ONLY. The never-healing spot is at
         // LBA 1000, comfortably outside it.
@@ -2611,8 +2590,6 @@ mod tests {
              millisecond figure must not weaken the whole-disc gate"
         );
         assert!(!result.complete, "a rip the gate refused is never complete");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The LIVE end-of-recovery gate must abort when the mapfile cannot be read at the
@@ -2620,7 +2597,7 @@ mod tests {
     // expects the NaN fail-safe.
     #[test]
     fn multipass_rip_aborts_when_the_mapfile_cannot_be_read_at_the_gate() {
-        let (dir, iso, mapfile, disc) = in_title_damage_fixture("gate-unreadable-mapfile");
+        let (_dir, iso, mapfile, disc) = in_title_damage_fixture("gate-unreadable-mapfile");
         let mut reader = never_healing_reader();
         let job = raw_job(&iso);
         let opts = MultipassOpts {
@@ -2673,8 +2650,6 @@ mod tests {
             "an unquantifiable loss is Serious, not a lower tier"
         );
         assert!(!result.halted, "this is the gate firing, not a cancel");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A failed end-of-recovery PROMOTION must abort the rip: `Mapfile::load` SUCCEEDS here
@@ -2682,7 +2657,7 @@ mod tests {
     // fails.
     #[test]
     fn multipass_rip_aborts_when_the_end_of_recovery_promotion_cannot_be_persisted() {
-        let (dir, iso, mapfile, disc) = in_title_damage_fixture("gate-promotion-failure");
+        let (_dir, iso, mapfile, disc) = in_title_damage_fixture("gate-promotion-failure");
         let mut reader = never_healing_reader();
         let job = raw_job(&iso);
         let opts = MultipassOpts {
@@ -2742,8 +2717,6 @@ mod tests {
         );
         assert!(!result.complete);
         assert_eq!(result.severity, crate::DamageSeverity::Serious);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A rip cancelled mid-loop, AFTER damage has been found, is halted and never Clean —
@@ -2751,8 +2724,8 @@ mod tests {
     // log line.
     #[test]
     fn multipass_rip_cancelled_mid_loop_is_halted_and_never_reported_clean() {
-        let (dir, iso) = scratch_iso("mid-loop-cancel");
-        let sectors = 200_000u32;
+        let (_dir, iso) = scratch_iso("mid-loop-cancel");
+        let sectors = 8_192u32;
         let disc = test_disc(sectors, vec![]);
         // One spot that heals on the next touch (so patch pass 1 makes real
         // progress and the loop-bottom NoProgress gate does NOT break for us)
@@ -2766,7 +2739,7 @@ mod tests {
                     attempts: 0,
                 },
                 Spot {
-                    lba: 100_000,
+                    lba: 6_000,
                     heal_after: u32::MAX,
                     attempts: 0,
                 },
@@ -2826,8 +2799,6 @@ mod tests {
             !result.aborted_for_loss,
             "the abort gate is not reached on the halted path"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // The halted exit must score damage it MEASURED, not work not got to — a wide unrecovered
@@ -2844,7 +2815,7 @@ mod tests {
             }
         }
 
-        let (dir, iso) = scratch_iso("wide-pending-cancel");
+        let (_dir, iso) = scratch_iso("wide-pending-cancel");
         let sectors = 8192u32;
         let disc = test_disc(sectors, vec![test_title(0, sectors)]);
         let mut reader = MultiSpotReader {
@@ -2860,7 +2831,6 @@ mod tests {
 
         let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &CancelAtOnce)
             .expect("a cancelled rip is a partial result, not an Err");
-        let _ = std::fs::remove_dir_all(&dir);
 
         assert!(result.halted);
         assert_eq!(
