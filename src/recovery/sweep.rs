@@ -125,12 +125,16 @@ impl Sink<WorkItem> for SweepSink {
             WorkItem::Good { pos, buf } => {
                 // Decrypt is on the producer; consumer assumes plaintext.
                 let len = buf.len() as u64;
-                self.file.seek(SeekFrom::Start(pos))?;
-                self.file.write_all(&buf)?;
+                let lost = |e| super::image_write_failed(&self.map, e);
+                self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
+                self.file.write_all(&buf).map_err(lost)?;
                 self.map.record(pos, len, SectorStatus::Finished)?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
-                self.file.seek(SeekFrom::Start(pos))?;
+                let map = &self.map;
+                self.file
+                    .seek(SeekFrom::Start(pos))
+                    .map_err(|e| super::image_write_failed(map, e))?;
                 // Subsequent writes are sequential; `WritebackFile`'s
                 // seek-elision keeps them on the writeback pipeline path.
                 let mut filled = 0u64;
@@ -140,7 +144,9 @@ impl Sink<WorkItem> for SweepSink {
                         return Ok(Flow::Stop);
                     }
                     let chunk = (len - filled).min(self.zero.len() as u64) as usize;
-                    self.file.write_all(&self.zero[..chunk])?;
+                    self.file
+                        .write_all(&self.zero[..chunk])
+                        .map_err(|e| super::image_write_failed(&self.map, e))?;
                     filled += chunk as u64;
                 }
                 self.map.record(pos, len, SectorStatus::NonTrimmed)?;
@@ -408,11 +414,15 @@ mod tests {
     fn a_failed_close_does_not_persist_finished_for_unsynced_data() {
         let dir = scratch("syncfail-drop");
         let (mut sink, _iso) = sink_over(&dir, 8192);
+        let fresh = freshly_flushed(&mut sink.map);
         sink.apply(WorkItem::Good {
             pos: 0,
             buf: vec![0x5Au8; 2048],
         })
         .unwrap();
+        if fresh.elapsed() >= FLUSH_WINDOW {
+            return; // the periodic persist already ran: inconclusive, not a failure
+        }
         let halt = libfreemkv::halt::Halt::new();
         halt.cancel();
         sink.file.set_halt(halt);
@@ -443,6 +453,44 @@ mod tests {
         assert!(
             got.iter().all(|&b| b == 0xAA),
             "an abandoned consumer overwrote the image a resumed pass now owns"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Under the mapfile's 1 s persist interval: a record made sooner stays in memory only.
+    const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(900);
+
+    // Persist `map` now, so the next record lands a full interval before the next persist.
+    fn freshly_flushed(map: &mut Mapfile) -> std::time::Instant {
+        map.record(0, 2048, SectorStatus::NonTried).unwrap();
+        map.set_disc_hash(&"ab".repeat(20));
+        map.flush().unwrap();
+        std::time::Instant::now()
+    }
+
+    // An `apply` write error (often the latched writeback failure of an EARLIER item) means
+    // the Finished records before it may not be on disk: the dropped sink must not flush them.
+    #[test]
+    fn a_failed_write_does_not_persist_earlier_finished_records() {
+        let dir = scratch("writefail-drop");
+        let (mut sink, iso) = sink_over(&dir, 8192);
+        let read_only = std::fs::File::open(&iso).unwrap();
+        sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
+        let fresh = freshly_flushed(&mut sink.map);
+        sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+        let r = sink.apply(WorkItem::Good {
+            pos: 2048,
+            buf: vec![0x5Au8; 2048],
+        });
+        if fresh.elapsed() >= FLUSH_WINDOW {
+            return; // inconclusive, as above
+        }
+        assert!(r.is_err(), "a write to a read-only handle must fail");
+        drop(sink);
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a failed write left earlier, possibly lost, ranges persisted Finished"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

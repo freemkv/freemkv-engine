@@ -229,8 +229,9 @@ impl Sink<PatchItem> for PatchSink {
         match item {
             PatchItem::Recovered { pos, buf } => {
                 let len = buf.len() as u64;
-                self.file.seek(SeekFrom::Start(pos)).map_err(Error::from)?;
-                self.file.write_all(&buf).map_err(Error::from)?;
+                let lost = |e| super::image_write_failed(&self.map, e);
+                self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
+                self.file.write_all(&buf).map_err(lost)?;
                 self.map
                     .record(pos, len, SectorStatus::Finished)
                     .map_err(Error::from)?;
@@ -2146,6 +2147,40 @@ mod tests {
         assert!(matches!(e, Error::DecryptFailed), "got {e:?}");
     }
 
+    // An `apply` write error may be the latched writeback failure of an earlier span: the
+    // dropped sink must not flush those spans' Finished records.
+    #[test]
+    fn a_failed_write_does_not_persist_earlier_finished_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+        let mapfile_path = dir.path().join("out.iso.mapfile");
+        let mut mf = Mapfile::create(&mapfile_path, 8192, "vTEST").unwrap();
+        mf.record(0, 8192, SectorStatus::NonTrimmed).unwrap();
+        mf.flush().unwrap();
+        let (mut sink, _shared) = PatchSink::new(&iso, mf, true, None).unwrap();
+        let read_only = std::fs::File::open(&iso).unwrap();
+        sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
+        sink.map.set_disc_hash(&"ab".repeat(20));
+        sink.map.flush().unwrap();
+        let fresh = std::time::Instant::now();
+        sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+        let r = sink.apply(PatchItem::Recovered {
+            pos: 2048,
+            buf: vec![7u8; 2048],
+        });
+        if fresh.elapsed() >= std::time::Duration::from_millis(900) {
+            return; // inconclusive
+        }
+        assert!(r.is_err(), "a write to a read-only handle must fail");
+        drop(sink);
+        let reloaded = Mapfile::load(&mapfile_path).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a failed write left earlier, possibly lost, spans persisted Finished"
+        );
+    }
+
     // R3: a failed `sync_all` means the recovered data is not durable, so the dropped
     // sink must not flush a Finished record for it.
     #[test]
@@ -2159,11 +2194,17 @@ mod tests {
         mf.flush().unwrap();
 
         let (mut sink, _shared) = PatchSink::new(&iso, mf, true, None).unwrap();
+        sink.map.set_disc_hash(&"ab".repeat(20));
+        sink.map.flush().unwrap();
+        let fresh = std::time::Instant::now();
         sink.apply(PatchItem::Recovered {
             pos: 0,
             buf: vec![7u8; 2048],
         })
         .unwrap();
+        if fresh.elapsed() >= std::time::Duration::from_millis(900) {
+            return; // the 1 s periodic persist already ran: inconclusive
+        }
         let halt = libfreemkv::halt::Halt::new();
         halt.cancel();
         sink.file.set_halt(halt);

@@ -626,6 +626,13 @@ pub(crate) fn pass_failure<R>(
     }
 }
 
+// A failed image write/seek: earlier records may cover bytes that never reach disk (a
+// latched writeback error surfaces on a LATER write), so the mapfile stops persisting.
+pub(crate) fn image_write_failed(map: &mapfile::Mapfile, e: std::io::Error) -> Error {
+    map.disown_handle().disown();
+    Error::from(e)
+}
+
 // Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive consumer gets a
 // grace spin, then is abandoned, instead of blocking `finish` forever.
 pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
