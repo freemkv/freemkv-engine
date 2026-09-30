@@ -10,10 +10,11 @@ use crate::engine_halt::{EngineHalt, HaltSink};
 use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
 use crate::job::{Selection, StreamChoice};
 use crate::keys::{KeyParams, key_source_factory};
-use crate::mux::{RipOutcome, TitleResult, classify_title_error, mux_title, resolve_selection};
-use crate::mux::{mux_iso_title, run_titles};
-use crate::sink::Level;
-use crate::sink::{Event, Sink};
+use crate::mux::{
+    RipOutcome, TitleResult, classify_title_error, mux_iso_title, mux_title, resolve_selection,
+    run_titles,
+};
+use crate::sink::{Event, Level, Sink};
 use libfreemkv::Halt;
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
 use libfreemkv::io::ArtifactLock;
@@ -216,11 +217,17 @@ const RUNTIME_SLACK_FRACTION: f64 = 0.02;
 /// a title's declared Duration in the header, so only the Cues reflect what was
 /// muxed; a file without Cues falls back to the header Duration.
 pub fn verify_mkv(path: &Path, title: &libfreemkv::DiscTitle) -> io::Result<libfreemkv::MkvProbe> {
-    if std::fs::metadata(path)?.len() == 0 {
-        return Err(verify_failed(path, "file is empty"));
-    }
+    nonempty_len(path)?;
     let file = io::BufReader::new(std::fs::File::open(path)?);
     check_probe(path, title, libfreemkv::probe_mkv_with_cues(file)?)
+}
+
+// The file's length; an empty file fails verify.
+fn nonempty_len(path: &Path) -> io::Result<u64> {
+    match std::fs::metadata(path)?.len() {
+        0 => Err(verify_failed(path, "file is empty")),
+        len => Ok(len),
+    }
 }
 
 fn check_probe(
@@ -450,12 +457,18 @@ impl Drop for DeleteOnDrop {
 }
 
 // Removes the partial file unless disarmed — every early return and a panic included.
-struct PartialFile<'a>(&'a Path, bool);
+struct PartialFile<'a>(Option<&'a Path>);
+
+impl PartialFile<'_> {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for PartialFile<'_> {
     fn drop(&mut self) {
-        if !self.1 {
-            let _ = std::fs::remove_file(self.0);
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -570,7 +583,7 @@ fn land_verified(
     let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &watch, h))?;
     let _lock = DeleteOnDrop(Some(lock));
     remove_stale_partial(partial)?;
-    let mut guard = PartialFile(partial, false);
+    let mut guard = PartialFile(Some(partial));
 
     sink.event(&Event::Phase { name: "mux" });
     let dest = format!("mkv://{partial_str}");
@@ -608,7 +621,7 @@ fn land_verified(
     if staged_partial.is_some() {
         sink.event(&Event::Phase { name: "copy" });
         remove_stale_partial(&target_partial)?;
-        remote_guard = Some(PartialFile(&target_partial, false));
+        remote_guard = Some(PartialFile(Some(&target_partial)));
         copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
@@ -630,11 +643,7 @@ fn land_verified(
         return Err(libfreemkv::Error::Halted.into());
     }
     std::fs::rename(landing, &job.target)?;
-    if let Some(g) = &mut remote_guard {
-        g.1 = true;
-    } else {
-        guard.1 = true;
-    }
+    remote_guard.as_mut().unwrap_or(&mut guard).disarm();
     // The rename committed: a Stop or a failure during the folder sync cuts only the sync
     // short (§2.6, §4.4), and the caller is still told the target was replaced.
     match sync_parent(rio, &job.target, halt) {
@@ -885,10 +894,7 @@ fn verify_watched(
     rio: &dyn RemuxIo,
     timing: RemuxTiming,
 ) -> io::Result<libfreemkv::MkvProbe> {
-    let total = std::fs::metadata(path)?.len();
-    if total == 0 {
-        return Err(verify_failed(path, "file is empty"));
-    }
+    let total = nonempty_len(path)?;
     let read = Arc::new(AtomicU64::new(0));
     let reader = Counting {
         inner: io::BufReader::new(rio.open_read(path)?),
@@ -1361,10 +1367,16 @@ mod tests {
         let _ = std::fs::create_dir(&folder); // APFS refuses the name; the check comes first
         let target = folder.join("Movie.mkv");
         let muxed = AtomicBool::new(false);
-        let e = land(&job(target.clone(), true), 0, &title(60.0), &Events::default(), |_| {
-            muxed.store(true, Ordering::SeqCst);
-            Ok(outcome(true))
-        })
+        let e = land(
+            &job(target.clone(), true),
+            0,
+            &title(60.0),
+            &Events::default(),
+            |_| {
+                muxed.store(true, Ordering::SeqCst);
+                Ok(outcome(true))
+            },
+        )
         .unwrap_err();
         let code = libfreemkv::error::E_STREAM_URL_INVALID;
         assert_eq!(crate::error_code(&e), Some(code), "{e}");
