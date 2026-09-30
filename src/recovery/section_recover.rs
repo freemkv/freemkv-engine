@@ -163,6 +163,8 @@ pub(super) trait RecoverySink {
     /// `buf` holds the plaintext bytes for the byte-range `[pos, pos+buf.len())`
     /// (all multiples of [`SECTOR`]). `Err` means nothing more can be written:
     /// the span is not recovered and the chain ends [`HandlerOutcome::Fatal`].
+    /// `Ok` is not a durability promise: on a halt the span may go unwritten
+    /// (the mapfile keeps it bad) while the chain winds down Halted.
     fn recovered(&mut self, pos: u64, buf: &[u8]) -> Result<(), Error>;
 }
 
@@ -311,8 +313,8 @@ fn read_span(
             );
             ReadHit::Transport
         }
-        // Not disc damage: stop the chain now (as a transport fault would) and
-        // hand the real error to the caller via `ctx.fatal`.
+        // Not disc damage: stop the chain now and hand the real error to the
+        // caller via `ctx.fatal`.
         Err(e) if !super::is_damage_candidate(&e) => {
             tracing::warn!(
                 target: "freemkv::disc",
@@ -322,7 +324,7 @@ fn read_span(
                 "non-read error during recovery; aborting the pass with it"
             );
             ctx.fatal = Some(e);
-            ReadHit::Transport
+            ReadHit::Fatal
         }
         Err(e) => {
             // Wedge watch: only a wedge-family sense AND a fast return (<
@@ -355,12 +357,6 @@ fn read_span(
                 ReadHit::Bad
             }
         }
-    };
-    // The non-damage arm above records its error in `ctx.fatal`: the chain ends
-    // Fatal, never as a transport fault (which reads as a dead bus).
-    let hit = match hit {
-        ReadHit::Transport if ctx.fatal.is_some() => ReadHit::Fatal,
-        h => h,
     };
     // Track the dead streak for the early-yield hand-off: a recovering read
     // resets it, a fruitless one advances it toward UNPRODUCTIVE_YIELD.

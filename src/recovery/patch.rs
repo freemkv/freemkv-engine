@@ -53,9 +53,8 @@ impl RecoverySink for PatchRecoverySink<'_> {
             self.halt,
         ) {
             Ok(()) => Ok(()),
-            // Halt is an outcome, not an error: the latch that released this send
-            // already drives the handler chain to `Halted`. Recording an error here
-            // would turn a Stop into a failed pass; the in-flight span stays bad.
+            // Ok on halt: not written, the mapfile keeps it bad (only the in-memory
+            // set drops it); the chain ends Halted. An Err would fail a Stop.
             Err(super::SendStall::Halted) => Ok(()),
             Err(stall) => Err(stall.into_error()),
         }
@@ -1055,6 +1054,10 @@ impl PatchCtx<'_, '_> {
             // spin-cycle the drive and resume from the mapfile next pass. `Fatal`
             // returned its error above; ending the pass is the safe reading if not.
             HandlerOutcome::TransportFault | HandlerOutcome::Fatal => {
+                debug_assert!(
+                    outcome != HandlerOutcome::Fatal,
+                    "a Fatal chain end must carry its error in ctx.fatal"
+                );
                 self.state.wedged_exit = true;
                 Ok(RegionOutcome::TransportFault)
             }
