@@ -20,6 +20,11 @@ project follows semantic versioning.
 - Remux: a Stop before the rename ends Halted with the target untouched; once the rename has happened, a failed folder sync is only a warning and the remux is Done (`replaced`, `Event::Replaced`). The staged copy to the library folder stops on Stop and fails E9073 after 60 s with no bytes written; a stopped or stalled copy empties the local staging file at once. A non-UTF-8 mux destination (the target's `.partial`, or the staging file) is refused with E9002 before anything is written, as is a non-UTF-8 disc folder source (before it is opened). A remux waiting on `<target>.lock` no longer times out (E9073) while the holder's sync or verify is making progress. Refusing an existing target (`AlreadyExists`) now carries only the quoted path as its message, so a file name beginning `E<digits>` is not read as that error code.
 
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
+- A Stop that interrupts a sweep read ends the pass halted (`copy`/`sweep` return `halted`, not `Err(Halted)`); the interrupted range stays unread instead of being zero-filled and recorded as damage.
+- A sweep resume whose mapfile cannot be read (EIO, EACCES) fails with that error instead of deleting the mapfile and starting over; only a damaged mapfile still restarts the sweep.
+- A sweep whose output write fails stops reading at once and fails with the write's error; a failed final fsync no longer leaves those ranges recorded Finished.
+- Sweep progress ticks every 250 ms. `work_done`/`work_total` run over the pass's scope (an MKV-staging sweep goes 0-100%), and a resumed sweep's first ticks include what the mapfile already held.
+- `ensure_titles_staged` also refuses (E6022) a staged title whose sectors were never read (a staging sweep stopped part-way).
 
 - A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
 
