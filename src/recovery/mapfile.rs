@@ -35,9 +35,9 @@ use std::time::{Duration, Instant};
 // one interval's worth of records.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
-// Load refuses a larger file (MapfileInvalid "too_large"): ~2M runs at ~32 bytes a line, far
+// Load refuses a larger file (MapfileInvalid "too_large"): ~8M runs at ~32 bytes a line, far
 // past any real damage map, so a wrong or planted file fails fast instead of filling memory.
-const MAX_MAPFILE_BYTES: u64 = 64 << 20;
+const MAX_MAPFILE_BYTES: u64 = 256 << 20;
 
 /// Mapfile path for a regular output file: appends `.mapfile` to the output
 /// path.
@@ -812,7 +812,7 @@ impl Mapfile {
                     )?;
                 }
                 #[cfg(test)]
-                fire_tmp_written_hook(&self.path);
+                fire_write_hook(&self.path, HookAt::TmpBuffered);
                 w.flush()?;
                 // fsync the tmp file before the rename so bytes are durable (notably on
                 // NFS, where a rename can reach the server before the data does).
@@ -829,12 +829,15 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // Re-check at the commit point: the tmp write may have hung (on the mount this
-        // exists for) past a disown. The commit lock makes check-then-rename atomic.
+        // Re-check: the tmp write may have hung past a disown. A disown landing after this
+        // check is still safe: the resumed owner's writes take the commit lock, so they land
+        // after this rename, never before it.
         if self.disowned.load(Ordering::Acquire) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(());
         }
+        #[cfg(test)]
+        fire_write_hook(&self.path, HookAt::PreRename);
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -858,25 +861,24 @@ impl Drop for Mapfile {
     }
 }
 
-// Test seam: runs once, inside `write_to_disk` for `.0`, after the tmp's lines are buffered.
+// Test seam: each hook runs once, inside `write_to_disk` for its path at its `HookAt` point.
 #[cfg(test)]
-type TmpWrittenHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookAt {
+    TmpBuffered,
+    PreRename,
+}
 #[cfg(test)]
-static TMP_WRITTEN_HOOK: std::sync::Mutex<Option<TmpWrittenHook>> = std::sync::Mutex::new(None);
+type WriteHook = (PathBuf, HookAt, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static WRITE_HOOKS: std::sync::Mutex<Vec<WriteHook>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-fn fire_tmp_written_hook(path: &Path) {
+fn fire_write_hook(path: &Path, at: HookAt) {
     let hook = {
-        let mut slot = TMP_WRITTEN_HOOK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match slot.take() {
-            Some((p, f)) if p == path => Some(f),
-            other => {
-                *slot = other;
-                None
-            }
-        }
+        let mut hooks = WRITE_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let i = hooks.iter().position(|(p, a, _)| p == path && *a == at);
+        i.map(|i| hooks.remove(i).2)
     };
     if let Some(f) = hook {
         f();
@@ -2711,8 +2713,9 @@ mod write_to_disk_cleanup_tests {
 
         let (at_tx, at_rx) = mpsc::channel::<()>();
         let (go_tx, go_rx) = mpsc::channel::<()>();
-        *TMP_WRITTEN_HOOK.lock().unwrap() = Some((
+        WRITE_HOOKS.lock().unwrap().push((
             path.clone(),
+            HookAt::TmpBuffered,
             Box::new(move || {
                 at_tx.send(()).unwrap();
                 let _ = go_rx.recv();
@@ -2753,6 +2756,50 @@ mod write_to_disk_cleanup_tests {
         );
         assert_eq!(Mapfile::load(&path).unwrap().stats().bytes_unreadable, 0);
         assert!(!tmp.exists(), "no tmp left behind");
+    }
+
+    // M2: the abandoned writer passed its disowned check and stalls before its rename while
+    // the resumed owner writes. The owner must wait for that rename, not race it.
+    #[test]
+    fn a_resumed_owner_waits_for_a_stalled_disowned_rename() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("rename-race.mapfile");
+        let mut stale = Mapfile::create(&path, 4096, "abandoned-pass").unwrap();
+        stale.record(0, 2048, SectorStatus::Unreadable).unwrap();
+        let disown = stale.disown_handle();
+
+        let pause = |at: HookAt| {
+            let (at_tx, at_rx) = mpsc::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                let _ = at_tx.send(());
+                let _ = go_rx.recv();
+            });
+            WRITE_HOOKS.lock().unwrap().push((path.clone(), at, hook));
+            (at_rx, go_tx)
+        };
+        let (a_at, a_go) = pause(HookAt::PreRename);
+        let abandoned = std::thread::spawn(move || stale.flush());
+        a_at.recv_timeout(Duration::from_secs(30))
+            .expect("the abandoned writer never reached its rename");
+        disown.disown();
+
+        let (b_at, b_go) = pause(HookAt::PreRename);
+        let owner_path = path.clone();
+        let owner = std::thread::spawn(move || {
+            Mapfile::create(&owner_path, 4096, "resumed-pass").map(|m| m.total_size())
+        });
+        // Without the lock the owner reaches its own rename; with it, it waits on the lock.
+        let _ = b_at.recv_timeout(Duration::from_millis(500));
+        a_go.send(()).unwrap();
+        abandoned.join().unwrap().expect("the abandoned rename");
+        b_go.send(()).unwrap();
+        assert_eq!(owner.join().unwrap().expect("the owner's write"), 4096);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Created by resumed-pass"), "{text}");
+        assert!(!tmp_of(&path).exists(), "no tmp left behind");
     }
 
     // M27: a bare relative mapfile name syncs the current directory, not `""` (ENOENT).
