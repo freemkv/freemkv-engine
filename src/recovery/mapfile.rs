@@ -330,12 +330,7 @@ impl Mapfile {
                 // (that dropped a data line whose size lacked `0x`). A current line's
                 // 2nd field is a single status char; a data line's is the hex size.
                 let fields: Vec<&str> = t.split_whitespace().collect();
-                let is_current_line = fields
-                    .get(1)
-                    .and_then(|f| single_char(f))
-                    .and_then(SectorStatus::from_char)
-                    .is_some();
-                if is_current_line {
+                if is_current_line(&fields) {
                     continue;
                 }
                 // Otherwise it's a data line — fall through to entry parse.
@@ -1015,6 +1010,22 @@ fn single_char(field: &str) -> Option<char> {
     match (chars.next(), chars.next()) {
         (Some(c), None) => Some(c),
         _ => None,
+    }
+}
+
+// ddrescue's current line is `pos status [pass ...]`; its status adds `F` (filling) and `G`
+// (generating) to the block alphabet. `F` is also a hex digit, so `0 F +` stays a data line.
+fn is_current_line(fields: &[&str]) -> bool {
+    let Some(c) = fields.get(1).and_then(|f| single_char(f)) else {
+        return false;
+    };
+    match c {
+        'G' => true,
+        'F' => !fields
+            .get(2)
+            .and_then(|f| single_char(f))
+            .is_some_and(|s| SectorStatus::from_char(s).is_some()),
+        _ => SectorStatus::from_char(c).is_some(),
     }
 }
 
@@ -2270,6 +2281,24 @@ mod tests {
         let r = Mapfile::load(&p);
         let _ = std::fs::remove_file(&p);
         r
+    }
+
+    // M3: ddrescue's current-line status also has `F` (filling) and `G` (generating).
+    #[test]
+    fn load_accepts_ddrescue_fill_and_generate_current_lines() {
+        for cur in ["0x00100000  F  1", "0x00100000  G  1", "0x0  F"] {
+            let mf = load_text(
+                "load_current_fg",
+                &format!("# Rescue Logfile. Created by GNU ddrescue\n{cur}\n0x0 0x800 +\n"),
+            )
+            .unwrap_or_else(|e| panic!("{cur}: {e}"));
+            assert_eq!(mf.entries().len(), 1, "{cur}");
+            assert_eq!(mf.total_size(), 0x800, "{cur}");
+        }
+        // A bare-hex data line whose size is `F` is still a data line.
+        let mf = load_text("load_size_f", "0 F +\nF 1 -\n").unwrap();
+        assert_eq!(mf.total_size(), 0x10);
+        assert_eq!(mf.stats().bytes_good, 0xF);
     }
 
     // M26: a data line is exactly `pos size status`, the status one character.
