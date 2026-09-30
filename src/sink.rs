@@ -29,12 +29,12 @@ pub enum Level {
 /// All byte counts are of the *current* operation unless noted.
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
-    /// Human-facing name of the current pass, e.g. `"sweep"`, `"patch #2"`,
+    /// Human-facing name of the current pass, e.g. `"sweep"`, `"patch-scrape"`,
     /// `"mux"`. Front-ends may localize; the engine supplies a stable key.
     /// `Cow` so the common case — one of a small set of fixed pass names —
     /// costs no allocation. `ProgressBridge::report` runs once per batch
     /// (400k-1.6M times per rip) and allocated a fresh `String` every call to
-    /// carry one of five literals. A dynamic name (`"patch #2"`) still works
+    /// carry one of five literals. A dynamic name still works
     /// via `Cow::Owned`.
     pub pass: std::borrow::Cow<'static, str>,
     /// Bytes completed in the current operation.

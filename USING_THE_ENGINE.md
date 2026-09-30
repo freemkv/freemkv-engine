@@ -1,9 +1,11 @@
 # Using `freemkv-engine` (for the desktop UI)
 
 `freemkv-engine` is the shared rip layer between `libfreemkv` (SCSI, parse,
-decrypt, mux, raw reads) and the front-ends. **The UI depends on the engine
-alone** for the disc model, cancellation, scanning, recovery and muxing; the
-engine re-exports what you need.
+decrypt, mux, raw reads) and the front-ends. **The UI needs no direct
+libfreemkv dependency for the disc model and cancellation**: the engine
+re-exports them. A few types are not re-exported (`DeviceTarget`,
+`DriveCredentials`, `SectorSource`, `keys::ResolvedKeySet`, `DecryptStatus`), so
+add `libfreemkv = "1.7"` (with the same `[patch.crates-io]` block) to name them.
 
 ```
 libfreemkv        ← primitives (unchanged)
@@ -66,7 +68,8 @@ impl Sink for UiSink {
     }
     fn progress(&self, p: &Progress) {
         // Called frequently. Marshal to the UI thread; keep cheap.
-        // p.pass ("sweep", "patch #2", "mux", "sync", "verify", …),
+        // p.pass: "sweep" | "patch-scrape" | "patch-trim" | "mux" | "sync"
+        //        | "verify" | "copy" (remux)  — stable keys you localize,
         // p.bytes_done/bytes_total, p.sectors_bad,
         // p.speed_bps, p.eta_secs  ← all DERIVED BY THE ENGINE.
     }
@@ -118,7 +121,7 @@ use freemkv_engine::{
     open_image_with, OpenImageOptions, KeyInput, OpenedImage,
     mux_image_titles, MuxPlan, RipOutcome, resolve_selection,
     remux_iso, RemuxJob, RemuxReport,
-    // re-exported disc model (no direct libfreemkv dep needed)
+    // re-exported disc model (no direct libfreemkv dep needed for these)
     Disc, DiscTitle, DiscFormat, Codec, Resolution, VideoStream, AudioStream,
     SubtitleStream, Stream, Halt,
     Result,   // = std::result::Result<T, libfreemkv::Error>
@@ -309,7 +312,7 @@ panel fields. All `Disc` fields are public. Pass `raw_copy = true` to
 enum with a numeric `.code()` and **no English text** — map codes to your
 localized strings, exactly as the CLI does. A key refusal (no key, no keydb, a
 key service that failed) comes back typed from `keys::resolve_for_rip`; map its
-code, don't string-match the error. The mux/remux paths return `std::io::Error`;
+code, don't string-match the error. `remux_iso*` returns `std::io::Error`, `mux_image_titles*` a `RipOutcome` (`Failed { code, kind, data }`), `open_image_with` a `libfreemkv::Error`;
 `freemkv_engine::error_code(&e)` recovers the code (`None` for an OS error).
 
 ---
@@ -334,7 +337,7 @@ the default scheduler.
 - **Don't print.** Nothing in the engine writes to stdout/stderr; neither should
   your Sink impl in a GUI (route to the log pane).
 - **Don't recompute speed/ETA** — use `Progress.speed_bps` / `.eta_secs`.
-- **Don't add a direct `libfreemkv` dep for the disc model** — the engine
+- **Don't add a direct `libfreemkv` dep just for the disc model** — the engine
   re-exports `Disc`/`DiscTitle`/stream types/`Halt`, and wraps scanning and
   muxing (`scan_image`, `open_scan`, `mux_image_titles`, `remux_iso`).
 - **Don't call recovery on the UI thread** — it blocks; run it on a worker and
@@ -345,14 +348,14 @@ the default scheduler.
 ## Minimal end-to-end shape (multipass rip to MKV)
 
 ```rust
-fn rip(path: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
-    let (disc, mut reader) = scan_image(&ImageSource::from_path(&path))?;
+fn rip(src: PathBuf, iso_out: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
+    let (disc, mut reader) = scan_image(&ImageSource::from_path(&src))?;
     let sources = key_source_factory(&KeyParams::default());
     let titles = resolve_selection(&disc, &Selection::MainMovie);
     let scope = rip_scope(&disc, &titles, RipOutput::Streams);
     let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
     update_keydb_strip(key_status(&disc, &set));
-    let mut job = Job::new(path.to_string_lossy(), "/output/dir").with_mode(RipMode::Multi);
+    let mut job = Job::new(src.to_string_lossy(), "/output/dir").with_mode(RipMode::Multi);
     job.raw = true;                      // the image is ciphertext; the mux decrypts
     if let Preflight::Blocked(reasons) = preflight(&disc, &job) {
         show_blocked(reasons);
@@ -360,13 +363,13 @@ fn rip(path: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
     }
     let sink = UiSink::new();            // your impl
     Ok(std::thread::spawn(move || -> Result<()> {
-        let mp = multipass_rip(&disc, &mut *reader, &path, &job, &opts, &sink)?;
+        let mp = multipass_rip(&disc, &mut *reader, &iso_out, &job, &opts, &sink)?;
         if !mp.complete {
             show_partial(mp);
             return Ok(());
         }
         let opened = open_image_with(
-            &ImageSource::Iso(path),
+            &ImageSource::Iso(iso_out),
             OpenImageOptions { disc: Some(disc), ..OpenImageOptions::known(set) },
         )?;
         let outcome = mux_image_titles(&opened, &MuxPlan::new(titles), &dest_for, &sink);
