@@ -7,13 +7,16 @@
 //! Format:
 //! ```text
 //! # Rescue Logfile. Created by freemkv-engine vX.Y.Z
-//! # Current pos / status / pass / pass_time (ddrescue state machine — we only populate pos)
+//! # Current pos / status / pass / pass_time
 //! 0x000000000  ?  1  0
 //! #      pos        size  status
 //! 0x000000000  0x12345678    +
 //! 0x012345678  0x00001000    -
 //! 0x012346678  0x01234500    ?
 //! ```
+//!
+//! The current-position line is ddrescue's state line; freemkv writes it as a fixed
+//! `0x000000000  ?  1  0` and ignores it on load.
 //!
 //! Status chars: `?` non-tried · `*` non-trimmed · `/` non-scraped · `-` unreadable · `+` finished.
 //!
@@ -169,9 +172,8 @@ pub struct MapStats {
     /// Number of distinct `Unreadable` ranges (for UI display).
     /// Computed by `compute_stats` (counts coalesced `-` entries).
     pub num_bad_ranges: u32,
-    /// Largest gap among unreadable ranges in milliseconds. Computed as
-    /// largest range size / bytes_per_sec * 1000. Set by caller (autorip)
-    /// since bytes_per_sec is application-specific.
+    /// Always `0.0`: the engine never computes this (it needs a bitrate the map lacks).
+    /// The lost-time figure is `MultipassResult::main_lost_ms`; kept for API compatibility.
     pub main_lost_ms: f64,
 }
 
@@ -317,9 +319,7 @@ impl Mapfile {
                 // would present a partial image as a whole-disc one.
                 if let Some(sc) = rest.strip_prefix("freemkv-scope:") {
                     let Some(ranges) = parse_scope(sc.trim()) else {
-                        let e: io::Error =
-                            libfreemkv::error::Error::MapfileInvalid { kind: "scope" }.into();
-                        return Err(e);
+                        return Err(invalid("scope"));
                     };
                     scope = Some(ranges);
                 }
@@ -356,17 +356,13 @@ impl Mapfile {
             // code adds pos+size freely, and a crafted line would otherwise panic
             // (debug) or wrap to a tiny range (release), corrupting stats/resume.
             if pos.checked_add(size).is_none() {
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
-                return Err(e);
+                return Err(invalid("range"));
             }
             // A zero-size entry is degenerate: it contributes nothing to the
             // partition yet trips overlap/coalesce arithmetic (two entries can
             // share the same pos). Reject it rather than carry it through.
             if size == 0 {
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "zero_size" }.into();
-                return Err(e);
+                return Err(invalid("zero_size"));
             }
             // The whole token, not its first char: `+garbage` is damage, not Finished.
             let status = single_char(fields[2])
@@ -382,9 +378,7 @@ impl Mapfile {
         let mut cursor: u64 = 0;
         for e in entries {
             if e.pos < cursor {
-                let err: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "overlap" }.into();
-                return Err(err);
+                return Err(invalid("overlap"));
             }
             if e.pos > cursor {
                 // Leading or internal gap — fill it as NonTried.
@@ -430,7 +424,7 @@ impl Mapfile {
             Ok(mf) => {
                 // load() derives total_size from the last entry's pos+size; if that
                 // disagrees with the caller's size, resume math keys off the wrong
-                // basis. Warn, don't fail — so `==` here is an equivalent mutant.
+                // basis. Warn only: sweep() already forces a fresh sweep on a mismatch.
                 if mf.total_size != total_size {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -462,8 +456,7 @@ impl Mapfile {
         // rather than storing a saturated entry, which load() would then reject
         // on the next resume (making the mapfile unreadable).
         let Some(end) = pos.checked_add(size) else {
-            let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
-            return Err(e);
+            return Err(invalid("range"));
         };
         self.splice(pos, end, status);
         self.changed()
@@ -926,7 +919,7 @@ struct LegacyIdentity {
 /// malformed VID still fails the load: it named a disc). Nothing raw is kept.
 fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result<()> {
     if let Some(hex) = comment.strip_prefix("freemkv-vid:") {
-        let vid = parse_vid_hex(hex.trim()).ok_or_else(|| invalid("vid"))?;
+        let vid = parse_hex16(hex.trim()).ok_or_else(|| invalid("vid"))?;
         out.vidfp = Some(vid_fingerprint(&vid));
     } else if let Some(uk) = comment.strip_prefix("freemkv-uk:")
         && let Some((cps, key)) = parse_uk_line(uk.trim())
@@ -940,10 +933,9 @@ fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result
     Ok(())
 }
 
-// Parse a 32-char hex VID string. `None` on malformation, which `load()`
-// turns into a hard `MapfileInvalid{kind:"vid"}` rather than "no identity" —
-// else corruption here would re-open the cross-disc resume splice.
-fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
+// 32 hex digits (a legacy VID or key line) → 16 bytes; `None` on malformation. A bad VID
+// fails the load (`vid`) rather than reading as "no identity" (cross-disc resume splice).
+fn parse_hex16(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
     // byte-based so a multi-byte legacy VID comment rejects, never panics).
     libfreemkv::hex::parse_hex_fixed::<16>(s)
@@ -954,7 +946,7 @@ fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
 fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let (cps, hex) = s.split_once(':')?;
     let cps: u32 = cps.trim().parse().ok()?;
-    let key = parse_vid_hex(hex.trim())?; // 32-hex → [u8; 16], shared parser
+    let key = parse_hex16(hex.trim())?;
     Some((cps, key))
 }
 
@@ -1051,12 +1043,8 @@ fn push_coalesced(out: &mut Vec<MapEntry>, e: MapEntry) {
 
 fn parse_hex(s: &str) -> io::Result<u64> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).map_err(|_| {
-        // Underlying ParseIntError dropped — its Display is OS-locale text.
-        // The typed variant carries `kind = "hex"` which is stable.
-        let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "hex" }.into();
-        e
-    })
+    // The ParseIntError is dropped for the stable `hex` kind.
+    u64::from_str_radix(s, 16).map_err(|_| invalid("hex"))
 }
 
 #[cfg(test)]
@@ -1680,16 +1668,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_vid_hex_does_not_panic_on_multibyte_32_byte_input() {
+    fn parse_hex16_does_not_panic_on_multibyte_32_byte_input() {
         // A 32-BYTE comment containing a multi-byte char would make the
         // old `&s[i*2..i*2+2]` slice fall inside a char boundary and
         // panic. Must return None instead.
         let s = "中".to_string() + &"a".repeat(29); // 3 + 29 = 32 bytes
         assert_eq!(s.len(), 32);
-        assert_eq!(parse_vid_hex(&s), None);
+        assert_eq!(parse_hex16(&s), None);
         // A valid 32-char ASCII hex string still parses.
         assert_eq!(
-            parse_vid_hex("00112233445566778899aabbccddeeff"),
+            parse_hex16("00112233445566778899aabbccddeeff"),
             Some([
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
                 0xee, 0xff,
@@ -1841,7 +1829,7 @@ mod tests {
         }
     }
 
-    // ── parse_hex / parse_uk_line / parse_vid_hex error paths ─────
+    // ── parse_hex / parse_uk_line / parse_hex16 error paths ─────
 
     /// parse_hex accepts both `0x`-prefixed and bare hex (ddrescue writes
     /// `0x`-prefixed). A non-hex field is a MapfileInvalid{kind:"hex"}.
@@ -1890,6 +1878,7 @@ mod tests {
                 .unwrap()
                 .contains("freemkv-scope")
         );
+        let _ = std::fs::remove_file(&p);
     }
 
     // Dropping a malformed scope would present a partial image as a whole one.
@@ -1902,7 +1891,9 @@ mod tests {
                 format!("# freemkv-scope: {bad}\n0x0 ? 1\n0x0 0x800 ?\n"),
             )
             .unwrap();
-            assert!(Mapfile::load(&p).is_err(), "{bad}");
+            let e = Mapfile::load(&p).map(|_| ()).unwrap_err();
+            let _ = std::fs::remove_file(&p);
+            assert_eq!(invalid_kind(&e), Some("scope"), "{bad}: {e}");
         }
     }
 
@@ -1932,20 +1923,20 @@ mod tests {
         );
     }
 
-    /// parse_vid_hex tolerates an optional `0x` prefix and uppercase hex,
+    /// parse_hex16 tolerates an optional `0x` prefix and uppercase hex,
     /// but a 31- or 33-char string (not 32) is rejected — a VID is exactly
     /// 16 bytes = 32 hex chars.
     #[test]
-    fn parse_vid_hex_length_and_case() {
+    fn parse_hex16_length_and_case() {
         assert_eq!(
-            parse_vid_hex("0xAABBCCDDEEFF00112233445566778899"),
+            parse_hex16("0xAABBCCDDEEFF00112233445566778899"),
             Some([
                 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                 0x88, 0x99
             ])
         );
-        assert_eq!(parse_vid_hex(&"a".repeat(31)), None);
-        assert_eq!(parse_vid_hex(&"a".repeat(33)), None);
+        assert_eq!(parse_hex16(&"a".repeat(31)), None);
+        assert_eq!(parse_hex16(&"a".repeat(33)), None);
     }
 
     // ── next_with / ranges_with semantics ─────────────────────────
@@ -2033,7 +2024,7 @@ mod tests {
         mf.record(0, 250, SectorStatus::Finished).unwrap();
         mf.record(250, 250, SectorStatus::Unreadable).unwrap();
         mf.record(500, 250, SectorStatus::NonTrimmed).unwrap();
-        // NonTried (500..750? no) leftover is [750,1000).
+        // [750, 1000) is still NonTried.
         let s = mf.stats();
         assert_eq!(
             s.bytes_good + s.bytes_unreadable + s.bytes_pending,
@@ -2580,9 +2571,8 @@ mod write_to_disk_cleanup_tests {
     // Reachable via a directory sitting on the destination name (rename fails).
     #[test]
     fn a_failed_write_does_not_orphan_the_tmp_file() {
-        let dir = std::env::temp_dir().join(format!("fmkv-tmpclean-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path();
 
         // Occupy the mapfile's own name with a non-empty DIRECTORY, so the
         // rename at the end of `write_to_disk` cannot succeed.
@@ -2603,7 +2593,6 @@ mod write_to_disk_cleanup_tests {
             !tmp.exists(),
             "a partially-written tmp was left behind at {tmp:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2613,12 +2602,9 @@ mod load_if_present_tests {
 
     #[test]
     fn absent_is_none_not_an_error() {
-        let dir = std::env::temp_dir().join(format!("fmkv-lip-absent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("nope.map");
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nope.map");
         assert!(load_if_present(&p).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The distinction the three call sites kept re-deriving: a mapfile that
@@ -2626,9 +2612,8 @@ mod load_if_present_tests {
     /// "nothing here".
     #[test]
     fn corrupt_is_an_error_not_none() {
-        let dir = std::env::temp_dir().join(format!("fmkv-lip-corrupt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("bad.map");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.map");
         std::fs::write(&p, b"# Rescue Logfile. Created by test\n0x00 0xZZZZ +\n").unwrap();
         match load_if_present(&p) {
             Err(e) => assert_ne!(
@@ -2638,7 +2623,6 @@ mod load_if_present_tests {
             ),
             Ok(_) => panic!("a corrupt mapfile must not load, nor read as absent"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
