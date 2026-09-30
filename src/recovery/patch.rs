@@ -31,8 +31,8 @@ const PER_HANDLER_BUDGET_SECS: u64 = 60;
 const PROGRESS_TICK_MS: u64 = 250;
 
 // Bridges [`RecoverySink`] onto the patch consumer pipe: each recovered span
-// becomes a [`PatchItem::Recovered`]. `recovered` can't return an error (the
-// trait is infallible), so a pipe-closed / halt error is captured in `err`.
+// becomes a [`PatchItem::Recovered`]. A dead / stalled consumer is returned as
+// `Err`, which ends the handler chain Fatal instead of reading on.
 struct PatchRecoverySink<'a> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
     /// Cancellation token for the send below — the caller's external Stop bit
@@ -40,14 +40,10 @@ struct PatchRecoverySink<'a> {
     /// to observe a Stop at all: `WRITE_THROUGH_DEPTH` is 1, so a consumer
     /// stalled inside its write parks the producer in `send` indefinitely.
     halt: &'a libfreemkv::halt::Halt,
-    err: Option<Error>,
 }
 
 impl RecoverySink for PatchRecoverySink<'_> {
-    fn recovered(&mut self, pos: u64, buf: &[u8]) {
-        if self.err.is_some() {
-            return;
-        }
+    fn recovered(&mut self, pos: u64, buf: &[u8]) -> Result<()> {
         match super::send_bounded(
             self.pipe,
             PatchItem::Recovered {
@@ -56,12 +52,12 @@ impl RecoverySink for PatchRecoverySink<'_> {
             },
             self.halt,
         ) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             // Halt is an outcome, not an error: the latch that released this send
             // already drives the handler chain to `Halted`. Recording an error here
             // would turn a Stop into a failed pass; the in-flight span stays bad.
-            Err(super::SendStall::Halted) => {}
-            Err(stall) => self.err = Some(stall.into_error()),
+            Err(super::SendStall::Halted) => Ok(()),
+            Err(stall) => Err(stall.into_error()),
         }
     }
 }
@@ -955,7 +951,6 @@ impl PatchCtx<'_, '_> {
         let mut sink = PatchRecoverySink {
             pipe: self.pipe,
             halt: &pass_halt,
-            err: None,
         };
 
         let bad_before = bad.total_len();
@@ -1025,8 +1020,8 @@ impl PatchCtx<'_, '_> {
             (o, ctx.wedge_streak, ctx.fatal.take())
         };
         self.wedge_streak = wedge_after;
-        // A non-read error ended the chain: fail the pass with it, before any
-        // residue is recorded NonTrimmed as if it were unreadable media.
+        // A non-read error (or a sink that can no longer write) ended the chain: fail
+        // the pass with it, before any residue is recorded NonTrimmed as damage.
         if let Some(e) = fatal {
             return Err(e);
         }
@@ -1043,12 +1038,6 @@ impl PatchCtx<'_, '_> {
             recovered = bad_before.saturating_sub(bad.total_len()),
             "region tier finished"
         );
-
-        // A pipe-closed / halt error captured while emitting recovered spans is
-        // fatal to the pass.
-        if let Some(e) = sink.err.take() {
-            return Err(e);
-        }
 
         // On the FINAL tier, whatever is still bad is this pass's residue: record
         // NonTrimmed and account the range once. A later pass gets another shot;
@@ -1090,8 +1079,9 @@ impl PatchCtx<'_, '_> {
                 Ok(RegionOutcome::Halted)
             }
             // Bridge/transport crash: end the pass so the orchestrator can
-            // spin-cycle the drive and resume from the mapfile next pass.
-            HandlerOutcome::TransportFault => {
+            // spin-cycle the drive and resume from the mapfile next pass. `Fatal`
+            // returned its error above; ending the pass is the safe reading if not.
+            HandlerOutcome::TransportFault | HandlerOutcome::Fatal => {
                 self.state.wedged_exit = true;
                 Ok(RegionOutcome::TransportFault)
             }

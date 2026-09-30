@@ -150,6 +150,10 @@ pub(super) enum HandlerOutcome {
     /// answered. The coordinator returns this so the caller can un-wedge
     /// (spin-cycle) before deciding whether to continue.
     TransportFault,
+    /// A non-read error (a key stop, or a sink that can no longer write) ended
+    /// the chain; the error is in [`HandlerCtx::fatal`]. Not disc damage and
+    /// not a dead bus: the caller fails the pass with it.
+    Fatal,
 }
 
 /// Receives sectors a handler successfully read back. Kept minimal and
@@ -157,8 +161,9 @@ pub(super) enum HandlerOutcome {
 /// live wiring maps `recovered` onto the mapfile write + Finished mark.
 pub(super) trait RecoverySink {
     /// `buf` holds the plaintext bytes for the byte-range `[pos, pos+buf.len())`
-    /// (all multiples of [`SECTOR`]).
-    fn recovered(&mut self, pos: u64, buf: &[u8]);
+    /// (all multiples of [`SECTOR`]). `Err` means nothing more can be written:
+    /// the span is not recovered and the chain ends [`HandlerOutcome::Fatal`].
+    fn recovered(&mut self, pos: u64, buf: &[u8]) -> Result<(), Error>;
 }
 
 /// Everything a handler needs, borrowed for the duration of one `recover` call.
@@ -193,8 +198,8 @@ pub(super) struct HandlerCtx<'a> {
     /// handler. Seeded to max — the caller resets the drive to max before the
     /// chain runs.
     pub cur_speed: u16,
-    /// A non-read error (e.g. a decrypt refusal) that ended the chain; the
-    /// caller must surface it instead of recording the section as damage.
+    /// The error behind a [`HandlerOutcome::Fatal`] (a key stop, or the sink
+    /// refusing a span); the caller surfaces it instead of recording damage.
     pub fatal: Option<Error>,
 }
 
@@ -242,6 +247,8 @@ enum ReadHit {
     Bad,
     /// Transport-layer fault — the bus is gone. Abort now.
     Transport,
+    /// A non-read error, recorded in [`HandlerCtx::fatal`]. End the chain now.
+    Fatal,
 }
 
 /// Read `count` sectors at byte offset `pos` and, on success, hand them to the
@@ -278,10 +285,14 @@ fn read_span(
     let recovery = params.timeout.recovery();
     let read_started = (ctx.now)();
     let hit = match recovery_read(ctx.reader, lba, count, buf, recovery, params.fua) {
-        Ok(n) if n == bytes => {
-            ctx.sink.recovered(pos, &buf[..bytes]);
-            ReadHit::Good
-        }
+        Ok(n) if n == bytes => match ctx.sink.recovered(pos, &buf[..bytes]) {
+            Ok(()) => ReadHit::Good,
+            // The span was read but cannot be written: stop reading into a dead sink.
+            Err(e) => {
+                ctx.fatal = Some(e);
+                ReadHit::Fatal
+            }
+        },
         // A short transfer is a failed read, not partial recovery: `buf` is reused
         // across reads, so committing buf[..bytes] here would hand the sink a
         // previous span's tail. Should be unreachable; kept as a defensive check.
@@ -326,6 +337,12 @@ fn read_span(
             }
         }
     };
+    // The non-damage arm above records its error in `ctx.fatal`: the chain ends
+    // Fatal, never as a transport fault (which reads as a dead bus).
+    let hit = match hit {
+        ReadHit::Transport if ctx.fatal.is_some() => ReadHit::Fatal,
+        h => h,
+    };
     // Track the dead streak for the early-yield hand-off: a recovering read
     // resets it, a fruitless one advances it toward UNPRODUCTIVE_YIELD.
     match hit {
@@ -335,10 +352,10 @@ fn read_span(
         }
         // A Bad read is unproductive grinding — advance the yield streak.
         ReadHit::Bad => ctx.unproductive = ctx.unproductive.saturating_add(1),
-        // A Transport hit aborts the handler immediately, so it is NOT unproductive
-        // grinding — leave the streak untouched (kept honest in case an arm is
-        // ever reordered, though it's never read again after TransportFault).
-        ReadHit::Transport => {}
+        // A Transport / Fatal hit aborts the handler immediately, so it is NOT
+        // unproductive grinding — leave the streak untouched (it is never read
+        // again after the chain ends).
+        ReadHit::Transport | ReadHit::Fatal => {}
     }
     // Heartbeat after every read (the tick closure throttles to ~250 ms) so the
     // UI's bar/speed move DURING a handler, not just when the section finishes.
@@ -439,6 +456,7 @@ impl SectionHandler for Linear {
                     // Leave the failed batch bad; Bisect salvages islands within it.
                     ReadHit::Bad => {}
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Fatal => return HandlerOutcome::Fatal,
                 }
                 done += span;
             }
@@ -520,6 +538,7 @@ impl SectionHandler for Bisect {
                                 }
                             }
                             ReadHit::Transport => return HandlerOutcome::TransportFault,
+                            ReadHit::Fatal => return HandlerOutcome::Fatal,
                         }
                     }
                     // Expand BACKWARD from mid toward rp until a read fails.
@@ -549,6 +568,7 @@ impl SectionHandler for Bisect {
                                 }
                             }
                             ReadHit::Transport => return HandlerOutcome::TransportFault,
+                            ReadHit::Fatal => return HandlerOutcome::Fatal,
                         }
                     }
                     // Locating this readable island was productive work; the failed
@@ -575,6 +595,7 @@ impl SectionHandler for Bisect {
                     }
                 }
                 ReadHit::Transport => return HandlerOutcome::TransportFault,
+                ReadHit::Fatal => return HandlerOutcome::Fatal,
             }
         }
 
@@ -640,6 +661,7 @@ impl SectionHandler for Jump {
                         }
                     }
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Fatal => return HandlerOutcome::Fatal,
                 }
             }
         }
@@ -707,6 +729,7 @@ impl SectionHandler for SpeedSweep {
                             continue;
                         }
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Fatal => return HandlerOutcome::Fatal,
                     }
                 }
                 off += SECTOR;
@@ -752,9 +775,10 @@ impl SectionHandler for CachePrime {
             // the servo/PLL, so the boundary sector is read warm, not cold-seeked.
             if rp >= SECTOR {
                 // A bad/absent preceding sector just means no prime — read cold.
-                if let ReadHit::Transport = read_span(ctx, &mut prime, rp - SECTOR, 1, self.params)
-                {
-                    return HandlerOutcome::TransportFault;
+                match read_span(ctx, &mut prime, rp - SECTOR, 1, self.params) {
+                    ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Fatal => return HandlerOutcome::Fatal,
+                    ReadHit::Good | ReadHit::Bad => {}
                 }
             }
             // Now walk the island forward while warm; contiguous reads keep the
@@ -774,6 +798,7 @@ impl SectionHandler for CachePrime {
                     ReadHit::Good => bad.remove(pos, span),
                     ReadHit::Bad => {}
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Fatal => return HandlerOutcome::Fatal,
                 }
                 done += span;
             }
@@ -831,6 +856,7 @@ impl SectionHandler for Oscillate {
                 if pos >= SECTOR {
                     match read_span(ctx, &mut probe, pos - SECTOR, 1, self.params) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Fatal => return HandlerOutcome::Fatal,
                         ReadHit::Good => bad.remove(pos - SECTOR, SECTOR),
                         ReadHit::Bad => {}
                     }
@@ -843,12 +869,13 @@ impl SectionHandler for Oscillate {
                 if ctx.past(deadline) {
                     return HandlerOutcome::Remaining;
                 }
-                let mut recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
+                let recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
                     ReadHit::Good => {
                         bad.remove(pos, SECTOR);
                         true
                     }
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
+                    ReadHit::Fatal => return HandlerOutcome::Fatal,
                     ReadHit::Bad => false,
                 };
                 // Reverse-into: prime from the sector above (head from higher LBA).
@@ -868,6 +895,7 @@ impl SectionHandler for Oscillate {
                     // two+ sectors long, so a landed prime is a real recovery.
                     match read_span(ctx, &mut probe, pos + SECTOR, 1, self.params) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
+                        ReadHit::Fatal => return HandlerOutcome::Fatal,
                         ReadHit::Good => bad.remove(pos + SECTOR, SECTOR),
                         ReadHit::Bad => {}
                     }
@@ -879,16 +907,13 @@ impl SectionHandler for Oscillate {
                     if ctx.past(deadline) {
                         return HandlerOutcome::Remaining;
                     }
-                    recovered = match read_span(ctx, &mut probe, pos, 1, self.params) {
-                        ReadHit::Good => {
-                            bad.remove(pos, SECTOR);
-                            true
-                        }
+                    match read_span(ctx, &mut probe, pos, 1, self.params) {
+                        ReadHit::Good => bad.remove(pos, SECTOR),
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
-                        ReadHit::Bad => false,
-                    };
+                        ReadHit::Fatal => return HandlerOutcome::Fatal,
+                        ReadHit::Bad => {}
+                    }
                 }
-                let _ = recovered;
                 off += SECTOR;
             }
         }
@@ -1026,7 +1051,7 @@ pub(super) fn run_handlers(
             bad_bytes_after = after,
             recovered = before.saturating_sub(after),
             outcome = ?outcome,
-            // Set when `outcome` is TransportFault only because a non-read error ended it.
+            // Set when `outcome` is Fatal: the non-read error that ended the chain.
             fatal_code = ctx.fatal.as_ref().map(|e| e.code()),
             "handler finished; remaining bad bytes carry to the next handler"
         );
@@ -1035,6 +1060,7 @@ pub(super) fn run_handlers(
             HandlerOutcome::Remaining => continue,
             HandlerOutcome::Halted => return HandlerOutcome::Halted,
             HandlerOutcome::TransportFault => return HandlerOutcome::TransportFault,
+            HandlerOutcome::Fatal => return HandlerOutcome::Fatal,
         }
     }
     if bad.is_empty() {
@@ -1218,8 +1244,9 @@ mod tests {
         got: HashMap<u64, usize>, // pos -> bytes
     }
     impl RecoverySink for RecordSink {
-        fn recovered(&mut self, pos: u64, buf: &[u8]) {
+        fn recovered(&mut self, pos: u64, buf: &[u8]) -> Result<()> {
             self.got.insert(pos, buf.len());
+            Ok(())
         }
     }
 
@@ -2335,5 +2362,86 @@ mod tests {
             "CachePrime must recover the primed boundary sector"
         );
         assert_eq!(sink.got.get(&(15 * SECTOR)).copied(), Some(SECTOR as usize));
+    }
+
+    /// A source whose every read fails with one fixed, non-read error.
+    struct FailingSource(fn() -> Error);
+    impl SectorSource for FailingSource {
+        fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+            Err((self.0)())
+        }
+    }
+
+    // A non-read error (here a key stop) ends the chain Fatal with the error kept,
+    // never as a transport fault (which the pass reads as a dead bus to spin-cycle).
+    #[test]
+    fn a_non_read_error_ends_the_chain_fatal_not_as_a_transport_fault() {
+        let (h, _) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut src = FailingSource(|| Error::WholeDiscKeyMissing);
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(src, sink, now);
+        let mut bad = SubRanges::from_section(0, 64 * SECTOR);
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: ReadParams::fast(),
+            }),
+            Box::new(Bisect {
+                params: ReadParams::fast(),
+            }),
+        ];
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+        let mut sb = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
+        assert_eq!(out, HandlerOutcome::Fatal);
+        assert!(
+            matches!(ctx.fatal, Some(Error::WholeDiscKeyMissing)),
+            "the error that ended the chain is kept for the caller: {:?}",
+            ctx.fatal
+        );
+        assert_eq!(bad.total_len(), 64 * SECTOR, "nothing claimed recovered");
+    }
+
+    /// Refuses every span, as the patch sink does once its consumer is gone.
+    #[derive(Default)]
+    struct RefusingSink {
+        calls: u32,
+    }
+    impl RecoverySink for RefusingSink {
+        fn recovered(&mut self, _pos: u64, _buf: &[u8]) -> Result<()> {
+            self.calls += 1;
+            Err(Error::PipelineConsumerGone)
+        }
+    }
+
+    // A sink that can no longer write ends the chain at once: no more drive reads
+    // into a dead sink, and the refused span stays bad (it was never written).
+    #[test]
+    fn a_refusing_sink_stops_the_chain_and_keeps_the_span_bad() {
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RefusingSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(disc, sink, now);
+        let mut bad = SubRanges::from_section(0, 96 * SECTOR);
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: ReadParams::fast(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Reverse,
+                params: ReadParams::fast(),
+            }),
+        ];
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+        let mut sb = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
+        assert_eq!(out, HandlerOutcome::Fatal);
+        assert!(matches!(ctx.fatal, Some(Error::PipelineConsumerGone)));
+        assert_eq!(h.read_count(), 1, "no read after the sink refused");
+        assert_eq!(sink.calls, 1);
+        assert_eq!(bad.total_len(), 96 * SECTOR, "an unwritten span stays bad");
     }
 }
