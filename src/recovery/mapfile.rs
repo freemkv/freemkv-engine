@@ -829,7 +829,7 @@ impl Mapfile {
         // fsync the parent directory so the rename itself is durable — syncing the
         // tmp file's bytes alone isn't enough, since the new dirent lives only in the
         // page cache until synced. Best-effort: unsupported dirs aren't a failure.
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = parent_dir(&self.path) {
             libfreemkv::io::fsync::dir(parent);
         }
         Ok(())
@@ -867,6 +867,14 @@ fn fire_tmp_written_hook(path: &Path) {
     };
     if let Some(f) = hook {
         f();
+    }
+}
+
+// The directory holding `path`: `.` for a bare relative name, whose `parent()` is `""`.
+fn parent_dir(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => Some(Path::new(".")),
+        p => p,
     }
 }
 
@@ -2687,6 +2695,17 @@ mod write_to_disk_cleanup_tests {
         );
         assert_eq!(Mapfile::load(&path).unwrap().stats().bytes_unreadable, 0);
         assert!(!tmp.exists(), "no tmp left behind");
+    }
+
+    // M27: a bare relative mapfile name syncs the current directory, not `""` (ENOENT).
+    #[test]
+    fn a_relative_mapfile_syncs_the_current_directory() {
+        for p in ["rel.mapfile", "sub/rel.mapfile", "/abs/rel.mapfile"] {
+            let dir = parent_dir(Path::new(p)).unwrap();
+            assert!(!dir.as_os_str().is_empty(), "{p}");
+        }
+        let dir = parent_dir(Path::new("rel.mapfile")).unwrap();
+        libfreemkv::io::fsync::dir_checked(dir).expect("fsync the current directory");
     }
 
     // N2: a symlink planted at the predictable tmp name is replaced, never written through.
