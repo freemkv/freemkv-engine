@@ -30,6 +30,14 @@ project follows semantic versioning.
 - Multipass loss and convergence are measured over the titles `Job::selection` picks, not always the first title.
 - Halted or wedged multipass results report `main_lost_ms` as NaN (unmeasured) when damaged or pending bytes remain, instead of 0.0.
 
+### Fixed
+
+- `preflight` counts a job's key set as usable only when it covers the selected titles, instead of reporting Ready for a title the set cannot decrypt.
+- `preflight` refuses a requested language tag that names no language with the new reason `unknown-language` (detail = the tag), instead of passing the job to fail after the image opens, or blaming the disc with `language-unmatched`.
+- `episode_titles` picks the largest group of similar lengths (ties to the shorter), so one episode beside a play-all title is kept; titles with no extents are never dropped as duplicates.
+- A `Halted` error with no cancel behind it is `Failed` in every build profile; debug builds no longer panic on it.
+- Patch passes report speed over the fixed 10 s window, so a recovery burst shows promptly.
+
 ### Added
 
 - `multipass_rip_staged`, `mkv_staging_scope`, `sweep_scoped` and `ensure_whole_image`: an image staged for an MKV rip reads only UDF, nav/AACS files and the chosen titles (AACS BD Pre-recorded 0.953 §3.7: none of it bus-encrypted), so a disc with an unlocatable bus-encrypted stream file still rips to MKV. The scope is recorded in the mapfile (`# freemkv-scope:`), where `stats()` leaves the unread rest out of pending. `copy` and a whole-disc `sweep` over a scoped mapfile refuse with E6021 until every stream file is located, then fill the rest; `patch` re-reads only in-scope damage. `ensure_whole_image` refuses a staged image as a whole-disc source with E6022, and `ensure_titles_staged` refuses (E6022) muxing a title from it whose extents lie outside its scope. A staging image is whole only when it is kept and every stream file was located.
@@ -38,7 +46,7 @@ project follows semantic versioning.
 - `open_image_with(src, OpenImageOptions)`: open an image with a key set the caller already holds (`KeyInput::Known`, no key-service call), with a set plus a top-up (`Seeded`), or by resolving (`Resolve`), and with an already-scanned disc (`disc`), in which case an `iso://` image is not rescanned. A `dir://` folder is always scanned, so a pre-scanned disc given with one is refused (E7013). `open_image` calls it. `mux_image_titles` muxes each title from the disc the open already has instead of rescanning the image per title, so a staged ISO whose playlists were never read still muxes.
 - E7034: an image whose keys need the disc's Volume ID (its sidecar mapfile has a VID fingerprint) stops before writing anything and asks for the disc, instead of E7022.
 - `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
-- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
+- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced, output opened); the default ignores them.
 - `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form; they read codes exactly as `libfreemkv::error_code` does.
 - `open_scan(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
 - `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged once per factory, fault kind only).
