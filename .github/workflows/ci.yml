@@ -105,7 +105,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       # fmt runs on the pinned MSRV toolchain; clippy runs on stable. Linting on
       # stable makes new-lint debt a BLOCKING gate the pinned version would hide.
       # The MSRV pin is installed second so it stays the default (fmt uses it
@@ -140,7 +140,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -166,7 +166,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -195,7 +195,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -233,7 +233,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -268,7 +268,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -318,6 +318,7 @@ jobs:
           freemkv-keysources = { path = "../freemkv-keysources" }
           freemkv-engine = { path = "../freemkv-engine" }
           freemkv-i18n = { path = "../freemkv-i18n" }
+          freemkv-unlock = { path = "../freemkv-unlock" }
           EOF
           done
       # freemkv's app build (`--features gui`) compiles a GTK4 + libadwaita
@@ -360,7 +361,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}

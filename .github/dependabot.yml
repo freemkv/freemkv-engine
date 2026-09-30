@@ -14,9 +14,7 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
-    # One PR per week for the routine bumps instead of one per crate. Eight
-    # repos times a handful of crates is a volume nobody reads, and an
-    # unread PR queue is indistinguishable from no updates at all.
+    # One PR per week for the routine bumps instead of one per crate.
     groups:
       minor-and-patch:
         update-types:
@@ -24,18 +22,14 @@ updates:
           - patch
     ignore:
       # The freemkv crates depend on each other by GIT TAG, re-pinned by
-      # release-orchestrate.yml in the release commit. Dependabot cannot see that
-      # cascade, so a PR bumping one of these would fight the release process
-      # and could pin a version whose tag does not exist yet.
+      # release-orchestrate.yml in the release commit. A bot bump would fight
+      # the release cascade and could pin a tag that does not exist yet.
       - dependency-name: freemkv-unlock
       - dependency-name: libfreemkv
       - dependency-name: freemkv-keysources
       - dependency-name: freemkv-i18n
       - dependency-name: freemkv-engine
 
-  # The workflows are now real infrastructure -- the release cascade, the
-  # cross-platform hash matrix, the disc gate -- so their actions need the same
-  # attention as the crates.
   - package-ecosystem: github-actions
     directory: /
     target-branch: dev
@@ -48,10 +42,11 @@ updates:
           - minor
           - patch
     ignore:
-      # NOT a dependency: `dtolnay/rust-toolchain` is versioned by the RUST
-      # release it installs. Dependabot reads those tags as semver and proposed
-      # 1.90.0 -> 1.100.0, a Rust version that does not exist: permanently-red
-      # PRs regenerated weekly. The workflows track `@master`/`@stable` and
-      # choose the Rust version via `toolchain:` (MSRV from Cargo.toml, or
-      # stable), per freemkv-private CI.md.
+      # Versioned by the Rust release it installs; CI picks the toolchain via
+      # `toolchain:` on @master/@stable. Dependabot proposes Rust versions that
+      # do not exist. Toolchain bumps are a deliberate all-repo change.
       - dependency-name: dtolnay/rust-toolchain
+      # The org's own reusable workflows/actions. @v1 and @v2 are independent
+      # moving tags (v2 is only the comment guard), not semver releases: a
+      # "bump" from v1 to v2 would move a caller onto an OLDER guard.
+      - dependency-name: "freemkv/.github*"

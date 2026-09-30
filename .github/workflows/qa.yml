@@ -111,7 +111,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
@@ -140,7 +140,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
       - uses: dtolnay/rust-toolchain@stable
@@ -170,7 +170,7 @@ jobs:
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
-          patch: libfreemkv freemkv-keysources
+          patch: libfreemkv freemkv-keysources freemkv-unlock
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
