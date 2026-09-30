@@ -22,7 +22,7 @@ project follows semantic versioning.
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
 - A Stop that interrupts a sweep read ends the pass halted (`copy`/`sweep` return `halted`, not `Err(Halted)`); the interrupted range stays unread instead of being zero-filled and recorded as damage.
 - A sweep resume whose mapfile cannot be read (EIO, EACCES) fails with that error instead of deleting the mapfile and starting over; only a damaged mapfile still restarts the sweep.
-- A sweep whose output write fails stops reading at once and fails with the write's error; a failed final fsync no longer leaves those ranges recorded Finished.
+- A sweep or patch whose output write fails stops reading at once and fails with the write's error (not "consumer gone"); a failed write or final fsync no longer flushes the ranges behind it as Finished.
 - Sweep progress ticks every 250 ms. `work_done`/`work_total` run over the pass's scope (an MKV-staging sweep goes 0-100%), and a resumed sweep's first ticks include what the mapfile already held.
 - `ensure_titles_staged` also refuses (E6022) a staged title whose sectors were never read (a staging sweep stopped part-way).
 

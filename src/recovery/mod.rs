@@ -1437,9 +1437,8 @@ fn sweep_linked(
     let consumer_failed = pipe.consumer_failed();
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
 
-    // Producer-side error wins over consumer-side (the read failure
-    // is what motivated quitting; the consumer's flush error, if
-    // any, is downstream).
+    // The producer's error wins, unless the consumer's apply failed first: then its write
+    // error is the cause (see `pass_failure`).
     if let Some(e) = producer_err {
         // Producer error is returned, dropping the consumer's result — but do NOT
         // let a consumer close() failure vanish silently: it's the only signal the

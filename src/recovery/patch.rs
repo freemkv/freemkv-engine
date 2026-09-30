@@ -108,6 +108,30 @@ impl SharedPatchState {
     }
 }
 
+// A pass's result from its producer run and consumer teardown: the producer's error wins,
+// unless the consumer's `apply` failed first (its write error is the cause).
+fn settle(
+    run_result: Result<()>,
+    finish_result: Result<PatchSummary>,
+    consumer_failed: bool,
+) -> Result<PatchSummary> {
+    let Err(e) = run_result else {
+        return finish_result;
+    };
+    // Don't let a close() failure vanish on the both-failed path: it's the only signal
+    // that the mapfile on disk is now untrustworthy.
+    if let Err(close_err) = &finish_result {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "patch.finish.dropped",
+            pass_error = %e,
+            close_error = %close_err,
+            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
+        );
+    }
+    Err(super::pass_failure(e, finish_result, consumer_failed))
+}
+
 // Final summary from [`Sink::close`] on a clean drain: the final mapfile
 // stats. A `sync_all` failure on a regular file short-circuits `close` with
 // an `Err` before this is built, so it never carries a fsync-error field.
@@ -1362,24 +1386,9 @@ fn patch_linked(
     // Drain the consumer unconditionally: drop tx, wait for `close`, take final
     // stats. Bounded by the SAME Stop bit `run`'s sends use — a plain
     // `Pipeline::finish` once hung joining a wedged consumer and swallowed a halt.
+    let consumer_failed = pipe.consumer_failed();
     let finish_result = super::finish_bounded_disowning(pipe, &finish_halt, &map_disown);
-
-    // Producer-side error wins over consumer-side (mirrors sweep's precedence),
-    // but don't let a close() failure vanish silently on the both-failed path:
-    // it's the only signal that the mapfile on disk is now untrustworthy.
-    if let Err(ref e) = run_result
-        && let Err(close_err) = &finish_result
-    {
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "patch.finish.dropped",
-            pass_error = %e,
-            close_error = %close_err,
-            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
-        );
-    }
-    run_result?;
-    let summary = finish_result?;
+    let summary = settle(run_result, finish_result, consumer_failed)?;
 
     let outcome = build_outcome(
         &state,
@@ -2118,6 +2127,23 @@ mod tests {
         // Tier 0 reads each 1-sector range 4 times (one per scout): the 16th wedge
         // sense lands in the 4th range. Without the carry nothing trips until tier 2.
         assert_eq!(reader.reads, 16);
+    }
+
+    // R7: once the consumer's write failed, the producer stops on "consumer gone"; the
+    // pass must fail with the write's own error (ENOSPC/EIO), not that.
+    #[test]
+    fn a_failed_consumer_write_is_the_error_the_patch_reports() {
+        let enospc = || Error::IoError {
+            source: std::io::Error::other("ENOSPC"),
+        };
+        let gone = || Err(super::super::SendStall::ConsumerGone.into_error());
+        let e = settle(gone(), Err(enospc()), true).err().unwrap();
+        assert!(matches!(e, Error::IoError { .. }), "got {e:?}");
+        // The consumer healthy: the producer's own failure stands.
+        let e = settle(Err(Error::DecryptFailed), Err(enospc()), false)
+            .err()
+            .unwrap();
+        assert!(matches!(e, Error::DecryptFailed), "got {e:?}");
     }
 
     // R3: a failed `sync_all` means the recovered data is not durable, so the dropped
