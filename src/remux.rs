@@ -1261,6 +1261,13 @@ mod tests {
     fn an_unreadable_target_folder_is_refused_not_taken_as_empty() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // ENOTDIR (a file where the folder should be) holds as root too.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let under_file = file.join("Title.mkv");
+        let err = refuse_existing(&job(under_file.clone(), false)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+        assert!(target_present(&under_file).is_err());
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1268,7 +1275,7 @@ mod tests {
         let probe = std::fs::symlink_metadata(&target);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         if probe.is_ok() || probe.as_ref().unwrap_err().kind() == io::ErrorKind::NotFound {
-            return; // running as root: permissions are not enforced
+            return; // root: permissions are not enforced (ENOTDIR above still ran)
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let refused = refuse_existing(&job(target.clone(), false));
