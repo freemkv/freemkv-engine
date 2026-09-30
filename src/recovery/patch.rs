@@ -1537,14 +1537,15 @@ mod tests {
         mf.flush().unwrap();
         std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
 
-        // Nothing bad to patch, so this returns without reading a sector — the
-        // point is only that it did NOT return ImageTruncated.
+        // Nothing bad to patch, so this returns without reading a sector; any
+        // refusal at all (not just ImageTruncated) fails the healthy resume.
         let opts = PatchOptions::for_patch_pass(true, None, None);
-        let r = patch(&disc, &mut NoReader, &iso, &opts);
-        assert!(
-            !matches!(r, Err(Error::ImageTruncated { .. })),
-            "an image of exactly the right length must not be refused"
-        );
+        let out = match patch(&disc, &mut NoReader, &iso, &opts) {
+            Ok(out) => out,
+            Err(e) => panic!("an image of exactly the right length must be accepted: {e:?}"),
+        };
+        assert_eq!((out.bytes_total, out.bytes_good), (full, full));
+        assert!(!out.halted && !out.wedged_exit);
 
         let _ = std::fs::remove_file(&mapfile_path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2032,6 +2033,86 @@ mod tests {
             &shared
         ));
         assert_eq!(calls.get(), 1, "the reporter still hears the snapshot");
+    }
+
+    /// Fails every read with one fixed error, counting the reads.
+    struct FixedErrReader {
+        err: fn(u32) -> Error,
+        reads: u32,
+    }
+    impl libfreemkv::sector::SectorSource for FixedErrReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _decrypt: bool,
+        ) -> std::result::Result<usize, libfreemkv::Error> {
+            self.reads += 1;
+            Err((self.err)(lba))
+        }
+    }
+
+    /// One real patch pass over single-sector bad ranges at `lbas` (a 2000-sector disc).
+    fn patch_bad_sectors(tag: &str, lbas: &[u32], reader: &mut FixedErrReader) -> PatchOutcome {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join(format!("{tag}.iso"));
+        let disc = guard_disc(2000);
+        let full = disc.capacity_bytes;
+        let mapfile_path = disc.mapfile_for(&iso);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        for &lba in lbas {
+            mf.record(lba as u64 * 2048, 2048, mapfile::SectorStatus::NonTrimmed)
+                .unwrap();
+        }
+        mf.flush().unwrap();
+        std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
+        let opts = PatchOptions::for_patch_pass(false, None, None);
+        patch(&disc, reader, &iso, &opts).expect("a dead bus ends the pass, it does not fail it")
+    }
+
+    // A bridge crash (status 0xFF) on the first read ends the whole pass wedged, with
+    // no further reads: the orchestrator spin-cycles the drive before the next pass.
+    #[test]
+    fn a_transport_failure_ends_the_patch_pass_after_one_read() {
+        let mut reader = FixedErrReader {
+            err: |lba| Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                sense: None,
+            },
+            reads: 0,
+        };
+        let out = patch_bad_sectors("transport", &[100, 200, 300], &mut reader);
+        assert!(out.wedged_exit, "a dead bus must end the pass wedged");
+        assert!(!out.halted);
+        assert_eq!(reader.reads, 1, "no read after the transport failure");
+        assert_eq!(out.bytes_recovered_this_pass, 0);
+    }
+
+    // The wedge streak is carried across ranges: 1-sector ranges each see only a
+    // few fast wedge senses, yet the pass aborts once 16 accumulate in total.
+    #[test]
+    fn the_wedge_streak_carries_across_ranges_to_abort_the_pass() {
+        let mut reader = FixedErrReader {
+            err: |lba| Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION),
+                sense: Some(libfreemkv::scsi::ScsiSense {
+                    sense_key: libfreemkv::scsi::SENSE_KEY_ILLEGAL_REQUEST,
+                    asc: 0x21,
+                    ascq: 0x00,
+                }),
+            },
+            reads: 0,
+        };
+        let lbas: Vec<u32> = (1..=10).map(|i| i * 100).collect();
+        let out = patch_bad_sectors("wedge", &lbas, &mut reader);
+        assert!(out.wedged_exit, "a wedged drive must end the pass");
+        // Tier 0 reads each 1-sector range 4 times (one per scout): the 16th wedge
+        // sense lands in the 4th range. Without the carry nothing trips until tier 2.
+        assert_eq!(reader.reads, 16);
     }
 }
 
