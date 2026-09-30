@@ -41,7 +41,8 @@ pub struct RipFile {
 /// The result of a completed rip. Success, partial, and failure are all
 /// expressed here rather than only through the `Result` — a partial rip that
 /// wrote a usable MKV with some unreadable sectors is `Ok(Outcome { .. })` with
-/// a non-`Clean` [`severity`](Outcome::severity), not an `Err`.
+/// a non-`Clean` [`severity`](Outcome::severity), not an `Err`. The engine's
+/// entry points do not build one; a front-end that wants it maps their results.
 #[derive(Clone, Debug)]
 pub struct Outcome {
     /// Files written (usually one per selected title).
@@ -68,7 +69,8 @@ impl Outcome {
 
 /// Key resolution state, as data rather than log lines — so a UI can render the
 /// "keydb: N entries" strip and grey out Start with a real reason instead of
-/// scraping a log.
+/// scraping a log. Front-end data: the engine reports key state through
+/// [`crate::keys::key_status`] (a `DecryptStatus`) and never builds this.
 #[derive(Clone, Debug)]
 pub struct KeyStatus {
     /// Whether usable decryption keys were resolved for the selected content.

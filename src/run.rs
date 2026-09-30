@@ -2,12 +2,10 @@
 //!
 //! [`recover_to_iso`] is the disc→ISO half of a rip: it runs the multipass
 //! sweep/patch dispatch ([`crate::recovery::copy`]) against a caller-provided
-//! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`]. It is the
-//! first consumer of the relocated recovery module, and the piece a front-end
-//! composes with `mux_with_keys` to get disc→MKV.
-//!
-//! The ISO→MKV mux stage is driven by the front-end via `libfreemkv::mux_with_keys`,
-//! kept separately callable to mirror how the CLI and autorip already stage a rip.
+//! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`].
+//! The mux stage lives beside it ([`crate::mux_title`], [`crate::run_titles`],
+//! [`crate::mux_image_titles`], [`crate::remux_iso`]); [`ProgressBridge`] adapts
+//! libfreemkv pass progress to the [`Sink`].
 
 use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};

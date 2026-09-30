@@ -28,7 +28,7 @@ mod recovery;
 
 // Recovery primitives (relocated from libfreemkv). `multipass_rip` drives
 // sweep/patch for the common case; a consumer that must interleave its own
-// work between passes (autorip's staging/resume/watchdog) drives them directly.
+// work between passes (staging, resume, a watchdog) drives them directly.
 pub use recovery::mapfile::{MapStats, Mapfile, SectorStatus, mapfile_path_for, vid_fingerprint};
 pub use recovery::{
     CopyOptions, CopyResult, PatchOptions, PatchOutcome, SweepOptions,

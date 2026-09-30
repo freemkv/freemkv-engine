@@ -48,11 +48,11 @@ fn display_window_secs(elapsed_pass_secs: f64) -> f64 {
 /// Tracks byte-progress samples and produces a smoothed *display* throughput
 /// plus a stable *ETA* rate. Not thread-safe by itself; callers that touch it
 /// from a callback wrap it in the appropriate interior-mutability/lock (see
-/// `run.rs`, `mux.rs`, and autorip's pass state).
+/// `run.rs`, `mux.rs`).
 ///
 /// Construct one **per pass** (each pass anchors its own running-average clock
-/// on the first `observe`); a `bytes_done` that goes backwards mid-life is also
-/// treated as a fresh pass and re-anchors cleanly.
+/// on the first `observe`); a `bytes_done` below that first observation's count
+/// is also treated as a fresh pass and re-anchors cleanly.
 #[derive(Debug)]
 pub struct SpeedEstimator {
     /// Sliding window of `(observation_time, bytes_done)`, oldest at the front.
@@ -206,6 +206,7 @@ impl Default for SpeedEstimator {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     // `sample_at` must report real throughput, not a constant — kills the six
     // "replace sample -> (0, None)" mutants (each asserts a value no constant
@@ -266,9 +267,8 @@ mod tests {
         );
     }
 
-    // The display window's phase boundaries are exact. Kills the `<` -> `<=`
-    // mutants in `display_window_secs`: each assertion below sits exactly ON
-    // a boundary, where the two operators disagree.
+    // The display window's phase boundaries are exact. Both `<` -> `<=` mutants in
+    // `display_window_secs` are equivalent (the curve is continuous there); these pin the rest.
     #[test]
     fn the_display_window_boundaries_are_exact() {
         // Static phase: [0, 60) is a flat 10s window.
@@ -295,8 +295,6 @@ mod tests {
         assert_eq!(display_window_secs(end), MAX_WINDOW_SECS);
         assert_eq!(display_window_secs(end + 10_000.0), MAX_WINDOW_SECS);
     }
-
-    use super::*;
 
     // ─── Display speed (observe) ────────────────────────────────────────────
 

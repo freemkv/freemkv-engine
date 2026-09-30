@@ -3,7 +3,6 @@
 
 use super::*;
 use libfreemkv::Error;
-use std::time::{Duration, Instant};
 
 struct Cancels(AtomicBool);
 impl Sink for Cancels {
@@ -93,8 +92,8 @@ fn a_bridged_call_returns_without_waiting_for_the_next_slice() {
     );
 }
 
-// ET8 `engine_outcome_mapping` — §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when
-// the op token is cancelled"; "`TimedOut` → **Failed** always".
+// ET8 `engine_outcome_mapping` — §2.6: `Halted` → `Stopped` only on a cancel (the op token,
+// or the narrower flag and Sink the engine also honours, §4.2); "`TimedOut` → **Failed** always".
 #[test]
 fn engine_outcome_mapping() {
     let op = Halt::new();
@@ -119,6 +118,14 @@ fn engine_outcome_mapping() {
         matches!(r, EngineOutcome::Failed(_)),
         "TimedOut stays Failed after a Stop"
     );
+    let extra = Arc::new(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), Some(extra));
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, never);
+    assert!(r.is_stopped(), "a narrower-flag cancel is a Stop: {r:?}");
+    let sink = Cancels(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, never);
+    assert!(r.is_stopped(), "a Sink cancel is a Stop: {r:?}");
 }
 
 // ET8, last case — §2.6: "Otherwise it … maps to `Failed`", in every build profile. A

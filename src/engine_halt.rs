@@ -156,9 +156,10 @@ pub enum EngineOutcome<T> {
 impl<T> EngineOutcome<T> {
     /// Map a `_with` entry's result. `halted` reads an artifact result's own Stop flag.
     ///
-    /// §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when the op token is
-    /// cancelled. Otherwise it … maps to `Failed`." It warns instead of the spec's
-    /// `debug_assert!`: a non-sticky `should_cancel` or a source's own `Halted` reach it.
+    /// §2.6: `Halted` → `Stopped` only on a cancel ([`EngineHalt::is_cancelled`]: the op
+    /// token, the narrower flag or the Sink); "Otherwise it … maps to `Failed`". It warns
+    /// instead of the spec's `debug_assert!`: a non-sticky `should_cancel` or a source's own
+    /// `Halted` reach it.
     pub(crate) fn from_result(
         r: crate::Result<T>,
         halt: &EngineHalt<'_>,
