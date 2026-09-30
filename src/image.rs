@@ -346,7 +346,7 @@ impl Remembered {
             .map_or("", |(_, d)| d)
             .to_string();
         let io = match e {
-            Error::IoError { source } => Some((source.kind(), source.raw_os_error())),
+            Error::IoError { source, .. } => Some((source.kind(), source.raw_os_error())),
             _ => None,
         };
         Some(Remembered {
@@ -801,7 +801,7 @@ mod tests {
             .map(|_| ())
             .unwrap_err();
         assert!(
-            matches!(&err, Error::IoError { source } if source.kind() == std::io::ErrorKind::NotFound),
+            matches!(&err, Error::IoError { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
             "{err:?}"
         );
     }
@@ -847,7 +847,7 @@ mod tests {
         };
         let err = check_prescanned(&fx.disc, &mut r, None, None, &[]).unwrap_err();
         assert!(
-            matches!(&err, Error::IoError { source } if source.raw_os_error() == Some(5)),
+            matches!(&err, Error::IoError { source, .. } if source.raw_os_error() == Some(5)),
             "{err:?}"
         );
     }
