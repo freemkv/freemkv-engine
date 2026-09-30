@@ -3623,8 +3623,7 @@ mod tests {
             &crate::sink::NoopSink,
         )
         .expect_err("a decrypting multipass rip must be refused");
-        let want = crate::run::multipass_requires_raw().to_string();
-        assert_eq!(err.to_string(), want);
+        assert_eq!(err.to_string(), "E9082");
         assert!(
             reads.lock().unwrap().is_empty(),
             "the refused rip read the disc"

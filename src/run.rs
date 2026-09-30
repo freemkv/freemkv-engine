@@ -650,7 +650,8 @@ mod tests {
     // A decrypting multipass job is refused with its own code (E9082), before any read.
     #[test]
     fn a_decrypting_multipass_job_is_refused_with_its_code() {
-        let iso = std::env::temp_dir().join("fmkv-engine-never-written.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("never-written.iso");
         let disc = clean_disc(64);
         let mut reader = ZeroReader { capacity: 64 };
         let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());

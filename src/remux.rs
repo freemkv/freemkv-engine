@@ -378,16 +378,7 @@ fn remux_iso_sources_at(
     };
     let (opened, idx, keys) = halt.linked(open)?;
     let title = &opened.disc.titles[idx];
-    let selection = if job.streams.is_all() {
-        libfreemkv::StreamSelection::default()
-    } else {
-        crate::streams::resolve_stream_selection_forced(
-            title,
-            &job.streams.audio,
-            &job.streams.subtitles,
-        )
-        .map_err(|e| io::Error::from(libfreemkv::Error::from(e)))?
-    };
+    let selection = title_selection(title, &job.streams)?;
     let options = mux_options(false);
     land_verified(
         job,
@@ -399,6 +390,18 @@ fn remux_iso_sources_at(
         staged_partial,
         |dest| mux_opened_title(&opened, &keys, idx, selection, dest, &options, sink),
     )
+}
+
+// The job's stream choice as PIDs for `title`; an unknown language tag is E9083.
+fn title_selection(
+    title: &libfreemkv::DiscTitle,
+    streams: &StreamChoice,
+) -> io::Result<libfreemkv::StreamSelection> {
+    if streams.is_all() {
+        return Ok(libfreemkv::StreamSelection::default());
+    }
+    crate::streams::resolve_stream_selection_forced(title, &streams.audio, &streams.subtitles)
+        .map_err(|e| io::Error::from(libfreemkv::Error::from(e)))
 }
 
 // Only NotFound means absent: EIO/ESTALE/permission errors surface, so a flaky
@@ -1576,6 +1579,20 @@ mod tests {
         let code = libfreemkv::error::E_STREAM_URL_INVALID;
         assert_eq!(crate::error_code(&e), Some(code), "{e}");
         assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
+    }
+
+    // Preflight catches an unknown tag first; a caller that skips it still gets E9083, not prose.
+    #[test]
+    fn an_unknown_stream_language_is_its_code() {
+        let streams = StreamChoice {
+            audio: crate::job::StreamFilter::Langs(vec!["Klingonish".into()]),
+            subtitles: crate::job::StreamFilter::All.into(),
+        };
+        let e = title_selection(&title(60.0), &streams).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        let code = libfreemkv::error::E_STREAM_LANGUAGE_UNKNOWN;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert_eq!(e.to_string(), "E9083: Klingonish");
     }
 
     // A relative target named like a libfreemkv code reads as E9084, not that code.
