@@ -15,10 +15,10 @@ use crate::mux::{
     run_titles,
 };
 use crate::sink::{Event, Level, Sink};
-use libfreemkv::Halt;
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
 use libfreemkv::io::ArtifactLock;
 use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::{Halt, RemuxVerifyKind};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -232,7 +232,7 @@ pub fn verify_mkv(path: &Path, title: &libfreemkv::DiscTitle) -> io::Result<libf
 // The file's length; an empty file fails verify.
 fn nonempty_len(path: &Path) -> io::Result<u64> {
     match std::fs::metadata(path)?.len() {
-        0 => Err(verify_failed(path, "file is empty")),
+        0 => Err(verify_failed(path, RemuxVerifyKind::Empty)),
         len => Ok(len),
     }
 }
@@ -243,19 +243,21 @@ fn check_probe(
     probe: libfreemkv::MkvProbe,
 ) -> io::Result<libfreemkv::MkvProbe> {
     if probe.tracks.is_empty() {
-        return Err(verify_failed(path, "no tracks"));
+        return Err(verify_failed(path, RemuxVerifyKind::NoTracks));
     }
     let expected = title.duration_secs;
     if expected.is_finite() && expected > 0.0 {
-        let Some(runtime) = muxed_runtime(&probe) else {
-            return Err(verify_failed(path, "no runtime"));
+        // A non-finite runtime is no usable runtime.
+        let Some(runtime) = muxed_runtime(&probe).filter(|r| r.is_finite()) else {
+            return Err(verify_failed(path, RemuxVerifyKind::NoRuntime));
         };
         let slack = RUNTIME_SLACK_SECS.max(expected * RUNTIME_SLACK_FRACTION);
-        if !runtime.is_finite() || (runtime - expected).abs() > slack {
-            return Err(verify_failed(
-                path,
-                &format!("runtime {runtime:.1}s, title is {expected:.1}s"),
-            ));
+        if (runtime - expected).abs() > slack {
+            let kind = RemuxVerifyKind::RuntimeMismatch {
+                have_secs: runtime,
+                want_secs: expected,
+            };
+            return Err(verify_failed(path, kind));
         }
     }
     Ok(probe)
@@ -265,11 +267,9 @@ fn muxed_runtime(probe: &libfreemkv::MkvProbe) -> Option<f64> {
     probe.last_cue_secs.or(probe.duration_secs)
 }
 
-fn verify_failed(path: &Path, why: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("verify {}: {why}", path.display()),
-    )
+fn verify_failed(path: &Path, kind: RemuxVerifyKind) -> io::Error {
+    let path = path.display().to_string();
+    libfreemkv::Error::RemuxVerifyFailed { kind, path }.into()
 }
 
 /// A remux of one title from an image to an MKV.
@@ -386,7 +386,7 @@ fn remux_iso_sources_at(
             &job.streams.audio,
             &job.streams.subtitles,
         )
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("{e:?}")))?
+        .map_err(|e| io::Error::from(libfreemkv::Error::from(e)))?
     };
     let options = mux_options(false);
     land_verified(
@@ -418,9 +418,9 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     Ok(())
 }
 
-// The quoted path only: a bare path starting `E<digits>` would parse as that error code.
 fn target_exists(target: &Path) -> io::Error {
-    io::Error::new(io::ErrorKind::AlreadyExists, format!("{target:?}"))
+    let path = target.display().to_string();
+    libfreemkv::Error::RemuxTargetExists { path }.into()
 }
 
 // The requested title, or the main title by the same rule a rip's default uses.
@@ -574,10 +574,7 @@ fn land_verified(
     let target_partial = partial_path(&job.target);
     let partial = staged_partial.unwrap_or(&target_partial);
     if partial == job.target || (staged_partial.is_some() && partial == target_partial) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid remux staging path",
-        ));
+        return Err(libfreemkv::Error::RemuxStagingInvalid.into());
     }
     // The mux takes a String URL: a non-UTF-8 path would be written under a lossy name.
     let Some(partial_str) = partial.to_str() else {
@@ -607,7 +604,7 @@ fn land_verified(
         return Err(if halt.is_cancelled() {
             libfreemkv::Error::Halted.into()
         } else {
-            io::Error::other(format!("mux of title {} did not complete", idx + 1))
+            libfreemkv::Error::MuxIncomplete { title: idx + 1 }.into()
         });
     }
     durable_sync(rio, partial, halt, sink, timing)?;
@@ -730,11 +727,13 @@ fn copy_staged(
         }
     }
     let done = watched??;
-    if done != total || std::fs::metadata(destination)?.len() != total {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "remux copy size mismatch",
-        ));
+    let have = match done {
+        n if n != total => n,
+        _ => std::fs::metadata(destination)?.len(),
+    };
+    if have != total {
+        let want = total;
+        return Err(libfreemkv::Error::StagedCopySizeMismatch { have, want }.into());
     }
     Ok(())
 }
@@ -968,7 +967,7 @@ fn watch_worker<T>(
         match done {
             Ok(result) => return Ok(result),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other(format!("{op} worker lost")));
+                return Err(libfreemkv::Error::WorkerLost { op }.into());
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -1056,6 +1055,7 @@ mod tests {
             "an incomplete mux is a failure: {e}"
         );
         assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(e.to_string(), "E9078: 1");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!local_partial.exists());
         assert!(!partial_path(&target).exists());
@@ -1093,6 +1093,8 @@ mod tests {
                 "{}",
                 staged.display()
             );
+            let code = libfreemkv::error::E_REMUX_STAGING_INVALID;
+            assert_eq!(crate::error_code(&e), Some(code), "{e}");
             assert!(!muxed.load(Ordering::SeqCst));
             assert_eq!(std::fs::read(&target).unwrap(), b"old");
             assert!(!target_partial.exists());
@@ -1130,6 +1132,66 @@ mod tests {
         let err = copy_staged(&source, &destination, &halt, &sink, &OsRemuxIo, timing).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
+    }
+
+    // A destination that accepts writes but keeps no bytes: the copy counts `total`, the file holds 0.
+    struct DroppingIo;
+    impl RemuxIo for DroppingIo {
+        fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+            OsRemuxIo.sync(f, h, p)
+        }
+        fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+            OsRemuxIo.open_read(path)
+        }
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+            drop(OsRemuxIo.create_new(path)?);
+            Ok(Box::new(io::sink()))
+        }
+        fn timing(&self) -> RemuxTiming {
+            RemuxTiming::default()
+        }
+    }
+
+    #[test]
+    fn a_staged_copy_short_on_disk_is_a_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, destination) = (dir.path().join("s.mkv"), dir.path().join("d.partial"));
+        std::fs::write(&source, b"new bytes").unwrap();
+        let token = Halt::new();
+        let sink = Events::default();
+        let halt = EngineHalt::new(&token, None).with_sink(&sink);
+        let timing = RemuxTiming::default();
+        let e = copy_staged(&source, &destination, &halt, &sink, &DroppingIo, timing).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(e.to_string(), "E9080: 0/9");
+    }
+
+    // A worker that drops its sender without reporting is WorkerLost naming the op (E9081).
+    #[test]
+    fn a_lost_worker_is_its_code_naming_the_op() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        drop(tx);
+        let token = Halt::new();
+        let sink = Events::default();
+        let halt = EngineHalt::new(&token, None).with_sink(&sink);
+        let timing = RemuxTiming::default();
+        let beat = LockBeat::new(None, timing.lock_beat);
+        let moved = AtomicU64::new(0);
+        let report = |n: u64| activity("verify", n, 1);
+        let e = watch_worker(
+            &rx,
+            &moved,
+            "verify",
+            timing.verify_stall,
+            &halt,
+            &sink,
+            timing,
+            beat,
+            &report,
+        )
+        .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(e.to_string(), "E9081: verify");
     }
 
     #[test]
@@ -1342,9 +1404,12 @@ mod tests {
         assert!(!ok(100.0, 89.0) && !ok(100.0, 111.0));
         assert!(!ok(100.0, f64::NAN) && !ok(100.0, f64::INFINITY));
         let t = title(100.0);
-        assert!(
-            check_probe(Path::new("a"), &t, probe(None, None)).is_err(),
-            "no runtime"
+        let shown = |p| check_probe(Path::new("a"), &t, p).unwrap_err().to_string();
+        assert_eq!(shown(probe(None, None)), "E9077: no-runtime a");
+        assert_eq!(shown(probe(Some(f64::NAN), None)), "E9077: no-runtime a");
+        assert_eq!(
+            shown(probe(Some(80.0), None)),
+            "E9077: runtime-mismatch 80.0/100.0 a"
         );
         assert!(
             check_probe(Path::new("a"), &t, probe(None, Some(100.0))).is_ok(),
@@ -1356,10 +1421,11 @@ mod tests {
     fn verify_rejects_empty_trackless_and_foreign_files() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("a.mkv");
+        let shown = |t: f64| verify_mkv(&p, &title(t)).unwrap_err().to_string();
         std::fs::write(&p, b"").unwrap();
-        assert!(verify_mkv(&p, &title(0.0)).is_err());
+        assert_eq!(shown(0.0), format!("E9077: empty {}", p.display()));
         std::fs::write(&p, mkv(10.0, Some(9), 0)).unwrap();
-        assert!(verify_mkv(&p, &title(10.0)).is_err());
+        assert_eq!(shown(10.0), format!("E9077: no-tracks {}", p.display()));
         std::fs::write(&p, vec![0x47u8; 4096]).unwrap();
         assert!(verify_mkv(&p, &title(10.0)).is_err());
         assert!(verify_mkv(&dir.path().join("missing.mkv"), &title(0.0)).is_err());
@@ -1433,6 +1499,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        let code = libfreemkv::error::E_REMUX_VERIFY_FAILED;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!partial_path(&target).exists());
         assert!(sink.0.lock().unwrap().contains(&"verify:false".to_string()));
@@ -1510,13 +1578,14 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
     }
 
-    // A relative target named like a libfreemkv code must not read as that code.
+    // A relative target named like a libfreemkv code reads as E9084, not that code.
     #[test]
     fn an_existing_target_named_like_an_error_code_is_not_that_code() {
         let e = target_exists(Path::new("E7022 Movie.mkv"));
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(crate::error_code(&e), None, "{e}");
-        assert!(e.to_string().contains("E7022 Movie.mkv"), "{e}");
+        let code = libfreemkv::error::E_REMUX_TARGET_EXISTS;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert_eq!(e.to_string(), "E9084: E7022 Movie.mkv");
     }
 
     #[test]

@@ -15,13 +15,7 @@ use crate::sink::{Level, Progress, Sink};
 // One constructor so the two call sites can't describe the same refusal two
 // different ways.
 pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
-    libfreemkv::Error::IoError {
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "multipass implies raw: a multipass rip recovers a whole-disc \
-             image and cannot decrypt",
-        ),
-    }
+    libfreemkv::Error::MultipassRequiresRaw
 }
 
 // Sets `done` on every exit path, including a panic unwind, since a plain `store(true)` placed
@@ -651,5 +645,23 @@ mod tests {
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
              token is polled every 100 ms and must break the pause"
         );
+    }
+
+    // A decrypting multipass job is refused with its own code (E9082), before any read.
+    #[test]
+    fn a_decrypting_multipass_job_is_refused_with_its_code() {
+        let iso = std::env::temp_dir().join("fmkv-engine-never-written.iso");
+        let disc = clean_disc(64);
+        let mut reader = ZeroReader { capacity: 64 };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.mode = RipMode::Multi;
+        let e =
+            recover_to_iso(&disc, &mut reader, &iso, &job, &CountingSink::default()).unwrap_err();
+        assert!(
+            matches!(e, libfreemkv::Error::MultipassRequiresRaw),
+            "{e:?}"
+        );
+        assert_eq!(e.to_string(), "E9082");
+        assert!(!iso.exists());
     }
 }

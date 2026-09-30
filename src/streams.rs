@@ -250,6 +250,17 @@ pub enum StreamSelError {
     UnknownLanguage { tag: String },
 }
 
+/// The coded form (E9083) for callers that surface a selection error as an I/O error.
+impl From<StreamSelError> for libfreemkv::Error {
+    fn from(e: StreamSelError) -> Self {
+        match e {
+            StreamSelError::UnknownLanguage { tag } => {
+                libfreemkv::Error::StreamLanguageUnknown { tag }
+            }
+        }
+    }
+}
+
 /// Translate the audio + subtitle policy for ONE scanned title into a lib
 /// `StreamSelection` (PIDs). A `Langs` tag that resolves to no known language
 /// is an [`StreamSelError::UnknownLanguage`]. A resolvable tag that simply has
@@ -1047,5 +1058,20 @@ mod tests {
         assert_eq!(u.len(), 2);
         assert!(u.iter().any(|c| c.class == "audio"));
         assert!(u.iter().any(|c| c.class == "subtitle"));
+    }
+
+    // An unknown tag surfaces as E9083 carrying the tag, as an InvalidInput io::Error.
+    #[test]
+    fn an_unknown_language_converts_to_its_code() {
+        let e = StreamSelError::UnknownLanguage {
+            tag: "Klingonish".into(),
+        };
+        let io: std::io::Error = libfreemkv::Error::from(e).into();
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            crate::error_code(&io),
+            Some(libfreemkv::error::E_STREAM_LANGUAGE_UNKNOWN)
+        );
+        assert_eq!(io.to_string(), "E9083: Klingonish");
     }
 }
