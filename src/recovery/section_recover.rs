@@ -26,16 +26,16 @@ const BATCH_SECTORS: u64 = 32;
 /// resumes rather than reading every dead sector.
 const JUMP_AFTER_FAILS: u32 = 2;
 
-// Early-yield: after this many consecutive unproductive reads, a handler hands the still-bad
-// set to the next handler instead of grinding its whole budget on a dead zone.
+/// Early-yield: after this many consecutive unproductive reads, a handler hands the still-bad
+/// set to the next handler instead of grinding its whole budget on a dead zone.
 const UNPRODUCTIVE_YIELD: u32 = 4;
 
-// Wedge abort: after this many CONSECUTIVE wedge-family senses, `read_span` escalates to
-// `Transport` and the whole pass aborts rather than hammering remaining sections.
+/// Wedge abort: after this many CONSECUTIVE wedge-family senses, `read_span` escalates to
+/// `Transport` and the whole pass aborts rather than hammering remaining sections.
 const WEDGE_ABORT_STREAK: u32 = 16;
 
-// A wedge-family failure only counts toward WEDGE_ABORT_STREAK if it came back faster than
-// this, so slow genuine ECC recovery doesn't false-trip the wedge abort.
+/// A wedge-family failure only counts toward WEDGE_ABORT_STREAK if it came back faster than
+/// this, so slow genuine ECC recovery doesn't false-trip the wedge abort.
 const WEDGE_FASTFAIL_MS: u64 = 500;
 
 // DELIBERATE DIVERGENCE from read_error.rs's WEDGE_ABORT_THRESHOLD (also 16, no
@@ -47,9 +47,9 @@ const WEDGE_FASTFAIL_MS: u64 = 500;
 /// spindle passes [`SpeedPref::Min`] and [`read_span`] restores this on exit.
 const SPEED_MAX_KBS: u16 = 0xFFFF;
 
-// Min read speed (~DVD 1x). Slower rotation gives the servo more dwell and
-// the ECC engine more integration time per sector (SlowSpin / SpeedSweep).
-// Only needs to be well below max; the drive rounds to a supported step.
+/// Min read speed (~DVD 1x). Slower rotation gives the servo more dwell and
+/// the ECC engine more integration time per sector (min-speed [`Linear`] and
+/// [`SpeedSweep`]). Only needs to be well below max; the drive rounds to a supported step.
 const SPEED_MIN_KBS: u16 = 1385;
 
 /// Which spindle speed a read requests. `Max` is the streaming default; `Min`
@@ -87,9 +87,9 @@ impl TimeoutPref {
     }
 }
 
-// The per-read knobs a handler hands to read_span: speed / cache(FUA) /
-// timeout (direction is the handler's own walk). A new technique is a new
-// parameterisation of the same read primitive, never a bypass of it.
+/// The per-read knobs a handler hands to read_span: speed / cache(FUA) /
+/// timeout (direction is the handler's own walk). A new technique is a new
+/// parameterisation of the same read primitive, never a bypass of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ReadParams {
     pub speed: SpeedPref,
@@ -900,8 +900,8 @@ impl SectionHandler for Oscillate {
     }
 }
 
-// EWMA smoothing factor for the decayed recovery rate: higher = more reactive (leadership flips
-// sooner), lower = steadier.
+/// EWMA smoothing factor for the decayed recovery rate: higher = more reactive (leadership flips
+/// sooner), lower = steadier.
 const SCORE_EWMA_ALPHA: f64 = 0.5;
 
 /// Per-rip handler scorecard: decayed recovery rate ([`SCORE_EWMA_ALPHA`] EWMA of bytes/second)
@@ -956,7 +956,8 @@ impl HandlerScoreboard {
             // handler perpetually crowds out proven performers.
             Some(s) => match s.ewma_rate {
                 None => 0,
-                Some(r) => r.max(0.0).min(u64::MAX as f64) as u64,
+                // `as` saturates: NaN / negative rank 0, overflow ranks u64::MAX.
+                Some(r) => r as u64,
             },
         }
     }
@@ -1007,8 +1008,8 @@ pub(super) fn run_handlers(
         // the early-yield trips.
         ctx.unproductive = 0;
         let outcome = handler.recover(ctx, bad, deadline);
-        // A handler may have dropped the spindle (SlowSpin / SpeedSweep) or set
-        // FUA; restore max speed before the next handler so it starts from the
+        // A handler may have dropped the spindle (min-speed Linear / SpeedSweep) or
+        // set FUA; restore max speed before the next handler so it starts from the
         // streaming default (FUA is a per-read param, so nothing to unwind there).
         if ctx.cur_speed != SPEED_MAX_KBS {
             ctx.reader.set_speed(SPEED_MAX_KBS);
@@ -1070,10 +1071,10 @@ mod tests {
         // manipulates matches — so recovering it proves the technique was exercised.
         /// Current `SET CD SPEED` value (updated by `set_speed`); max at build.
         speed: u16,
-        /// Reads ONLY at min speed (fails at max) → SlowSpin / SpeedSweep.
+        /// Reads ONLY at min speed (fails at max) → min-speed Linear / SpeedSweep.
         slow_only: HashSet<u32>,
         /// Reads ONLY on the Nth *physical* (FUA) attempt; a cached (non-FUA)
-        /// re-read never gets it → FuaRetry. Maps LBA → attempts required.
+        /// re-read never gets it → FUA Linear / Bisect. Maps LBA → attempts required.
         fua_need: HashMap<u32, u32>,
         /// Physical (FUA) attempts observed so far, per LBA.
         fua_seen: HashMap<u32, u32>,
@@ -1271,6 +1272,23 @@ mod tests {
         }
     }
 
+    /// Build a ctx over `disc` with the fake clock — the common per-test setup.
+    macro_rules! ctx {
+        ($disc:expr, $sink:expr, $now:expr) => {
+            HandlerCtx {
+                reader: &mut $disc,
+                sink: &mut $sink,
+                now: &$now,
+                halt: None,
+                tick: None,
+                unproductive: 0,
+                fatal: None,
+                wedge_streak: 0,
+                cur_speed: SPEED_MAX_KBS,
+            }
+        };
+    }
+
     fn lba(pos: u64) -> u32 {
         (pos / SECTOR) as u32
     }
@@ -1283,17 +1301,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut buf = [0u8; SECTOR as usize];
         let hit = read_span(&mut ctx, &mut buf, 0, 0, ReadParams::fast());
         assert!(
@@ -1321,17 +1329,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 10 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
         // Linear leaves the failed 10-sector batch whole.
@@ -1374,17 +1372,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 40 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
         let mut lin = Linear {
@@ -1413,17 +1401,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(3);
         let mut lin = Linear {
@@ -1450,17 +1428,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 9 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
         let mut bis = Bisect {
@@ -1488,17 +1456,7 @@ mod tests {
         disc.dir_reverse_only = [40u32].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let section = 96 * SECTOR; // 3 batches of BATCH_SECTORS (32)
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -1549,17 +1507,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 16 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
             Box::new(Linear {
@@ -1594,17 +1542,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 64 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![Box::new(Linear {
             direction: Direction::Forward,
@@ -1627,18 +1565,8 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
-        // Single-sector batches so the transport LBA is hit directly.
+        let mut ctx = ctx!(disc, sink, now);
+        // One 8-sector batch (shorter than BATCH_SECTORS) that contains the transport LBA.
         let mut bad = SubRanges::from_section(0, 8 * SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(10);
         let mut lin = Linear {
@@ -1659,17 +1587,7 @@ mod tests {
         disc.wedge = (0..1000u32).collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         // The full tier-0 chain: the wedge streak persists across handlers (only
         // `unproductive` resets per handler), so it reaches the abort threshold
@@ -1721,17 +1639,7 @@ mod tests {
         disc.wedge = (0..1000u32).collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = HandlerCtx {
-            reader: &mut disc,
-            sink: &mut sink,
-            now: &now,
-            halt: None,
-            tick: None,
-            unproductive: 0,
-            fatal: None,
-            wedge_streak: 0,
-            cur_speed: SPEED_MAX_KBS,
-        };
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(0, 1000 * SECTOR);
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
             Box::new(Bisect {
@@ -2064,23 +1972,6 @@ mod tests {
         assert_eq!(sb.rank("idle"), 0, "attempted-but-zero-time → bottom");
     }
 
-    /// Build a ctx over `disc` with the fake clock — the common per-test setup.
-    macro_rules! ctx {
-        ($h:expr, $disc:expr, $sink:expr, $now:expr) => {
-            HandlerCtx {
-                reader: &mut $disc,
-                sink: &mut $sink,
-                now: &$now,
-                halt: None,
-                tick: None,
-                unproductive: 0,
-                fatal: None,
-                wedge_streak: 0,
-                cur_speed: SPEED_MAX_KBS,
-            }
-        };
-    }
-
     fn min_deep() -> ReadParams {
         ReadParams {
             speed: SpeedPref::Min,
@@ -2090,16 +1981,16 @@ mod tests {
     }
 
     #[test]
-    fn slow_spin_recovers_a_min_speed_only_sector_that_max_linear_misses() {
+    fn min_speed_linear_recovers_a_min_speed_only_sector_that_max_linear_misses() {
         // Sector 5 reads ONLY at min spindle speed (weak signal / servo drift):
-        // a max-speed deep Linear leaves it bad; SlowSpin (Linear pinned to min)
+        // a max-speed deep Linear leaves it bad; Linear pinned to min speed
         // recovers it. Single-sector residual so Linear reads it directly.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.slow_only = [5u32].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(5 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -2116,14 +2007,17 @@ mod tests {
             "max-speed linear must leave it bad"
         );
 
-        // SlowSpin = Linear at min speed — recovers it.
+        // Linear at min speed — recovers it.
         let out = Linear {
             direction: Direction::Forward,
             params: min_deep(),
         }
         .recover(&mut ctx, &mut bad, deadline);
         assert_eq!(out, HandlerOutcome::Complete);
-        assert!(bad.is_empty(), "SlowSpin must recover the min-only sector");
+        assert!(
+            bad.is_empty(),
+            "min-speed Linear must recover the min-only sector"
+        );
         assert_eq!(sink.got.get(&(5 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 
@@ -2137,7 +2031,7 @@ mod tests {
         disc.slow_only = [7u32].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(7 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -2161,16 +2055,16 @@ mod tests {
     }
 
     #[test]
-    fn fua_retry_recovers_a_stochastic_sector_a_cached_read_keeps_missing() {
+    fn fua_reads_recover_a_stochastic_sector_a_cached_read_keeps_missing() {
         // Sector 9 lands only on its 2nd physical (FUA) read; a cached re-read
-        // never gets it. FuaRetry = Linear fwd+rev + Bisect at FUA params: across
+        // never gets it. Linear fwd+rev + Bisect at FUA params: across
         // its reads the sector gets enough physical attempts to land.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.fua_need = [(9u32, 2u32)].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(9 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -2186,7 +2080,7 @@ mod tests {
             assert_eq!(bad.total_len(), SECTOR, "cached read must keep missing");
         }
 
-        // FuaRetry group: Linear fwd (FUA attempt 1) leaves it, Linear rev (FUA
+        // FUA group: Linear fwd (FUA attempt 1) leaves it, Linear rev (FUA
         // attempt 2) lands it.
         let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
             Box::new(Linear {
@@ -2204,22 +2098,25 @@ mod tests {
         let mut sb = HandlerScoreboard::default();
         let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
         assert_eq!(out, HandlerOutcome::Complete);
-        assert!(bad.is_empty(), "FuaRetry must land the stochastic sector");
+        assert!(
+            bad.is_empty(),
+            "the FUA group must land the stochastic sector"
+        );
         assert_eq!(sink.got.get(&(9 * SECTOR)).copied(), Some(SECTOR as usize));
     }
 
     #[test]
-    fn slow_fua_recovers_the_hardest_sector_needing_both_min_and_fua() {
+    fn min_speed_fua_linear_recovers_the_hardest_sector_needing_both() {
         // Sector 11 is the hardest case: it reads ONLY at min speed AND ONLY on a
-        // physical (FUA) read. Neither lever alone works — SlowFua (Linear at
-        // {min, fua, deep}) is the combination that recovers it.
+        // physical (FUA) read. Neither lever alone works — Linear at
+        // {min, fua, deep} is the combination that recovers it.
         let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
         let mut disc = disc;
         disc.slow_only = [11u32].into_iter().collect();
         disc.fua_need = [(11u32, 1u32)].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(11 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -2262,7 +2159,7 @@ mod tests {
         assert_eq!(out, HandlerOutcome::Complete);
         assert!(
             bad.is_empty(),
-            "SlowFua (min+fua) must recover the hardest sector"
+            "min+fua Linear must recover the hardest sector"
         );
         assert_eq!(sink.got.get(&(11 * SECTOR)).copied(), Some(SECTOR as usize));
     }
@@ -2277,7 +2174,7 @@ mod tests {
         disc.dir_reverse_only = [13u32].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(13 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 
@@ -2312,7 +2209,7 @@ mod tests {
         let mut disc = disc;
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         // The residual is sectors 1 and 2 — a two-sector sub-range, so sector 1's
         // prime-above target IS sector 2.
         let mut bad = SubRanges::from_section(SECTOR, 2 * SECTOR);
@@ -2362,7 +2259,7 @@ mod tests {
         let past_end = disc.past_end.clone();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         // The residual sector is the very last one on the disc.
         let mut bad = SubRanges::from_section((CAP as u64 - 1) * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
@@ -2410,7 +2307,7 @@ mod tests {
         disc.prime_only = [15u32].into_iter().collect();
         let mut sink = RecordSink::default();
         let now = h.now_fn();
-        let mut ctx = ctx!(h, disc, sink, now);
+        let mut ctx = ctx!(disc, sink, now);
         let mut bad = SubRanges::from_section(15 * SECTOR, SECTOR);
         let deadline = (ctx.now)() + Duration::from_secs(30);
 

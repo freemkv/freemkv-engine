@@ -670,7 +670,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                 timeout: TimeoutPref::Deep,
             };
             vec![
-                // SlowSpin: Linear fwd + rev at min speed.
+                // Slow spin: Linear fwd + rev at min speed.
                 Box::new(Linear {
                     direction: Direction::Reverse,
                     params: min_deep,
@@ -679,7 +679,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                     direction: Direction::Forward,
                     params: min_deep,
                 }),
-                // FuaRetry: Linear fwd + rev + Bisect under FUA (multiple physical
+                // FUA retry: Linear fwd + rev + Bisect under FUA (multiple physical
                 // attempts per marginal sector).
                 Box::new(Linear {
                     direction: Direction::Forward,
@@ -690,7 +690,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                     params: fua_deep,
                 }),
                 Box::new(Bisect { params: fua_deep }),
-                // SlowFua: the hardest sector — min speed AND FUA.
+                // Slow + FUA: the hardest sector — min speed AND FUA.
                 Box::new(Linear {
                     direction: Direction::Forward,
                     params: slow_fua,
