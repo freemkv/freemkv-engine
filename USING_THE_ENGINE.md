@@ -125,9 +125,12 @@ use freemkv_engine::{
 };
 ```
 
-`multipass_rip_with`, `mux_image_titles_with` and `remux_iso_with` take a
-`Halt` op token as a second cancel input next to `Sink::should_cancel`
-(`OpenImageOptions::halt` does the same for the image open).
+The `*_with` variants add a `Halt` op token as a second cancel input next to
+`Sink::should_cancel`: `mux_image_titles_with` and `remux_iso_with` take it as
+the LAST argument (same return types as the plain fns); `multipass_rip_with`
+takes it FIRST and returns `EngineOutcome<MultipassResult>`, not a `Result`.
+`OpenImageOptions::halt` does the same for the image open. (Import them by
+name; they are not in the list above.)
 
 ### 1. Build a `Job` (the request, pure data)
 
@@ -342,25 +345,35 @@ the default scheduler.
 ## Minimal end-to-end shape (multipass rip to MKV)
 
 ```rust
-let (disc, mut reader) = scan_image(&ImageSource::from_path(path))?;
-let titles = resolve_selection(&disc, &Selection::MainMovie);
-let scope = rip_scope(&disc, &titles, RipOutput::Streams);
-let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
-update_keydb_strip(key_status(&disc, &set));
-let mut job = Job::new(src, iso_path).with_mode(RipMode::Multi);
-job.raw = true;                          // the image is ciphertext; the mux decrypts
-if let Preflight::Blocked(reasons) = preflight(&disc, &job) {
-    return show_blocked(reasons);
+fn rip(path: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
+    let (disc, mut reader) = scan_image(&ImageSource::from_path(&path))?;
+    let sources = key_source_factory(&KeyParams::default());
+    let titles = resolve_selection(&disc, &Selection::MainMovie);
+    let scope = rip_scope(&disc, &titles, RipOutput::Streams);
+    let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
+    update_keydb_strip(key_status(&disc, &set));
+    let mut job = Job::new(path.to_string_lossy(), "/output/dir").with_mode(RipMode::Multi);
+    job.raw = true;                      // the image is ciphertext; the mux decrypts
+    if let Preflight::Blocked(reasons) = preflight(&disc, &job) {
+        show_blocked(reasons);
+        return Ok(std::thread::spawn(|| Ok(())));
+    }
+    let sink = UiSink::new();            // your impl
+    Ok(std::thread::spawn(move || -> Result<()> {
+        let mp = multipass_rip(&disc, &mut *reader, &path, &job, &opts, &sink)?;
+        if !mp.complete {
+            show_partial(mp);
+            return Ok(());
+        }
+        let opened = open_image_with(
+            &ImageSource::Iso(path),
+            OpenImageOptions { disc: Some(disc), ..OpenImageOptions::known(set) },
+        )?;
+        let outcome = mux_image_titles(&opened, &MuxPlan::new(titles), &dest_for, &sink);
+        show_result(mp, outcome);
+        Ok(())
+    }))
 }
-let sink = UiSink::new();                // your impl
-std::thread::spawn(move || {
-    let mp = multipass_rip(&disc, &mut *reader, &iso_path, &job, &opts, &sink)?;
-    if !mp.complete { return show_partial(mp); }
-    let opened = open_image_with(&ImageSource::Iso(iso_path),
-        OpenImageOptions { disc: Some(disc), ..OpenImageOptions::known(set) })?;
-    let outcome = mux_image_titles(&opened, &MuxPlan::new(titles), &dest_for, &sink);
-    show_result(mp, outcome);
-});
 ```
 
 That's the whole contract: build a `Job`, resolve its keys once and show
