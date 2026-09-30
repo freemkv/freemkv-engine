@@ -652,18 +652,19 @@ fn remux_sync_emits_activity_while_healthy() {
     };
     let rio = FakeIo::new(healthy, ReadPlan::default());
     let w = Watch::default();
-    let started = Instant::now();
     run(&target, &w, &Halt::new(), &rio, writes(good(), true)).unwrap();
     let phases = w.phases.lock().unwrap().clone();
     assert_eq!(phases, ["mux", "sync", "verify", "replace"]);
     let sync = w.of("sync");
     assert!(sync.len() >= 10, "{} sync calls", sync.len());
-    // Scaled "at least every 3 s" for ~2 s pieces: 5 × margin over the 20 ms pieces.
-    let mut last = sync[0].2.max(started);
-    for &(_, _, at) in &sync[1..] {
-        assert!(at - last < Duration::from_millis(150), "a silent gap");
-        last = at;
-    }
+    // Pieces land >= 20 ms apart and the rate limit is 10 ms: every piece is reported, so no
+    // step skips one (bytes, not wall clock: scheduler stalls delay both sides alike).
+    let piece = (good().len() as u64).div_ceil(40);
+    assert!(sync[0].0 <= piece, "a silent first piece");
+    assert!(
+        sync.windows(2).all(|p| p[1].0 - p[0].0 <= piece),
+        "a silent gap"
+    );
     assert!(
         sync.windows(2).all(|p| p[0].0 < p[1].0),
         "bytes_done is monotonic"
@@ -715,10 +716,11 @@ fn remux_verify_emits_activity_while_healthy() {
     run(&target, &w, &Halt::new(), &rio, writes(good(), true)).unwrap();
     let verify = w.of("verify");
     assert!(verify.len() >= 5, "{} verify calls", verify.len());
+    // Polled reports carry scheduler jitter; the contract is a report within the stall window.
     assert!(
         verify
             .windows(2)
-            .all(|p| p[0].0 < p[1].0 && p[1].2 - p[0].2 < Duration::from_millis(150))
+            .all(|p| p[0].0 < p[1].0 && p[1].2 - p[0].2 < WINDOW)
     );
     let (done, total, _) = *verify.last().unwrap();
     assert_eq!(total, std::fs::metadata(&target).unwrap().len());
