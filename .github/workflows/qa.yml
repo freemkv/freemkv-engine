@@ -107,7 +107,7 @@ jobs:
         with:
           persist-credentials: false
           path: freemkv-engine
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
@@ -136,7 +136,7 @@ jobs:
         with:
           persist-credentials: false
           path: freemkv-engine
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
@@ -166,7 +166,7 @@ jobs:
         with:
           persist-credentials: false
           path: freemkv-engine
-      - uses: freemkv/.github/.github/actions/checkout-siblings@v1
+      - uses: freemkv/.github/.github/actions/checkout-siblings@v2
         with:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
