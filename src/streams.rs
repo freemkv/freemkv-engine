@@ -84,6 +84,22 @@ impl StreamChoice {
         out
     }
 
+    /// The requested language tags no language resolves from, in request order,
+    /// deduped: what [`StreamSelError::UnknownLanguage`] would later refuse.
+    pub(crate) fn unknown_language_tags(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for sel in [&self.audio, &self.subtitles.normal, &self.subtitles.forced] {
+            if let StreamFilter::Langs(tags) = sel {
+                for t in tags {
+                    if normalize_lang(t).is_none() && !out.contains(&t.as_str()) {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The class keys whose language request NOT ONE of `titles` can satisfy —
     /// i.e. the whole rip will ship without that track class, however many
     /// titles it writes.

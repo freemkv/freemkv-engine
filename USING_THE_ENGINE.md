@@ -161,11 +161,13 @@ match preflight(&disc, &job) {
     Preflight::Blocked(reasons) => {
         for r in &reasons {
             // r.key is a STABLE identifier you localize (never English).
-            // The COMPLETE set the engine emits — map all six, or a
+            // The COMPLETE set the engine emits — map all seven, or a
             // blocked Start renders with no explanation:
             //   "no-titles" | "empty-selection" | "title-out-of-range"
             //   | "multipass-requires-raw" | "language-unmatched"
-            //   | "encrypted-no-key"
+            //   | "unknown-language" | "encrypted-no-key"
+            // "unknown-language": a requested tag names no language;
+            // r.detail is the tag as given.
             // "language-unmatched": a language-filtered stream class the job
             // asked for is carried by no selected title; r.detail is the class
             // key ("audio", "subtitle", "subtitle_forced").
