@@ -1139,6 +1139,11 @@ mod tests {
         /// answers those with ILLEGAL REQUEST — a wedge-family sense — so a
         /// handler that issues one is feeding its own wedge detector.
         past_end: Arc<AtomicU64>,
+        /// `(recovery, fua)` of every read, in order — the timeout / cache flags
+        /// the handler actually asked the drive for.
+        modes: Vec<(bool, bool)>,
+        /// Every `SET CD SPEED` value issued, in order.
+        speed_sets: Vec<u16>,
     }
 
     impl SectorSource for FakeDisc {
@@ -1162,10 +1167,11 @@ mod tests {
             lba: u32,
             count: u16,
             buf: &mut [u8],
-            _recovery: bool,
+            recovery: bool,
             fua: bool,
         ) -> Result<usize> {
             self.reads.fetch_add(1, Ordering::Relaxed);
+            self.modes.push((recovery, fua));
             if self.capacity != 0 && lba + count as u32 > self.capacity {
                 self.past_end.fetch_add(1, Ordering::Relaxed);
             }
@@ -1244,6 +1250,7 @@ mod tests {
 
         fn set_speed(&mut self, kbs: u16) {
             self.speed = kbs;
+            self.speed_sets.push(kbs);
         }
     }
 
@@ -1296,6 +1303,8 @@ mod tests {
                 last_lba: None,
                 capacity: 0,
                 past_end: Arc::new(AtomicU64::new(0)),
+                modes: Vec::new(),
+                speed_sets: Vec::new(),
             };
             (
                 Harness {
@@ -1989,7 +1998,7 @@ mod tests {
         let dt = Duration::from_secs(1);
 
         // Round 1 — "early" cleans the easy bulk; "late" finds nothing yet.
-        sb.record("early", 1_000_000, dt);
+        sb.record("early", 1_000_000_000, dt);
         sb.record("late", 0, dt);
         assert!(
             sb.rank("early") > sb.rank("late"),
@@ -1997,8 +2006,9 @@ mod tests {
         );
 
         // The bulk is gone. Now "early"'s technique no longer fits the hardened
-        // residual (barren attempts) while "late"'s specialist starts winning.
-        for _ in 0..4 {
+        // residual (barren attempts) while "late"'s specialist starts winning. By
+        // cumulative rate early still leads (1e9/13 s vs 12e6/13 s); decayed, it does not.
+        for _ in 0..12 {
             sb.record("early", 0, dt);
             sb.record("late", 1_000_000, dt);
         }
@@ -2462,5 +2472,158 @@ mod tests {
         assert_eq!(h.read_count(), 1, "no read after the sink refused");
         assert_eq!(sink.calls, 1);
         assert_eq!(bad.total_len(), 96 * SECTOR, "an unwritten span stays bad");
+    }
+
+    // Pins the decayed rate itself: exact EWMA values (alpha 0.5) that a
+    // cumulative bytes/second average does not produce.
+    #[test]
+    fn scorecard_rate_is_an_ewma_of_timed_samples() {
+        let mut sb = HandlerScoreboard::default();
+        let dt = Duration::from_secs(1);
+        sb.record("h", 1000, dt);
+        assert_eq!(sb.rank("h"), 1000, "seeded to the first sample");
+        sb.record("h", 0, dt);
+        sb.record("h", 0, dt);
+        assert_eq!(
+            sb.rank("h"),
+            250,
+            "halved per barren sample (cumulative: 333)"
+        );
+        sb.record("h", 400, dt);
+        assert_eq!(sb.rank("h"), 325, "0.5 * 400 + 0.5 * 250 (cumulative: 350)");
+    }
+
+    // Jump: after JUMP_AFTER_FAILS dead batches it skips to the middle of what is
+    // left, recovers the readable tail, and leaves the skipped span bad.
+    #[test]
+    fn jump_skips_half_the_remainder_and_recovers_the_tail() {
+        let dead: Vec<u32> = (0..64).collect();
+        let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(disc, sink, now);
+        let mut bad = SubRanges::from_section(0, 200 * SECTOR);
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+        let out = Jump {
+            params: ReadParams::fast(),
+        }
+        .recover(&mut ctx, &mut bad, deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        // Dead [0,32) and [32,64), then jump by half of the 168 sectors left
+        // from 32: resume at 116 and read the tail in batches.
+        assert_eq!(h.read_count(), 5);
+        assert_eq!(bad.ranges(), &[(0, 116 * SECTOR)], "skipped span stays bad");
+        let mut got: Vec<(u64, usize)> = sink.got.iter().map(|(&p, &l)| (p, l)).collect();
+        got.sort();
+        let s = SECTOR as usize;
+        assert_eq!(
+            got,
+            vec![
+                (116 * SECTOR, 32 * s),
+                (148 * SECTOR, 32 * s),
+                (180 * SECTOR, 20 * s)
+            ]
+        );
+    }
+
+    // Fast scouts ask for the short timeout, deep reads for the ECC budget, and
+    // FUA reaches the drive only when the params ask for it.
+    #[test]
+    fn read_params_reach_the_drive_as_recovery_and_fua_flags() {
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let deadline = (now)() + Duration::from_secs(30);
+        let fua_fast = ReadParams {
+            speed: SpeedPref::Max,
+            fua: true,
+            timeout: TimeoutPref::Fast,
+        };
+        for params in [ReadParams::fast(), ReadParams::deep(), fua_fast] {
+            let mut ctx = ctx!(disc, sink, now);
+            let mut bad = SubRanges::from_section(0, SECTOR);
+            let out = Linear {
+                direction: Direction::Forward,
+                params,
+            }
+            .recover(&mut ctx, &mut bad, deadline);
+            assert_eq!(out, HandlerOutcome::Complete);
+        }
+        assert_eq!(
+            disc.modes,
+            vec![(false, false), (true, false), (false, true)]
+        );
+    }
+
+    // run_handlers restores max speed after a min-speed handler, and read_span
+    // programs the spindle only when the wanted speed changes (not per read).
+    #[test]
+    fn spindle_speed_is_set_on_change_and_restored_after_a_handler() {
+        let dead: Vec<u32> = (0..96).collect();
+        let (h, disc) = Harness::build(&dead, None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(disc, sink, now);
+        let mut bad = SubRanges::from_section(0, 96 * SECTOR);
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: min_deep(),
+            }),
+            Box::new(Linear {
+                direction: Direction::Forward,
+                params: ReadParams::fast(),
+            }),
+        ];
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+        let mut sb = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
+        assert_eq!(out, HandlerOutcome::Remaining);
+        assert_eq!(ctx.cur_speed, SPEED_MAX_KBS);
+        assert_eq!(h.read_count(), 6, "three batches per handler");
+        assert_eq!(
+            disc.speed_sets,
+            vec![SPEED_MIN_KBS, SPEED_MAX_KBS],
+            "one SET CD SPEED for three min-speed reads, one restore after"
+        );
+        assert_eq!(disc.speed, SPEED_MAX_KBS);
+    }
+
+    // The runtime guard's second half: a pos that is not a sector multiple is a
+    // failed read, issued to no drive and never recorded as recovered.
+    #[test]
+    fn read_span_refuses_an_unaligned_pos_as_a_failed_read() {
+        let (h, disc) = Harness::build(&[], None, Duration::from_millis(1));
+        let mut disc = disc;
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(disc, sink, now);
+        let mut buf = [0u8; SECTOR as usize];
+        let hit = read_span(&mut ctx, &mut buf, 1024, 1, ReadParams::fast());
+        assert!(matches!(hit, ReadHit::Bad));
+        assert!(sink.got.is_empty());
+        assert_eq!(h.read_count(), 0, "the guard fires before any read");
+    }
+
+    // WEDGE_FASTFAIL_MS is exclusive: a wedge sense back in 499 ms counts toward
+    // the abort streak, one back in exactly 500 ms does not.
+    #[test]
+    fn the_wedge_fast_fail_gate_is_strictly_below_500_ms() {
+        for (ms, want) in [(WEDGE_FASTFAIL_MS - 1, 1), (WEDGE_FASTFAIL_MS, 0)] {
+            let (h, disc) = Harness::build(&[], None, Duration::from_millis(ms));
+            let mut disc = disc;
+            disc.wedge = [0u32].into_iter().collect();
+            let mut sink = RecordSink::default();
+            let now = h.now_fn();
+            let mut ctx = ctx!(disc, sink, now);
+            let mut buf = [0u8; SECTOR as usize];
+            let hit = read_span(&mut ctx, &mut buf, 0, 1, ReadParams::fast());
+            assert!(matches!(hit, ReadHit::Bad));
+            assert_eq!(ctx.wedge_streak, want, "a wedge sense back in {ms} ms");
+        }
+        assert_eq!(WEDGE_FASTFAIL_MS, 500);
     }
 }
