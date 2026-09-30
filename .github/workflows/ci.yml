@@ -170,10 +170,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check advisories bans licenses sources
-          manifest-path: freemkv-engine/Cargo.toml
+      - uses: taiki-e/install-action@cargo-deny
+      # Run from the repo dir so the generated .cargo/config.toml path patches apply.
+      - run: cargo deny --all-features check advisories bans licenses sources
+        working-directory: freemkv-engine
 
   # The release profile is a DIFFERENT program. `[profile.release]` sets lto and
   # codegen-units but not debug-assertions, so every debug_assert! in the
