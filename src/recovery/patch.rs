@@ -284,26 +284,24 @@ use libfreemkv::sector::SectorSource;
 // See `PatchCtx::run` and `build_tier_handlers`.
 const PATCH_TIERS: usize = 3;
 
-// Phase A pre-snapshot: captures the fields the patch loop needs after the
-// live `Mapfile` moves into the consumer thread. Returned `Mapfile` is the
-// same object loaded; caller passes ownership into `PatchSink::new`.
-#[allow(clippy::type_complexity)]
+// Phase A pre-snapshot: the fields the patch loop needs after the live
+// `Mapfile` moves into the consumer thread (`map` is the object loaded).
+pub(super) struct InitialState {
+    pub map: Mapfile,
+    pub stats: MapStats,
+    pub total_bytes: u64,
+    pub bad_ranges: Vec<(u64, u64)>,
+    pub work_total: u64,
+    pub is_regular: bool,
+}
+
 pub(super) fn compute_initial_state(
     path: &std::path::Path,
     mapfile_path: &std::path::Path,
-) -> Result<(
-    Mapfile,
-    MapStats,
-    Vec<mapfile::MapEntry>,
-    u64,
-    Vec<(u64, u64)>,
-    u64,
-    bool,
-)> {
+) -> Result<InitialState> {
     let map = mapfile::Mapfile::load(mapfile_path).map_err(Error::from)?;
     let total_bytes = map.total_size();
     let initial_stats = map.stats();
-    let initial_entries: Vec<_> = map.entries().to_vec();
     // Retry passes act on NonTrimmed/NonScraped/Unreadable (a failed sector gets
     // a fresh shot next pass); NonTried is excluded since a preceding sweep pass
     // covers it. Not reversed for `opts.reverse`: `PatchCtx::run` sorts this list.
@@ -316,15 +314,14 @@ pub(super) fn compute_initial_state(
     // `sync_all` failure surfaces rather than gets swallowed. `/dev/null` and
     // pipes still map to `false`; only a genuine metadata error hits the default.
     let is_regular = super::output_is_regular(std::fs::metadata(path));
-    Ok((
+    Ok(InitialState {
         map,
-        initial_stats,
-        initial_entries,
+        stats: initial_stats,
         total_bytes,
         bad_ranges,
         work_total,
         is_regular,
-    ))
+    })
 }
 
 // One recovery read of `[lba, lba+count)` into `buf[..count*2048]`. `recovery` selects the SCSI
@@ -449,7 +446,7 @@ pub(super) fn log_patch_start_snapshot(
                 phase = "patch.mapfile.entry.start",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
-                status_char = entry.status.to_char() as u8 as i32,
+                status_char = %entry.status.to_char(),
                 "Mapfile entry"
             );
         }
@@ -467,7 +464,7 @@ pub(super) fn log_patch_start_snapshot(
                 phase = "patch.mapfile.entry.end",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
-                status_char = format!("{}", entry.status.to_char()),
+                status_char = %entry.status.to_char(),
                 "Mapfile entry"
             );
         }
@@ -1240,8 +1237,14 @@ fn patch_linked(
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
-    let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
-        compute_initial_state(path, &mapfile_path)?;
+    let InitialState {
+        map,
+        stats: initial_stats,
+        total_bytes,
+        bad_ranges,
+        work_total,
+        is_regular,
+    } = compute_initial_state(path, &mapfile_path)?;
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
     // stream file". A scoped (MKV-staging) map only re-reads its scope, where none is lost.
     if map.scope().is_none() {
@@ -1289,7 +1292,6 @@ fn patch_linked(
         "begin"
     );
     let bytes_good_before = initial_stats.bytes_good;
-    let bytes_good_start = bytes_good_before;
 
     // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim); AACS
     // reads widen onto each file's unit grid. Bad sectors = PHYSICAL read failure.
@@ -1301,6 +1303,8 @@ fn patch_linked(
         opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
+    // Logged from the live map before it moves into the sink (no entry copy).
+    log_patch_start_snapshot(map.entries(), &initial_stats, bytes_good_before);
 
     // Spawn the consumer: `WritebackFile`/`Mapfile` move into the sink; the shared
     // snapshot lets producer callbacks read consumer effects. Disown taken
@@ -1330,7 +1334,6 @@ fn patch_linked(
     // only as informational PassKind labels; clamp to ≥1 to avoid underflow.
     let initial_batch = initial_batch_of(opts);
     let recovery = opts.full_recovery;
-    log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
 
     tracing::info!(
         target: "freemkv::disc",
@@ -1349,7 +1352,7 @@ fn patch_linked(
         wedged_threshold = opts.wedged_threshold,
         num_ranges = bad_ranges.len(),
         work_total,
-        bytes_good_start,
+        bytes_good_start = bytes_good_before,
         "Disc::patch entered"
     );
 
