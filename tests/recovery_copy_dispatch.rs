@@ -256,9 +256,8 @@ fn sweep_to_dev_null_real() {
     };
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
         .expect("sweep to /dev/null must not fail with ENODEV");
-    // `is_ok()` alone constrained nothing; this is the character-device
-    // sibling of `multipass_copy_over_bad_sectors_returns_a_damage_report_not_an_error`. Accounting must match a
-    // regular file: the sink swallows bytes, it does not excuse bookkeeping.
+    // `is_ok()` alone constrained nothing. Like the regular-file multipass test,
+    // accounting must show the damage: a sink swallowing bytes excuses nothing.
     assert!(
         !result.complete,
         "a disc with unreadable sectors is not complete, sink notwithstanding"
@@ -631,11 +630,18 @@ fn sweep_fresh_refuses_to_inherit_a_stale_mapfile_it_cannot_remove() {
             .unwrap();
         mf.flush().unwrap();
     }
-    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+    let sentinel = vec![0x55u8; sectors as usize * 2048];
+    std::fs::write(&iso_path, &sentinel).unwrap();
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let _restore = Restore(dir.clone());
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-    let restore = || std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
     if std::fs::write(dir.join("probe"), b"x").is_ok() {
-        restore().unwrap();
+        eprintln!("skipped: directory permissions do not bind (root?)");
         return;
     }
 
@@ -650,14 +656,13 @@ fn sweep_fresh_refuses_to_inherit_a_stale_mapfile_it_cannot_remove() {
         &plain_sweep_opts(false, true),
     );
     let img = std::fs::read(&iso_path).unwrap();
-    restore().unwrap();
     assert!(
         r.is_err(),
         "a stale mapfile that cannot be removed must abort the fresh sweep"
     );
     assert!(
-        img.iter().all(|&b| b == 0),
-        "nothing may be swept into the image under the stale mapfile"
+        img == sentinel,
+        "the image must be untouched: not truncated, recreated or swept into"
     );
 }
 
@@ -849,7 +854,9 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
     }
     // The ISO file must already exist (it was being written before the
     // interrupt) so the resume opens it rather than recreating it.
-    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+    let mut prior = vec![0u8; sectors as usize * 2048];
+    prior[..100 * 2048].fill(0x55);
+    std::fs::write(&iso_path, prior).unwrap();
 
     let reads = Arc::new(Mutex::new(HashSet::new()));
     let mut reader = TrackingReader {
@@ -903,7 +910,7 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
         "the resumed tail must hold the data the sweep read"
     );
     assert!(
-        img[..100 * 2048].iter().all(|&b| b == 0),
+        img[..100 * 2048].iter().all(|&b| b == 0x55),
         "the Finished prefix must be left untouched"
     );
 }
@@ -2430,6 +2437,7 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
             }
             // Not merely "different": exactly the library's descramble of the
             // scrambled sector, with the scramble flag bits cleared.
+            // The synthetic packs ride the cached title key (no re-crack fires).
             let mut expected = raw;
             libfreemkv::css::descramble_sector(css, &mut expected);
             assert_ne!(
