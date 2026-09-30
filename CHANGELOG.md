@@ -25,6 +25,11 @@ project follows semantic versioning.
 
 - A per-title key top-up keeps its original refusal (e.g. E7028, or an OS error's kind and errno) instead of E7022 or E6011 on later titles; an OS error reading an image's key file is reported as that error, not a disc mismatch.
 
+- A multipass re-run on the same image resumes from its mapfile instead of wiping it: sectors already recovered are not read again. A mapfile this version wrote for another disc (known disc hash or VID fingerprint) is refused (E6011 `disc-mismatch`) while its image exists; with the image missing or empty it is dropped and the rip starts fresh. Multipass still starts fresh over a mapfile written by an older version or by a decrypting rip.
+- Mapfiles record whether the image is raw or decrypted (`# freemkv-raw:`). A rip in the other mode overwrites the existing image, with a warning, instead of mixing raw and decrypted sectors in it.
+- Multipass loss and convergence are measured over the titles `Job::selection` picks, not always the first title.
+- Halted or wedged multipass results report `main_lost_ms` as NaN (unmeasured) when damaged or pending bytes remain, instead of 0.0.
+
 ### Added
 
 - `multipass_rip_staged`, `mkv_staging_scope`, `sweep_scoped` and `ensure_whole_image`: an image staged for an MKV rip reads only UDF, nav/AACS files and the chosen titles (AACS BD Pre-recorded 0.953 §3.7: none of it bus-encrypted), so a disc with an unlocatable bus-encrypted stream file still rips to MKV. The scope is recorded in the mapfile (`# freemkv-scope:`), where `stats()` leaves the unread rest out of pending. `copy` and a whole-disc `sweep` over a scoped mapfile refuse with E6021 until every stream file is located, then fill the rest; `patch` re-reads only in-scope damage. `ensure_whole_image` refuses a staged image as a whole-disc source with E6022, and `ensure_titles_staged` refuses (E6022) muxing a title from it whose extents lie outside its scope. A staging image is whole only when it is kept and every stream file was located.
