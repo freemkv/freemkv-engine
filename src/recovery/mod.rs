@@ -826,6 +826,66 @@ pub(crate) fn sector_scope_to_bytes(scope: &[(u32, u32)]) -> Vec<(u64, u64)> {
         .collect()
 }
 
+// Minimum interval between sweep progress reports (patch's PROGRESS_TICK_MS).
+const SWEEP_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+// A sweep's progress bar: `work_*` run 0..=100% over the pass's domain (its scope, or the
+// whole disc), counting what the mapfile already held as done, so a resume starts there.
+struct SweepBar {
+    // Mapfile stats at pass start: stand in for a consumer snapshot until one lands.
+    base: mapfile::MapStats,
+    done_before: u64,
+    domain: u64,
+    total_bytes: u64,
+}
+
+impl SweepBar {
+    // One tick after `done` bytes of this pass's regions, `good` of them read clean.
+    fn tick(
+        &self,
+        disc: &libfreemkv::Disc,
+        snap: Option<&sweep::ProgressSnapshot>,
+        main_title_bad: u64,
+        located: &libfreemkv::progress::LocatedProgress,
+        done: u64,
+        good: u64,
+    ) -> libfreemkv::progress::PassProgress {
+        let b = &self.base;
+        // The snapshot lags the producer, so good never regresses below its own count.
+        // Without one, done-but-not-good bytes are this pass's damage, not lost from view.
+        let (good, unreadable, pending, retryable) = match snap {
+            Some(s) => (
+                s.stats.bytes_good.max(b.bytes_good.saturating_add(good)),
+                s.stats.bytes_unreadable,
+                s.stats.bytes_pending,
+                s.stats.bytes_retryable,
+            ),
+            None => (
+                b.bytes_good.saturating_add(good),
+                b.bytes_unreadable,
+                b.bytes_pending.saturating_sub(done),
+                b.bytes_retryable.saturating_add(done.saturating_sub(good)),
+            ),
+        };
+        let main_title = disc.titles.first();
+        libfreemkv::progress::PassProgress {
+            kind: libfreemkv::progress::PassKind::Sweep,
+            work_done: self.done_before.saturating_add(done).min(self.domain),
+            work_total: self.domain,
+            bytes_good_total: good,
+            bytes_unreadable_total: unreadable,
+            bytes_pending_total: pending,
+            bytes_retryable_total: retryable,
+            bytes_total_disc: self.total_bytes,
+            disc_duration_secs: main_title.map(|t| t.duration_secs),
+            bytes_bad_in_main_title: main_title_bad,
+            main_title_duration_secs: main_title.map(|t| t.duration_secs),
+            main_title_size_bytes: main_title.map(|t| t.size_bytes),
+            located: located.clone(),
+        }
+    }
+}
+
 // A sweep under `halt`, which already holds `opts.halt`.
 pub(crate) fn sweep_in(
     disc: &libfreemkv::Disc,
@@ -1003,6 +1063,22 @@ fn sweep_linked(
     if let Some(scope) = map.scope() {
         regions = mapfile::intersect(&regions, scope);
     }
+    let domain = match map.scope() {
+        Some(scope) => mapfile::intersect(&[(0, total_bytes)], scope)
+            .iter()
+            .map(|r| r.1)
+            .sum(),
+        None => total_bytes,
+    };
+    let todo: u64 = regions.iter().map(|&(p, n)| snap_to_sectors(p, n).1).sum();
+    let bar = SweepBar {
+        base: map.stats(),
+        done_before: domain.saturating_sub(todo),
+        domain,
+        total_bytes,
+    };
+    // The drilldown starts from the damage already recorded, not empty.
+    let prior_damage = map.ranges_with(&mapfile::damage_sector_statuses());
 
     // Spawn the consumer (owns WritebackFile + Mapfile; producer keeps reader/halt).
     // `map_disown` is taken BEFORE `map` moves into the sink: it's the only way left
@@ -1050,8 +1126,16 @@ fn sweep_linked(
     // Derived from `cached_snapshot.bad_ranges` + the main title only, changing
     // exactly when a new snapshot lands — not once per batch. The old per-iteration
     // recompute ran `bytes_bad_in_title` (O(ranges x extents)) up to 1.6M times/rip.
-    let mut cached_main_title_bad: u64 = 0;
-    let mut cached_located = libfreemkv::progress::LocatedProgress::default();
+    let (mut cached_main_title_bad, mut cached_located) = match disc.titles.first() {
+        Some(t) => (
+            bytes_bad_in_title(t, &prior_damage),
+            locate_ranges(&prior_damage, t),
+        ),
+        None => (0, libfreemkv::progress::LocatedProgress::default()),
+    };
+    let mut last_tick: Option<std::time::Instant> = None;
+    // A tick the throttle skipped: reported once the pass completes, so its bar ends at 100%.
+    let mut tick_owed = false;
     let mut producer_err: Option<Error> = None;
 
     tracing::trace!(
@@ -1309,56 +1393,40 @@ fn sweep_linked(
             }
 
             if let Some(reporter) = opts.progress {
-                // Use the latest consumer snapshot if present, else synthesise from the
-                // two producer counters. `bytes_good` is recovery-only, NOT `bytes_done`
-                // (a position advancing over skipped/zero-fills too, once conflated).
-                let main_title = disc.titles.first();
-                let main_title_bad = cached_main_title_bad;
-                // Consumer snapshot is truth for unreadable/pending, but bytes_good lags
-                // the producer when consumer is behind — take the max so display never
-                // regresses. Floor is `bytes_good_done`, not `bytes_done` (damage paths).
-                let (bytes_good, bytes_unreadable, bytes_pending, bytes_retryable) =
-                    match &cached_snapshot {
-                        Some(snap) => (
-                            snap.stats.bytes_good.max(bytes_good_done),
-                            snap.stats.bytes_unreadable,
-                            snap.stats.bytes_pending,
-                            snap.stats.bytes_retryable,
-                        ),
-                        // No snapshot yet: derive the partition from the two producer
-                        // counters. Done-but-not-good bytes are this pass's damage
-                        // (skip/fail/zero-fill); they must land in a bucket, not vanish.
-                        None => (
-                            bytes_good_done,
-                            0u64,
-                            total_bytes.saturating_sub(bytes_done),
-                            bytes_done.saturating_sub(bytes_good_done),
-                        ),
-                    };
-                let pp = libfreemkv::progress::PassProgress {
-                    kind: libfreemkv::progress::PassKind::Sweep,
-                    work_done: pos,
-                    work_total: total_bytes,
-                    bytes_good_total: bytes_good,
-                    bytes_unreadable_total: bytes_unreadable,
-                    bytes_pending_total: bytes_pending,
-                    bytes_retryable_total: bytes_retryable,
-                    bytes_total_disc: total_bytes,
-                    disc_duration_secs: main_title.map(|t| t.duration_secs),
-                    bytes_bad_in_main_title: main_title_bad,
-                    main_title_duration_secs: main_title.map(|t| t.duration_secs),
-                    main_title_size_bytes: main_title.map(|t| t.size_bytes),
-                    // Rendered drilldown from the consumer's in-memory
-                    // snapshot (bad ranges) + title; empty until the first
-                    // snapshot arrives.
-                    located: cached_located.clone(),
-                };
-                if !reporter.report(&pp) {
-                    halt_requested = true;
-                    break 'outer;
+                tick_owed = last_tick.is_some_and(|t| t.elapsed() < SWEEP_TICK);
+                if !tick_owed {
+                    last_tick = Some(std::time::Instant::now());
+                    let pp = bar.tick(
+                        disc,
+                        cached_snapshot.as_ref(),
+                        cached_main_title_bad,
+                        &cached_located,
+                        bytes_done,
+                        bytes_good_done,
+                    );
+                    if !reporter.report(&pp) {
+                        halt_requested = true;
+                        break 'outer;
+                    }
                 }
             }
         }
+    }
+
+    if tick_owed
+        && !halt_requested
+        && producer_err.is_none()
+        && let Some(reporter) = opts.progress
+    {
+        let pp = bar.tick(
+            disc,
+            cached_snapshot.as_ref(),
+            cached_main_title_bad,
+            &cached_located,
+            bytes_done,
+            bytes_good_done,
+        );
+        let _ = reporter.report(&pp);
     }
 
     // Producer is done; let the consumer drain and run close() (writeback, fsync,
@@ -2929,5 +2997,104 @@ mod sweep_contract_tests {
                 "skip={skip_on_error}: everything from the interrupted read on stays NonTried"
             );
         }
+    }
+
+    // Every tick a sweep reports, in order.
+    #[derive(Default)]
+    struct Ticks(std::sync::Mutex<Vec<libfreemkv::progress::PassProgress>>);
+
+    impl libfreemkv::progress::Progress for Ticks {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            self.0.lock().unwrap().push(p.clone());
+            true
+        }
+    }
+
+    // R4: `work_done / work_total` is the pass's own 0..=100% — a scoped (MKV-staging)
+    // sweep's bar runs over its scope, not the absolute disc position.
+    #[test]
+    fn a_scoped_sweep_s_bar_runs_from_zero_to_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("scoped.iso");
+        let d = disc(8192);
+        let ticks = Ticks::default();
+        let mut o = opts(false, true);
+        o.progress = Some(&ticks);
+        sweep_scoped(&d, &mut reader(8192, |_| None), &iso, &o, &[(4096, 2048)]).unwrap();
+        let t = ticks.0.lock().unwrap();
+        let scope = 2048 * 2048;
+        assert!(
+            t.iter().all(|p| p.work_total == scope),
+            "the bar's total is the scope"
+        );
+        assert!(
+            t[0].work_done <= 64 * 2048,
+            "starts at 0, not the scope's disc offset: {}",
+            t[0].work_done
+        );
+        assert_eq!(
+            t.last().unwrap().work_done,
+            scope,
+            "a finished pass ends at 100%"
+        );
+    }
+
+    // R8: a resumed sweep's first ticks (before any consumer snapshot) start from what the
+    // mapfile already holds, not from zero.
+    #[test]
+    fn a_resumed_sweep_s_first_tick_counts_the_prior_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("resume.iso");
+        let sectors = 8192u32;
+        let total = sectors as u64 * 2048;
+        let d = disc(sectors);
+        std::fs::write(&iso, vec![0xAAu8; total as usize]).unwrap();
+        {
+            let mut m = mapfile::Mapfile::create(&d.mapfile_for(&iso), total, "t").unwrap();
+            m.record(0, total / 2, mapfile::SectorStatus::Finished)
+                .unwrap();
+            m.flush().unwrap();
+        }
+        let ticks = Ticks::default();
+        let mut o = opts(true, true);
+        o.progress = Some(&ticks);
+        sweep(&d, &mut reader(sectors, |_| None), &iso, &o).unwrap();
+        let first = ticks.0.lock().unwrap()[0].clone();
+        assert!(
+            first.bytes_good_total >= total / 2,
+            "first tick claims {} good; the mapfile already held {}",
+            first.bytes_good_total,
+            total / 2
+        );
+        assert!(
+            first.bytes_pending_total <= total / 2,
+            "pending {}",
+            first.bytes_pending_total
+        );
+        assert!(
+            first.work_done >= total / 2,
+            "the bar restarts at 0: {}",
+            first.work_done
+        );
+    }
+
+    // R12: the reporter is a UI tick, throttled like patch's; not one call per batch.
+    #[test]
+    fn a_sweep_reports_progress_at_a_tick_not_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("tick.iso");
+        let sectors = 32 * 4000;
+        let ticks = Ticks::default();
+        let mut o = opts(false, true);
+        o.progress = Some(&ticks);
+        o.batch_sectors = Some(32);
+        let t0 = std::time::Instant::now();
+        sweep(&disc(sectors), &mut reader(sectors, |_| None), &iso, &o).unwrap();
+        let bound = t0.elapsed().as_millis() as usize / 250 + 2;
+        let n = ticks.0.lock().unwrap().len();
+        assert!(
+            n <= bound,
+            "{n} reports for 4000 batches; a 250 ms tick allows {bound}"
+        );
     }
 }
