@@ -735,15 +735,17 @@ fn multipass_rip_inner(
         });
     }
 
-    // ── Pass 1: the forward sweep, resuming an existing mapfile (a re-run after Stop, a
-    // wedge or an abort): the sweep re-reads only NonTried and refuses another disc's map. ──
+    // ── Pass 1: the forward sweep, resuming a mapfile stamped raw (a re-run after Stop, a wedge
+    // or an abort). The sweep re-reads only NonTried and refuses a map whose known identity
+    // differs; an identity-less disc (DVD, pre-stamp map) is matched on capacity alone. ──
     let mut passes = 0u32;
     let (mut last_good, mut last_unreadable, mut last_pending, mut halted);
     {
         let bridge = ProgressBridge::new(sink);
         let sweep_opts = SweepOptions {
             decrypt: pass_should_decrypt(job.raw),
-            resume: disc.mapfile_for(iso_path).exists(),
+            // Multipass is always raw, so only a map proven raw may be resumed.
+            resume: Mapfile::load(&disc.mapfile_for(iso_path)).is_ok_and(|m| m.raw() == Some(true)),
             batch_sectors: None,
             skip_on_error: true,
             progress: Some(&bridge),
@@ -3182,6 +3184,135 @@ mod tests {
         )
         .expect("run 2");
         assert_resumed(&finished, &reads, &iso, &second);
+    }
+
+    // Run 1 stops mid-sweep in `run1_raw` mode; run 2 in the other mode must re-read every
+    // sector run 1 wrote, never splice raw and decrypted sectors into one image.
+    fn assert_a_mode_switch_sweeps_fresh(run1_raw: bool) {
+        let (_dir, iso) = scratch_iso(if run1_raw {
+            "raw-then-dec"
+        } else {
+            "dec-then-raw"
+        });
+        let disc = test_disc(4096, vec![test_title(0, 4096)]);
+        let job = |raw| Job {
+            raw,
+            ..raw_job(&iso)
+        };
+        let opts = |raw| MultipassOpts {
+            max_passes: if raw { 3 } else { 0 },
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        let op = libfreemkv::Halt::new();
+        let (mut r1, _) = stamp_reader(0xA1);
+        r1.halt_at = Some((2000, op.clone()));
+        let (d, j1, o1) = (&disc, job(run1_raw), opts(run1_raw));
+        let first = multipass_rip_with(&op, d, &mut r1, &iso, &j1, &o1, &crate::sink::NoopSink);
+        assert!(
+            first.value().is_some_and(|r| r.halted),
+            "fixture check: run 1 must stop mid-sweep"
+        );
+        let finished = finished_lbas(&disc.mapfile_for(&iso));
+        assert!(
+            finished.len() > 100,
+            "fixture check: run 1 recovered nothing"
+        );
+
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let (j2, o2) = (job(!run1_raw), opts(!run1_raw));
+        let second =
+            multipass_rip(d, &mut r2, &iso, &j2, &o2, &crate::sink::NoopSink).expect("run 2");
+        let reads = reads.lock().unwrap();
+        let kept: Vec<u32> = finished
+            .iter()
+            .copied()
+            .filter(|l| !reads.contains(l))
+            .take(5)
+            .collect();
+        assert!(
+            kept.is_empty(),
+            "run 2 kept run 1's other-mode sectors, e.g. {kept:?}"
+        );
+        assert_eq!(marker_at(&iso, finished[0]), 0xB2);
+        assert!(second.complete, "{second:?}");
+    }
+
+    #[test]
+    fn a_multipass_rerun_never_resumes_a_decrypted_partial() {
+        assert_a_mode_switch_sweeps_fresh(false);
+    }
+
+    #[test]
+    fn a_decrypting_rerun_never_resumes_a_raw_multipass_partial() {
+        assert_a_mode_switch_sweeps_fresh(true);
+    }
+
+    // The mode stamp round-trips, and a malformed one is refused rather than read as unknown.
+    #[test]
+    fn the_raw_mode_stamp_round_trips_and_a_bad_one_is_refused() {
+        let (_dir, iso) = scratch_iso("raw-stamp");
+        let path = crate::mapfile_path_for(&iso);
+        let mut map = Mapfile::create(&path, 4096, "t").unwrap();
+        assert_eq!(map.raw(), None);
+        map.set_raw(true);
+        map.flush().unwrap();
+        assert_eq!(Mapfile::load(&path).unwrap().raw(), Some(true));
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("freemkv-raw: 1", "freemkv-raw: yes")).unwrap();
+        assert!(Mapfile::load(&path).is_err());
+    }
+
+    fn disc_with_hash(c: char) -> libfreemkv::Disc {
+        let mut aacs = libfreemkv::test_util::aacs_state().build();
+        aacs.disc_hash = c.to_string().repeat(40);
+        libfreemkv::Disc {
+            aacs: Some(aacs),
+            ..test_disc(4096, vec![test_title(0, 4096)])
+        }
+    }
+
+    // A consumer that deletes the ISO after muxing leaves `<iso>.mapfile` behind. Another
+    // disc's map over NO image guards nothing: the next rip sweeps fresh. With the image
+    // still there, the refusal stands.
+    #[test]
+    fn another_discs_mapfile_is_refused_only_while_its_image_exists() {
+        let (_dir, iso) = scratch_iso("stale-map-other-disc");
+        let opts = MultipassOpts {
+            max_passes: 3,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        let rip = |disc: &libfreemkv::Disc| {
+            let (mut r, _) = stamp_reader(0xA1);
+            multipass_rip(
+                disc,
+                &mut r,
+                &iso,
+                &raw_job(&iso),
+                &opts,
+                &crate::sink::NoopSink,
+            )
+        };
+        let (disc_a, disc_b) = (disc_with_hash('a'), disc_with_hash('b'));
+        assert!(rip(&disc_a).expect("disc A").complete);
+
+        let refused = rip(&disc_b).expect_err("disc A's image is still there");
+        assert!(
+            matches!(
+                refused,
+                libfreemkv::Error::MapfileInvalid {
+                    kind: "disc-mismatch"
+                }
+            ),
+            "{refused:?}"
+        );
+
+        std::fs::remove_file(&iso).unwrap();
+        let fresh = rip(&disc_b).expect("a stale map with no image must not block disc B");
+        assert!(fresh.complete, "{fresh:?}");
+        let map = Mapfile::load(&disc_b.mapfile_for(&iso)).unwrap();
+        assert_eq!(map.disc_hash(), Some("b".repeat(40).as_str()));
     }
 
     // Loss is measured over the titles being ripped (`Job::selection`), not `disc.titles[0]`.

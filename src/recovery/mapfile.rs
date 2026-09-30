@@ -222,6 +222,9 @@ pub struct Mapfile {
     /// `# freemkv-scope:` header. Outside them nothing is read: the file is not a
     /// whole-disc image, and `stats()` leaves those unread bytes out of pending.
     scope: Option<Vec<(u64, u64)>>,
+    /// Whether the image holds raw (`true`) or decrypted (`false`) sectors, `# freemkv-raw:`.
+    /// `None` = unknown (written before the stamp existed): a resume cannot prove its mode.
+    raw: Option<bool>,
     /// Raised through a [`MapfileDisown`] handle when this mapfile's owner
     /// has been abandoned; once set, no further write reaches the path. See
     /// [`MapfileDisown`].
@@ -254,6 +257,7 @@ impl Mapfile {
             vidfp: None,
             legacy_keyfps: Vec::new(),
             scope: None,
+            raw: None,
             disowned: Arc::new(AtomicBool::new(false)),
         };
         // Eager initial persist so a resume can pick this up even if
@@ -273,6 +277,7 @@ impl Mapfile {
         let mut vidfp: Option<[u8; 32]> = None;
         let mut legacy = LegacyIdentity::default();
         let mut scope: Option<Vec<(u64, u64)>> = None;
+        let mut raw: Option<bool> = None;
         for line in text.lines() {
             let t = line.trim();
             if t.is_empty() {
@@ -297,6 +302,13 @@ impl Mapfile {
                     legacy.keyfps.push(fp.ok_or_else(|| invalid("keyfp"))?);
                 }
                 parse_legacy_key_lines(rest, &mut legacy)?;
+                if let Some(r) = rest.strip_prefix("freemkv-raw:") {
+                    raw = Some(match r.trim() {
+                        "1" => true,
+                        "0" => false,
+                        _ => return Err(invalid("raw")),
+                    });
+                }
                 // Like the identity headers, a malformed scope is refused: dropping it
                 // would present a partial image as a whole-disc one.
                 if let Some(sc) = rest.strip_prefix("freemkv-scope:") {
@@ -418,6 +430,7 @@ impl Mapfile {
             vidfp: vidfp.or(legacy.vidfp),
             legacy_keyfps: legacy.keyfps,
             scope,
+            raw,
             disowned: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -563,6 +576,19 @@ impl Mapfile {
     /// The disc's Volume ID fingerprint (a converted legacy raw VID line included).
     pub fn vid_fingerprint(&self) -> Option<[u8; 32]> {
         self.vidfp
+    }
+
+    /// Record whether the image holds raw or decrypted sectors (`# freemkv-raw:`).
+    pub(crate) fn set_raw(&mut self, raw: bool) {
+        if self.raw != Some(raw) {
+            self.raw = Some(raw);
+            self.dirty = true;
+        }
+    }
+
+    /// Raw (`true`) or decrypted (`false`) image; `None` if the mapfile does not say.
+    pub(crate) fn raw(&self) -> Option<bool> {
+        self.raw
     }
 
     /// Fingerprints of the keys a pre-1.8 mapfile stored (KU §4.1, decision b).
@@ -726,6 +752,9 @@ impl Mapfile {
                         .map(|(p, n)| format!("0x{p:x}+0x{n:x}"))
                         .collect();
                     writeln!(w, "# freemkv-scope: {}", list.join(","))?;
+                }
+                if let Some(raw) = self.raw {
+                    writeln!(w, "# freemkv-raw: {}", u8::from(raw))?;
                 }
                 writeln!(w, "# Current pos / status / pass / pass_time")?;
                 writeln!(w, "0x000000000  ?  1  0")?;

@@ -187,6 +187,11 @@ pub(crate) fn copy_in(
         // disc whose predecessor finished would otherwise report the job done
         // having never touched the disc actually in the drive.
         mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).map_err(Error::from)?;
+        if map.raw().is_some_and(|raw| raw == opts.decrypt) {
+            // An image of the other raw/decrypt mode: resuming or patching it would mix the two.
+            tracing::info!("copy dispatch: → sweep (mapfile is for the other raw/decrypt mode)");
+            return sweep_internal(disc, reader, path, opts, false, halt);
+        }
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
         let covers_disc = map.total_size() == disc_size;
@@ -833,8 +838,24 @@ fn sweep_linked(
             Ok(existing) => {
                 // Identity first, crucially BEFORE `stamp_identity` below: that stamps
                 // the current job's identity onto the mapfile, so checking after never fires.
-                mapfile::check_mapfile_identity(&existing, disc, opts.keys.as_ref())?;
-                if existing.total_size() != total_bytes {
+                if let Err(e) = mapfile::check_mapfile_identity(&existing, disc, opts.keys.as_ref())
+                {
+                    // Another disc's map over a missing/empty image guards no data (a consumer
+                    // deleted the ISO after muxing it): drop it and start fresh.
+                    if image_state(path, existing.total_size())?.len != 0 {
+                        return Err(Error::from(e));
+                    }
+                    tracing::info!(
+                        "sweep: another disc's mapfile has no image; forcing fresh sweep"
+                    );
+                    resume = false;
+                } else if existing.raw().is_some_and(|raw| raw == opts.decrypt) {
+                    // Raw and decrypted sectors must never share one image.
+                    tracing::info!(
+                        "sweep: mapfile is for the other raw/decrypt mode; forcing fresh sweep"
+                    );
+                    resume = false;
+                } else if existing.total_size() != total_bytes {
                     tracing::info!(
                         "sweep: mapfile total_size {} != disc {}; forcing fresh sweep",
                         existing.total_size(),
@@ -884,6 +905,7 @@ fn sweep_linked(
     // The disc's identity for a later resume (KU §4.1): its hash and VID fingerprint only,
     // never a key byte or a raw VID (J6).
     mapfile::stamp_identity(&mut map, disc, opts.keys.as_ref());
+    map.set_raw(!opts.decrypt);
 
     // ISO file: resume + Finished ranges opens existing; otherwise creates fresh,
     // pre-sized to total_bytes. `is_regular` MUST come from the open handle, not a
