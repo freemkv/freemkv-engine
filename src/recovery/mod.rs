@@ -529,7 +529,8 @@ pub(crate) enum SendStall {
     /// The halt token fired while the producer was waiting for a slot. Not an
     /// error: the caller reports the pass as halted and drops the item.
     Halted,
-    /// The consumer thread is gone (panicked / receiver dropped).
+    /// The consumer thread is gone (panicked / receiver dropped), or its `apply`
+    /// failed and it now discards every item.
     ConsumerGone,
     /// The consumer is ALIVE but has not taken the item within
     /// [`SEND_DEADLINE`] — the hung-mount case.
@@ -579,6 +580,11 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
     halt: &libfreemkv::halt::Halt,
     deadline: std::time::Duration,
 ) -> std::result::Result<(), SendStall> {
+    // A failed consumer drains and discards, so the fast path below would accept every item
+    // and the producer read on for a write that already failed.
+    if pipe.consumer_failed() {
+        return Err(SendStall::ConsumerGone);
+    }
     // Try ONCE, without blocking, before halt gets a vote: `send_with_halt` polls halt
     // first and would otherwise discard an item that took real drive time to produce.
     // Nothing here can block; `Disconnected` falls through too so diagnosis stays put.
@@ -592,6 +598,9 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
             if halt.is_cancelled() {
                 return Err(SendStall::Halted);
             }
+            if pipe.consumer_failed() {
+                return Err(SendStall::ConsumerGone);
+            }
             // Not halted: item came back for disconnect/deadline/fatal-apply. One probe
             // separates them; `Ok` stays a success even if apply failed (finish() surfaces
             // the real error). Uses `is_disconnected()`: libfreemkv doesn't re-export the type.
@@ -601,6 +610,19 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
                 Err(_) => Err(SendStall::Stalled),
             }
         }
+    }
+}
+
+// The error that fails a pass whose producer stopped with `producer`, given the consumer's
+// teardown result: the producer's, unless the consumer's `apply` had already failed.
+pub(crate) fn pass_failure<R>(
+    producer: Error,
+    consumer: Result<R>,
+    consumer_failed: bool,
+) -> Error {
+    match consumer {
+        Err(cause) if consumer_failed => cause,
+        _ => producer,
     }
 }
 
@@ -1345,6 +1367,7 @@ fn sweep_linked(
     // Producer is done; let the consumer drain and run close() (writeback, fsync,
     // mapfile.flush). Bounded by the SAME halt the sends above use — a plain
     // `Pipeline::finish` would re-block on the stalled consumer, so Stop never returns.
+    let consumer_failed = pipe.consumer_failed();
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
 
     // Producer-side error wins over consumer-side (the read failure
@@ -1363,7 +1386,7 @@ fn sweep_linked(
                 "sweep: consumer close failed while the pass was already failing — the mapfile on disk may be incomplete"
             );
         }
-        return Err(e);
+        return Err(pass_failure(e, summary, consumer_failed));
     }
     let summary = summary?;
 
@@ -1864,6 +1887,60 @@ mod send_bounded_tests {
         });
 
         drop(pipe);
+    }
+
+    // R7: a consumer whose `apply` failed keeps draining and discarding, so the non-blocking
+    // fast path would accept every later item and the producer read the whole disc.
+    #[test]
+    fn a_consumer_whose_apply_failed_refuses_every_later_item() {
+        struct FailingSink;
+        impl Sink<u32> for FailingSink {
+            type Output = ();
+            fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+                Err(Error::IoError {
+                    source: std::io::Error::other("ENOSPC"),
+                })
+            }
+            fn close(self) -> std::result::Result<(), Error> {
+                Ok(())
+            }
+        }
+        let pipe = Pipeline::<u32, ()>::spawn(WRITE_THROUGH_DEPTH, FailingSink).expect("spawn");
+        let halt = Halt::new();
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let t0 = Instant::now();
+        while !pipe.consumer_failed() {
+            assert!(t0.elapsed() < WATCHDOG, "the apply never failed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for i in 2..10 {
+            assert_eq!(
+                send_bounded(&pipe, i, &halt),
+                Err(SendStall::ConsumerGone),
+                "item {i} was handed to a consumer that discards everything"
+            );
+        }
+        assert!(
+            pipe.finish().is_err(),
+            "the apply error still reaches finish"
+        );
+    }
+
+    // ...and the pass then fails with the consumer's error (the cause), not the
+    // producer's "consumer gone" that it stopped on.
+    #[test]
+    fn a_failed_consumer_s_own_error_fails_the_pass() {
+        let enospc = || Error::IoError {
+            source: std::io::Error::other("ENOSPC"),
+        };
+        let gone = || SendStall::ConsumerGone.into_error();
+        let e = pass_failure(gone(), Err::<(), _>(enospc()), true);
+        assert!(matches!(e, Error::IoError { .. }), "got {e:?}");
+        // A producer failure of its own (the consumer still healthy) keeps precedence.
+        let e = pass_failure(Error::DecryptFailed, Err::<(), _>(enospc()), false);
+        assert!(matches!(e, Error::DecryptFailed), "got {e:?}");
+        let e = pass_failure(gone(), Ok(()), true);
+        assert!(matches!(e, Error::PipelineConsumerGone), "got {e:?}");
     }
 
     /// The other side of the discrimination: a consumer that is really gone
