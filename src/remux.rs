@@ -1254,10 +1254,15 @@ mod tests {
         info.extend(el(&[0x44, 0x89], &(duration_secs * 1000.0).to_be_bytes()));
         info.extend(el(&[0x4D, 0x80], b"freemkv 9.9.9 (gtest)"));
         info.extend(el(&[0x57, 0x41], b"freemkv 9.9.9 (gtest)"));
-        let mut entry = el(&[0xD7], &[1]);
-        entry.extend(el(&[0x83], &[1]));
-        entry.extend(el(&[0x86], b"V_MPEG4/ISO/AVC"));
-        let entries: Vec<u8> = (0..tracks).flat_map(|_| el(&[0xAE], &entry)).collect();
+        // TrackNumber is unique per Matroska; libfreemkv rejects a duplicate.
+        let entries: Vec<u8> = (0..tracks)
+            .flat_map(|i| {
+                let mut entry = el(&[0xD7], &[i as u8 + 1]);
+                entry.extend(el(&[0x83], &[1]));
+                entry.extend(el(&[0x86], b"V_MPEG4/ISO/AVC"));
+                el(&[0xAE], &entry)
+            })
+            .collect();
         let mut body = el(&[0x15, 0x49, 0xA9, 0x66], &info);
         body.extend(el(&[0x16, 0x54, 0xAE, 0x6B], &entries));
         if let Some(t) = last_cue_secs {

@@ -543,6 +543,7 @@ dependencies = [
  "aes",
  "base64",
  "crossbeam-channel",
+ "flate2",
  "freemkv-unlock",
  "libc",
  "memchr",
@@ -1369,11 +1370,3 @@ dependencies = [
  "log",
  "simd-adler32",
 ]
-
-[[patch.unused]]
-name = "freemkv-engine"
-version = "1.7.7"
-
-[[patch.unused]]
-name = "freemkv-i18n"
-version = "1.7.7"
