@@ -14,45 +14,76 @@ const EPISODE_MIN_SECS: f64 = 600.0;
 // same episode length.
 const EPISODE_TOLERANCE_FRAC: f64 = 0.25;
 const EPISODE_TOLERANCE_MIN_SECS: f64 = 300.0;
+// A play-all's runtime equals its episodes' sum within this fraction (or floor).
+const PLAY_ALL_SUM_FRAC: f64 = 0.01;
+const PLAY_ALL_SUM_MIN_SECS: f64 = 15.0;
 
 /// The episode titles of a TV disc, in disc order: drops the "play all"
 /// sum-title, extras/menus (far from the episode-length cluster), and
 /// duplicate-content titles.
 pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
-    let durations: Vec<f64> = titles.iter().map(|t| t.duration_secs).collect();
-    dedup_by_content(titles, episode_cluster(&durations, EPISODE_MIN_SECS))
+    dedup_by_content(titles, episode_cluster(titles, EPISODE_MIN_SECS))
 }
 
 fn same_length(center: f64, d: f64) -> bool {
     (d - center).abs() <= (center * EPISODE_TOLERANCE_FRAC).max(EPISODE_TOLERANCE_MIN_SECS)
 }
 
-// Indices in the modal episode-length cluster: the largest group of similar lengths, ties to
-// the shorter length (a play-all sums its episodes, so it is never the shorter).
-fn episode_cluster(durations: &[f64], min_len: f64) -> Vec<usize> {
-    let cands: Vec<usize> = durations
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| d.is_finite() && **d >= min_len)
-        .map(|(i, _)| i)
+// Indices in the modal episode-length cluster: the largest group of similar lengths. Among
+// equal-size groups the longest wins unless it is a play-all of a shorter, disjoint one.
+fn episode_cluster(titles: &[DiscTitle], min_len: f64) -> Vec<usize> {
+    let dur = |i: usize| titles[i].duration_secs;
+    let cands: Vec<usize> = (0..titles.len())
+        .filter(|&i| dur(i).is_finite() && dur(i) >= min_len)
         .collect();
-    let Some((_, center)) = cands
-        .iter()
-        .map(|&c| {
-            let members = cands
-                .iter()
-                .filter(|&&i| same_length(durations[c], durations[i]))
-                .count();
-            (members, durations[c])
-        })
-        .max_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)))
-    else {
+    let group = |c: usize| -> Vec<usize> {
+        cands
+            .iter()
+            .copied()
+            .filter(|&i| same_length(dur(c), dur(i)))
+            .collect()
+    };
+    let Some(most) = cands.iter().map(|&c| group(c).len()).max() else {
         return cands;
     };
-    cands
-        .into_iter()
-        .filter(|&i| same_length(center, durations[i]))
-        .collect()
+    let mut tied: Vec<usize> = cands
+        .iter()
+        .copied()
+        .filter(|&c| group(c).len() == most)
+        .collect();
+    tied.sort_by(|&a, &b| dur(b).total_cmp(&dur(a)));
+    let pick = tied
+        .iter()
+        .copied()
+        .find(|&l| {
+            let long = group(l);
+            !tied
+                .iter()
+                .filter(|&&s| dur(s) < dur(l))
+                .map(|&s| group(s))
+                .filter(|s| s.iter().all(|i| !long.contains(i)))
+                .any(|s| plays_all(titles, &long, &s))
+        })
+        .or(tied.last().copied());
+    pick.map(group).unwrap_or_default()
+}
+
+// Every title of `long` plays the `short` group: its extents hold a `short` title's start,
+// or its runtime is their sum (a playlist's runtime is its clips', to within seconds).
+fn plays_all(titles: &[DiscTitle], long: &[usize], short: &[usize]) -> bool {
+    let sum: f64 = short.iter().map(|&i| titles[i].duration_secs).sum();
+    long.iter().all(|&l| {
+        let t = &titles[l];
+        let holds = short.iter().any(|&s| {
+            titles[s].extents.first().is_some_and(|f| {
+                t.extents.iter().any(|e| {
+                    (e.start_lba..e.start_lba.saturating_add(e.sector_count)).contains(&f.start_lba)
+                })
+            })
+        });
+        holds
+            || (t.duration_secs - sum).abs() <= (sum * PLAY_ALL_SUM_FRAC).max(PLAY_ALL_SUM_MIN_SECS)
+    })
 }
 
 // Drop titles whose content duplicates an already-kept one: DVD angles or redundant
@@ -112,22 +143,62 @@ mod tests {
         assert_eq!(episode_titles(&titles), vec![0]);
     }
 
-    // One episode plus play-all titles (the sums of episodes): the largest group of similar
-    // lengths wins, ties to the shorter, so an even count or a lone episode keeps the episode.
+    // A play-all spanning the given episode titles' extents.
+    fn play_all(eps: &[&DiscTitle]) -> DiscTitle {
+        let mut t = title(eps.iter().map(|e| e.duration_secs).sum(), 0);
+        t.extents = eps.iter().flat_map(|e| e.extents.clone()).collect();
+        t
+    }
+
+    // Play-alls never displace the episodes, even when as many or more of them exist: they
+    // play the episodes' extents, or run for the episodes' summed length.
     #[test]
     fn play_all_titles_never_displace_the_episode_length() {
         let ep = 44.0 * 60.0;
-        let t = |mults: &[f64]| -> Vec<DiscTitle> {
-            let lba = |i: usize| 100 * (i as u32 + 1);
-            mults
-                .iter()
+        let (a, b) = (title(ep, 1000), title(ep * 1.02, 2000));
+        assert_eq!(episode_titles(&[a.clone(), play_all(&[&a, &a])]), vec![0]);
+        let (p2, p3) = (play_all(&[&a, &a]), play_all(&[&a, &a, &a]));
+        assert_eq!(episode_titles(&[a.clone(), p2.clone(), p3]), vec![0]);
+        let titles = [
+            a.clone(),
+            b.clone(),
+            play_all(&[&a, &b]),
+            play_all(&[&b, &a]),
+        ];
+        assert_eq!(episode_titles(&titles), vec![0, 1]);
+    }
+
+    // Equal-size groups of extras and episodes: the episodes win (reviewer cases).
+    #[test]
+    fn as_many_extras_as_episodes_keep_the_episodes() {
+        let m = 60.0;
+        let t = |ds: &[f64]| -> Vec<DiscTitle> {
+            ds.iter()
                 .enumerate()
-                .map(|(i, m)| title(ep * m, lba(i)))
+                .map(|(k, d)| title(d * m, 1000 + k as u32 * 5000))
                 .collect()
         };
-        assert_eq!(episode_titles(&t(&[1.0, 2.0])), vec![0]);
-        assert_eq!(episode_titles(&t(&[1.0, 1.02, 2.0, 3.0])), vec![0, 1]);
-        assert_eq!(episode_titles(&t(&[1.0, 2.0, 3.0])), vec![0]);
+        let three = t(&[44.0, 44.5, 45.0, 15.0, 15.0, 15.0]);
+        assert_eq!(episode_titles(&three), vec![0, 1, 2]);
+        let four = t(&[44.0, 44.0, 44.5, 44.5, 20.0, 20.5, 20.0, 20.5, 177.0]);
+        assert_eq!(episode_titles(&four), vec![0, 1, 2, 3]);
+    }
+
+    // Bench case: two episodes and two play-alls of their summed length, no shared extents.
+    #[test]
+    fn densest_cluster_beats_upper_median() {
+        let m = 60.0;
+        let t = |ds: &[f64]| -> Vec<DiscTitle> {
+            ds.iter()
+                .enumerate()
+                .map(|(k, d)| title(d * m, 1000 + k as u32 * 100))
+                .collect()
+        };
+        assert_eq!(episode_titles(&t(&[44.0, 44.5, 88.0, 88.5])), vec![0, 1]);
+        assert_eq!(
+            episode_titles(&t(&[44.0, 44.5, 88.0, 88.5, 120.0])),
+            vec![0, 1]
+        );
     }
 
     // A title with no extents has no content identity: equal durations are not duplicates.

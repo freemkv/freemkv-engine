@@ -34,7 +34,7 @@ project follows semantic versioning.
 
 - `preflight` counts a job's key set as usable only when it covers the selected titles, instead of reporting Ready for a title the set cannot decrypt.
 - `preflight` refuses a requested language tag that names no language with the new reason `unknown-language` (detail = the tag), instead of passing the job to fail after the image opens, or blaming the disc with `language-unmatched`.
-- `episode_titles` picks the largest group of similar lengths (ties to the shorter), so one episode beside a play-all title is kept; titles with no extents are never dropped as duplicates.
+- `episode_titles` picks the largest group of similar lengths; between equal-size groups it keeps the longer unless that one is a play-all of the other (it plays their extents or runs their summed length), so an episode beside a play-all is kept and equal numbers of extras don't displace episodes. Titles with no extents are never dropped as duplicates.
 - A `Halted` error with no cancel behind it is `Failed` in every build profile; debug builds no longer panic on it.
 - Patch passes report speed over the fixed 10 s window, so a recovery burst shows promptly.
 
