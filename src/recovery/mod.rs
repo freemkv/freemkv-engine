@@ -787,7 +787,7 @@ pub fn ensure_whole_image(path: &std::path::Path) -> Result<()> {
 
 /// Refuse muxing `titles` (indices into `disc.titles`, scanned from the image at `path`)
 /// when the image was staged for an MKV rip and its scope does not hold every sector of
-/// their extents: the rest was never read, so it would mux zeros. Checked by extents, so
+/// their extents, or holds some never read (a stopped staging): those would mux zeros. Checked by extents, so
 /// a staging mux that re-maps its titles against the staged image still passes.
 pub fn ensure_titles_staged(
     path: &std::path::Path,
@@ -802,6 +802,8 @@ pub fn ensure_titles_staged(
     let Some(scope) = map.scope() else {
         return Ok(());
     };
+    // In scope is not enough: a staging sweep stopped part-way leaves NonTried there too.
+    let unread = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
     let extents = titles
         .iter()
         .filter_map(|&i| disc.titles.get(i))
@@ -809,7 +811,7 @@ pub fn ensure_titles_staged(
     for e in extents {
         let want = (e.start_lba as u64 * 2048, e.sector_count as u64 * 2048);
         let have: u64 = mapfile::intersect(&[want], scope).iter().map(|r| r.1).sum();
-        if have != want.1 {
+        if have != want.1 || !mapfile::intersect(&[want], &unread).is_empty() {
             return Err(Error::ImageScoped {
                 path: path.display().to_string(),
             });
@@ -3096,5 +3098,45 @@ mod sweep_contract_tests {
             n <= bound,
             "{n} reports for 4000 batches; a 250 ms tick allows {bound}"
         );
+    }
+
+    // R5: a staged image passes only when its title sectors were read. A staging sweep
+    // stopped part-way leaves them NonTried (zeros from `set_len`): refused like out-of-scope
+    // ones. Damage (read and failed) still passes: blank + warn + count, never fatal.
+    #[test]
+    fn a_staged_title_with_unread_sectors_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("staged.iso");
+        let mut d = disc(8192);
+        let mut title = libfreemkv::DiscTitle::empty();
+        title.extents = vec![libfreemkv::disc::Extent {
+            start_lba: 4096,
+            sector_count: 1024,
+        }];
+        d.titles = vec![title];
+        let total = 8192u64 * 2048;
+        let (start, len) = (4096u64 * 2048, 1024u64 * 2048);
+        let stage = |status: Option<mapfile::SectorStatus>| {
+            let mut m = mapfile::Mapfile::create(&d.mapfile_for(&iso), total, "t").unwrap();
+            m.set_scope(vec![(start, len)]);
+            m.record(start, len / 2, mapfile::SectorStatus::Finished)
+                .unwrap();
+            if let Some(st) = status {
+                m.record(start + len / 2, len / 2, st).unwrap();
+            }
+            m.flush().unwrap();
+        };
+        stage(None);
+        assert!(
+            matches!(
+                ensure_titles_staged(&iso, &d, &[0]),
+                Err(Error::ImageScoped { .. })
+            ),
+            "half the title was never read: muxing it would emit zeros"
+        );
+        stage(Some(mapfile::SectorStatus::NonTrimmed));
+        ensure_titles_staged(&iso, &d, &[0]).expect("read-but-damaged sectors are not unread");
+        stage(Some(mapfile::SectorStatus::Finished));
+        ensure_titles_staged(&iso, &d, &[0]).expect("a fully staged title passes");
     }
 }
