@@ -332,14 +332,8 @@ impl Mapfile {
                 let fields: Vec<&str> = t.split_whitespace().collect();
                 let is_current_line = fields
                     .get(1)
-                    .and_then(|f| {
-                        let mut chars = f.chars();
-                        match (chars.next(), chars.next()) {
-                            // Exactly one char that is a valid status char.
-                            (Some(c), None) => SectorStatus::from_char(c),
-                            _ => None,
-                        }
-                    })
+                    .and_then(|f| single_char(f))
+                    .and_then(SectorStatus::from_char)
                     .is_some();
                 if is_current_line {
                     continue;
@@ -352,9 +346,10 @@ impl Mapfile {
                 // A short data line is dropped coverage, not noise: skipping it deletes
                 // its range from the gapless [0, total_size) partition, and skipping
                 // the last one shrinks total_size itself. Reject rather than skip.
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "short_line" }.into();
-                return Err(e);
+                return Err(invalid("short_line"));
+            }
+            if fields.len() > 3 {
+                return Err(invalid("long_line"));
             }
             let pos = parse_hex(fields[0])?;
             let size = parse_hex(fields[1])?;
@@ -374,19 +369,10 @@ impl Mapfile {
                     libfreemkv::error::Error::MapfileInvalid { kind: "zero_size" }.into();
                 return Err(e);
             }
-            let status = fields[2]
-                .chars()
-                .next()
+            // The whole token, not its first char: `+garbage` is damage, not Finished.
+            let status = single_char(fields[2])
                 .and_then(SectorStatus::from_char)
-                .ok_or_else(|| {
-                    // No English text — the variant carries a stable
-                    // language-neutral kind identifier (`status_char`).
-                    let e: io::Error = libfreemkv::error::Error::MapfileInvalid {
-                        kind: "status_char",
-                    }
-                    .into();
-                    e
-                })?;
+                .ok_or_else(|| invalid("status_char"))?;
             entries.push(MapEntry { pos, size, status });
         }
         entries.sort_by_key(|e| e.pos);
@@ -1022,6 +1008,14 @@ pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64
         }
     }
     out
+}
+
+fn single_char(field: &str) -> Option<char> {
+    let mut chars = field.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
 }
 
 fn parse_hex(s: &str) -> io::Result<u64> {
@@ -2261,6 +2255,36 @@ mod tests {
         assert_eq!(mf.entries()[1].pos, 0x200);
         assert_eq!(mf.total_size(), 0x300);
         let _ = std::fs::remove_file(&p);
+    }
+
+    fn invalid_kind(e: &io::Error) -> Option<&'static str> {
+        match e.get_ref()?.downcast_ref::<libfreemkv::error::Error>()? {
+            libfreemkv::error::Error::MapfileInvalid { kind } => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn load_text(tag: &str, text: &str) -> io::Result<Mapfile> {
+        let p = tmpfile(tag);
+        std::fs::write(&p, text).unwrap();
+        let r = Mapfile::load(&p);
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    // M26: a data line is exactly `pos size status`, the status one character.
+    #[test]
+    fn load_refuses_a_malformed_status_field() {
+        for (line, kind) in [
+            ("0x0 0x800 +garbage", "status_char"),
+            ("0x0 0x800 +?", "status_char"),
+            ("0x0 0x800 + extra", "long_line"),
+        ] {
+            let e = load_text("load_status_field", &format!("0x0 ? 1\n{line}\n"))
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(invalid_kind(&e), Some(kind), "{line}: {e}");
+        }
     }
 
     // ── write_to_disk format ──────────────────────────────────────
