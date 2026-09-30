@@ -398,12 +398,14 @@ fn target_present(path: &Path) -> io::Result<bool> {
 
 fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     if !job.replace && target_present(&job.target)? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} exists", job.target.display()),
-        ));
+        return Err(target_exists(&job.target));
     }
     Ok(())
+}
+
+// The quoted path only: a bare path starting `E<digits>` would parse as that error code.
+fn target_exists(target: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, format!("{target:?}"))
 }
 
 // The requested title, or the main title by the same rule a rip's default uses.
@@ -1342,6 +1344,15 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    // A relative target named like a libfreemkv code must not read as that code.
+    #[test]
+    fn an_existing_target_named_like_an_error_code_is_not_that_code() {
+        let e = target_exists(Path::new("E7022 Movie.mkv"));
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(crate::error_code(&e), None, "{e}");
+        assert!(e.to_string().contains("E7022 Movie.mkv"), "{e}");
     }
 
     #[test]
