@@ -1048,6 +1048,61 @@ mod tests {
         assert!(!partial_path(&target).exists());
     }
 
+    // A staged partial that is the target or `<target>.partial` would overwrite the library
+    // file or delete its own source: refused before the lock, the mux or any file change.
+    #[test]
+    fn a_staging_path_on_the_target_or_its_partial_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        std::fs::write(&target, b"old").unwrap();
+        let target_partial = partial_path(&target);
+        for staged in [&target, &target_partial] {
+            let sink = Events::default();
+            let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+            let muxed = AtomicBool::new(false);
+            let e = land_verified(
+                &job(target.clone(), true),
+                0,
+                &title(600.0),
+                &sink,
+                &halt,
+                &OsRemuxIo,
+                Some(staged),
+                |dest| {
+                    muxed.store(true, Ordering::SeqCst);
+                    writes(mkv(600.0, Some(598), 2), true)(dest)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "{}",
+                staged.display()
+            );
+            assert!(!muxed.load(Ordering::SeqCst));
+            assert_eq!(std::fs::read(&target).unwrap(), b"old");
+            assert!(!target_partial.exists());
+        }
+    }
+
+    // The public staged entry: an image that cannot open leaves no partial anywhere.
+    #[test]
+    fn remux_iso_staged_with_an_unopenable_image_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        let staged = dir.path().join("7.mkv.partial");
+        std::fs::write(&target, b"old").unwrap();
+        let sink = Events::default();
+        let keys = KeyParams::default();
+        let e = remux_iso_staged(&job(target.clone(), true), &keys, &sink, &staged).unwrap_err();
+        assert!(!libfreemkv::is_halt(&e), "{e}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(!staged.exists() && !partial_path(&target).exists());
+        let refused = remux_iso_staged(&job(target.clone(), false), &keys, &sink, &staged);
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+    }
+
     #[test]
     fn staged_copy_refuses_to_overwrite_an_existing_partial() {
         let dir = tempfile::tempdir().unwrap();
