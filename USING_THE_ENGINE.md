@@ -212,9 +212,10 @@ let mp: MultipassResult = multipass_rip(
     &sink,
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
-// mp.main_lost_ms (NaN = unquantifiable; always scoped to the MAIN TITLE's
-//                  extents, even when is_iso_output widens the abort gate to
-//                  the whole disc), mp.severity (DamageSeverity),
+// mp.main_lost_ms (NaN = unquantifiable; playback lost in the titles
+//                  job.selection picks, title 0 for the default MainMovie,
+//                  summed per title, even when is_iso_output widens the abort
+//                  gate to the whole disc), mp.severity (DamageSeverity),
 // mp.passes, mp.aborted_for_loss, mp.halted,
 // mp.wedged, mp.complete
 ```
@@ -239,6 +240,8 @@ rip that stages an image first), stage only what the mux needs:
 
 ```rust
 let scope = mkv_staging_scope(&disc, &mut *reader, &title_indices, keep_iso)?;
+// Measure loss over the titles you stage, not title 0.
+let job = job.with_selection(Selection::Titles(title_indices.clone()));
 let mp = multipass_rip_staged(&disc, &mut *reader, iso_path, &job, &opts,
                               scope.as_deref(), &sink)?;
 if scope.is_some() {
