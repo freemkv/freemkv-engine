@@ -225,8 +225,9 @@ fn copy_and_sweep_refuse_a_zero_capacity_disc() {
         fault: Fault::Short,
     };
 
-    // A leftover empty mapfile would otherwise let copy's resume dispatch
-    // declare the 0-byte "image" complete without ever reaching sweep.
+    // A leftover zero-size mapfile must not change the verdict: the capacity
+    // gate runs before the mapfile is read (a zero-size mapfile is itself
+    // refused as invalid on load), so the answer stays EmptyImage.
     let iso = tmp.path().join("copy.iso");
     let map_path = freemkv_engine::mapfile_path_for(&iso);
     Mapfile::create(&map_path, 0, "test").unwrap();
