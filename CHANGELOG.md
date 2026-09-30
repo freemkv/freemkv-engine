@@ -17,6 +17,8 @@ project follows semantic versioning.
 
 - `copy`, `sweep`, `patch`, `ensure_whole_image` and `ensure_titles_staged` return libfreemkv's typed error instead of the generic I/O error (E5000) when an I/O error carries one: a mapfile for another disc is E6011 (`disc-mismatch`), a damaged mapfile E6011, and a stalled or lost output flush E9056/E9057. An output flush stall is no longer read as a drive transport failure.
 
+- Remux: a Stop before the rename ends Halted with the target untouched; once the rename has happened, a failed folder sync is only a warning and the remux is Done (`replaced`, `Event::Replaced`). The staged copy to the library folder stops on Stop and fails E9073 after 60 s with no bytes written. A non-UTF-8 target path is refused with E9002 before anything is written.
+
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
 
 - A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
