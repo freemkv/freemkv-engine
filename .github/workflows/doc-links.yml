@@ -5,6 +5,9 @@ name: doc-links
 # reusable gate checks them out as siblings (plus freemkv-unlock, which
 # libfreemkv path-deps) and resolves the toolchain from rust-version.
 on: [push, pull_request]
+# Least privilege: the reusable guard only reads the repo.
+permissions:
+  contents: read
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

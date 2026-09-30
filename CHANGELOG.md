@@ -1,5 +1,9 @@
 # Changelog
 
+All notable changes to `freemkv-engine` are documented here. The format is
+based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
+project follows semantic versioning.
+
 ## [Unreleased]
 
 ### Changed
@@ -61,6 +65,7 @@
 - Version aligned to 1.7.5 for the unified release. No functional changes to this crate; the release is driven by freemkv-unlock mirroring the freemkv-firmware 0.9.0 ABI (the drive's `Ake` and `Bus` levers retired into a single `Encryption` lever).
 
 ## [1.7.4] — 2026-09-21
+
 ### Changed
 
 - Aligned to libfreemkv 1.7.4 `KeyStep` (new `matched_entry` / `store_entries` fields).
@@ -75,13 +80,13 @@
 
 - Unified release with freemkv 1.7.3 (`info --share` disc-structure capture for bug reports + the multi-angle UHD main-title fix in libfreemkv; see the libfreemkv/freemkv 1.7.3 notes). No functional changes to this crate.
 
-## [1.7.2] — UNRELEASED
+## [1.7.2] — 2026-09-18
 
 ### Changed
 
 - Unified release with freemkv-unlock 1.7.2 (firmware ABI v2). No functional changes to this crate.
 
-## [1.7.1] — UNRELEASED
+## [1.7.1] — 2026-09-14
 
 ### Changed
 
@@ -273,10 +278,6 @@
 ## [1.6.2] — 2026-08-08
 
 Version sync with the workspace. No functional change in this crate.
-
-All notable changes to `freemkv-engine` are documented here. The format is
-based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
-project follows semantic versioning.
 
 ## [1.6.1] — 2026-08-07
 
