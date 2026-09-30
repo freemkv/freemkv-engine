@@ -1802,16 +1802,90 @@ mod snap_tests {
     }
 }
 
+// A stallable consumer, shared by the send- and finish-side bounded-pipeline tests.
+#[cfg(test)]
+mod stall_fixtures {
+    use libfreemkv::error::Error;
+    use libfreemkv::io::pipeline::{Flow, Sink};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// A gate a test thread can hold shut and then open.
+    #[derive(Clone)]
+    pub(super) struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Gate {
+        pub(super) fn shut() -> Self {
+            Self(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+        pub(super) fn wait(&self) {
+            let (lock, cv) = &*self.0;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }
+        pub(super) fn open(&self) {
+            let (lock, cv) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
+    /// The hung-mount consumer: alive, healthy, and stuck in its first `apply` until the
+    /// gate opens. Stands in for `SweepSink`/`PatchSink` blocked inside
+    /// `WritebackFile::write_all` on a mount that never answers.
+    pub(super) struct StalledSink {
+        pub(super) entered: Arc<AtomicUsize>,
+        pub(super) gate: Gate,
+        /// Counts `close()` calls.
+        pub(super) closed: Arc<AtomicUsize>,
+        /// Set once the consumer thread has let go of the sink, closed or not.
+        pub(super) dropped: Arc<AtomicBool>,
+    }
+
+    impl StalledSink {
+        pub(super) fn new(entered: &Arc<AtomicUsize>, gate: &Gate) -> Self {
+            StalledSink {
+                entered: Arc::clone(entered),
+                gate: gate.clone(),
+                closed: Arc::default(),
+                dropped: Arc::default(),
+            }
+        }
+    }
+
+    impl Sink<u32> for StalledSink {
+        type Output = u32;
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.wait();
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> std::result::Result<u32, Error> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    impl Drop for StalledSink {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 // The producer-side handoff guard: what happens to a `send` when the
 // consumer is ALIVE but not draining. Pins the fix for a plain
 // `Pipeline::send` parking forever on a stalled (not dead) consumer.
 #[cfg(test)]
 mod send_bounded_tests {
+    use super::stall_fixtures::{Gate, StalledSink};
     use super::*;
     use libfreemkv::halt::Halt;
     use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     // Cancel is flipped this long after the producer parks in `send` — long
@@ -1824,48 +1898,6 @@ mod send_bounded_tests {
     /// Bound on the whole experiment so a regression FAILS instead of hanging
     /// the suite.
     const WATCHDOG: Duration = Duration::from_secs(10);
-
-    /// A gate a test thread can hold shut and then open.
-    #[derive(Clone)]
-    struct Gate(Arc<(Mutex<bool>, Condvar)>);
-
-    impl Gate {
-        fn shut() -> Self {
-            Self(Arc::new((Mutex::new(false), Condvar::new())))
-        }
-        fn wait(&self) {
-            let (lock, cv) = &*self.0;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }
-        fn open(&self) {
-            let (lock, cv) = &*self.0;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
-    }
-
-    /// The hung-mount consumer: healthy, alive, draining nothing because its
-    /// first `apply` is stuck in a write that never returns. Stands in for
-    /// `SweepSink`/`PatchSink` blocked inside `WritebackFile::write_all`.
-    struct StalledSink {
-        entered: Arc<AtomicUsize>,
-        gate: Gate,
-    }
-
-    impl Sink<u32> for StalledSink {
-        type Output = ();
-        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
-            self.entered.fetch_add(1, Ordering::SeqCst);
-            self.gate.wait();
-            Ok(Flow::Continue)
-        }
-        fn close(self) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-    }
 
     // A consumer that DIES on its first item, distinguishable from a stalled
     // one. Must panic: `Flow::Stop`/an `apply` error both leave the consumer
@@ -1889,14 +1921,9 @@ mod send_bounded_tests {
     fn a_stop_lands_on_a_producer_parked_on_a_stalled_consumer() {
         let entered = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, ()>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-            },
-        )
-        .expect("spawn consumer");
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, StalledSink::new(&entered, &gate))
+                .expect("spawn consumer");
         let halt = Halt::new();
 
         // Item 1 is taken by the consumer, which then wedges inside `apply`.
@@ -2044,14 +2071,9 @@ mod send_bounded_tests {
     fn a_stalled_consumer_with_no_halt_times_out_rather_than_blocking() {
         let entered = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, ()>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-            },
-        )
-        .expect("spawn consumer");
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, StalledSink::new(&entered, &gate))
+                .expect("spawn consumer");
         let halt = Halt::new();
         assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
         let waited = Instant::now();
@@ -2208,11 +2230,12 @@ mod send_bounded_tests {
 // producer out must not then block forever in `Pipeline::finish` on the same stalled consumer.
 #[cfg(test)]
 mod finish_bounded_tests {
+    use super::stall_fixtures::{Gate, StalledSink};
     use super::*;
     use libfreemkv::halt::Halt;
     use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     // MARGIN: a correct teardown returns at ~5.3s (250ms halt-observe +
@@ -2222,66 +2245,15 @@ mod finish_bounded_tests {
     // Bound on the whole experiment so a regression FAILS, not hangs, `cargo test`.
     const WATCHDOG: Duration = Duration::from_secs(45);
 
-    /// A gate a test thread can hold shut and then open.
-    #[derive(Clone)]
-    struct Gate(Arc<(Mutex<bool>, Condvar)>);
-
-    impl Gate {
-        fn shut() -> Self {
-            Self(Arc::new((Mutex::new(false), Condvar::new())))
-        }
-        fn wait(&self) {
-            let (lock, cv) = &*self.0;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }
-        fn open(&self) {
-            let (lock, cv) = &*self.0;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
-    }
-
-    /// The hung-mount consumer: alive, healthy, and stuck in its first `apply`
-    /// forever. Stands in for `SweepSink`/`PatchSink` blocked inside
-    /// `WritebackFile::write_all` on a mount that never answers.
-    struct StalledSink {
-        entered: Arc<AtomicUsize>,
-        gate: Gate,
-        closed: Arc<AtomicUsize>,
-    }
-
-    impl Sink<u32> for StalledSink {
-        type Output = u32;
-        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
-            self.entered.fetch_add(1, Ordering::SeqCst);
-            self.gate.wait();
-            Ok(Flow::Continue)
-        }
-        fn close(self) -> std::result::Result<u32, Error> {
-            self.closed.fetch_add(1, Ordering::SeqCst);
-            Ok(0)
-        }
-    }
-
     // Park a consumer inside `apply`, raise the halt, then tear down: the
     // teardown must COME BACK — the last link in the Stop chain.
     #[test]
     fn a_stop_lands_on_a_teardown_joining_a_stalled_consumer() {
         let entered = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, u32>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-                closed: Arc::clone(&closed),
-            },
-        )
-        .expect("spawn consumer");
+        let sink = StalledSink::new(&entered, &gate);
+        let (closed, dropped) = (Arc::clone(&sink.closed), Arc::clone(&sink.dropped));
+        let pipe = Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, sink).expect("spawn consumer");
         let halt = Halt::new();
 
         // Item 1 is taken; the consumer wedges inside `apply` and never
@@ -2339,6 +2311,14 @@ mod finish_bounded_tests {
         // The abandoned consumer must NOT go on to run `close()`. For the
         // recovery sinks that call is `sync_all` + `map.flush()` against an
         // output the caller has already reported as interrupted.
+        let waited = Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "the released consumer never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             closed.load(Ordering::SeqCst),
             0,
@@ -2827,27 +2807,35 @@ mod patch_preset_tests {
     fn the_wedged_threshold_is_reported_not_enforced() {
         let o = PatchOptions::for_patch_pass(false, None, None);
 
-        let state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
+        let mut state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
         let summary = patch::PatchSummary {
             stats: mapfile::MapStats::default(),
         };
-        let outcome = patch::build_outcome(
-            &state,
-            &summary,
-            std::path::Path::new("/nonexistent/for-outcome-only"),
-            4096,
-            0,
-            o.wedged_threshold,
-        );
+        let outcome_of = |state: &patch::PatchLoopState| {
+            patch::build_outcome(
+                state,
+                &summary,
+                std::path::Path::new("/nonexistent/for-outcome-only"),
+                4096,
+                0,
+                o.wedged_threshold,
+            )
+        };
+        let outcome = outcome_of(&state);
         assert_eq!(
             outcome.wedged_threshold, 50,
             "the preset's threshold must reach the caller's outcome verbatim"
         );
+        // `wedged_exit` is the pass's own transport-fault flag, echoed; the threshold
+        // neither sets nor clears it.
+        assert!(!outcome.wedged_exit);
+        state.wedged_exit = true;
+        let wedged = outcome_of(&state);
         assert!(
-            !outcome.wedged_exit,
-            "the threshold alone must not mark a pass wedged — `wedged_exit` \
-             comes from a handler's TransportFault, nothing counts against 50"
+            wedged.wedged_exit,
+            "a transport-fault exit must reach the outcome"
         );
+        assert_eq!(wedged.wedged_threshold, 50);
     }
 }
 
