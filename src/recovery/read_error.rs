@@ -1,6 +1,6 @@
 //! Single source of truth for what to do when a sector read fails.
 //!
-//! Pass 1 (`recovery::sweep_internal`, this crate) calls into
+//! Pass 1 (`recovery::sweep_linked`, this crate) calls into
 //! `handle_read_error` after every failed `read_sectors` — the ONE
 //! production call site. The handler classifies the error, updates the
 //! in-flight context (counters, damage window, retry budgets), and
@@ -16,31 +16,31 @@ use libfreemkv::scsi::SenseFamily;
 
 /// In-flight bookkeeping a read loop must keep across iterations. The
 /// handler reads and mutates this. Caller owns the storage.
-pub struct ReadCtx {
+pub(crate) struct ReadCtx {
     /// Number of sectors per read attempt. Scales the damage-jump
     /// distance, so a jump clears a whole multiple of the read size.
-    pub batch: u16,
+    pub(crate) batch: u16,
     /// Successful reads since the last failure. Resets to 0 on failure.
     /// Used by callers to drive damage-zone exit / speed restoration.
-    pub consecutive_good: u64,
+    pub(crate) consecutive_good: u64,
     /// Failed reads since the last success. Resets to 0 on success.
     /// Drives long-pause escalation on persistent failure.
-    pub consecutive_failures: u64,
+    pub(crate) consecutive_failures: u64,
     /// Failed batch reads since the last success. Drives the
     /// fast-entry damage-jump on Pass 1 (skip the disc-level grind
     /// once we're clearly in a damaged region; Pass N will recover
     /// the actual sectors). Reset on success.
-    pub consecutive_outer_failures: u64,
+    pub(crate) consecutive_outer_failures: u64,
     /// Sliding window of recent read outcomes (true=ok, false=fail).
     /// Capped at `damage_window_max`. Drives damage-jump decisions.
-    pub damage_window: Vec<bool>,
+    pub(crate) damage_window: Vec<bool>,
     /// Maximum number of outcome entries kept in `damage_window`; the
     /// oldest is evicted once this is exceeded. A whole count (e.g. 16).
-    pub damage_window_max: usize,
+    pub(crate) damage_window_max: usize,
     /// Fraction of `damage_window` entries that must be failures before
     /// the window-based damage-jump fires, as a whole-number percentage
     /// (e.g. `12` = 12%).
-    pub damage_threshold_pct: usize,
+    pub(crate) damage_threshold_pct: usize,
     /// Trigger a damage-jump after this many consecutive outer-batch
     /// failures, even when the damage_window isn't full yet. Pass 1
     /// uses a small value (1 — jump on the first outer failure; see
@@ -48,15 +48,15 @@ pub struct ReadCtx {
     /// minutes grinding to fill a 16-block window before the first jump
     /// on a damage zone we entered cleanly. Pass N uses a larger value
     /// because Pass N's whole job IS to grind on the bad ranges.
-    pub fast_jump_threshold: u64,
+    pub(crate) fast_jump_threshold: u64,
     /// Multiplier applied to damage-jump distance. Doubles each jump,
     /// resets to 1 after `damage_window_max` consecutive good reads.
-    pub jump_multiplier: u64,
+    pub(crate) jump_multiplier: u64,
     /// NOT_READY retries used so far for the current LBA. Reset to 0
     /// on any non-NOT_READY response.
-    pub not_ready_retries: u32,
+    pub(crate) not_ready_retries: u32,
     /// Bridge-degradation cooldowns used so far.
-    pub bridge_degradation_count: u32,
+    pub(crate) bridge_degradation_count: u32,
     /// Which pass this context belongs to: `false` = Pass 1 sweep,
     /// `true` = a Pass N patch. It selects the wedge-skip distance
     /// (Pass 1 jumps `WEDGE_JUMP_SECTORS`; Pass N only
@@ -64,54 +64,54 @@ pub struct ReadCtx {
     /// single known-bad range), exempts Pass N from the zone-entry
     /// cooldown (being inside damage is its normal state, not a
     /// transition worth a 30s pause), and labels the wedge logs.
-    pub patch_pass: bool,
+    pub(crate) patch_pass: bool,
     /// Count of consecutive firmware-wedge responses (HARDWARE_ERROR
     /// or ILLEGAL_REQUEST sense keys) since the last successful read.
     /// Pass 1 uses this to drive the wedge-skip path: each wedge
     /// triggers a 1 GB jump + cooldown pause. Reaching
     /// `WEDGE_ABORT_THRESHOLD` consecutive wedges with no good read
     /// in between → real AbortPass.
-    pub wedge_count: u64,
+    pub(crate) wedge_count: u64,
     // Diagnostic counters (added 2026-05-10): aggregate state for post-mortem
     // analysis, so an operator can tell from the logs whether a wedge was one
     // read at physically-damaged media vs. accumulated firmware-state buildup.
     /// `Instant` of the most recent successful read. Used to compute
     /// "time since last good" for the WARN log on each error. None
     /// before the first successful read.
-    pub last_success_at: Option<std::time::Instant>,
+    pub(crate) last_success_at: Option<std::time::Instant>,
     /// `Instant` of the most recent failed read. Used to compute
     /// "time since last error" for the WARN log. None before the
     /// first error.
-    pub last_error_at: Option<std::time::Instant>,
+    pub(crate) last_error_at: Option<std::time::Instant>,
     /// Last error's sense-key "family" (Medium / Hardware / IllegalRequest
     /// / NotReady / Other). Used to detect WEDGE TRANSITIONS — when
     /// the family changes from Medium → Hardware/IllegalRequest, the
     /// drive almost certainly just entered fast-fail mode. That
     /// transition gets its own WARN log so the trace is unambiguous.
-    pub last_error_family: Option<SenseFamily>,
+    pub(crate) last_error_family: Option<SenseFamily>,
     /// Sum of all errors observed during this sweep. Reported in the
     /// end-of-pass summary.
-    pub total_errors: u64,
+    pub(crate) total_errors: u64,
     /// Sum of all successful reads during this sweep.
-    pub total_reads_ok: u64,
+    pub(crate) total_reads_ok: u64,
     /// Count of damage zones entered (transitions from clean → in-damage).
-    pub zones_entered: u64,
+    pub(crate) zones_entered: u64,
     /// Count of damage-jumps executed during this sweep.
-    pub jumps_taken: u64,
+    pub(crate) jumps_taken: u64,
     /// True between "first error after a clean period" and "16 consecutive
     /// good reads after the last error in the cluster." Used to count
     /// zone entries and to bound zone_reads accurately.
-    pub in_damage_zone: bool,
+    pub(crate) in_damage_zone: bool,
     /// Count of long-streak pause escalations taken this pass — the `consecutive_failures >=
     /// CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD` branch of the pause selection. Reported in the
     /// pass summary so an operator can see how often the drive was in a long failure streak.
-    pub long_pause_escalations: u64,
+    pub(crate) long_pause_escalations: u64,
     /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
     /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
     /// marked NonTrimmed for a Pass N re-read; the count is reported in the
     /// pass summary so an operator can see how much of a "clean" rip was actually
     /// marginal.
-    pub marginal_recovered: u64,
+    pub(crate) marginal_recovered: u64,
 }
 
 impl ReadCtx {
@@ -121,7 +121,7 @@ impl ReadCtx {
     /// Pass 1 jumps immediately rather than grinding the same LBA. Transient errors still get a
     /// small bounded number of retries (`NOT_READY_MAX_RETRIES` /
     /// `BRIDGE_DEGRADATION_MAX_RETRIES`).
-    pub fn for_sweep(batch: u16) -> Self {
+    pub(crate) fn for_sweep(batch: u16) -> Self {
         Self {
             batch,
             consecutive_good: 0,
@@ -152,8 +152,10 @@ impl ReadCtx {
     /// Initial context for a Pass 2-N patch: `batch` sectors per read. The fast-jump threshold
     /// is loose (window-based jump only) since Pass N exists to recover scattered sectors Pass
     /// 1 skipped, and `damage_threshold_pct` uses [`PATCH_DAMAGE_THRESHOLD_PCT`] (6%, tighter
-    /// than Pass 1's 12%) to converge faster on bad sub-zones. No production caller.
-    pub fn for_patch(batch: u16) -> Self {
+    /// than Pass 1's 12%) to converge faster on bad sub-zones. Tests only: Pass N does not
+    /// route here (`section_recover` owns it), so this pins the `patch_pass` branches.
+    #[cfg(test)]
+    pub(crate) fn for_patch(batch: u16) -> Self {
         Self {
             batch,
             consecutive_good: 0,
@@ -184,7 +186,7 @@ impl ReadCtx {
     }
 
     /// Caller calls this after every successful read.
-    pub fn on_success(&mut self) {
+    pub(crate) fn on_success(&mut self) {
         self.consecutive_good += 1;
         self.consecutive_failures = 0;
         self.not_ready_retries = 0;
@@ -219,7 +221,7 @@ impl ReadCtx {
 
     /// Final per-pass summary suitable for an INFO log at the end of a
     /// Pass 1 `sweep`. Caller renders this to a single structured log line.
-    pub fn pass_summary(&self) -> PassSummary {
+    pub(crate) fn pass_summary(&self) -> PassSummary {
         PassSummary {
             total_reads_ok: self.total_reads_ok,
             total_errors: self.total_errors,
@@ -235,23 +237,23 @@ impl ReadCtx {
 /// an operator answer "how damaged is this disc?" from a single log
 /// line per pass.
 #[derive(Debug, Clone, Copy)]
-pub struct PassSummary {
-    pub total_reads_ok: u64,
-    pub total_errors: u64,
-    pub zones_entered: u64,
-    pub jumps_taken: u64,
+pub(crate) struct PassSummary {
+    pub(crate) total_reads_ok: u64,
+    pub(crate) total_errors: u64,
+    pub(crate) zones_entered: u64,
+    pub(crate) jumps_taken: u64,
     /// Long-streak pause escalations taken — see
     /// [`ReadCtx::long_pause_escalations`].
-    pub long_pause_escalations: u64,
+    pub(crate) long_pause_escalations: u64,
     /// RECOVERED ERROR (marginal) reads distrusted and re-queued for Pass N.
-    pub marginal_recovered: u64,
+    pub(crate) marginal_recovered: u64,
 }
 
 /// What the caller should do after a read failure. The caller owns the
 /// I/O side-effects (sleep, write zeros, advance pos) — the handler
 /// only decides which side-effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReadAction {
+pub(crate) enum ReadAction {
     /// Pause `pause_secs` then retry the same LBA / batch. Used for
     /// transient conditions (NOT_READY, bridge degradation) that the
     /// drive may recover from on its own.
@@ -314,7 +316,8 @@ const WEDGE_PASS_N_SKIP_SECTORS: u64 = 64;
 /// a 16-entry sliding window, 6% fires once 1/16 recent reads failed.
 /// Twice as eager as Pass 1's 12% (`damage_threshold_pct` on
 /// `for_sweep`), since patch's job is to converge on bad sub-zones.
-pub const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
+#[cfg(test)]
+pub(crate) const PATCH_DAMAGE_THRESHOLD_PCT: usize = 6;
 
 // Damage classifications on this thread (EK11: an on-arrival side read never lands here).
 #[cfg(test)]
@@ -328,7 +331,7 @@ thread_local! {
 /// New error class = add a new arm here. New logging on errors = add
 /// it once at the top. New retry policy = adjust the constants. No
 /// other read site needs to change.
-pub fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
+pub(crate) fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
     // 0. KU §2.4 on-arrival key stop (E7022/E7032): the unit WAS read, so it is not
     //    damage. Checked before any counter moves: no retry, skip, jump or zone entry.
     if super::is_key_stop(err) {
@@ -712,8 +715,9 @@ mod tests {
         );
 
         // The error that DOES reach the pause selection is the real zone
-        // entry, and it must get the long cooldown.
-        let a = handle_read_error(&hardware_err(), &mut ctx);
+        // entry, and it must get the long cooldown. A MEDIUM error: a wedge-family
+        // one would pass on the wedge arm's own 30 s pause, whatever the latch did.
+        let a = handle_read_error(&medium_err(), &mut ctx);
         assert!(ctx.in_damage_zone);
         assert_eq!(ctx.zones_entered, 1);
         let pause = match a {
@@ -1202,8 +1206,8 @@ mod tests {
         }
     }
 
-    /// Transport failure: SCSI status 0xFF (bridge crash). CLAUDE.md
-    /// "Bad-sector handling": this aborts the copy.
+    /// Transport failure: SCSI status 0xFF (bridge crash). Step 1 of
+    /// `handle_read_error`: this aborts the copy.
     fn transport_failure_err() -> Error {
         Error::DiscRead {
             sector: 100,
@@ -1238,7 +1242,7 @@ mod tests {
 
     #[test]
     fn not_ready_retries_capped_at_three_then_falls_through() {
-        // CLAUDE.md "Bad-sector handling" mode 1: NOT READY -> pause 3s, retry
+        // Step 3 of `handle_read_error`: NOT READY -> pause 3s, retry
         // up to 3x (NOT_READY_MAX_RETRIES), then mark NonTrimmed. The 1st-3rd
         // must Retry, the 4th must fall through to skip.
         let mut ctx = ReadCtx::for_patch(1);
@@ -1259,7 +1263,7 @@ mod tests {
 
     #[test]
     fn transport_failure_aborts_on_both_passes() {
-        // CLAUDE.md "Bad-sector handling" mode 2: transport failure (bridge
+        // Step 1 of `handle_read_error`: transport failure (bridge
         // crash, status 0xFF) aborts the pass to re-enumerate the bridge — must
         // hold on both passes, not get swallowed into a JumpAhead by wedge-skip.
         let mut ctx = ReadCtx::for_patch(32);
@@ -1365,7 +1369,7 @@ mod tests {
 
     #[test]
     fn jump_multiplier_caps_and_jump_distance_stays_bounded() {
-        // CLAUDE.md damage-jump: multiplier doubles per jump but is capped at
+        // Step 7 of `handle_read_error`: multiplier doubles per jump but is capped at
         // MAX_JUMP_MULTIPLIER=64 (the "4 GiB cap"), so a single jump can never
         // grow unbounded and skip the rest of the disc; verify saturation holds.
         const MAX_JUMP_MULTIPLIER: u64 = 64;
