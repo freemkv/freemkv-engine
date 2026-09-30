@@ -675,6 +675,15 @@ fn multipass_rip_inner(
     if plan.multipass && !job.raw {
         return Err(crate::run::multipass_requires_raw());
     }
+    // The recovery sweeps an image of the other raw/decrypt mode fresh; say so where users see it.
+    if Mapfile::load(&disc.mapfile_for(iso_path))
+        .is_ok_and(|m| m.raw().is_some_and(|r| r != job.raw))
+    {
+        sink.log(
+            Level::Warn,
+            "multipass_rip: the existing image is in the other raw/decrypt mode; overwriting it",
+        );
+    }
     let empty_title = libfreemkv::DiscTitle::empty();
     let titles = measured_titles(disc, job, &empty_title);
     if !plan.multipass {
@@ -3265,6 +3274,164 @@ mod tests {
         assert!(Mapfile::load(&path).is_err());
     }
 
+    fn whole_disc() -> libfreemkv::Disc {
+        test_disc(4096, vec![test_title(0, 4096)])
+    }
+
+    fn single_pass(raw: bool) -> (Job, MultipassOpts) {
+        let job = Job {
+            raw,
+            ..Job::new("disc:///dev/null", "out.iso")
+        };
+        let opts = MultipassOpts {
+            max_passes: 0,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        };
+        (job, opts)
+    }
+
+    fn iso_multipass() -> MultipassOpts {
+        MultipassOpts {
+            max_passes: 3,
+            abort_on_lost_secs: 0,
+            is_iso_output: true,
+        }
+    }
+
+    // copy's dispatch guard alone: a FINISHED raw image re-requested as a decrypted copy must be
+    // read again, not reported done, and the user is told the image is overwritten.
+    #[test]
+    fn a_finished_raw_image_rerun_as_a_decrypted_copy_is_read_again() {
+        let (_dir, iso) = scratch_iso("finished-raw-then-dec");
+        let disc = whole_disc();
+        let (mut r1, _) = stamp_reader(0xA1);
+        let first = multipass_rip(
+            &disc,
+            &mut r1,
+            &iso,
+            &raw_job(&iso),
+            &iso_multipass(),
+            &crate::sink::NoopSink,
+        )
+        .expect("run 1");
+        assert!(first.complete, "fixture check: {first:?}");
+
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let (job, opts) = single_pass(false);
+        let sink = HookSink::new("", false, Box::new(|| {}));
+        let second = multipass_rip(&disc, &mut r2, &iso, &job, &opts, &sink).expect("run 2");
+        assert!(second.complete, "{second:?}");
+        assert_eq!(
+            reads.lock().unwrap().len(),
+            4096,
+            "every sector must be read again"
+        );
+        assert_eq!(marker_at(&iso, 4095), 0xB2);
+        assert!(sink.logged(Level::Warn, "other raw/decrypt mode"));
+    }
+
+    // Pass 1's "only a map proven raw" rule alone: a decrypted partial whose map predates the
+    // mode stamp must not be resumed by a raw multipass run.
+    #[test]
+    fn an_unstamped_decrypted_partial_is_not_resumed_by_multipass() {
+        let (_dir, iso) = scratch_iso("unstamped-dec-then-raw");
+        let disc = whole_disc();
+        let op = libfreemkv::Halt::new();
+        let (mut r1, _) = stamp_reader(0xA1);
+        r1.halt_at = Some((2000, op.clone()));
+        let (job, opts) = single_pass(false);
+        let first = multipass_rip_with(
+            &op,
+            &disc,
+            &mut r1,
+            &iso,
+            &job,
+            &opts,
+            &crate::sink::NoopSink,
+        );
+        assert!(first.value().is_some_and(|r| r.halted), "fixture check");
+        let map = disc.mapfile_for(&iso);
+        let text = std::fs::read_to_string(&map).unwrap();
+        assert!(text.contains("# freemkv-raw: 0\n"), "fixture check: {text}");
+        std::fs::write(&map, text.replace("# freemkv-raw: 0\n", "")).unwrap();
+        let finished = finished_lbas(&map);
+        assert!(finished.len() > 100, "fixture check");
+
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let second = multipass_rip(
+            &disc,
+            &mut r2,
+            &iso,
+            &raw_job(&iso),
+            &iso_multipass(),
+            &crate::sink::NoopSink,
+        )
+        .expect("run 2");
+        let reads = reads.lock().unwrap();
+        assert!(
+            finished.iter().all(|l| reads.contains(l)),
+            "run 2 resumed an unproven map"
+        );
+        assert!(second.complete, "{second:?}");
+    }
+
+    // The sweep's own guard alone: a direct resuming sweep in decrypt mode over a raw partial
+    // must start fresh.
+    #[test]
+    fn a_resuming_decrypted_sweep_never_continues_a_raw_partial() {
+        let (_dir, iso) = scratch_iso("raw-then-dec-sweep");
+        let disc = whole_disc();
+        let op = libfreemkv::Halt::new();
+        let (mut r1, _) = stamp_reader(0xA1);
+        r1.halt_at = Some((2000, op.clone()));
+        let first = multipass_rip_with(
+            &op,
+            &disc,
+            &mut r1,
+            &iso,
+            &raw_job(&iso),
+            &iso_multipass(),
+            &crate::sink::NoopSink,
+        );
+        assert!(first.value().is_some_and(|r| r.halted), "fixture check");
+        let finished = finished_lbas(&disc.mapfile_for(&iso));
+        assert!(finished.len() > 100, "fixture check");
+
+        let (mut r2, reads) = stamp_reader(0xB2);
+        let opts = SweepOptions {
+            decrypt: true,
+            resume: true,
+            batch_sectors: None,
+            skip_on_error: true,
+            progress: None,
+            halt: None,
+            keys: None,
+        };
+        crate::recovery::sweep(&disc, &mut r2, &iso, &opts).expect("run 2");
+        let reads = reads.lock().unwrap();
+        assert!(
+            finished.iter().all(|l| reads.contains(l)),
+            "run 2 resumed the raw partial"
+        );
+        assert_eq!(marker_at(&iso, finished[0]), 0xB2);
+    }
+
+    // "No image" is missing or an empty regular file. A device reports length 0 whatever it
+    // holds, so another disc's map beside one is still refused, never dropped.
+    #[test]
+    fn only_a_missing_or_empty_regular_file_counts_as_no_image() {
+        let (dir, iso) = scratch_iso("no-image");
+        assert!(crate::recovery::no_image(&iso).unwrap());
+        std::fs::write(&iso, b"").unwrap();
+        assert!(crate::recovery::no_image(&iso).unwrap());
+        std::fs::write(&iso, b"x").unwrap();
+        assert!(!crate::recovery::no_image(&iso).unwrap());
+        assert!(!crate::recovery::no_image(dir.path()).unwrap());
+        #[cfg(unix)]
+        assert!(!crate::recovery::no_image(std::path::Path::new("/dev/null")).unwrap());
+    }
+
     fn disc_with_hash(c: char) -> libfreemkv::Disc {
         let mut aacs = libfreemkv::test_util::aacs_state().build();
         aacs.disc_hash = c.to_string().repeat(40);
@@ -3310,6 +3477,24 @@ mod tests {
             "{refused:?}"
         );
 
+        let (single, single_opts) = single_pass(true);
+        let (mut r, _) = stamp_reader(0xA1);
+        let copy = |r: &mut StampReader| {
+            multipass_rip(
+                &disc_b,
+                r,
+                &iso,
+                &single,
+                &single_opts,
+                &crate::sink::NoopSink,
+            )
+        };
+        assert!(copy(&mut r).is_err(), "a single-pass copy is refused too");
+
+        std::fs::remove_file(&iso).unwrap();
+        let fresh =
+            copy(&mut r).expect("a stale map with no image must not block a copy of disc B");
+        assert!(fresh.complete, "{fresh:?}");
         std::fs::remove_file(&iso).unwrap();
         let fresh = rip(&disc_b).expect("a stale map with no image must not block disc B");
         assert!(fresh.complete, "{fresh:?}");

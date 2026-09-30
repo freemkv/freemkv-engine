@@ -176,6 +176,14 @@ pub(crate) fn copy_in(
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
         let mut map = mapfile::Mapfile::load(&mf_path).map_err(Error::from)?;
+        // Another disc's map with no image beside it guards no data (a consumer deleted the
+        // ISO after muxing it): start fresh instead of refusing every later rip.
+        if mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).is_err()
+            && no_image(path)?
+        {
+            tracing::info!("copy dispatch: → sweep (another disc's mapfile has no image)");
+            return sweep_internal(disc, reader, path, opts, false, halt);
+        }
         // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
         // stream file is now located, so widen it and let the dispatch fill the rest.
         if map.scope().is_some() {
@@ -189,7 +197,7 @@ pub(crate) fn copy_in(
         mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).map_err(Error::from)?;
         if map.raw().is_some_and(|raw| raw == opts.decrypt) {
             // An image of the other raw/decrypt mode: resuming or patching it would mix the two.
-            tracing::info!("copy dispatch: → sweep (mapfile is for the other raw/decrypt mode)");
+            tracing::warn!("copy dispatch: image is in the other raw/decrypt mode; overwriting it");
             return sweep_internal(disc, reader, path, opts, false, halt);
         }
         let stats = map.stats();
@@ -464,6 +472,16 @@ pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageStat
         IsoLen::Len(n) => n,
     };
     Ok(ImageState { len, want })
+}
+
+// No recovered data at `path`: missing, or an EMPTY REGULAR file. A device reports length 0
+// whatever it holds, so it never counts as empty. A stat error other than "not found" is an error.
+pub(crate) fn no_image(path: &std::path::Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.is_file() && m.len() == 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(Error::from(e)),
+    }
 }
 
 // Whether the output is a REGULAR FILE — governs sync_all-failure severity and pre-sizing. A
@@ -842,7 +860,7 @@ fn sweep_linked(
                 {
                     // Another disc's map over a missing/empty image guards no data (a consumer
                     // deleted the ISO after muxing it): drop it and start fresh.
-                    if image_state(path, existing.total_size())?.len != 0 {
+                    if !no_image(path)? {
                         return Err(Error::from(e));
                     }
                     tracing::info!(
@@ -851,9 +869,7 @@ fn sweep_linked(
                     resume = false;
                 } else if existing.raw().is_some_and(|raw| raw == opts.decrypt) {
                     // Raw and decrypted sectors must never share one image.
-                    tracing::info!(
-                        "sweep: mapfile is for the other raw/decrypt mode; forcing fresh sweep"
-                    );
+                    tracing::warn!("sweep: image is in the other raw/decrypt mode; overwriting it");
                     resume = false;
                 } else if existing.total_size() != total_bytes {
                     tracing::info!(
