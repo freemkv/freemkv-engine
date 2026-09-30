@@ -1046,8 +1046,6 @@ fn sweep_linked(
     // emitting "no silent hang" liveness even between the 100-iter marks.
     let mut last_log_time = std::time::Instant::now();
     let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
-    let mut in_damage_zone = false;
-    const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
     let mut cached_snapshot: Option<ProgressSnapshot> = None;
     // Derived from `cached_snapshot.bad_ranges` + the main title only, changing
     // exactly when a new snapshot lands — not once per batch. The old per-iteration
@@ -1120,20 +1118,18 @@ fn sweep_linked(
             match read_result {
                 Ok(_) => {
                     read_ok_count += 1;
+                    // `ReadCtx` owns the damage zone (exit after `damage_window_max` clean
+                    // reads, jump multiplier reset with it); the drive speed follows it.
+                    let was_in_zone = read_ctx.in_damage_zone;
                     read_ctx.on_success();
-
-                    if read_ctx.consecutive_good >= DAMAGE_ZONE_EXIT_THRESHOLD {
-                        read_ctx.jump_multiplier = 1;
-                        if in_damage_zone {
-                            in_damage_zone = false;
-                            reader.set_speed(0xFFFF);
-                            tracing::debug!(
-                                target: "freemkv::disc",
-                                phase = "damage_exit",
-                                lba = block_lba,
-                                "Exited damage zone; restoring max read speed"
-                            );
-                        }
+                    if was_in_zone && !read_ctx.in_damage_zone {
+                        reader.set_speed(0xFFFF);
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "damage_exit",
+                            lba = block_lba,
+                            "Exited damage zone; restoring max read speed"
+                        );
                     }
                     // bridge_degradation_count already reset inside on_success() above.
 
@@ -1163,6 +1159,7 @@ fn sweep_linked(
                 }
                 Err(err) => {
                     read_err_count += 1;
+                    let was_in_zone = read_ctx.in_damage_zone;
                     let action = read_error::handle_read_error(&err, &mut read_ctx);
 
                     match action {
@@ -1202,8 +1199,8 @@ fn sweep_linked(
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
 
-                            if !in_damage_zone {
-                                in_damage_zone = true;
+                            // Every Pass-1 jump follows the error that entered the zone.
+                            if !was_in_zone {
                                 reader.set_speed(0x0000);
                                 tracing::debug!(
                                     target: "freemkv::disc",
