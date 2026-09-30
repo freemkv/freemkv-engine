@@ -262,7 +262,7 @@ pub fn patch_pass_decision_measured(
 /// the recovery actually read something (`bytes_good > 0`) first: a complete
 /// Pass 1 still converges and skips redundant passes; an empty mapfile (or a
 /// `None`/unreadable one, which measured never converges) falls through to run
-/// the pass. Mirrors autorip's `pre_pass_converged` over its copy of the loop.
+/// the pass. The server's patch loop calls this same gate.
 pub fn pre_pass_converged(mux_scope_bad: Option<u64>, bytes_good: u64) -> bool {
     bytes_good > 0 && patch_pass_decision_measured(mux_scope_bad, None) == PatchDecision::Converged
 }

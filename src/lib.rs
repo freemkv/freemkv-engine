@@ -61,7 +61,7 @@ pub use multipass::{
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
     end_of_recovery_promotion, loss_aborts, measured_scope_bad, mkv_staging_scope, multipass_rip,
     multipass_rip_staged, multipass_rip_with, pass_exit, patch_made_progress, patch_pass_decision,
-    plan_passes, scope_bad_bytes, scope_converged, should_abort_for_loss,
+    plan_passes, pre_pass_converged, scope_bad_bytes, scope_converged, should_abort_for_loss,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
