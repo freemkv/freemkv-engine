@@ -117,22 +117,36 @@ impl Sink<WorkItem> for SweepSink {
     type Output = ConsumerSummary;
 
     fn apply(&mut self, item: WorkItem) -> Result<Flow, Error> {
+        // Abandoned by teardown: a resumed pass owns the image now.
+        if self.map.is_disowned() {
+            return Ok(Flow::Stop);
+        }
         match item {
             WorkItem::Good { pos, buf } => {
                 // Decrypt is on the producer; consumer assumes plaintext.
                 let len = buf.len() as u64;
-                self.file.seek(SeekFrom::Start(pos))?;
-                self.file.write_all(&buf)?;
+                let lost = |e| super::image_write_failed(&self.map, e);
+                self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
+                self.file.write_all(&buf).map_err(lost)?;
                 self.map.record(pos, len, SectorStatus::Finished)?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
-                self.file.seek(SeekFrom::Start(pos))?;
+                let map = &self.map;
+                self.file
+                    .seek(SeekFrom::Start(pos))
+                    .map_err(|e| super::image_write_failed(map, e))?;
                 // Subsequent writes are sequential; `WritebackFile`'s
                 // seek-elision keeps them on the writeback pipeline path.
                 let mut filled = 0u64;
                 while filled < len {
+                    // A fill can run GBs; stop mid-way if teardown abandons us.
+                    if self.map.is_disowned() {
+                        return Ok(Flow::Stop);
+                    }
                     let chunk = (len - filled).min(self.zero.len() as u64) as usize;
-                    self.file.write_all(&self.zero[..chunk])?;
+                    self.file
+                        .write_all(&self.zero[..chunk])
+                        .map_err(|e| super::image_write_failed(&self.map, e))?;
                     filled += chunk as u64;
                 }
                 self.map.record(pos, len, SectorStatus::NonTrimmed)?;
@@ -162,6 +176,8 @@ impl Sink<WorkItem> for SweepSink {
         if let Err(e) = self.file.sync_all()
             && self.is_regular
         {
+            // The data is not durable: the dropped map must not flush it as Finished.
+            self.map.disown_handle().disown();
             return Err(Error::from(e));
         }
         // Non-regular outputs (/dev/null, pipes) always fail
@@ -389,6 +405,93 @@ mod tests {
         sink.file.set_halt(halt);
         let err = sink.close().err().expect("a halted fsync must fail");
         assert!(matches!(err, Error::Halted), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R3: a failed fsync means the bytes behind this close's Finished records are not
+    // durable, so dropping the sink must not flush those records.
+    #[test]
+    fn a_failed_close_does_not_persist_finished_for_unsynced_data() {
+        let dir = scratch("syncfail-drop");
+        let (mut sink, _iso) = sink_over(&dir, 8192);
+        let fresh = freshly_flushed(&mut sink.map);
+        sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        })
+        .unwrap();
+        if fresh.elapsed() >= FLUSH_WINDOW {
+            return; // the periodic persist already ran: inconclusive, not a failure
+        }
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        assert!(sink.close().is_err(), "a halted fsync must fail");
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a range whose data never reached disk was persisted Finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2: once teardown abandons this consumer (mapfile disowned), a resumed pass owns the
+    // image; an in-flight zero-fill must not go on writing zeros over what it recovers.
+    #[test]
+    fn a_disowned_sink_writes_nothing_more_to_the_image() {
+        let dir = scratch("disowned");
+        let total = 4 * ZERO_CHUNK as u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+        sink.map.disown_handle().disown();
+        let _ = sink.apply(WorkItem::GapFill { pos: 0, len: total });
+        let _ = sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        });
+        drop(sink);
+        let got = std::fs::read(&iso).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 0xAA),
+            "an abandoned consumer overwrote the image a resumed pass now owns"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Under the mapfile's 1 s persist interval: a record made sooner stays in memory only.
+    const FLUSH_WINDOW: std::time::Duration = std::time::Duration::from_millis(900);
+
+    // Persist `map` now, so the next record lands a full interval before the next persist.
+    fn freshly_flushed(map: &mut Mapfile) -> std::time::Instant {
+        map.record(0, 2048, SectorStatus::NonTried).unwrap();
+        map.set_disc_hash(&"ab".repeat(20));
+        map.flush().unwrap();
+        std::time::Instant::now()
+    }
+
+    // An `apply` write error (often the latched writeback failure of an EARLIER item) means
+    // the Finished records before it may not be on disk: the dropped sink must not flush them.
+    #[test]
+    fn a_failed_write_does_not_persist_earlier_finished_records() {
+        let dir = scratch("writefail-drop");
+        let (mut sink, iso) = sink_over(&dir, 8192);
+        let read_only = std::fs::File::open(&iso).unwrap();
+        sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
+        let fresh = freshly_flushed(&mut sink.map);
+        sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+        let r = sink.apply(WorkItem::Good {
+            pos: 2048,
+            buf: vec![0x5Au8; 2048],
+        });
+        if fresh.elapsed() >= FLUSH_WINDOW {
+            return; // inconclusive, as above
+        }
+        assert!(r.is_err(), "a write to a read-only handle must fail");
+        drop(sink);
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a failed write left earlier, possibly lost, ranges persisted Finished"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

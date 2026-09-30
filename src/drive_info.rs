@@ -113,10 +113,6 @@ const FEATURES: &[(u16, &str)] = &[
 
 /// Capture all available drive data via SCSI commands.
 /// Returns raw responses — no formatting, no zipping, no presentation.
-///
-/// The Renesas signature check is the pure [`is_renesas_sat`] (unit-tested). This function
-/// and `raw` themselves need a `&mut Drive`, which libfreemkv cannot build without a real
-/// SCSI device, so their remaining mutants are untestable here.
 pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let id = &session.drive_id;
 
@@ -143,21 +139,15 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
     let (mut wb_41, mut rb_b0_04_postknock, mut rb_b0_500000_postknock) = (None, None, None);
     let mut rb_f4 = None;
     if rb_f1.as_deref().is_some_and(is_renesas_sat) {
-        use libfreemkv::scsi::{DataDirection as D, build_read_buffer};
-        let read_04 = build_read_buffer(0x02, 0xB0, 0x04, 164);
-        let read_500000 = build_read_buffer(0x02, 0xB0, 0x500000, 164);
-        let read_f4 = build_read_buffer(0x02, 0xF4, 0x00, 256);
-        let knock = [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0];
-
         // BEFORE: both windows + the F4 firmware window.
-        rb_b0_04 = raw(session, &read_04, D::FromDevice, 164);
-        rb_b0_500000 = raw(session, &read_500000, D::FromDevice, 164);
-        rb_f4 = raw(session, &read_f4, D::FromDevice, 256);
+        rb_b0_04 = read_window(session, RB_B0_04);
+        rb_b0_500000 = read_window(session, RB_B0_500000);
+        rb_f4 = read_window(session, RB_F4);
         // KNOCK: the universal enable (payload-less write). `Some(empty)` = GOOD.
-        wb_41 = raw(session, &knock, D::None, 0);
+        wb_41 = raw(session, &KNOCK, libfreemkv::scsi::DataDirection::None, 0);
         // AFTER: re-read both windows to observe the knock's effect.
-        rb_b0_04_postknock = raw(session, &read_04, D::FromDevice, 164);
-        rb_b0_500000_postknock = raw(session, &read_500000, D::FromDevice, 164);
+        rb_b0_04_postknock = read_window(session, RB_B0_04);
+        rb_b0_500000_postknock = read_window(session, RB_B0_500000);
     }
 
     // Standard queries
@@ -179,6 +169,25 @@ pub fn capture_drive_data(session: &mut Drive) -> Result<DriveCapture> {
         rb_b0_500000_postknock,
         rb_f4,
     })
+}
+
+/// A Renesas READ_BUFFER (mode 0x02) window: `(buffer id, offset, length)`.
+type Window = (u8, u32, u32);
+const RB_B0_04: Window = (0xB0, 0x04, 164);
+const RB_B0_500000: Window = (0xB0, 0x50_0000, 164);
+const RB_F4: Window = (0xF4, 0x00, 256);
+/// WRITE BUFFER mode 0x02, id 0x41, offset 0xA5AAAA, no payload.
+const KNOCK: [u8; 10] = [0x3B, 0x02, 0x41, 0xA5, 0xAA, 0xAA, 0, 0, 0, 0];
+
+/// Read one Renesas window; the CDB's length and the buffer size come from one value.
+fn read_window(session: &mut Drive, (id, offset, len): Window) -> Option<Vec<u8>> {
+    let cdb = libfreemkv::scsi::build_read_buffer(0x02, id, offset, len);
+    raw(
+        session,
+        &cdb,
+        libfreemkv::scsi::DataDirection::FromDevice,
+        len as usize,
+    )
 }
 
 /// Renesas signature: `SAT` at bytes 16..19 of the READ_BUFFER 0xF1 response.
@@ -224,7 +233,8 @@ pub fn mask_bytes(data: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    //! Privacy-masking + capture-orchestration tests.
+    //! Privacy-masking, Debug and feature-table tests. `capture_drive_data` needs a
+    //! real SCSI device; only its pure signature check (`is_renesas_sat`) is tested.
     //!
     //! `mask_string` / `mask_bytes` redact identifying characters before
     //! a drive capture leaves the machine: every ASCII letter → 'A',

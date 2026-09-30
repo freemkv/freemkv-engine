@@ -2,12 +2,10 @@
 //!
 //! [`recover_to_iso`] is the disc→ISO half of a rip: it runs the multipass
 //! sweep/patch dispatch ([`crate::recovery::copy`]) against a caller-provided
-//! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`]. It is the
-//! first consumer of the relocated recovery module, and the piece a front-end
-//! composes with `mux_with_keys` to get disc→MKV.
-//!
-//! The ISO→MKV mux stage is driven by the front-end via `libfreemkv::mux_with_keys`,
-//! kept separately callable to mirror how the CLI and autorip already stage a rip.
+//! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`].
+//! The mux stage lives beside it ([`crate::mux_title`], [`crate::run_titles`],
+//! [`crate::mux_image_titles`], [`crate::remux_iso`]); [`ProgressBridge`] adapts
+//! libfreemkv pass progress to the [`Sink`].
 
 use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
@@ -37,6 +35,16 @@ impl Drop for SignalDone<'_> {
     }
 }
 
+// Wakes a parked watcher on every exit path. Declare it BEFORE the `SignalDone` guard: locals
+// drop in reverse, so `done` is already set when the watcher wakes.
+pub(crate) struct WakeOnDrop(pub(crate) std::thread::Thread);
+
+impl Drop for WakeOnDrop {
+    fn drop(&mut self) {
+        self.0.unpark();
+    }
+}
+
 // Wires a halt token, not just the progress callback, so Stop is honoured even during a retry
 // cooldown when no progress tick fires.
 pub(crate) fn with_cancel_watcher<T>(
@@ -58,16 +66,17 @@ pub(crate) fn with_cancel_watcher<T>(
     std::thread::scope(|s| {
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
-        s.spawn(move || {
+        let watcher = s.spawn(move || {
             while !watcher_done.load(Ordering::Acquire) {
                 if sink.should_cancel() {
                     watcher_halt.store(true, Ordering::Relaxed);
                     return;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
             }
         });
 
+        let _wake = WakeOnDrop(watcher.thread().clone());
         let _signal_done = SignalDone(&done);
         f(&halt)
     })
@@ -97,6 +106,13 @@ impl<'a> ProgressBridge<'a> {
 
 impl libfreemkv::progress::Progress for ProgressBridge<'_> {
     fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+        self.report_at(std::time::Instant::now(), p)
+    }
+}
+
+impl ProgressBridge<'_> {
+    // `report` at an injected `now`, so the speed derivation is testable.
+    fn report_at(&self, now: std::time::Instant, p: &libfreemkv::progress::PassProgress) -> bool {
         // Borrowed, not allocated: this runs once per batch.
         let pass: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(match p.kind {
             libfreemkv::progress::PassKind::Sweep => "sweep",
@@ -107,11 +123,16 @@ impl libfreemkv::progress::Progress for ProgressBridge<'_> {
         });
         // Derive speed/ETA ONCE, here — the front-end just formats it. Sweep's
         // work_done/work_total are the authoritative progress denominator.
-        let (speed_bps, eta_secs) = self
-            .speed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sample(p.work_done, p.work_total);
+        let (speed_bps, eta_secs) = {
+            let mut speed = self.speed.lock().unwrap_or_else(|e| e.into_inner());
+            // Patch passes read in bursts: a fixed window shows a burst instead of diluting it.
+            speed.set_responsive(matches!(
+                p.kind,
+                libfreemkv::progress::PassKind::Scrape { .. }
+                    | libfreemkv::progress::PassKind::Trim { .. }
+            ));
+            speed.sample_at(now, p.work_done, p.work_total)
+        };
         let progress = Progress {
             pass,
             bytes_done: p.work_done,
@@ -264,9 +285,8 @@ mod tests {
 
     #[test]
     fn single_pass_recovers_a_clean_synthetic_disc_to_iso() {
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-run-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("out.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
 
         let sectors = 256u32;
         let disc = clean_disc(sectors);
@@ -285,8 +305,6 @@ mod tests {
         assert!(!result.halted);
         // The engine logged the recovery start (the bridge/sink is wired).
         assert!(sink.logs.load(Ordering::Relaxed) >= 1);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Exercises the WATCHER, not the check-before-starting: a sink that stays uncancelled for
@@ -310,7 +328,7 @@ mod tests {
             asks: AtomicUsize::new(0),
         };
         let observed = with_cancel_watcher(&sink, |halt| {
-            // Give the watcher time to poll at least once (it sleeps 100 ms); the
+            // Give the watcher time to poll at least once (every 100 ms); the
             // loop returns the instant the flag goes up, costing nothing on the
             // happy path. This is a liveness backstop, not a timing measurement.
             for _ in 0..400 {
@@ -330,18 +348,16 @@ mod tests {
 
     #[test]
     fn cancel_via_sink_halts_recovery() {
-        // A sink whose should_cancel is always true must make the library halt.
-        // The sweep's progress reporter is called on EVERY batch iteration, so
-        // a tick — and the halt — is guaranteed on the first disc iteration.
+        // A sink cancelled before the call: the pre-start check halts it. The watcher and
+        // `report`'s return are pinned by their own tests.
         struct CancelSink;
         impl Sink for CancelSink {
             fn should_cancel(&self) -> bool {
                 true
             }
         }
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-cancel-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("c.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("c.iso");
         let sectors = 4096u32;
         let disc = clean_disc(sectors);
         let mut reader = ZeroReader { capacity: sectors };
@@ -353,7 +369,6 @@ mod tests {
         // wiring a halt token would legitimately change them.
         assert!(r.halted, "a cancelling sink must halt the rip");
         assert!(!r.complete, "a halted rip is not complete");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // `sectors_bad` must count DAMAGE, not un-swept territory: deriving it from
@@ -445,6 +460,95 @@ mod tests {
         );
     }
 
+    // The watcher is woken when the work ends: a quick call must not wait out a poll interval.
+    #[test]
+    fn a_finished_call_returns_without_waiting_for_the_next_poll() {
+        struct NeverCancel;
+        impl Sink for NeverCancel {}
+        let t0 = std::time::Instant::now();
+        // Each call outlives the watcher's first poll, so the watcher is asleep when it ends.
+        for _ in 0..5 {
+            with_cancel_watcher(&NeverCancel, |_halt| {
+                std::thread::sleep(std::time::Duration::from_millis(5))
+            });
+        }
+        let took = t0.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(250),
+            "5 short calls took {took:?}: each waited out the watcher's 100 ms sleep"
+        );
+    }
+
+    fn tick(kind: libfreemkv::progress::PassKind, done: u64) -> libfreemkv::progress::PassProgress {
+        libfreemkv::progress::PassProgress {
+            kind,
+            work_done: done,
+            work_total: 1 << 40,
+            bytes_good_total: done,
+            bytes_unreadable_total: 0,
+            bytes_pending_total: 0,
+            bytes_retryable_total: 0,
+            bytes_total_disc: 1 << 40,
+            disc_duration_secs: None,
+            bytes_bad_in_main_title: 0,
+            main_title_duration_secs: None,
+            main_title_size_bytes: None,
+            located: libfreemkv::progress::LocatedProgress::default(),
+        }
+    }
+
+    // Patch passes read in bursts: their displayed speed uses the fixed 10 s window, while
+    // the steady sweep's window has grown (to 20 s at 120 s), diluting the same burst.
+    #[test]
+    fn patch_passes_show_a_burst_over_the_fixed_window() {
+        use libfreemkv::progress::PassKind;
+        #[derive(Default)]
+        struct Speeds(std::sync::Mutex<Vec<u64>>);
+        impl Sink for Speeds {
+            fn progress(&self, p: &Progress) {
+                self.0.lock().unwrap().push(p.speed_bps);
+            }
+        }
+        let mib = 1024 * 1024;
+        let last_speed = |kind: PassKind| {
+            let sink = Speeds::default();
+            let bridge = ProgressBridge::new(&sink);
+            let t0 = std::time::Instant::now();
+            for (secs, done) in [(0, 0), (100, 0), (112, 0), (120, 100 * mib)] {
+                bridge.report_at(t0 + std::time::Duration::from_secs(secs), &tick(kind, done));
+            }
+            let last = *sink.0.lock().unwrap().last().unwrap();
+            last / mib
+        };
+        let scrape = PassKind::Scrape { reverse: false };
+        assert_eq!(
+            last_speed(scrape),
+            12,
+            "100 MiB over the last 8 s of a 10 s window"
+        );
+        assert_eq!(last_speed(PassKind::Sweep), 5, "100 MiB over a 20 s window");
+    }
+
+    // `report`'s return is the library's keep-going flag: false exactly when the sink cancels.
+    #[test]
+    fn report_returns_false_once_the_sink_cancels() {
+        use libfreemkv::progress::{PassKind, Progress as _};
+        struct Flag(std::sync::atomic::AtomicBool);
+        impl Sink for Flag {
+            fn should_cancel(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let sink = Flag(std::sync::atomic::AtomicBool::new(false));
+        let bridge = ProgressBridge::new(&sink);
+        assert!(
+            bridge.report(&tick(PassKind::Sweep, 0)),
+            "no cancel: keep going"
+        );
+        sink.0.store(true, Ordering::SeqCst);
+        assert!(!bridge.report(&tick(PassKind::Sweep, 0)), "cancel: halt");
+    }
+
     // A panic inside the watched call must PROPAGATE, not hang the join. The failure mode is a
     // deadlock, so this runs the call on its own thread and asserts via a receive timeout.
     #[test]
@@ -453,14 +557,12 @@ mod tests {
         impl Sink for NeverCancel {}
 
         let (tx, rx) = std::sync::mpsc::channel();
+        // The panic message is expected in the log: the hook is process-global, so swapping
+        // it here would race every other test thread.
         std::thread::spawn(move || {
-            // The panic is deliberate; keep it off the test log.
-            let prev = std::panic::take_hook();
-            std::panic::set_hook(Box::new(|_| {}));
             let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_cancel_watcher(&NeverCancel, |_halt| panic!("boom"));
+                with_cancel_watcher(&NeverCancel, |_halt| panic!("deliberate test panic"));
             }));
-            std::panic::set_hook(prev);
             let _ = tx.send(caught.is_err());
         });
 
@@ -516,9 +618,8 @@ mod tests {
                 self.start.elapsed() > std::time::Duration::from_millis(50)
             }
         }
-        let dir = std::env::temp_dir().join(format!("fmkv-engine-cooldown-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let iso = dir.join("cd.iso");
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("cd.iso");
         let sectors = 4096u32;
         let disc = clean_disc(sectors);
         let mut reader = NotReadyReader { capacity: sectors };
@@ -550,6 +651,5 @@ mod tests {
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
              token is polled every 100 ms and must break the pause"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

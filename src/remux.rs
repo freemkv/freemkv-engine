@@ -33,9 +33,6 @@ pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
         raw,
         // Per title from `MuxPlan::streams` (an `iso://` title) or `InputOptions` (`dir://`).
         selection: libfreemkv::StreamSelection::default(),
-        // Stop v5 ST-X1a: `send_deadline` is retired (T27); `Default` is the
-        // halt-aware-only send every front end now gets.
-        ..Default::default()
     }
 }
 
@@ -191,7 +188,6 @@ fn mux_opened_title(
                 batch_sectors: mux.batch_sectors,
                 raw: mux.raw,
                 selection,
-                ..Default::default()
             };
             let format = opened.disc.content_format;
             mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)

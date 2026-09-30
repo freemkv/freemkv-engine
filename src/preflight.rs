@@ -50,6 +50,7 @@ pub struct Reason {
     /// "multipass-requires-raw" RipMode::Multi without job.raw
     /// "language-unmatched"     a language-filtered class no selected title
     ///                          carries (detail = audio|subtitle|subtitle_forced)
+    /// "unknown-language"       a requested tag names no language (detail = tag)
     /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
     /// ```
     pub key: String,
@@ -76,9 +77,9 @@ impl Reason {
 /// free — safe to call on every UI selection change.
 ///
 /// Checks, cheapest first: the disc has titles; the selection resolves to a non-empty set of
-/// in-range indices; every language-filtered stream class the job asks for is carried by a
-/// selected title; a multipass job is `raw`; and, if the disc is encrypted and the job is not
-/// `raw`, a usable key exists.
+/// in-range indices; every requested language tag names a language; every language-filtered
+/// stream class the job asks for is carried by a selected title; a multipass job is `raw`;
+/// and, if the disc is encrypted and the job is not `raw`, a usable key exists.
 pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     let mut reasons = Vec::new();
 
@@ -114,6 +115,14 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         reasons.push(Reason::new("empty-selection"));
     }
 
+    // A tag that names no language fails the rip only after the image opens; refuse it
+    // here by name (and skip the class check below, which would blame the disc instead).
+    if reasons.is_empty() {
+        for tag in job.streams.unknown_language_tags() {
+            reasons.push(Reason::with_detail("unknown-language", tag));
+        }
+    }
+
     // A language request no selected title can honour. Previously `-a jpn` on a
     // disc with no Japanese audio silently muxed a video-only MKV, exit 0.
     // Judged across the whole selection so multi-title rips aren't over-refused.
@@ -133,14 +142,17 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         reasons.push(Reason::new("multipass-requires-raw"));
     }
 
-    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key. The rip's key
-    // set decides (KU §3.5); without one, the executors' gate over no set (KU-X1: never the
+    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key set (KU §3.5)
+    // covering the selected titles; with none, the executors' gate (KU-X1: never the
     // disc-banked keys), so preflight can't pass a rip the passes refuse.
     let keyed = match &job.keys {
-        Some(set) => matches!(
-            crate::keys::key_status(disc, set),
-            libfreemkv::keys::DecryptStatus::Ready | libfreemkv::keys::DecryptStatus::NotEncrypted
-        ),
+        Some(set) => {
+            matches!(
+                crate::keys::key_status(disc, set),
+                libfreemkv::keys::DecryptStatus::Ready
+                    | libfreemkv::keys::DecryptStatus::NotEncrypted
+            ) && set.covers(&libfreemkv::keys::KeyScope::Titles(resolved))
+        }
         None => crate::resolve::ensure_decryptable_with(disc, false, None).is_ok(),
     };
     if disc.encrypted && !job.raw && !keyed {
@@ -248,8 +260,6 @@ mod tests {
         }
     }
 
-    use crate::job::Job;
-
     // An AacsState as a scan leaves it: it carries no key (KU-X2), so no preflight gate
     // accepts it without the rip's key set (KU-X1).
     fn resolved_aacs() -> libfreemkv::AacsState {
@@ -328,6 +338,31 @@ mod tests {
         );
         let banked = preflight(&disc_with(2, true, true), &j);
         assert!(banked.reasons().iter().any(|r| r.key == "encrypted-no-key"));
+    }
+
+    // A set resolved for title 0 does not key title 1: the executors refuse a title outside
+    // the set's scope, so preflight must not report Ready for it.
+    #[test]
+    fn a_set_that_does_not_cover_the_selection_is_not_keyed() {
+        use crate::test_fixtures::{Answer, Calls, K1, K2, bd_image, resolve};
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let scope = libfreemkv::keys::KeyScope::Titles(vec![0]);
+        let set = resolve(&fx, scope, &[(Answer::Keydb, &[K1])], &Calls::default()).unwrap();
+        let job = |sel| Job {
+            selection: sel,
+            ..Job::new("iso://x.iso", "/out").with_keys(set.clone())
+        };
+        assert_eq!(
+            preflight(&fx.disc, &job(Selection::Titles(vec![0]))),
+            Preflight::Ready
+        );
+        for sel in [Selection::Titles(vec![1]), Selection::All] {
+            let pf = preflight(&fx.disc, &job(sel.clone()));
+            assert!(
+                pf.reasons().iter().any(|r| r.key == "encrypted-no-key"),
+                "{sel:?} reaches a title the set does not key: {pf:?}"
+            );
+        }
     }
 
     // `is_ready` is the accessor a front-end greys out Start on; assert both directions against
@@ -435,8 +470,7 @@ mod tests {
         );
     }
 
-    // A title carrying exactly the audio languages named, and one English
-    // full subtitle so the subtitle class is never the thing being tested.
+    // A title carrying exactly the audio languages named and no subtitles.
     fn title_with_audio(langs: &[&str]) -> libfreemkv::DiscTitle {
         let mut t = libfreemkv::DiscTitle::empty();
         t.duration_secs = 3600.0;
@@ -541,6 +575,81 @@ mod tests {
             preflight(&d, &audio_job(&["jpn"])).is_ready(),
             "a title with no audio streams cannot 'miss' an audio language"
         );
+    }
+
+    // English audio plus one full and one forced subtitle in `sub` and `forced`.
+    fn title_with_subs(sub: &str, forced: &str) -> libfreemkv::DiscTitle {
+        let mut t = title_with_audio(&["eng"]);
+        for (i, (lang, forced)) in [(sub, false), (forced, true)].into_iter().enumerate() {
+            t.streams
+                .push(libfreemkv::Stream::Subtitle(libfreemkv::SubtitleStream {
+                    pid: 0x1200 + i as u16,
+                    codec: libfreemkv::Codec::Pgs,
+                    language: lang.into(),
+                    forced,
+                    qualifier: libfreemkv::LabelQualifier::None,
+                    codec_data: None,
+                }));
+        }
+        t
+    }
+
+    fn unmatched(pf: &Preflight) -> Vec<&str> {
+        pf.reasons()
+            .iter()
+            .filter(|r| r.key == "language-unmatched")
+            .filter_map(|r| r.detail.as_deref())
+            .collect()
+    }
+
+    // Both subtitle sides are judged on their own, across the whole selection.
+    #[test]
+    fn a_subtitle_language_no_selected_title_carries_is_refused() {
+        let d = disc_with_titles(vec![
+            title_with_subs("eng", "eng"),
+            title_with_subs("fra", "fra"),
+        ]);
+        let job = |sel: Selection, sub: &str, forced: &str| {
+            Job::new("iso://x.iso", "/out")
+                .with_selection(sel)
+                .with_subtitles(crate::job::StreamFilter::Langs(vec![sub.into()]))
+                .with_forced_subtitles(crate::job::StreamFilter::Langs(vec![forced.into()]))
+        };
+        assert!(preflight(&d, &job(Selection::All, "fra", "eng")).is_ready());
+        let only_first = Selection::Titles(vec![0]);
+        assert_eq!(
+            unmatched(&preflight(&d, &job(only_first.clone(), "fra", "eng"))),
+            ["subtitle"]
+        );
+        assert_eq!(
+            unmatched(&preflight(&d, &job(Selection::All, "eng", "deu"))),
+            ["subtitle_forced"]
+        );
+        let every = Job {
+            selection: only_first,
+            ..job(Selection::All, "fra", "fra")
+                .with_audio(crate::job::StreamFilter::Langs(vec!["jpn".into()]))
+        };
+        assert_eq!(
+            unmatched(&preflight(&d, &every)),
+            ["audio", "subtitle", "subtitle_forced"]
+        );
+    }
+
+    // A tag that names no language is refused as such, before any stream is judged: the
+    // rip would otherwise fail on it after opening the image.
+    #[test]
+    fn an_unknown_language_tag_is_refused_by_name() {
+        let d = disc_with_titles(vec![title_with_audio(&["eng"])]);
+        for tags in [vec!["eng", "Klingonish"], vec!["Klingonish"]] {
+            let pf = preflight(&d, &audio_job(&tags));
+            let keys: Vec<_> = pf
+                .reasons()
+                .iter()
+                .map(|r| (r.key.as_str(), r.detail.as_deref()))
+                .collect();
+            assert_eq!(keys, [("unknown-language", Some("Klingonish"))], "{tags:?}");
+        }
     }
 
     #[test]

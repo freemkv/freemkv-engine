@@ -895,14 +895,12 @@ fn multipass_rip_inner(
                 // NonTrimmed silently drops out — a write error ships as a good rip.
                 let mut promotion_intact = true;
                 let (promote_from, promote_to) = end_of_recovery_promotion();
-                for (pos, size) in map.ranges_with(promote_from) {
-                    if let Err(e) = map.record(pos, size, promote_to) {
-                        promotion_intact = false;
-                        sink.log(
-                            Level::Warn,
-                            &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
-                        );
-                    }
+                if let Err(e) = map.promote(promote_from, promote_to) {
+                    promotion_intact = false;
+                    sink.log(
+                        Level::Warn,
+                        &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
+                    );
                 }
                 if let Err(e) = map.flush() {
                     promotion_intact = false;

@@ -34,8 +34,9 @@ pub(crate) fn is_key_stop(err: &Error) -> bool {
     matches!(err, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing)
 }
 
-/// Whether a failed read may enter skip-on-error damage handling. `Halted`
-/// keeps its existing route there pending the unified stop redesign.
+/// Whether a failed read may enter damage handling. The sweep takes `Halted` as a stop
+/// before asking; `section_recover` leaves the span bad and its handler's halt check ends
+/// the chain `Halted` (a Fatal there would turn a patch Stop into `Err(Halted)`).
 pub(crate) fn is_damage_candidate(err: &Error) -> bool {
     !is_key_stop(err) && (is_read_fault(err) || matches!(err, Error::Halted))
 }
@@ -528,7 +529,8 @@ pub(crate) enum SendStall {
     /// The halt token fired while the producer was waiting for a slot. Not an
     /// error: the caller reports the pass as halted and drops the item.
     Halted,
-    /// The consumer thread is gone (panicked / receiver dropped).
+    /// The consumer thread is gone (panicked / receiver dropped), or its `apply`
+    /// failed and it now discards every item.
     ConsumerGone,
     /// The consumer is ALIVE but has not taken the item within
     /// [`SEND_DEADLINE`] — the hung-mount case.
@@ -546,6 +548,15 @@ impl SendStall {
             // drain within its deadline". `finish_with_halt` returns it for the
             // same condition observed at join instead of at send.
             SendStall::Stalled => Error::PipelineJoinTimeout,
+        }
+    }
+
+    /// What a failed hand-off makes of the pass: `None` for a Stop (a parked send is a
+    /// halt, not a failure), else the error that fails it.
+    pub(crate) fn pass_error(self) -> Option<Error> {
+        match self {
+            SendStall::Halted => None,
+            stall => Some(stall.into_error()),
         }
     }
 }
@@ -569,6 +580,11 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
     halt: &libfreemkv::halt::Halt,
     deadline: std::time::Duration,
 ) -> std::result::Result<(), SendStall> {
+    // A failed consumer drains and discards, so the fast path below would accept every item
+    // and the producer read on for a write that already failed.
+    if pipe.consumer_failed() {
+        return Err(SendStall::ConsumerGone);
+    }
     // Try ONCE, without blocking, before halt gets a vote: `send_with_halt` polls halt
     // first and would otherwise discard an item that took real drive time to produce.
     // Nothing here can block; `Disconnected` falls through too so diagnosis stays put.
@@ -582,6 +598,9 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
             if halt.is_cancelled() {
                 return Err(SendStall::Halted);
             }
+            if pipe.consumer_failed() {
+                return Err(SendStall::ConsumerGone);
+            }
             // Not halted: item came back for disconnect/deadline/fatal-apply. One probe
             // separates them; `Ok` stays a success even if apply failed (finish() surfaces
             // the real error). Uses `is_disconnected()`: libfreemkv doesn't re-export the type.
@@ -592,6 +611,26 @@ fn send_bounded_within<I: Send + 'static, R: Send + 'static>(
             }
         }
     }
+}
+
+// The error that fails a pass whose producer stopped with `producer`, given the consumer's
+// teardown result: the producer's, unless the consumer's `apply` had already failed.
+pub(crate) fn pass_failure<R>(
+    producer: Error,
+    consumer: Result<R>,
+    consumer_failed: bool,
+) -> Error {
+    match consumer {
+        Err(cause) if consumer_failed => cause,
+        _ => producer,
+    }
+}
+
+// A failed image write/seek: earlier records may cover bytes that never reach disk (a
+// latched writeback error surfaces on a LATER write), so the mapfile stops persisting.
+pub(crate) fn image_write_failed(map: &mapfile::Mapfile, e: std::io::Error) -> Error {
+    map.disown_handle().disown();
+    Error::from(e)
 }
 
 // Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive consumer gets a
@@ -755,7 +794,7 @@ pub fn ensure_whole_image(path: &std::path::Path) -> Result<()> {
 
 /// Refuse muxing `titles` (indices into `disc.titles`, scanned from the image at `path`)
 /// when the image was staged for an MKV rip and its scope does not hold every sector of
-/// their extents: the rest was never read, so it would mux zeros. Checked by extents, so
+/// their extents, or holds some never read (a stopped staging): those would mux zeros. Checked by extents, so
 /// a staging mux that re-maps its titles against the staged image still passes.
 pub fn ensure_titles_staged(
     path: &std::path::Path,
@@ -770,6 +809,8 @@ pub fn ensure_titles_staged(
     let Some(scope) = map.scope() else {
         return Ok(());
     };
+    // In scope is not enough: a staging sweep stopped part-way leaves NonTried there too.
+    let unread = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
     let extents = titles
         .iter()
         .filter_map(|&i| disc.titles.get(i))
@@ -777,7 +818,7 @@ pub fn ensure_titles_staged(
     for e in extents {
         let want = (e.start_lba as u64 * 2048, e.sector_count as u64 * 2048);
         let have: u64 = mapfile::intersect(&[want], scope).iter().map(|r| r.1).sum();
-        if have != want.1 {
+        if have != want.1 || !mapfile::intersect(&[want], &unread).is_empty() {
             return Err(Error::ImageScoped {
                 path: path.display().to_string(),
             });
@@ -792,6 +833,66 @@ pub(crate) fn sector_scope_to_bytes(scope: &[(u32, u32)]) -> Vec<(u64, u64)> {
         .iter()
         .map(|&(l, n)| (l as u64 * 2048, n as u64 * 2048))
         .collect()
+}
+
+// Minimum interval between sweep progress reports (patch's PROGRESS_TICK_MS).
+const SWEEP_TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+// A sweep's progress bar: `work_*` run 0..=100% over the pass's domain (its scope, or the
+// whole disc), counting what the mapfile already held as done, so a resume starts there.
+struct SweepBar {
+    // Mapfile stats at pass start: stand in for a consumer snapshot until one lands.
+    base: mapfile::MapStats,
+    done_before: u64,
+    domain: u64,
+    total_bytes: u64,
+}
+
+impl SweepBar {
+    // One tick after `done` bytes of this pass's regions, `good` of them read clean.
+    fn tick(
+        &self,
+        disc: &libfreemkv::Disc,
+        snap: Option<&sweep::ProgressSnapshot>,
+        main_title_bad: u64,
+        located: &libfreemkv::progress::LocatedProgress,
+        done: u64,
+        good: u64,
+    ) -> libfreemkv::progress::PassProgress {
+        let b = &self.base;
+        // The snapshot lags the producer, so good never regresses below its own count.
+        // Without one, done-but-not-good bytes are this pass's damage, not lost from view.
+        let (good, unreadable, pending, retryable) = match snap {
+            Some(s) => (
+                s.stats.bytes_good.max(b.bytes_good.saturating_add(good)),
+                s.stats.bytes_unreadable,
+                s.stats.bytes_pending,
+                s.stats.bytes_retryable,
+            ),
+            None => (
+                b.bytes_good.saturating_add(good),
+                b.bytes_unreadable,
+                b.bytes_pending.saturating_sub(done),
+                b.bytes_retryable.saturating_add(done.saturating_sub(good)),
+            ),
+        };
+        let main_title = disc.titles.first();
+        libfreemkv::progress::PassProgress {
+            kind: libfreemkv::progress::PassKind::Sweep,
+            work_done: self.done_before.saturating_add(done).min(self.domain),
+            work_total: self.domain,
+            bytes_good_total: good,
+            bytes_unreadable_total: unreadable,
+            bytes_pending_total: pending,
+            bytes_retryable_total: retryable,
+            bytes_total_disc: self.total_bytes,
+            disc_duration_secs: main_title.map(|t| t.duration_secs),
+            bytes_bad_in_main_title: main_title_bad,
+            main_title_duration_secs: main_title.map(|t| t.duration_secs),
+            main_title_size_bytes: main_title.map(|t| t.size_bytes),
+            located: located.clone(),
+        }
+    }
 }
 
 // A sweep under `halt`, which already holds `opts.halt`.
@@ -817,7 +918,6 @@ fn sweep_linked(
     lib: &libfreemkv::Halt,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
-    use libfreemkv::sector::SectorSource;
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
     // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
@@ -897,7 +997,7 @@ fn sweep_linked(
                     }
                 }
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 // Mapfile exists but is corrupt/unparseable. resume=true would hand
                 // garbage to open_or_create and mis-track progress; downgrade so the
                 // `!resume` path below drops it and the rip restarts clean.
@@ -907,6 +1007,9 @@ fn sweep_linked(
                 );
                 resume = false;
             }
+            // EIO/EACCES/ESTALE say nothing about the contents: a fresh sweep would
+            // delete a good mapfile and truncate the ISO, so surface them.
+            Err(e) => return Err(Error::from(e)),
         }
     }
     if !resume {
@@ -969,6 +1072,22 @@ fn sweep_linked(
     if let Some(scope) = map.scope() {
         regions = mapfile::intersect(&regions, scope);
     }
+    let domain = match map.scope() {
+        Some(scope) => mapfile::intersect(&[(0, total_bytes)], scope)
+            .iter()
+            .map(|r| r.1)
+            .sum(),
+        None => total_bytes,
+    };
+    let todo: u64 = regions.iter().map(|&(p, n)| snap_to_sectors(p, n).1).sum();
+    let bar = SweepBar {
+        base: map.stats(),
+        done_before: domain.saturating_sub(todo),
+        domain,
+        total_bytes,
+    };
+    // The drilldown starts from the damage already recorded, not empty.
+    let prior_damage = map.ranges_with(&mapfile::damage_sector_statuses());
 
     // Spawn the consumer (owns WritebackFile + Mapfile; producer keeps reader/halt).
     // `map_disown` is taken BEFORE `map` moves into the sink: it's the only way left
@@ -981,6 +1100,9 @@ fn sweep_linked(
     // Halt token for `send_bounded` below: the op's; with none wired, a never-cancelled
     // token keeps SEND_DEADLINE as the only bound.
     let send_halt = lib.clone();
+    // One hand-off; `Err` ends the read loop (see `SendStall::pass_error`).
+    let send =
+        |item: WorkItem| send_bounded(&pipe, item, &send_halt).map_err(SendStall::pass_error);
 
     let mut buf = vec![0u8; batch as usize * 2048];
     // POSITION: how far the producer's cursor has advanced, good bytes and
@@ -1009,14 +1131,20 @@ fn sweep_linked(
     // emitting "no silent hang" liveness even between the 100-iter marks.
     let mut last_log_time = std::time::Instant::now();
     let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
-    let mut in_damage_zone = false;
-    const DAMAGE_ZONE_EXIT_THRESHOLD: u64 = 16;
     let mut cached_snapshot: Option<ProgressSnapshot> = None;
     // Derived from `cached_snapshot.bad_ranges` + the main title only, changing
     // exactly when a new snapshot lands — not once per batch. The old per-iteration
     // recompute ran `bytes_bad_in_title` (O(ranges x extents)) up to 1.6M times/rip.
-    let mut cached_main_title_bad: u64 = 0;
-    let mut cached_located = libfreemkv::progress::LocatedProgress::default();
+    let (mut cached_main_title_bad, mut cached_located) = match disc.titles.first() {
+        Some(t) => (
+            bytes_bad_in_title(t, &prior_damage),
+            locate_ranges(&prior_damage, t),
+        ),
+        None => (0, libfreemkv::progress::LocatedProgress::default()),
+    };
+    let mut last_tick: Option<std::time::Instant> = None;
+    // A tick the throttle skipped: reported once the pass completes, so its bar ends at 100%.
+    let mut tick_owed = false;
     let mut producer_err: Option<Error> = None;
 
     tracing::trace!(
@@ -1083,44 +1211,38 @@ fn sweep_linked(
             match read_result {
                 Ok(_) => {
                     read_ok_count += 1;
+                    // `ReadCtx` owns the damage zone (exit after `damage_window_max` clean
+                    // reads, jump multiplier reset with it); the drive speed follows it.
+                    let was_in_zone = read_ctx.in_damage_zone;
                     read_ctx.on_success();
-
-                    if read_ctx.consecutive_good >= DAMAGE_ZONE_EXIT_THRESHOLD {
-                        read_ctx.jump_multiplier = 1;
-                        if in_damage_zone {
-                            in_damage_zone = false;
-                            reader.set_speed(0xFFFF);
-                            tracing::debug!(
-                                target: "freemkv::disc",
-                                phase = "damage_exit",
-                                lba = block_lba,
-                                "Exited damage zone; restoring max read speed"
-                            );
-                        }
+                    if was_in_zone && !read_ctx.in_damage_zone {
+                        reader.set_speed(0xFFFF);
+                        tracing::debug!(
+                            target: "freemkv::disc",
+                            phase = "damage_exit",
+                            lba = block_lba,
+                            "Exited damage zone; restoring max read speed"
+                        );
                     }
                     // bridge_degradation_count already reset inside on_success() above.
 
-                    // Plaintext: DecryptingSectorSource decrypted in-place during read.
+                    // Plaintext: the whole-disc reader decrypted in place during the read.
 
                     // Fresh owned Vec into the channel; producer's `buf` is reused.
                     let send_buf = buf[..block_bytes as usize].to_vec();
-                    match send_bounded(&pipe, WorkItem::Good { pos, buf: send_buf }, &send_halt) {
-                        Ok(()) => {}
-                        // A Stop that lands while this send is parked is a
-                        // halt, not a failure: same outcome as the loop-top
-                        // check that used to be the only place it could land.
-                        Err(SendStall::Halted) => {
-                            halt_requested = true;
-                            break 'outer;
-                        }
-                        Err(stall) => {
-                            producer_err = Some(stall.into_error());
-                            break 'outer;
-                        }
+                    if let Err(e) = send(WorkItem::Good { pos, buf: send_buf }) {
+                        (halt_requested, producer_err) = (e.is_none(), e);
+                        break 'outer;
                     }
                     bytes_good_done = bytes_good_done.saturating_add(block_bytes);
                     bytes_done = bytes_done.saturating_add(block_bytes);
                     pos += block_bytes;
+                }
+                // A Stop that landed mid-read (the drive's LD3 `Halted`): the pass ends
+                // halted and the block stays NonTried, never zero-filled as damage.
+                Err(Error::Halted) => {
+                    halt_requested = true;
+                    break 'outer;
                 }
                 // Not skipping, or not disc damage (e.g. a decrypt refusal): abort
                 // with the real cause rather than zero-filling it as NonTrimmed.
@@ -1130,6 +1252,7 @@ fn sweep_linked(
                 }
                 Err(err) => {
                     read_err_count += 1;
+                    let was_in_zone = read_ctx.in_damage_zone;
                     let action = read_error::handle_read_error(&err, &mut read_ctx);
 
                     match action {
@@ -1140,23 +1263,13 @@ fn sweep_linked(
                             }
                         }
                         read_error::ReadAction::SkipBlock { pause_secs } => {
-                            match send_bounded(
-                                &pipe,
-                                WorkItem::SkipFill {
-                                    pos,
-                                    len: block_bytes,
-                                },
-                                &send_halt,
-                            ) {
-                                Ok(()) => {}
-                                Err(SendStall::Halted) => {
-                                    halt_requested = true;
-                                    break 'outer;
-                                }
-                                Err(stall) => {
-                                    producer_err = Some(stall.into_error());
-                                    break 'outer;
-                                }
+                            let fill = WorkItem::SkipFill {
+                                pos,
+                                len: block_bytes,
+                            };
+                            if let Err(e) = send(fill) {
+                                (halt_requested, producer_err) = (e.is_none(), e);
+                                break 'outer;
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
                             if sleep_secs_or_halt(pause_secs, halt) {
@@ -1169,28 +1282,18 @@ fn sweep_linked(
                             sectors,
                             pause_secs,
                         } => {
-                            match send_bounded(
-                                &pipe,
-                                WorkItem::SkipFill {
-                                    pos,
-                                    len: block_bytes,
-                                },
-                                &send_halt,
-                            ) {
-                                Ok(()) => {}
-                                Err(SendStall::Halted) => {
-                                    halt_requested = true;
-                                    break 'outer;
-                                }
-                                Err(stall) => {
-                                    producer_err = Some(stall.into_error());
-                                    break 'outer;
-                                }
+                            let fill = WorkItem::SkipFill {
+                                pos,
+                                len: block_bytes,
+                            };
+                            if let Err(e) = send(fill) {
+                                (halt_requested, producer_err) = (e.is_none(), e);
+                                break 'outer;
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
 
-                            if !in_damage_zone {
-                                in_damage_zone = true;
+                            // Every Pass-1 jump follows the error that entered the zone.
+                            if !was_in_zone {
                                 reader.set_speed(0x0000);
                                 tracing::debug!(
                                     target: "freemkv::disc",
@@ -1212,23 +1315,13 @@ fn sweep_linked(
                             // `>= 0` here is an equivalent mutant: a zero-length GapFill is a
                             // no-op end to end.
                             if gap_bytes > 0 {
-                                match send_bounded(
-                                    &pipe,
-                                    WorkItem::GapFill {
-                                        pos: gap_start,
-                                        len: gap_bytes,
-                                    },
-                                    &send_halt,
-                                ) {
-                                    Ok(()) => {}
-                                    Err(SendStall::Halted) => {
-                                        halt_requested = true;
-                                        break 'outer;
-                                    }
-                                    Err(stall) => {
-                                        producer_err = Some(stall.into_error());
-                                        break 'outer;
-                                    }
+                                let fill = WorkItem::GapFill {
+                                    pos: gap_start,
+                                    len: gap_bytes,
+                                };
+                                if let Err(e) = send(fill) {
+                                    (halt_requested, producer_err) = (e.is_none(), e);
+                                    break 'outer;
                                 }
                                 bytes_done = bytes_done.saturating_add(gap_bytes);
                             }
@@ -1309,66 +1402,50 @@ fn sweep_linked(
             }
 
             if let Some(reporter) = opts.progress {
-                // Use the latest consumer snapshot if present, else synthesise from the
-                // two producer counters. `bytes_good` is recovery-only, NOT `bytes_done`
-                // (a position advancing over skipped/zero-fills too, once conflated).
-                let main_title = disc.titles.first();
-                let main_title_bad = cached_main_title_bad;
-                // Consumer snapshot is truth for unreadable/pending, but bytes_good lags
-                // the producer when consumer is behind — take the max so display never
-                // regresses. Floor is `bytes_good_done`, not `bytes_done` (damage paths).
-                let (bytes_good, bytes_unreadable, bytes_pending, bytes_retryable) =
-                    match &cached_snapshot {
-                        Some(snap) => (
-                            snap.stats.bytes_good.max(bytes_good_done),
-                            snap.stats.bytes_unreadable,
-                            snap.stats.bytes_pending,
-                            snap.stats.bytes_retryable,
-                        ),
-                        // No snapshot yet: derive the partition from the two producer
-                        // counters. Done-but-not-good bytes are this pass's damage
-                        // (skip/fail/zero-fill); they must land in a bucket, not vanish.
-                        None => (
-                            bytes_good_done,
-                            0u64,
-                            total_bytes.saturating_sub(bytes_done),
-                            bytes_done.saturating_sub(bytes_good_done),
-                        ),
-                    };
-                let pp = libfreemkv::progress::PassProgress {
-                    kind: libfreemkv::progress::PassKind::Sweep,
-                    work_done: pos,
-                    work_total: total_bytes,
-                    bytes_good_total: bytes_good,
-                    bytes_unreadable_total: bytes_unreadable,
-                    bytes_pending_total: bytes_pending,
-                    bytes_retryable_total: bytes_retryable,
-                    bytes_total_disc: total_bytes,
-                    disc_duration_secs: main_title.map(|t| t.duration_secs),
-                    bytes_bad_in_main_title: main_title_bad,
-                    main_title_duration_secs: main_title.map(|t| t.duration_secs),
-                    main_title_size_bytes: main_title.map(|t| t.size_bytes),
-                    // Rendered drilldown from the consumer's in-memory
-                    // snapshot (bad ranges) + title; empty until the first
-                    // snapshot arrives.
-                    located: cached_located.clone(),
-                };
-                if !reporter.report(&pp) {
-                    halt_requested = true;
-                    break 'outer;
+                tick_owed = last_tick.is_some_and(|t| t.elapsed() < SWEEP_TICK);
+                if !tick_owed {
+                    last_tick = Some(std::time::Instant::now());
+                    let pp = bar.tick(
+                        disc,
+                        cached_snapshot.as_ref(),
+                        cached_main_title_bad,
+                        &cached_located,
+                        bytes_done,
+                        bytes_good_done,
+                    );
+                    if !reporter.report(&pp) {
+                        halt_requested = true;
+                        break 'outer;
+                    }
                 }
             }
         }
     }
 
+    if tick_owed
+        && !halt_requested
+        && producer_err.is_none()
+        && let Some(reporter) = opts.progress
+    {
+        let pp = bar.tick(
+            disc,
+            cached_snapshot.as_ref(),
+            cached_main_title_bad,
+            &cached_located,
+            bytes_done,
+            bytes_good_done,
+        );
+        let _ = reporter.report(&pp);
+    }
+
     // Producer is done; let the consumer drain and run close() (writeback, fsync,
     // mapfile.flush). Bounded by the SAME halt the sends above use — a plain
     // `Pipeline::finish` would re-block on the stalled consumer, so Stop never returns.
+    let consumer_failed = pipe.consumer_failed();
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
 
-    // Producer-side error wins over consumer-side (the read failure
-    // is what motivated quitting; the consumer's flush error, if
-    // any, is downstream).
+    // The producer's error wins, unless the consumer's apply failed first: then its write
+    // error is the cause (see `pass_failure`).
     if let Some(e) = producer_err {
         // Producer error is returned, dropping the consumer's result — but do NOT
         // let a consumer close() failure vanish silently: it's the only signal the
@@ -1382,7 +1459,7 @@ fn sweep_linked(
                 "sweep: consumer close failed while the pass was already failing — the mapfile on disk may be incomplete"
             );
         }
-        return Err(e);
+        return Err(pass_failure(e, summary, consumer_failed));
     }
     let summary = summary?;
 
@@ -1731,16 +1808,90 @@ mod snap_tests {
     }
 }
 
+// A stallable consumer, shared by the send- and finish-side bounded-pipeline tests.
+#[cfg(test)]
+mod stall_fixtures {
+    use libfreemkv::error::Error;
+    use libfreemkv::io::pipeline::{Flow, Sink};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+
+    /// A gate a test thread can hold shut and then open.
+    #[derive(Clone)]
+    pub(super) struct Gate(Arc<(Mutex<bool>, Condvar)>);
+
+    impl Gate {
+        pub(super) fn shut() -> Self {
+            Self(Arc::new((Mutex::new(false), Condvar::new())))
+        }
+        pub(super) fn wait(&self) {
+            let (lock, cv) = &*self.0;
+            let mut open = lock.lock().unwrap();
+            while !*open {
+                open = cv.wait(open).unwrap();
+            }
+        }
+        pub(super) fn open(&self) {
+            let (lock, cv) = &*self.0;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+        }
+    }
+
+    /// The hung-mount consumer: alive, healthy, and stuck in its first `apply` until the
+    /// gate opens. Stands in for `SweepSink`/`PatchSink` blocked inside
+    /// `WritebackFile::write_all` on a mount that never answers.
+    pub(super) struct StalledSink {
+        pub(super) entered: Arc<AtomicUsize>,
+        pub(super) gate: Gate,
+        /// Counts `close()` calls.
+        pub(super) closed: Arc<AtomicUsize>,
+        /// Set once the consumer thread has let go of the sink, closed or not.
+        pub(super) dropped: Arc<AtomicBool>,
+    }
+
+    impl StalledSink {
+        pub(super) fn new(entered: &Arc<AtomicUsize>, gate: &Gate) -> Self {
+            StalledSink {
+                entered: Arc::clone(entered),
+                gate: gate.clone(),
+                closed: Arc::default(),
+                dropped: Arc::default(),
+            }
+        }
+    }
+
+    impl Sink<u32> for StalledSink {
+        type Output = u32;
+        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+            self.entered.fetch_add(1, Ordering::SeqCst);
+            self.gate.wait();
+            Ok(Flow::Continue)
+        }
+        fn close(self) -> std::result::Result<u32, Error> {
+            self.closed.fetch_add(1, Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    impl Drop for StalledSink {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 // The producer-side handoff guard: what happens to a `send` when the
 // consumer is ALIVE but not draining. Pins the fix for a plain
 // `Pipeline::send` parking forever on a stalled (not dead) consumer.
 #[cfg(test)]
 mod send_bounded_tests {
+    use super::stall_fixtures::{Gate, StalledSink};
     use super::*;
     use libfreemkv::halt::Halt;
     use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     // Cancel is flipped this long after the producer parks in `send` — long
@@ -1753,48 +1904,6 @@ mod send_bounded_tests {
     /// Bound on the whole experiment so a regression FAILS instead of hanging
     /// the suite.
     const WATCHDOG: Duration = Duration::from_secs(10);
-
-    /// A gate a test thread can hold shut and then open.
-    #[derive(Clone)]
-    struct Gate(Arc<(Mutex<bool>, Condvar)>);
-
-    impl Gate {
-        fn shut() -> Self {
-            Self(Arc::new((Mutex::new(false), Condvar::new())))
-        }
-        fn wait(&self) {
-            let (lock, cv) = &*self.0;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }
-        fn open(&self) {
-            let (lock, cv) = &*self.0;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
-    }
-
-    /// The hung-mount consumer: healthy, alive, draining nothing because its
-    /// first `apply` is stuck in a write that never returns. Stands in for
-    /// `SweepSink`/`PatchSink` blocked inside `WritebackFile::write_all`.
-    struct StalledSink {
-        entered: Arc<AtomicUsize>,
-        gate: Gate,
-    }
-
-    impl Sink<u32> for StalledSink {
-        type Output = ();
-        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
-            self.entered.fetch_add(1, Ordering::SeqCst);
-            self.gate.wait();
-            Ok(Flow::Continue)
-        }
-        fn close(self) -> std::result::Result<(), Error> {
-            Ok(())
-        }
-    }
 
     // A consumer that DIES on its first item, distinguishable from a stalled
     // one. Must panic: `Flow::Stop`/an `apply` error both leave the consumer
@@ -1818,14 +1927,9 @@ mod send_bounded_tests {
     fn a_stop_lands_on_a_producer_parked_on_a_stalled_consumer() {
         let entered = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, ()>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-            },
-        )
-        .expect("spawn consumer");
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, StalledSink::new(&entered, &gate))
+                .expect("spawn consumer");
         let halt = Halt::new();
 
         // Item 1 is taken by the consumer, which then wedges inside `apply`.
@@ -1885,6 +1989,60 @@ mod send_bounded_tests {
         drop(pipe);
     }
 
+    // R7: a consumer whose `apply` failed keeps draining and discarding, so the non-blocking
+    // fast path would accept every later item and the producer read the whole disc.
+    #[test]
+    fn a_consumer_whose_apply_failed_refuses_every_later_item() {
+        struct FailingSink;
+        impl Sink<u32> for FailingSink {
+            type Output = ();
+            fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
+                Err(Error::IoError {
+                    source: std::io::Error::other("ENOSPC"),
+                })
+            }
+            fn close(self) -> std::result::Result<(), Error> {
+                Ok(())
+            }
+        }
+        let pipe = Pipeline::<u32, ()>::spawn(WRITE_THROUGH_DEPTH, FailingSink).expect("spawn");
+        let halt = Halt::new();
+        assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
+        let t0 = Instant::now();
+        while !pipe.consumer_failed() {
+            assert!(t0.elapsed() < WATCHDOG, "the apply never failed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for i in 2..10 {
+            assert_eq!(
+                send_bounded(&pipe, i, &halt),
+                Err(SendStall::ConsumerGone),
+                "item {i} was handed to a consumer that discards everything"
+            );
+        }
+        assert!(
+            pipe.finish().is_err(),
+            "the apply error still reaches finish"
+        );
+    }
+
+    // ...and the pass then fails with the consumer's error (the cause), not the
+    // producer's "consumer gone" that it stopped on.
+    #[test]
+    fn a_failed_consumer_s_own_error_fails_the_pass() {
+        let enospc = || Error::IoError {
+            source: std::io::Error::other("ENOSPC"),
+        };
+        let gone = || SendStall::ConsumerGone.into_error();
+        let e = pass_failure(gone(), Err::<(), _>(enospc()), true);
+        assert!(matches!(e, Error::IoError { .. }), "got {e:?}");
+        // A producer failure of its own (the consumer still healthy) keeps precedence.
+        let e = pass_failure(Error::DecryptFailed, Err::<(), _>(enospc()), false);
+        assert!(matches!(e, Error::DecryptFailed), "got {e:?}");
+        let e = pass_failure(gone(), Ok(()), true);
+        assert!(matches!(e, Error::PipelineConsumerGone), "got {e:?}");
+    }
+
     /// The other side of the discrimination: a consumer that is really gone
     /// must still report `ConsumerGone`, not `Halted`, with the halt clear.
     #[test]
@@ -1919,14 +2077,9 @@ mod send_bounded_tests {
     fn a_stalled_consumer_with_no_halt_times_out_rather_than_blocking() {
         let entered = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, ()>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-            },
-        )
-        .expect("spawn consumer");
+        let pipe =
+            Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, StalledSink::new(&entered, &gate))
+                .expect("spawn consumer");
         let halt = Halt::new();
         assert_eq!(send_bounded(&pipe, 1, &halt), Ok(()));
         let waited = Instant::now();
@@ -2083,11 +2236,12 @@ mod send_bounded_tests {
 // producer out must not then block forever in `Pipeline::finish` on the same stalled consumer.
 #[cfg(test)]
 mod finish_bounded_tests {
+    use super::stall_fixtures::{Gate, StalledSink};
     use super::*;
     use libfreemkv::halt::Halt;
     use libfreemkv::io::pipeline::{Flow, Pipeline, Sink, WRITE_THROUGH_DEPTH};
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
 
     // MARGIN: a correct teardown returns at ~5.3s (250ms halt-observe +
@@ -2097,66 +2251,15 @@ mod finish_bounded_tests {
     // Bound on the whole experiment so a regression FAILS, not hangs, `cargo test`.
     const WATCHDOG: Duration = Duration::from_secs(45);
 
-    /// A gate a test thread can hold shut and then open.
-    #[derive(Clone)]
-    struct Gate(Arc<(Mutex<bool>, Condvar)>);
-
-    impl Gate {
-        fn shut() -> Self {
-            Self(Arc::new((Mutex::new(false), Condvar::new())))
-        }
-        fn wait(&self) {
-            let (lock, cv) = &*self.0;
-            let mut open = lock.lock().unwrap();
-            while !*open {
-                open = cv.wait(open).unwrap();
-            }
-        }
-        fn open(&self) {
-            let (lock, cv) = &*self.0;
-            *lock.lock().unwrap() = true;
-            cv.notify_all();
-        }
-    }
-
-    /// The hung-mount consumer: alive, healthy, and stuck in its first `apply`
-    /// forever. Stands in for `SweepSink`/`PatchSink` blocked inside
-    /// `WritebackFile::write_all` on a mount that never answers.
-    struct StalledSink {
-        entered: Arc<AtomicUsize>,
-        gate: Gate,
-        closed: Arc<AtomicUsize>,
-    }
-
-    impl Sink<u32> for StalledSink {
-        type Output = u32;
-        fn apply(&mut self, _item: u32) -> std::result::Result<Flow, Error> {
-            self.entered.fetch_add(1, Ordering::SeqCst);
-            self.gate.wait();
-            Ok(Flow::Continue)
-        }
-        fn close(self) -> std::result::Result<u32, Error> {
-            self.closed.fetch_add(1, Ordering::SeqCst);
-            Ok(0)
-        }
-    }
-
     // Park a consumer inside `apply`, raise the halt, then tear down: the
     // teardown must COME BACK — the last link in the Stop chain.
     #[test]
     fn a_stop_lands_on_a_teardown_joining_a_stalled_consumer() {
         let entered = Arc::new(AtomicUsize::new(0));
-        let closed = Arc::new(AtomicUsize::new(0));
         let gate = Gate::shut();
-        let pipe = Pipeline::<u32, u32>::spawn(
-            WRITE_THROUGH_DEPTH,
-            StalledSink {
-                entered: Arc::clone(&entered),
-                gate: gate.clone(),
-                closed: Arc::clone(&closed),
-            },
-        )
-        .expect("spawn consumer");
+        let sink = StalledSink::new(&entered, &gate);
+        let (closed, dropped) = (Arc::clone(&sink.closed), Arc::clone(&sink.dropped));
+        let pipe = Pipeline::<u32, u32>::spawn(WRITE_THROUGH_DEPTH, sink).expect("spawn consumer");
         let halt = Halt::new();
 
         // Item 1 is taken; the consumer wedges inside `apply` and never
@@ -2214,6 +2317,14 @@ mod finish_bounded_tests {
         // The abandoned consumer must NOT go on to run `close()`. For the
         // recovery sinks that call is `sync_all` + `map.flush()` against an
         // output the caller has already reported as interrupted.
+        let waited = Instant::now();
+        while !dropped.load(Ordering::SeqCst) {
+            assert!(
+                waited.elapsed() < WATCHDOG,
+                "the released consumer never finished"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             closed.load(Ordering::SeqCst),
             0,
@@ -2702,26 +2813,324 @@ mod patch_preset_tests {
     fn the_wedged_threshold_is_reported_not_enforced() {
         let o = PatchOptions::for_patch_pass(false, None, None);
 
-        let state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
+        let mut state = patch::PatchLoopState::new(0, patch::initial_batch_of(&o), 4096);
         let summary = patch::PatchSummary {
             stats: mapfile::MapStats::default(),
         };
-        let outcome = patch::build_outcome(
-            &state,
-            &summary,
-            std::path::Path::new("/nonexistent/for-outcome-only"),
-            4096,
-            0,
-            o.wedged_threshold,
-        );
+        let outcome_of = |state: &patch::PatchLoopState| {
+            patch::build_outcome(
+                state,
+                &summary,
+                std::path::Path::new("/nonexistent/for-outcome-only"),
+                4096,
+                0,
+                o.wedged_threshold,
+            )
+        };
+        let outcome = outcome_of(&state);
         assert_eq!(
             outcome.wedged_threshold, 50,
             "the preset's threshold must reach the caller's outcome verbatim"
         );
+        // `wedged_exit` is the pass's own transport-fault flag, echoed; the threshold
+        // neither sets nor clears it.
+        assert!(!outcome.wedged_exit);
+        state.wedged_exit = true;
+        let wedged = outcome_of(&state);
         assert!(
-            !outcome.wedged_exit,
-            "the threshold alone must not mark a pass wedged — `wedged_exit` \
-             comes from a handler's TransportFault, nothing counts against 50"
+            wedged.wedged_exit,
+            "a transport-fault exit must reach the outcome"
         );
+        assert_eq!(wedged.wedged_threshold, 50);
+    }
+}
+
+// End-to-end sweep contracts over a synthetic reader: resume reconciliation, stops,
+// progress and the consumer hand-off.
+#[cfg(test)]
+mod sweep_contract_tests {
+    use super::*;
+    use libfreemkv::disc::DiscRegion;
+    use libfreemkv::{ContentFormat, Disc, DiscFormat};
+
+    type FailAt = Box<dyn FnMut(u32) -> Option<Error> + Send>;
+
+    // A reader that fills every sector with 0xAA unless `fail` answers an error for the
+    // batch starting at that LBA; records every `SET CD SPEED`.
+    struct Reader {
+        sectors: u32,
+        fail: FailAt,
+        speeds: Vec<u16>,
+    }
+
+    impl SectorSource for Reader {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            if let Some(e) = (self.fail)(lba) {
+                return Err(e);
+            }
+            let n = count as usize * 2048;
+            buf[..n].fill(0xAA);
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.sectors
+        }
+        fn set_speed(&mut self, kbs: u16) {
+            self.speeds.push(kbs);
+        }
+    }
+
+    fn reader(sectors: u32, fail: impl FnMut(u32) -> Option<Error> + Send + 'static) -> Reader {
+        Reader {
+            sectors,
+            fail: Box::new(fail),
+            speeds: Vec::new(),
+        }
+    }
+
+    fn disc(sectors: u32) -> Disc {
+        Disc {
+            volume_id: "SWEEPCONTRACT".into(),
+            meta_title: None,
+            format: DiscFormat::Uhd,
+            capacity_sectors: sectors,
+            capacity_bytes: sectors as u64 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: ContentFormat::BdTs,
+        }
+    }
+
+    fn opts(resume: bool, skip_on_error: bool) -> SweepOptions<'static> {
+        SweepOptions {
+            resume,
+            skip_on_error,
+            ..Default::default()
+        }
+    }
+
+    // R10: only a corrupt mapfile (InvalidData) downgrades a resume to a fresh sweep. An
+    // unreadable one (EACCES here; EIO on a flaky mount) must fail the pass, not be deleted
+    // along with a truncated ISO.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_whose_mapfile_cannot_be_read_fails_instead_of_starting_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("ioerr.iso");
+        let sectors = 500u32;
+        let total = sectors as u64 * 2048;
+        let d = disc(sectors);
+        let mf = d.mapfile_for(&iso);
+        std::fs::write(&iso, vec![0x5Au8; total as usize]).unwrap();
+        std::fs::write(&mf, b"# Rescue Logfile\n").unwrap();
+        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&mf).is_ok() {
+            return; // root: permissions are not enforced
+        }
+
+        let r = sweep(&d, &mut reader(sectors, |_| None), &iso, &opts(true, true));
+        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            r.is_err(),
+            "an unreadable mapfile must fail the resume: {r:?}"
+        );
+        assert!(mf.exists(), "the unreadable mapfile must not be deleted");
+        let img = std::fs::read(&iso).unwrap();
+        assert_eq!(img.len() as u64, total, "the ISO must not be truncated");
+        assert!(
+            img.iter().all(|&b| b == 0x5A),
+            "the ISO must not be rewritten"
+        );
+    }
+
+    // R6: a Stop that lands mid-read comes back from the drive as `Error::Halted`. That
+    // is a stop, not damage: no zero-fill, no NonTrimmed, no drop to minimum speed, and
+    // the pass ends halted (not `Err(Halted)`) whether or not it skips errors.
+    #[test]
+    fn a_read_the_stop_interrupts_is_a_stop_not_damage() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for skip_on_error in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let iso = dir.path().join("stop.iso");
+            let sectors = 4096u32;
+            let d = disc(sectors);
+            let flag = Arc::new(AtomicBool::new(false));
+            let raised = flag.clone();
+            let mut r = reader(sectors, move |lba| {
+                (lba >= 1024).then(|| {
+                    raised.store(true, Ordering::SeqCst);
+                    Error::Halted
+                })
+            });
+            let mut o = opts(false, skip_on_error);
+            o.halt = Some(flag);
+            o.batch_sectors = Some(32); // 1024 is a batch boundary in both modes
+            let res = sweep(&d, &mut r, &iso, &o);
+            let res =
+                res.unwrap_or_else(|e| panic!("skip={skip_on_error}: a stop is not Err: {e:?}"));
+            assert!(res.halted, "skip={skip_on_error}: the pass must end halted");
+            assert!(
+                !r.speeds.contains(&0),
+                "skip={skip_on_error}: a stop is not a damage zone"
+            );
+            let map = mapfile::Mapfile::load(&d.mapfile_for(&iso)).unwrap();
+            assert!(
+                map.ranges_with(&mapfile::damage_sector_statuses())
+                    .is_empty(),
+                "skip={skip_on_error}: the stop was recorded as damage"
+            );
+            assert_eq!(
+                map.ranges_with(&[mapfile::SectorStatus::NonTried]),
+                vec![(1024 * 2048, (sectors as u64 - 1024) * 2048)],
+                "skip={skip_on_error}: everything from the interrupted read on stays NonTried"
+            );
+        }
+    }
+
+    // Every tick a sweep reports, in order.
+    #[derive(Default)]
+    struct Ticks(std::sync::Mutex<Vec<libfreemkv::progress::PassProgress>>);
+
+    impl libfreemkv::progress::Progress for Ticks {
+        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+            self.0.lock().unwrap().push(p.clone());
+            true
+        }
+    }
+
+    // R4: `work_done / work_total` is the pass's own 0..=100% — a scoped (MKV-staging)
+    // sweep's bar runs over its scope, not the absolute disc position.
+    #[test]
+    fn a_scoped_sweep_s_bar_runs_from_zero_to_its_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("scoped.iso");
+        let d = disc(8192);
+        let ticks = Ticks::default();
+        let mut o = opts(false, true);
+        o.progress = Some(&ticks);
+        sweep_scoped(&d, &mut reader(8192, |_| None), &iso, &o, &[(4096, 2048)]).unwrap();
+        let t = ticks.0.lock().unwrap();
+        let scope = 2048 * 2048;
+        assert!(
+            t.iter().all(|p| p.work_total == scope),
+            "the bar's total is the scope"
+        );
+        assert!(
+            t[0].work_done <= 64 * 2048,
+            "starts at 0, not the scope's disc offset: {}",
+            t[0].work_done
+        );
+        assert_eq!(
+            t.last().unwrap().work_done,
+            scope,
+            "a finished pass ends at 100%"
+        );
+    }
+
+    // R8: a resumed sweep's first ticks (before any consumer snapshot) start from what the
+    // mapfile already holds, not from zero.
+    #[test]
+    fn a_resumed_sweep_s_first_tick_counts_the_prior_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("resume.iso");
+        let sectors = 8192u32;
+        let total = sectors as u64 * 2048;
+        let d = disc(sectors);
+        std::fs::write(&iso, vec![0xAAu8; total as usize]).unwrap();
+        {
+            let mut m = mapfile::Mapfile::create(&d.mapfile_for(&iso), total, "t").unwrap();
+            m.record(0, total / 2, mapfile::SectorStatus::Finished)
+                .unwrap();
+            m.flush().unwrap();
+        }
+        let ticks = Ticks::default();
+        let mut o = opts(true, true);
+        o.progress = Some(&ticks);
+        sweep(&d, &mut reader(sectors, |_| None), &iso, &o).unwrap();
+        let first = ticks.0.lock().unwrap()[0].clone();
+        assert!(
+            first.bytes_good_total >= total / 2,
+            "first tick claims {} good; the mapfile already held {}",
+            first.bytes_good_total,
+            total / 2
+        );
+        assert!(
+            first.bytes_pending_total <= total / 2,
+            "pending {}",
+            first.bytes_pending_total
+        );
+        assert!(
+            first.work_done >= total / 2,
+            "the bar restarts at 0: {}",
+            first.work_done
+        );
+    }
+
+    // R12: the reporter is a UI tick, throttled like patch's; not one call per batch.
+    #[test]
+    fn a_sweep_reports_progress_at_a_tick_not_per_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("tick.iso");
+        let sectors = 32 * 4000;
+        let ticks = Ticks::default();
+        let mut o = opts(false, true);
+        o.progress = Some(&ticks);
+        o.batch_sectors = Some(32);
+        let t0 = std::time::Instant::now();
+        sweep(&disc(sectors), &mut reader(sectors, |_| None), &iso, &o).unwrap();
+        let bound = t0.elapsed().as_millis() as usize / 250 + 2;
+        let n = ticks.0.lock().unwrap().len();
+        assert!(
+            n <= bound,
+            "{n} reports for 4000 batches; a 250 ms tick allows {bound}"
+        );
+    }
+
+    // R5: a staged image passes only when its title sectors were read. A staging sweep
+    // stopped part-way leaves them NonTried (zeros from `set_len`): refused like out-of-scope
+    // ones. Damage (read and failed) still passes: blank + warn + count, never fatal.
+    #[test]
+    fn a_staged_title_with_unread_sectors_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("staged.iso");
+        let mut d = disc(8192);
+        let mut title = libfreemkv::DiscTitle::empty();
+        title.extents = vec![libfreemkv::disc::Extent {
+            start_lba: 4096,
+            sector_count: 1024,
+        }];
+        d.titles = vec![title];
+        let total = 8192u64 * 2048;
+        let (start, len) = (4096u64 * 2048, 1024u64 * 2048);
+        let stage = |status: Option<mapfile::SectorStatus>| {
+            let mut m = mapfile::Mapfile::create(&d.mapfile_for(&iso), total, "t").unwrap();
+            m.set_scope(vec![(start, len)]);
+            m.record(start, len / 2, mapfile::SectorStatus::Finished)
+                .unwrap();
+            if let Some(st) = status {
+                m.record(start + len / 2, len / 2, st).unwrap();
+            }
+            m.flush().unwrap();
+        };
+        stage(None);
+        assert!(
+            matches!(
+                ensure_titles_staged(&iso, &d, &[0]),
+                Err(Error::ImageScoped { .. })
+            ),
+            "half the title was never read: muxing it would emit zeros"
+        );
+        stage(Some(mapfile::SectorStatus::NonTrimmed));
+        ensure_titles_staged(&iso, &d, &[0]).expect("read-but-damaged sectors are not unread");
+        stage(Some(mapfile::SectorStatus::Finished));
+        ensure_titles_staged(&iso, &d, &[0]).expect("a fully staged title passes");
     }
 }

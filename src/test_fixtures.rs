@@ -10,6 +10,7 @@ use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::test_util::{BdFile, EncryptedBdImage, MemSource, encrypted_bd_image};
 use libfreemkv::{Disc, KeySource, KeySourceFactory, SectorSource};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub(crate) const K1: [u8; 16] = *b"\xA1KU-E1 key one!!";
@@ -262,6 +263,8 @@ struct Fake {
     keys: Vec<[u8; 16]>,
     fmts: Vec<[u8; 16]>,
     calls: Calls,
+    // Unit-key requests this spec's fakes answered, across every build of the factory.
+    asked: Arc<AtomicUsize>,
 }
 
 // Whether `key` opens `unit`: every decrypted source packet has TS sync (KS-2).
@@ -283,13 +286,7 @@ impl Fake {
         if matches!(self.answer, Answer::Unavailable | Answer::Down) {
             return Err(libfreemkv::Error::KeyServiceUnavailable);
         }
-        let asked_before = self
-            .calls
-            .all()
-            .iter()
-            .filter(|c| c.who == self.who)
-            .count()
-            > 1;
+        let asked_before = self.asked.fetch_add(1, Ordering::SeqCst) > 0;
         if self.answer == Answer::KeydbThenUnreadable && asked_before {
             return Err(libfreemkv::Error::KeydbInvalid);
         }
@@ -378,12 +375,15 @@ pub(crate) fn fmts_factory(
     fmts: &[[u8; 16]],
     calls: &Calls,
 ) -> KeySourceFactory {
-    let specs: Vec<(Answer, Vec<[u8; 16]>)> = specs.iter().map(|(a, k)| (*a, k.to_vec())).collect();
+    let specs: Vec<(Answer, Vec<[u8; 16]>, Arc<AtomicUsize>)> = specs
+        .iter()
+        .map(|(a, k)| (*a, k.to_vec(), Arc::default()))
+        .collect();
     let (fmts, calls) = (fmts.to_vec(), calls.clone());
     Arc::new(move || {
         specs
             .iter()
-            .map(|(answer, keys)| {
+            .map(|(answer, keys, asked)| {
                 Box::new(Fake {
                     who: if answer.is_online() {
                         "online"
@@ -394,6 +394,7 @@ pub(crate) fn fmts_factory(
                     keys: keys.clone(),
                     fmts: fmts.clone(),
                     calls: calls.clone(),
+                    asked: asked.clone(),
                 }) as Box<dyn KeySource>
             })
             .collect()
@@ -600,4 +601,17 @@ pub(crate) fn clear_folder(dir: &Path) {
     file("BDMV/PLAYLIST/00000.mpls", &one_item_mpls(b"00000"));
     file("BDMV/CLIPINF/00000.clpi", &minimal_clpi(n));
     file("BDMV/STREAM/00000.m2ts", &m2ts);
+}
+
+// A `KeydbThenUnreadable` source answers its own first request, whatever other keydb
+// sources were asked before it.
+#[test]
+fn keydb_then_unreadable_answers_its_first_request() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let scope = libfreemkv::keys::KeyScope::Titles(vec![0]);
+    let specs: &[(Answer, &[[u8; 16]])] =
+        &[(Answer::Keydb, &[K2]), (Answer::KeydbThenUnreadable, &[K1])];
+    let calls = Calls::default();
+    let set = resolve(&fx, scope, specs, &calls);
+    assert!(set.is_ok(), "{:?} after {:?}", set.err(), calls.all());
 }

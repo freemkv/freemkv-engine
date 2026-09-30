@@ -108,6 +108,30 @@ impl SharedPatchState {
     }
 }
 
+// A pass's result from its producer run and consumer teardown: the producer's error wins,
+// unless the consumer's `apply` failed first (its write error is the cause).
+fn settle(
+    run_result: Result<()>,
+    finish_result: Result<PatchSummary>,
+    consumer_failed: bool,
+) -> Result<PatchSummary> {
+    let Err(e) = run_result else {
+        return finish_result;
+    };
+    // Don't let a close() failure vanish on the both-failed path: it's the only signal
+    // that the mapfile on disk is now untrustworthy.
+    if let Err(close_err) = &finish_result {
+        tracing::warn!(
+            target: "freemkv::disc",
+            phase = "patch.finish.dropped",
+            pass_error = %e,
+            close_error = %close_err,
+            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
+        );
+    }
+    Err(super::pass_failure(e, finish_result, consumer_failed))
+}
+
 // Final summary from [`Sink::close`] on a clean drain: the final mapfile
 // stats. A `sync_all` failure on a regular file short-circuits `close` with
 // an `Err` before this is built, so it never carries a fsync-error field.
@@ -205,8 +229,9 @@ impl Sink<PatchItem> for PatchSink {
         match item {
             PatchItem::Recovered { pos, buf } => {
                 let len = buf.len() as u64;
-                self.file.seek(SeekFrom::Start(pos)).map_err(Error::from)?;
-                self.file.write_all(&buf).map_err(Error::from)?;
+                let lost = |e| super::image_write_failed(&self.map, e);
+                self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
+                self.file.write_all(&buf).map_err(lost)?;
                 self.map
                     .record(pos, len, SectorStatus::Finished)
                     .map_err(Error::from)?;
@@ -234,6 +259,8 @@ impl Sink<PatchItem> for PatchSink {
                     error_kind = ?e.kind(),
                     "patch: sync_all failed"
                 );
+                // The data is not durable: the dropped map must not flush it as Finished.
+                self.map.disown_handle().disown();
                 return Err(Error::from(e));
             }
             tracing::debug!(
@@ -1360,24 +1387,9 @@ fn patch_linked(
     // Drain the consumer unconditionally: drop tx, wait for `close`, take final
     // stats. Bounded by the SAME Stop bit `run`'s sends use — a plain
     // `Pipeline::finish` once hung joining a wedged consumer and swallowed a halt.
+    let consumer_failed = pipe.consumer_failed();
     let finish_result = super::finish_bounded_disowning(pipe, &finish_halt, &map_disown);
-
-    // Producer-side error wins over consumer-side (mirrors sweep's precedence),
-    // but don't let a close() failure vanish silently on the both-failed path:
-    // it's the only signal that the mapfile on disk is now untrustworthy.
-    if let Err(ref e) = run_result
-        && let Err(close_err) = &finish_result
-    {
-        tracing::warn!(
-            target: "freemkv::disc",
-            phase = "patch.finish.dropped",
-            pass_error = %e,
-            close_error = %close_err,
-            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
-        );
-    }
-    run_result?;
-    let summary = finish_result?;
+    let summary = settle(run_result, finish_result, consumer_failed)?;
 
     let outcome = build_outcome(
         &state,
@@ -2116,6 +2128,93 @@ mod tests {
         // Tier 0 reads each 1-sector range 4 times (one per scout): the 16th wedge
         // sense lands in the 4th range. Without the carry nothing trips until tier 2.
         assert_eq!(reader.reads, 16);
+    }
+
+    // R7: once the consumer's write failed, the producer stops on "consumer gone"; the
+    // pass must fail with the write's own error (ENOSPC/EIO), not that.
+    #[test]
+    fn a_failed_consumer_write_is_the_error_the_patch_reports() {
+        let enospc = || Error::IoError {
+            source: std::io::Error::other("ENOSPC"),
+        };
+        let gone = || Err(super::super::SendStall::ConsumerGone.into_error());
+        let e = settle(gone(), Err(enospc()), true).err().unwrap();
+        assert!(matches!(e, Error::IoError { .. }), "got {e:?}");
+        // The consumer healthy: the producer's own failure stands.
+        let e = settle(Err(Error::DecryptFailed), Err(enospc()), false)
+            .err()
+            .unwrap();
+        assert!(matches!(e, Error::DecryptFailed), "got {e:?}");
+    }
+
+    // An `apply` write error may be the latched writeback failure of an earlier span: the
+    // dropped sink must not flush those spans' Finished records.
+    #[test]
+    fn a_failed_write_does_not_persist_earlier_finished_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+        let mapfile_path = dir.path().join("out.iso.mapfile");
+        let mut mf = Mapfile::create(&mapfile_path, 8192, "vTEST").unwrap();
+        mf.record(0, 8192, SectorStatus::NonTrimmed).unwrap();
+        mf.flush().unwrap();
+        let (mut sink, _shared) = PatchSink::new(&iso, mf, true, None).unwrap();
+        let read_only = std::fs::File::open(&iso).unwrap();
+        sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
+        sink.map.set_disc_hash(&"ab".repeat(20));
+        sink.map.flush().unwrap();
+        let fresh = std::time::Instant::now();
+        sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+        let r = sink.apply(PatchItem::Recovered {
+            pos: 2048,
+            buf: vec![7u8; 2048],
+        });
+        if fresh.elapsed() >= std::time::Duration::from_millis(900) {
+            return; // inconclusive
+        }
+        assert!(r.is_err(), "a write to a read-only handle must fail");
+        drop(sink);
+        let reloaded = Mapfile::load(&mapfile_path).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a failed write left earlier, possibly lost, spans persisted Finished"
+        );
+    }
+
+    // R3: a failed `sync_all` means the recovered data is not durable, so the dropped
+    // sink must not flush a Finished record for it.
+    #[test]
+    fn sync_failure_on_close_does_not_persist_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 4096]).unwrap();
+        let mapfile_path = dir.path().join("out.iso.mapfile");
+        let mut mf = Mapfile::create(&mapfile_path, 4096, "vTEST").unwrap();
+        mf.record(0, 4096, SectorStatus::NonTrimmed).unwrap();
+        mf.flush().unwrap();
+
+        let (mut sink, _shared) = PatchSink::new(&iso, mf, true, None).unwrap();
+        sink.map.set_disc_hash(&"ab".repeat(20));
+        sink.map.flush().unwrap();
+        let fresh = std::time::Instant::now();
+        sink.apply(PatchItem::Recovered {
+            pos: 0,
+            buf: vec![7u8; 2048],
+        })
+        .unwrap();
+        if fresh.elapsed() >= std::time::Duration::from_millis(900) {
+            return; // the 1 s periodic persist already ran: inconclusive
+        }
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        assert!(sink.close().is_err(), "sync_all must fail under a halt");
+
+        let reloaded = Mapfile::load(&mapfile_path).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a non-durable sector must not be recorded Finished"
+        );
     }
 }
 

@@ -23,6 +23,8 @@ pub struct EngineHalt<'a> {
     extra: Option<Arc<AtomicBool>>,
     // §4.2: "The sink probe is an internal `pub(crate)` field of `EngineHalt`".
     pub(crate) sink: Option<&'a dyn Sink>,
+    // A cancel once observed stays observed: a non-sticky `should_cancel` stays a Stop.
+    seen: AtomicBool,
 }
 
 impl std::fmt::Debug for EngineHalt<'_> {
@@ -32,6 +34,7 @@ impl std::fmt::Debug for EngineHalt<'_> {
             .field("op_private", &self.op_private)
             .field("extra", &self.extra)
             .field("sink", &self.sink.is_some())
+            .field("seen", &self.seen)
             .finish()
     }
 }
@@ -44,6 +47,7 @@ impl EngineHalt<'static> {
             op_private: false,
             extra,
             sink: None,
+            seen: AtomicBool::new(false),
         }
     }
 
@@ -54,6 +58,7 @@ impl EngineHalt<'static> {
             op_private: true,
             extra,
             sink: None,
+            seen: AtomicBool::new(false),
         }
     }
 }
@@ -69,17 +74,25 @@ impl<'a> EngineHalt<'a> {
             op_private: self.op_private,
             extra: self.extra,
             sink: Some(sink),
+            seen: self.seen,
         }
     }
 
-    /// `op || extra || sink.should_cancel()`.
+    /// `op || extra || sink.should_cancel()`, sticky once true.
     pub fn is_cancelled(&self) -> bool {
-        self.op.is_cancelled()
+        if self.seen.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = self.op.is_cancelled()
             || self
                 .extra
                 .as_ref()
                 .is_some_and(|e| e.load(Ordering::Acquire))
-            || self.sink.is_some_and(|s| s.should_cancel())
+            || self.sink.is_some_and(|s| s.should_cancel());
+        if now {
+            self.seen.store(true, Ordering::Release);
+        }
+        now
     }
 
     /// The caller's op token (a private, never-cancelled one for a legacy entry).
@@ -125,15 +138,16 @@ impl<'a> EngineHalt<'a> {
         }
         let done = AtomicBool::new(false);
         std::thread::scope(|s| {
-            s.spawn(|| {
+            let bridge = s.spawn(|| {
                 while !done.load(Ordering::Acquire) {
                     if self.is_cancelled() {
                         child.cancel();
                         return;
                     }
-                    std::thread::sleep(WAIT_SLICE);
+                    std::thread::park_timeout(WAIT_SLICE);
                 }
             });
+            let _wake = crate::run::WakeOnDrop(bridge.thread().clone());
             let _done = crate::run::SignalDone(&done);
             f(&child)
         })
@@ -155,8 +169,10 @@ pub enum EngineOutcome<T> {
 impl<T> EngineOutcome<T> {
     /// Map a `_with` entry's result. `halted` reads an artifact result's own Stop flag.
     ///
-    /// §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when the op token is
-    /// cancelled. Otherwise it `debug_assert!`s and maps to `Failed`."
+    /// §2.6: `Halted` → `Stopped` only on a cancel ([`EngineHalt::is_cancelled`]: the op
+    /// token, the narrower flag or the Sink); "Otherwise it … maps to `Failed`". It warns
+    /// instead of the spec's `debug_assert!`: a non-sticky `should_cancel` or a source's own
+    /// `Halted` reach it.
     pub(crate) fn from_result(
         r: crate::Result<T>,
         halt: &EngineHalt<'_>,
@@ -167,7 +183,7 @@ impl<T> EngineOutcome<T> {
             Ok(t) => EngineOutcome::Done(t),
             Err(libfreemkv::Error::Halted) if halt.is_cancelled() => EngineOutcome::Stopped(None),
             Err(libfreemkv::Error::Halted) => {
-                debug_assert!(false, "Halted with no cancel (stop design §2.6)");
+                tracing::warn!(target: "freemkv::disc", "Halted with no cancel: Failed");
                 EngineOutcome::Failed(libfreemkv::Error::Halted)
             }
             Err(e) => EngineOutcome::Failed(e),

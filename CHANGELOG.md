@@ -19,7 +19,14 @@ project follows semantic versioning.
 
 - Remux: a Stop before the rename ends Halted with the target untouched; once the rename has happened, a failed folder sync is only a warning and the remux is Done (`replaced`, `Event::Replaced`). The staged copy to the library folder stops on Stop and fails E9073 after 60 s with no bytes written; a stopped or stalled copy empties the local staging file at once. A non-UTF-8 mux destination (the target's `.partial`, or the staging file) is refused with E9002 before anything is written, as is a non-UTF-8 disc folder source (before it is opened). A remux waiting on `<target>.lock` no longer times out (E9073) while the holder's sync or verify is making progress. Refusing an existing target (`AlreadyExists`) now carries only the quoted path as its message, so a file name beginning `E<digits>` is not read as that error code.
 
+- Mapfile loading: a ddrescue mapfile whose current-position line has status `F` or `G` now loads; a file over 256 MiB, a status field longer than one character (`+garbage`) or a data line with extra fields is refused as damaged (E6011), so a resume starts a fresh sweep instead of trusting it; split same-status runs are merged on load.
+
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
+- A Stop that interrupts a sweep read ends the pass halted (`copy`/`sweep` return `halted`, not `Err(Halted)`); the interrupted range stays unread instead of being zero-filled and recorded as damage.
+- A sweep resume whose mapfile cannot be read (EIO, EACCES) fails with that error instead of deleting the mapfile and starting over; only a damaged mapfile still restarts the sweep.
+- A sweep or patch whose output write fails stops reading at once and fails with the write's error (not "consumer gone"); a failed write or final fsync no longer flushes the ranges behind it as Finished.
+- Sweep progress ticks every 250 ms. `work_done`/`work_total` run over the pass's scope (an MKV-staging sweep goes 0-100%), and a resumed sweep's first ticks include what the mapfile already held.
+- `ensure_titles_staged` also refuses (E6022) a staged title whose sectors were never read (a staging sweep stopped part-way).
 
 - A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
 
@@ -30,6 +37,14 @@ project follows semantic versioning.
 - Multipass loss and convergence are measured over the titles `Job::selection` picks, not always the first title.
 - Halted or wedged multipass results report `main_lost_ms` as NaN (unmeasured) when damaged or pending bytes remain, instead of 0.0.
 
+### Fixed
+
+- `preflight` counts a job's key set as usable only when it covers the selected titles, instead of reporting Ready for a title the set cannot decrypt.
+- `preflight` refuses a requested language tag that names no language with the new reason `unknown-language` (detail = the tag), instead of passing the job to fail after the image opens, or blaming the disc with `language-unmatched`.
+- `episode_titles` picks the largest group of similar lengths; between equal-size groups it keeps the longer unless that one is a play-all of the other (it plays their extents or runs their summed length), so an episode beside a play-all is kept and equal numbers of extras don't displace episodes. Titles with no extents are never dropped as duplicates.
+- A `Halted` error with no cancel behind it is `Failed` in every build profile; debug builds no longer panic on it. A Stop seen once through a `Sink::should_cancel` that later returns false still ends the op as Stopped.
+- Patch passes report speed over the fixed 10 s window, so a recovery burst shows promptly.
+
 ### Added
 
 - `multipass_rip_staged`, `mkv_staging_scope`, `sweep_scoped` and `ensure_whole_image`: an image staged for an MKV rip reads only UDF, nav/AACS files and the chosen titles (AACS BD Pre-recorded 0.953 §3.7: none of it bus-encrypted), so a disc with an unlocatable bus-encrypted stream file still rips to MKV. The scope is recorded in the mapfile (`# freemkv-scope:`), where `stats()` leaves the unread rest out of pending. `copy` and a whole-disc `sweep` over a scoped mapfile refuse with E6021 until every stream file is located, then fill the rest; `patch` re-reads only in-scope damage. `ensure_whole_image` refuses a staged image as a whole-disc source with E6022, and `ensure_titles_staged` refuses (E6022) muxing a title from it whose extents lie outside its scope. A staging image is whole only when it is kept and every stream file was located.
@@ -38,7 +53,7 @@ project follows semantic versioning.
 - `open_image_with(src, OpenImageOptions)`: open an image with a key set the caller already holds (`KeyInput::Known`, no key-service call), with a set plus a top-up (`Seeded`), or by resolving (`Resolve`), and with an already-scanned disc (`disc`), in which case an `iso://` image is not rescanned. A `dir://` folder is always scanned, so a pre-scanned disc given with one is refused (E7013). `open_image` calls it. `mux_image_titles` muxes each title from the disc the open already has instead of rescanning the image per title, so a staged ISO whose playlists were never read still muxes.
 - E7034: an image whose keys need the disc's Volume ID (its sidecar mapfile has a VID fingerprint) stops before writing anything and asks for the disc, instead of E7022.
 - `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
-- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
+- `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced, output opened); the default ignores them.
 - `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form; they read codes exactly as `libfreemkv::error_code` does.
 - `open_scan(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
 - `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged once per factory, fault kind only).

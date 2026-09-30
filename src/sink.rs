@@ -1,8 +1,8 @@
 //! The one seam every front-end implements.
 //!
 //! `Sink` is how the engine talks to the outside world without printing. The
-//! CLI's impl prints; autorip's updates session state and feeds the web UI; a
-//! desktop UI marshals to its UI thread. It mirrors
+//! CLI's impl prints; a server's updates its job state; a desktop UI marshals
+//! to its UI thread. It mirrors
 //! `libfreemkv::progress::Progress` — a `should_cancel()` bool is the same
 //! cooperative-cancellation mechanism Ctrl-C already uses in the CLI.
 
@@ -29,13 +29,10 @@ pub enum Level {
 /// All byte counts are of the *current* operation unless noted.
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
-    /// Human-facing name of the current pass, e.g. `"sweep"`, `"patch-scrape"`,
-    /// `"mux"`. Front-ends may localize; the engine supplies a stable key.
-    /// `Cow` so the common case — one of a small set of fixed pass names —
-    /// costs no allocation. `ProgressBridge::report` runs once per batch
-    /// (400k-1.6M times per rip) and allocated a fresh `String` every call to
-    /// carry one of five literals. A dynamic name still works
-    /// via `Cow::Owned`.
+    /// Stable key of the current pass, for a front-end to localize: `"sweep"`,
+    /// `"patch-scrape"`, `"patch-trim"`, `"mux"`, `"sync"`, `"verify"`, `"copy"`.
+    /// `Cow` so the fixed keys cost no allocation: `ProgressBridge::report` runs
+    /// once per batch (400k-1.6M times per rip).
     pub pass: std::borrow::Cow<'static, str>,
     /// Bytes completed in the current operation.
     pub bytes_done: u64,
@@ -46,10 +43,10 @@ pub struct Progress {
     /// Throughput in bytes/sec, engine-smoothed (not an instant raw delta —
     /// see the struct doc). 0 until measurable.
     pub speed_bps: u64,
-    /// Estimated seconds remaining for the current operation, engine-
-    /// computed from `speed_bps`, once the estimate has converged (`None`
-    /// during the warm-up window — shows elapsed-only during warm-up, then
-    /// switches to ETA, per the UI study observed).
+    /// Estimated seconds remaining for the current operation, engine-computed.
+    /// `None` until a rate is measurable (the first tick), on a stall, and when
+    /// nothing is left. For the first 10 s of a pass it follows `speed_bps`,
+    /// then the pass's running average.
     pub eta_secs: Option<u64>,
 }
 
@@ -105,7 +102,9 @@ pub trait Sink: Send + Sync {
     /// A progress tick. Called frequently; keep the impl cheap.
     fn progress(&self, _p: &Progress) {}
 
-    /// The job finished (success, partial, or failure — see the outcome).
+    /// Reserved: the engine does not call this. Build the result from the value
+    /// the entry point returns (e.g. `MultipassResult`), mapped into an `Outcome`
+    /// if the front-end wants one.
     fn completed(&self, _outcome: &crate::Outcome) {}
 
     /// A typed milestone (see [`Event`]). Default ignores it.
@@ -120,7 +119,7 @@ pub trait Sink: Send + Sync {
 }
 
 /// A `Sink` that does nothing — for benchmarks, tests, and headless callers
-/// that only want the returned [`crate::Outcome`].
+/// that only want the entry point's returned result.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopSink;
 
@@ -149,7 +148,15 @@ mod tests {
             ..Default::default()
         };
         s.progress(&p);
-        assert_eq!(p.eta_secs, None);
+        s.event(&Event::Phase { name: "mux" });
+        s.completed(&crate::Outcome {
+            files: Vec::new(),
+            unreadable_bytes: 0,
+            lost_ms: 0.0,
+            severity: crate::DamageSeverity::Clean,
+            elapsed_secs: 0.0,
+            avg_bps: 0,
+        });
     }
 
     #[test]

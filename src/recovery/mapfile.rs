@@ -7,7 +7,7 @@
 //! Format:
 //! ```text
 //! # Rescue Logfile. Created by freemkv-engine vX.Y.Z
-//! # Current pos / status / pass / pass_time (ddrescue state machine — we only populate pos)
+//! # Current pos / status / pass / pass_time
 //! 0x000000000  ?  1  0
 //! #      pos        size  status
 //! 0x000000000  0x12345678    +
@@ -15,21 +15,29 @@
 //! 0x012346678  0x01234500    ?
 //! ```
 //!
+//! The current-position line is ddrescue's state line; freemkv writes it as a fixed
+//! `0x000000000  ?  1  0` and ignores it on load.
+//!
 //! Status chars: `?` non-tried · `*` non-trimmed · `/` non-scraped · `-` unreadable · `+` finished.
 //!
 //! Persisted to disk in time-batched intervals; see [`FLUSH_INTERVAL`] and
 //! [`Mapfile`] for the flush policy.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 // Minimum interval between mapfile persists (else on `flush()`/`Drop`).
 // Bounds atomic-rename RPC rate on NFS staging; worst-case crash loss is
 // one interval's worth of records.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
+
+// Load refuses a larger file (MapfileInvalid "too_large"): ~8M runs at ~32 bytes a line, far
+// past any real damage map, so a wrong or planted file fails fast instead of filling memory.
+const MAX_MAPFILE_BYTES: u64 = 256 << 20;
 
 /// Mapfile path for a regular output file: appends `.mapfile` to the output
 /// path.
@@ -165,9 +173,8 @@ pub struct MapStats {
     /// Number of distinct `Unreadable` ranges (for UI display).
     /// Computed by `compute_stats` (counts coalesced `-` entries).
     pub num_bad_ranges: u32,
-    /// Largest gap among unreadable ranges in milliseconds. Computed as
-    /// largest range size / bytes_per_sec * 1000. Set by caller (autorip)
-    /// since bytes_per_sec is application-specific.
+    /// Always `0.0`: the engine never computes this (it needs a bitrate the map lacks).
+    /// The lost-time figure is `MultipassResult::main_lost_ms`; kept for API compatibility.
     pub main_lost_ms: f64,
 }
 
@@ -196,7 +203,7 @@ pub struct Mapfile {
     /// (after any `record()`) with no two adjacent entries sharing a status. Deliberately
     /// uncapped — that invariant IS the bound, and the length is exactly the number of status
     /// runs the disc's damage actually has (it shrinks as damage is recovered, not just grows).
-    /// `record()` is O(entries).
+    /// `record()` is O(log entries + touched runs), plus a tail shift when the run count changes.
     entries: Vec<MapEntry>,
     total_size: u64,
     version: String,
@@ -238,11 +245,15 @@ impl Mapfile {
     pub fn create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         let mut mf = Self {
             path: path.to_path_buf(),
-            entries: vec![MapEntry {
-                pos: 0,
-                size: total_size,
-                status: SectorStatus::NonTried,
-            }],
+            // No entry for an empty image: load() refuses a zero-size one.
+            entries: (total_size > 0)
+                .then_some(MapEntry {
+                    pos: 0,
+                    size: total_size,
+                    status: SectorStatus::NonTried,
+                })
+                .into_iter()
+                .collect(),
             total_size,
             version: version.to_string(),
             stats: MapStats {
@@ -269,7 +280,7 @@ impl Mapfile {
 
     /// Load an existing mapfile from disk.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = read_capped(path)?;
         let mut entries = Vec::new();
         let mut saw_current_line = false;
         let mut version = String::from("unknown");
@@ -313,9 +324,7 @@ impl Mapfile {
                 // would present a partial image as a whole-disc one.
                 if let Some(sc) = rest.strip_prefix("freemkv-scope:") {
                     let Some(ranges) = parse_scope(sc.trim()) else {
-                        let e: io::Error =
-                            libfreemkv::error::Error::MapfileInvalid { kind: "scope" }.into();
-                        return Err(e);
+                        return Err(invalid("scope"));
                     };
                     scope = Some(ranges);
                 }
@@ -330,18 +339,7 @@ impl Mapfile {
                 // (that dropped a data line whose size lacked `0x`). A current line's
                 // 2nd field is a single status char; a data line's is the hex size.
                 let fields: Vec<&str> = t.split_whitespace().collect();
-                let is_current_line = fields
-                    .get(1)
-                    .and_then(|f| {
-                        let mut chars = f.chars();
-                        match (chars.next(), chars.next()) {
-                            // Exactly one char that is a valid status char.
-                            (Some(c), None) => SectorStatus::from_char(c),
-                            _ => None,
-                        }
-                    })
-                    .is_some();
-                if is_current_line {
+                if is_current_line(&fields) {
                     continue;
                 }
                 // Otherwise it's a data line — fall through to entry parse.
@@ -352,9 +350,10 @@ impl Mapfile {
                 // A short data line is dropped coverage, not noise: skipping it deletes
                 // its range from the gapless [0, total_size) partition, and skipping
                 // the last one shrinks total_size itself. Reject rather than skip.
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "short_line" }.into();
-                return Err(e);
+                return Err(invalid("short_line"));
+            }
+            if fields.len() > 3 {
+                return Err(invalid("long_line"));
             }
             let pos = parse_hex(fields[0])?;
             let size = parse_hex(fields[1])?;
@@ -362,31 +361,18 @@ impl Mapfile {
             // code adds pos+size freely, and a crafted line would otherwise panic
             // (debug) or wrap to a tiny range (release), corrupting stats/resume.
             if pos.checked_add(size).is_none() {
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
-                return Err(e);
+                return Err(invalid("range"));
             }
             // A zero-size entry is degenerate: it contributes nothing to the
             // partition yet trips overlap/coalesce arithmetic (two entries can
             // share the same pos). Reject it rather than carry it through.
             if size == 0 {
-                let e: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "zero_size" }.into();
-                return Err(e);
+                return Err(invalid("zero_size"));
             }
-            let status = fields[2]
-                .chars()
-                .next()
+            // The whole token, not its first char: `+garbage` is damage, not Finished.
+            let status = single_char(fields[2])
                 .and_then(SectorStatus::from_char)
-                .ok_or_else(|| {
-                    // No English text — the variant carries a stable
-                    // language-neutral kind identifier (`status_char`).
-                    let e: io::Error = libfreemkv::error::Error::MapfileInvalid {
-                        kind: "status_char",
-                    }
-                    .into();
-                    e
-                })?;
+                .ok_or_else(|| invalid("status_char"))?;
             entries.push(MapEntry { pos, size, status });
         }
         entries.sort_by_key(|e| e.pos);
@@ -397,20 +383,22 @@ impl Mapfile {
         let mut cursor: u64 = 0;
         for e in entries {
             if e.pos < cursor {
-                let err: io::Error =
-                    libfreemkv::error::Error::MapfileInvalid { kind: "overlap" }.into();
-                return Err(err);
+                return Err(invalid("overlap"));
             }
             if e.pos > cursor {
                 // Leading or internal gap — fill it as NonTried.
-                filled.push(MapEntry {
-                    pos: cursor,
-                    size: e.pos - cursor,
-                    status: SectorStatus::NonTried,
-                });
+                push_coalesced(
+                    &mut filled,
+                    MapEntry {
+                        pos: cursor,
+                        size: e.pos - cursor,
+                        status: SectorStatus::NonTried,
+                    },
+                );
             }
             cursor = e.pos.saturating_add(e.size);
-            filled.push(e);
+            // Coalesced so a loaded map meets the maximal-run invariant `record()` relies on.
+            push_coalesced(&mut filled, e);
         }
         let entries = filled;
         let total_size = entries
@@ -441,7 +429,7 @@ impl Mapfile {
             Ok(mf) => {
                 // load() derives total_size from the last entry's pos+size; if that
                 // disagrees with the caller's size, resume math keys off the wrong
-                // basis. Warn, don't fail — so `==` here is an equivalent mutant.
+                // basis. Warn only: sweep() already forces a fresh sweep on a mismatch.
                 if mf.total_size != total_size {
                     tracing::warn!(
                         target: "freemkv::disc",
@@ -473,55 +461,35 @@ impl Mapfile {
         // rather than storing a saturated entry, which load() would then reject
         // on the next resume (making the mapfile unreadable).
         let Some(end) = pos.checked_add(size) else {
-            let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "range" }.into();
-            return Err(e);
+            return Err(invalid("range"));
         };
-        let mut new_entries = Vec::with_capacity(self.entries.len() + 2);
+        self.splice(pos, end, status);
+        self.changed()
+    }
 
-        for e in self.entries.drain(..) {
-            let e_end = e.pos.saturating_add(e.size);
-            if e_end <= pos || e.pos >= end {
-                // entirely before or after — keep
-                new_entries.push(e);
-                continue;
+    /// Re-mark every run whose status is in `from` as `to`, in one O(entries) pass: the same
+    /// map as calling [`Mapfile::record`] over each such range (the end-of-recovery promotion),
+    /// without the per-range cost. Flushes like `record()`.
+    pub fn promote(&mut self, from: &[SectorStatus], to: SectorStatus) -> io::Result<()> {
+        let mut hit = false;
+        let mut merged: Vec<MapEntry> = Vec::with_capacity(self.entries.len());
+        for mut e in self.entries.drain(..) {
+            if from.contains(&e.status) {
+                e.status = to;
+                hit = true;
             }
-            // Overlap — keep portions outside [pos, end)
-            if e.pos < pos {
-                new_entries.push(MapEntry {
-                    pos: e.pos,
-                    size: pos - e.pos,
-                    status: e.status,
-                });
-            }
-            if e_end > end {
-                new_entries.push(MapEntry {
-                    pos: end,
-                    size: e_end - end,
-                    status: e.status,
-                });
-            }
+            push_coalesced(&mut merged, e);
         }
-        new_entries.push(MapEntry { pos, size, status });
-        new_entries.sort_by_key(|e| e.pos);
-
-        // Coalesce adjacent same-status entries.
-        let mut merged: Vec<MapEntry> = Vec::with_capacity(new_entries.len());
-        for e in new_entries {
-            if let Some(last) = merged.last_mut()
-                && last.pos.saturating_add(last.size) == e.pos
-                && last.status == e.status
-            {
-                last.size = last.size.saturating_add(e.size);
-                continue;
-            }
-            merged.push(e);
-        }
-
-        // Recompute stats from merged entries; record() is already O(n) so this is
-        // constant-factor overhead. The win is stats() becomes O(1), important
-        // since it's called millions of times in the sweep/patch hot path.
-        self.stats = Self::compute_stats(&merged, self.total_size);
         self.entries = merged;
+        if !hit {
+            return Ok(());
+        }
+        self.stats = Self::compute_stats(&self.entries, self.total_size);
+        self.changed()
+    }
+
+    // Marks in-memory state dirty and persists it once `FLUSH_INTERVAL` has elapsed.
+    fn changed(&mut self) -> io::Result<()> {
         self.dirty = true;
         if self.last_flushed.elapsed() >= FLUSH_INTERVAL {
             self.write_to_disk()?;
@@ -536,6 +504,12 @@ impl Mapfile {
     /// [`MapfileDisown`] and [`super::finish_bounded_disowning`].
     pub(crate) fn disown_handle(&self) -> MapfileDisown {
         MapfileDisown(Arc::clone(&self.disowned))
+    }
+
+    /// Whether a [`MapfileDisown`] handle has revoked this mapfile: its owner was
+    /// abandoned and must touch neither this file nor the image it describes.
+    pub(crate) fn is_disowned(&self) -> bool {
+        self.disowned.load(Ordering::Acquire)
     }
 
     /// Persist any pending in-memory changes to disk. No-op if clean.
@@ -638,9 +612,9 @@ impl Mapfile {
             .collect()
     }
 
-    /// Snapshot of the incrementally-maintained summary statistics.
-    /// O(1) — returns the cached `MapStats`. On a scoped mapfile the never-read bytes
-    /// outside the scope are not pending: they are not part of this image's job.
+    /// Snapshot of the incrementally-maintained summary statistics: O(1) on a whole-disc map.
+    /// On a scoped mapfile the never-read bytes outside the scope are not pending (not this
+    /// image's job); that adjustment is one O(entries + scope ranges) walk, allocation-free.
     pub fn stats(&self) -> MapStats {
         let mut s = self.stats;
         if self.scope.is_some() {
@@ -655,18 +629,27 @@ impl Mapfile {
         let Some(scope) = &self.scope else {
             return 0;
         };
-        let nontried: u64 = self
+        let end = |p: u64, n: u64| p.saturating_add(n);
+        let mut outside = 0u64;
+        let mut first = 0;
+        for e in self
             .entries
             .iter()
             .filter(|e| e.status == SectorStatus::NonTried)
-            .map(|e| e.size)
-            .sum();
-        let inside: u64 = self
-            .ranges_with(&[SectorStatus::NonTried])
-            .iter()
-            .map(|&r| intersect(&[r], scope).iter().map(|&(_, n)| n).sum::<u64>())
-            .sum();
-        nontried - inside
+        {
+            let e_end = end(e.pos, e.size);
+            // Scope is sorted and merged: ranges ending at or before this run end before later ones.
+            while scope.get(first).is_some_and(|&(p, n)| end(p, n) <= e.pos) {
+                first += 1;
+            }
+            let inside: u64 = scope[first..]
+                .iter()
+                .take_while(|&&(p, _)| p < e_end)
+                .map(|&(p, n)| end(p, n).min(e_end) - p.max(e.pos))
+                .sum();
+            outside = outside.saturating_add(e.size.saturating_sub(inside));
+        }
+        outside
     }
 
     /// The byte ranges a scoped (MKV-staging) image covers; `None` = the whole disc.
@@ -687,32 +670,86 @@ impl Mapfile {
         }
     }
 
+    // Replaces the entries overlapping or touching `[pos, end)` with their split remainders,
+    // the new run and merged neighbours; stats move by the window's delta. Given the
+    // maximal-run invariant nothing outside the window can merge, so this equals a full rebuild.
+    fn splice(&mut self, pos: u64, end: u64, status: SectorStatus) {
+        let run_end = |e: &MapEntry| e.pos.saturating_add(e.size);
+        let lo = self.entries.partition_point(|e| run_end(e) < pos);
+        let hi = self.entries.partition_point(|e| e.pos <= end);
+        let window = &self.entries[lo..hi];
+        let mut pieces: Vec<MapEntry> = Vec::with_capacity(window.len().min(4) + 1);
+        let mut placed = false;
+        let new_run = MapEntry {
+            pos,
+            size: end - pos,
+            status,
+        };
+        for e in window {
+            let e_end = run_end(e);
+            if e_end <= pos {
+                pieces.push(e.clone());
+                continue;
+            }
+            if e.pos < pos {
+                pieces.push(MapEntry {
+                    pos: e.pos,
+                    size: pos - e.pos,
+                    status: e.status,
+                });
+            }
+            if e_end > end && !placed {
+                pieces.push(new_run.clone());
+                placed = true;
+            }
+            if e.pos >= end {
+                pieces.push(e.clone());
+            } else if e_end > end {
+                pieces.push(MapEntry {
+                    pos: end,
+                    size: e_end - end,
+                    status: e.status,
+                });
+            }
+        }
+        if !placed {
+            pieces.push(new_run);
+        }
+        let mut merged: Vec<MapEntry> = Vec::with_capacity(pieces.len());
+        for e in pieces {
+            push_coalesced(&mut merged, e);
+        }
+        for e in window {
+            tally(&mut self.stats, e, false);
+        }
+        for e in &merged {
+            tally(&mut self.stats, e, true);
+        }
+        if merged.len() == hi - lo {
+            self.entries[lo..hi].clone_from_slice(&merged);
+        } else {
+            self.entries.splice(lo..hi, merged);
+        }
+    }
+
     fn compute_stats(entries: &[MapEntry], total_size: u64) -> MapStats {
         let mut s = MapStats {
             bytes_total: total_size,
             ..Default::default()
         };
         for e in entries {
-            match e.status {
-                SectorStatus::Finished => s.bytes_good += e.size,
-                SectorStatus::Unreadable => {
-                    s.bytes_unreadable += e.size;
-                    s.num_bad_ranges += 1;
-                }
-                SectorStatus::NonTried => {
-                    s.bytes_pending += e.size;
-                    s.bytes_nontried += e.size;
-                }
-                SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
-                    s.bytes_pending += e.size;
-                    s.bytes_retryable += e.size;
-                }
-            }
+            tally(&mut s, e, true);
         }
         s
     }
 
     fn write_to_disk(&self) -> io::Result<()> {
+        with_commit_lock(&self.path, || self.write_locked())
+    }
+
+    // Only under `with_commit_lock`: the disowned checks, tmp write and rename are then one
+    // step against any other writer of this path, so a stale snapshot can't land after a resume.
+    fn write_locked(&self) -> io::Result<()> {
         // DISOWNED: owner was abandoned; someone else records this path now. Checked
         // here (the single commit point) so one check covers flush/record/Drop.
         // Reported as success: not writing is correct, and no caller remains.
@@ -732,7 +769,13 @@ impl Mapfile {
         // a single cleanup covers every early return.
         let write_tmp = |tmp: &std::path::Path| -> io::Result<()> {
             {
-                let file = std::fs::File::create(tmp)?;
+                // Unlink, then create exclusively: a symlink planted at the tmp name is
+                // removed, never written through.
+                let _ = std::fs::remove_file(tmp);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)?;
                 let mut w = std::io::BufWriter::new(file);
                 writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
                 // Identity lines (KU §4.1): a disc hash and fingerprints only, never a key
@@ -768,6 +811,8 @@ impl Mapfile {
                         e.status.to_char()
                     )?;
                 }
+                #[cfg(test)]
+                fire_write_hook(&self.path, HookAt::TmpBuffered);
                 w.flush()?;
                 // fsync the tmp file before the rename so bytes are durable (notably on
                 // NFS, where a rename can reach the server before the data does).
@@ -784,13 +829,15 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // Re-check at the commit point: the entry check above can be stale, since
-        // writing/fsyncing the tmp hangs on the mount this mechanism exists for.
-        // Narrows (not closes) the race; true fix needs an atomic check-and-rename.
+        // Re-check: the tmp write may have hung past a disown. A disown landing after this
+        // check is still safe: the resumed owner's writes take the commit lock, so they land
+        // after this rename, never before it.
         if self.disowned.load(Ordering::Acquire) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(());
         }
+        #[cfg(test)]
+        fire_write_hook(&self.path, HookAt::PreRename);
         if let Err(e) = std::fs::rename(&tmp, &self.path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
@@ -798,7 +845,7 @@ impl Mapfile {
         // fsync the parent directory so the rename itself is durable — syncing the
         // tmp file's bytes alone isn't enough, since the new dirent lives only in the
         // page cache until synced. Best-effort: unsupported dirs aren't a failure.
-        if let Some(parent) = self.path.parent() {
+        if let Some(parent) = parent_dir(&self.path) {
             libfreemkv::io::fsync::dir(parent);
         }
         Ok(())
@@ -814,8 +861,91 @@ impl Drop for Mapfile {
     }
 }
 
+// Test seam: each hook runs once, inside `write_to_disk` for its path at its `HookAt` point.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HookAt {
+    TmpBuffered,
+    PreRename,
+}
+#[cfg(test)]
+type WriteHook = (PathBuf, HookAt, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static WRITE_HOOKS: std::sync::Mutex<Vec<WriteHook>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn fire_write_hook(path: &Path, at: HookAt) {
+    let hook = {
+        let mut hooks = WRITE_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+        let i = hooks.iter().position(|(p, a, _)| p == path && *a == at);
+        i.map(|i| hooks.remove(i).2)
+    };
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+// The directory holding `path`: `.` for a bare relative name, whose `parent()` is `""`.
+fn parent_dir(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(p) if p.as_os_str().is_empty() => Some(Path::new(".")),
+        p => p,
+    }
+}
+
+type CommitLocks = HashMap<PathBuf, Arc<Mutex<()>>>;
+
+// Runs `f` holding this process's lock for `path` (keyed as spelled: every pass builds its
+// mapfile path the same way). Per path, so one hung mount never stalls another rip's writes.
+fn with_commit_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    static LOCKS: LazyLock<Mutex<CommitLocks>> = LazyLock::new(Default::default);
+    let locks = || LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    let lock = Arc::clone(locks().entry(path.to_path_buf()).or_default());
+    let out = {
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        f()
+    };
+    drop(lock);
+    let mut map = locks();
+    if map.get(path).is_some_and(|l| Arc::strong_count(l) == 1) {
+        map.remove(path);
+    }
+    out
+}
+
 fn invalid(kind: &'static str) -> io::Error {
     libfreemkv::error::Error::MapfileInvalid { kind }.into()
+}
+
+// Adds (or removes) one entry's contribution to `s`. Saturating: `record()` only removes
+// what an earlier tally added, so this never actually clamps.
+fn tally(s: &mut MapStats, e: &MapEntry, add: bool) {
+    let f = |v: &mut u64| {
+        *v = if add {
+            v.saturating_add(e.size)
+        } else {
+            v.saturating_sub(e.size)
+        }
+    };
+    match e.status {
+        SectorStatus::Finished => f(&mut s.bytes_good),
+        SectorStatus::Unreadable => {
+            f(&mut s.bytes_unreadable);
+            s.num_bad_ranges = if add {
+                s.num_bad_ranges.saturating_add(1)
+            } else {
+                s.num_bad_ranges.saturating_sub(1)
+            };
+        }
+        SectorStatus::NonTried => {
+            f(&mut s.bytes_pending);
+            f(&mut s.bytes_nontried);
+        }
+        SectorStatus::NonTrimmed | SectorStatus::NonScraped => {
+            f(&mut s.bytes_pending);
+            f(&mut s.bytes_retryable);
+        }
+    }
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -871,7 +1001,7 @@ struct LegacyIdentity {
 /// malformed VID still fails the load: it named a disc). Nothing raw is kept.
 fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result<()> {
     if let Some(hex) = comment.strip_prefix("freemkv-vid:") {
-        let vid = parse_vid_hex(hex.trim()).ok_or_else(|| invalid("vid"))?;
+        let vid = parse_hex16(hex.trim()).ok_or_else(|| invalid("vid"))?;
         out.vidfp = Some(vid_fingerprint(&vid));
     } else if let Some(uk) = comment.strip_prefix("freemkv-uk:")
         && let Some((cps, key)) = parse_uk_line(uk.trim())
@@ -885,10 +1015,9 @@ fn parse_legacy_key_lines(comment: &str, out: &mut LegacyIdentity) -> io::Result
     Ok(())
 }
 
-// Parse a 32-char hex VID string. `None` on malformation, which `load()`
-// turns into a hard `MapfileInvalid{kind:"vid"}` rather than "no identity" —
-// else corruption here would re-open the cross-disc resume splice.
-fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
+// 32 hex digits (a legacy VID or key line) → 16 bytes; `None` on malformation. A bad VID
+// fails the load (`vid`) rather than reading as "no identity" (cross-disc resume splice).
+fn parse_hex16(s: &str) -> Option<[u8; 16]> {
     // The one workspace hex parser (accepts an optional `0x`/`0X` prefix,
     // byte-based so a multi-byte legacy VID comment rejects, never panics).
     libfreemkv::hex::parse_hex_fixed::<16>(s)
@@ -899,7 +1028,7 @@ fn parse_vid_hex(s: &str) -> Option<[u8; 16]> {
 fn parse_uk_line(s: &str) -> Option<(u32, [u8; 16])> {
     let (cps, hex) = s.split_once(':')?;
     let cps: u32 = cps.trim().parse().ok()?;
-    let key = parse_vid_hex(hex.trim())?; // 32-hex → [u8; 16], shared parser
+    let key = parse_hex16(hex.trim())?;
     Some((cps, key))
 }
 
@@ -944,14 +1073,60 @@ pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64
     out
 }
 
+// Reads a mapfile's text, refusing one over `MAX_MAPFILE_BYTES` without reading it all.
+fn read_capped(path: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_MAPFILE_BYTES {
+        return Err(invalid("too_large"));
+    }
+    let mut text = String::new();
+    file.take(MAX_MAPFILE_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_MAPFILE_BYTES {
+        return Err(invalid("too_large"));
+    }
+    Ok(text)
+}
+
+fn single_char(field: &str) -> Option<char> {
+    let mut chars = field.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+// ddrescue's current line is `pos status [pass ...]`; its status adds `F` (filling) and `G`
+// (generating) to the block alphabet. `F` is also a hex digit, so `0 F +` stays a data line.
+fn is_current_line(fields: &[&str]) -> bool {
+    let Some(c) = fields.get(1).and_then(|f| single_char(f)) else {
+        return false;
+    };
+    match c {
+        'G' => true,
+        'F' => !fields
+            .get(2)
+            .and_then(|f| single_char(f))
+            .is_some_and(|s| SectorStatus::from_char(s).is_some()),
+        _ => SectorStatus::from_char(c).is_some(),
+    }
+}
+
+fn push_coalesced(out: &mut Vec<MapEntry>, e: MapEntry) {
+    if let Some(last) = out.last_mut()
+        && last.pos.saturating_add(last.size) == e.pos
+        && last.status == e.status
+    {
+        last.size = last.size.saturating_add(e.size);
+        return;
+    }
+    out.push(e);
+}
+
 fn parse_hex(s: &str) -> io::Result<u64> {
     let s = s.strip_prefix("0x").unwrap_or(s);
-    u64::from_str_radix(s, 16).map_err(|_| {
-        // Underlying ParseIntError dropped — its Display is OS-locale text.
-        // The typed variant carries `kind = "hex"` which is stable.
-        let e: io::Error = libfreemkv::error::Error::MapfileInvalid { kind: "hex" }.into();
-        e
-    })
+    // The ParseIntError is dropped for the stable `hex` kind.
+    u64::from_str_radix(s, 16).map_err(|_| invalid("hex"))
 }
 
 #[cfg(test)]
@@ -1072,6 +1247,194 @@ mod tests {
             mf.total_size(),
             "partition must cover the whole image"
         );
+    }
+
+    // R14: a record that does not change the run count (a sweep extending its Finished run
+    // into NonTried) edits `entries` in place instead of rebuilding the whole Vec.
+    #[test]
+    fn a_record_that_keeps_the_run_count_edits_in_place() {
+        const SEC: u64 = 2048;
+        let p = tmpfile("record_in_place");
+        let _ = std::fs::remove_file(&p);
+        let mut mf = Mapfile::create(&p, 20_000 * SEC, "test").unwrap();
+        // Runs `* + ?` per 4-sector group: `*` at 4i, `+` at 4i+1, `?` over 4i+2..4i+4.
+        for i in 0..5_000u64 {
+            mf.record(i * 4 * SEC, SEC, SectorStatus::NonTrimmed)
+                .unwrap();
+            mf.record((i * 4 + 1) * SEC, SEC, SectorStatus::Finished)
+                .unwrap();
+        }
+        let (ptr, len) = (mf.entries().as_ptr(), mf.entries().len());
+        for i in 0..5_000u64 {
+            // Grows each `+` run by one sector into the `?` run after it.
+            mf.record((i * 4 + 2) * SEC, SEC, SectorStatus::Finished)
+                .unwrap();
+            assert_eq!(mf.entries().as_ptr(), ptr, "record() rebuilt the entry Vec");
+        }
+        assert_eq!(mf.entries().len(), len);
+        assert_canonical(&mf);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // The pre-R14 `record()` (full rebuild, sort, global coalesce): the reference the
+    // localized splice must agree with.
+    fn reference_record(
+        entries: &[MapEntry],
+        pos: u64,
+        size: u64,
+        status: SectorStatus,
+    ) -> Vec<MapEntry> {
+        if size == 0 {
+            return entries.to_vec();
+        }
+        let end = pos + size;
+        let mut out = Vec::new();
+        for e in entries.iter().cloned() {
+            let e_end = e.pos + e.size;
+            if e_end <= pos || e.pos >= end {
+                out.push(e);
+                continue;
+            }
+            if e.pos < pos {
+                out.push(MapEntry {
+                    pos: e.pos,
+                    size: pos - e.pos,
+                    status: e.status,
+                });
+            }
+            if e_end > end {
+                out.push(MapEntry {
+                    pos: end,
+                    size: e_end - end,
+                    status: e.status,
+                });
+            }
+        }
+        out.push(MapEntry { pos, size, status });
+        out.sort_by_key(|e| e.pos);
+        let mut merged: Vec<MapEntry> = Vec::new();
+        for e in out {
+            if let Some(last) = merged.last_mut()
+                && last.pos + last.size == e.pos
+                && last.status == e.status
+            {
+                last.size += e.size;
+                continue;
+            }
+            merged.push(e);
+        }
+        merged
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    const ALL_STATUSES: [SectorStatus; 5] = [
+        SectorStatus::NonTried,
+        SectorStatus::NonTrimmed,
+        SectorStatus::NonScraped,
+        SectorStatus::Unreadable,
+        SectorStatus::Finished,
+    ];
+
+    // R14 equivalence: random records (inside, straddling and past the end, leaving gaps;
+    // zero-size too) give exactly the old algorithm's entries, and the delta-maintained
+    // stats equal a full recount after every step.
+    #[test]
+    fn localized_record_matches_the_full_rebuild() {
+        let p = tmpfile("record_equivalence");
+        let _ = std::fs::remove_file(&p);
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for round in 0..200 {
+            let total = 1 + rng.below(400);
+            let mut mf = Mapfile::create(&p, total, "test").unwrap();
+            let mut reference = mf.entries().to_vec();
+            for step in 0..60 {
+                let pos = rng.below(total + 40);
+                let size = match rng.below(6) {
+                    0 => 0,
+                    1 => rng.below(total + 40) + 1,
+                    _ => rng.below(12) + 1,
+                };
+                let status = ALL_STATUSES[rng.below(5) as usize];
+                mf.record(pos, size, status).unwrap();
+                reference = reference_record(&reference, pos, size, status);
+                assert_eq!(
+                    mf.entries(),
+                    reference.as_slice(),
+                    "round {round} step {step}: record({pos}, {size}, {status:?})"
+                );
+                assert_eq!(
+                    mf.stats(),
+                    Mapfile::compute_stats(&reference, total),
+                    "round {round} step {step}: stats drifted"
+                );
+            }
+            mf.dirty = false;
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // The `# freemkv-raw:` stamp round-trips through promote(), the writer and strict load().
+    #[test]
+    fn the_raw_stamp_survives_promote_and_a_strict_reload() {
+        for raw in [false, true] {
+            let p = tmpfile("raw_stamp_promote");
+            let mut mf = Mapfile::create(&p, 8 * 2048, "test").unwrap();
+            mf.set_raw(raw);
+            mf.record(0, 2048, SectorStatus::NonTrimmed).unwrap();
+            mf.record(2048, 2048, SectorStatus::Finished).unwrap();
+            mf.promote(&[SectorStatus::NonTrimmed], SectorStatus::Unreadable)
+                .unwrap();
+            mf.flush().unwrap();
+            let back = Mapfile::load(&p).map_err(|e| e.to_string());
+            let _ = std::fs::remove_file(&p);
+            let back = back.unwrap();
+            assert_eq!(back.raw(), Some(raw));
+            assert_eq!(back.entries(), mf.entries());
+        }
+    }
+
+    // P6: `promote()` is the per-range `record()` loop in one pass: same entries, same stats.
+    #[test]
+    fn promote_matches_recording_each_range() {
+        let p = tmpfile("promote_equivalence");
+        let q = tmpfile("promote_equivalence_ref");
+        let from = [SectorStatus::NonTrimmed, SectorStatus::NonScraped];
+        let mut rng = XorShift(0xD1B5_4A32_D192_ED03);
+        for round in 0..100 {
+            let total = 1 + rng.below(300);
+            let mut mf = Mapfile::create(&p, total, "test").unwrap();
+            for _ in 0..40 {
+                let pos = rng.below(total);
+                let size = (rng.below(10) + 1).min(total - pos);
+                mf.record(pos, size, ALL_STATUSES[rng.below(5) as usize])
+                    .unwrap();
+            }
+            let to = ALL_STATUSES[rng.below(5) as usize];
+            let mut looped = Mapfile::create(&q, total, "test").unwrap();
+            looped.entries = mf.entries.clone();
+            looped.stats = mf.stats;
+            for (pos, size) in looped.ranges_with(&from) {
+                looped.record(pos, size, to).unwrap();
+            }
+            mf.promote(&from, to).unwrap();
+            assert_eq!(mf.entries(), looped.entries(), "round {round} to {to:?}");
+            assert_eq!(mf.stats(), looped.stats(), "round {round} to {to:?}");
+            assert_canonical(&mf);
+        }
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_file(&q);
     }
 
     // The `Mapfile.entries` bound, measured rather than asserted from a doc.
@@ -1407,16 +1770,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_vid_hex_does_not_panic_on_multibyte_32_byte_input() {
+    fn parse_hex16_does_not_panic_on_multibyte_32_byte_input() {
         // A 32-BYTE comment containing a multi-byte char would make the
         // old `&s[i*2..i*2+2]` slice fall inside a char boundary and
         // panic. Must return None instead.
         let s = "中".to_string() + &"a".repeat(29); // 3 + 29 = 32 bytes
         assert_eq!(s.len(), 32);
-        assert_eq!(parse_vid_hex(&s), None);
+        assert_eq!(parse_hex16(&s), None);
         // A valid 32-char ASCII hex string still parses.
         assert_eq!(
-            parse_vid_hex("00112233445566778899aabbccddeeff"),
+            parse_hex16("00112233445566778899aabbccddeeff"),
             Some([
                 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
                 0xee, 0xff,
@@ -1568,7 +1931,7 @@ mod tests {
         }
     }
 
-    // ── parse_hex / parse_uk_line / parse_vid_hex error paths ─────
+    // ── parse_hex / parse_uk_line / parse_hex16 error paths ─────
 
     /// parse_hex accepts both `0x`-prefixed and bare hex (ddrescue writes
     /// `0x`-prefixed). A non-hex field is a MapfileInvalid{kind:"hex"}.
@@ -1617,6 +1980,39 @@ mod tests {
                 .unwrap()
                 .contains("freemkv-scope")
         );
+        let _ = std::fs::remove_file(&p);
+    }
+
+    // M7: a scoped stats() is one merge walk over entries and scope, not entries x scope.
+    #[test]
+    fn scoped_stats_is_linear_in_entries_plus_scope() {
+        const N: u64 = 40_000;
+        let p = tmpfile("scoped_stats_linear");
+        let mut mf = Mapfile::create(&p, 2 * N * 2048, "test").unwrap();
+        let _ = std::fs::remove_file(&p);
+        mf.entries = (0..2 * N)
+            .map(|i| MapEntry {
+                pos: i * 2048,
+                size: 2048,
+                status: if i % 2 == 0 {
+                    SectorStatus::Finished
+                } else {
+                    SectorStatus::NonTried
+                },
+            })
+            .collect();
+        mf.stats = Mapfile::compute_stats(&mf.entries, mf.total_size);
+        // Scope: the first half of every NonTried run, plus one range spanning two runs.
+        let mut scope: Vec<(u64, u64)> = (0..N).map(|i| ((2 * i + 1) * 2048, 1024)).collect();
+        scope.push((3 * 2048 + 1024, 2 * 2048));
+        mf.set_scope(scope);
+        let t = Instant::now();
+        let st = mf.stats();
+        let took = t.elapsed();
+        assert_eq!(st.bytes_nontried, N * 1024 + 1024);
+        assert_eq!(st.bytes_pending, st.bytes_nontried);
+        assert!(took < Duration::from_millis(100), "stats() took {took:?}");
+        mf.dirty = false;
     }
 
     // Dropping a malformed scope would present a partial image as a whole one.
@@ -1629,7 +2025,9 @@ mod tests {
                 format!("# freemkv-scope: {bad}\n0x0 ? 1\n0x0 0x800 ?\n"),
             )
             .unwrap();
-            assert!(Mapfile::load(&p).is_err(), "{bad}");
+            let e = Mapfile::load(&p).map(|_| ()).unwrap_err();
+            let _ = std::fs::remove_file(&p);
+            assert_eq!(invalid_kind(&e), Some("scope"), "{bad}: {e}");
         }
     }
 
@@ -1659,20 +2057,20 @@ mod tests {
         );
     }
 
-    /// parse_vid_hex tolerates an optional `0x` prefix and uppercase hex,
+    /// parse_hex16 tolerates an optional `0x` prefix and uppercase hex,
     /// but a 31- or 33-char string (not 32) is rejected — a VID is exactly
     /// 16 bytes = 32 hex chars.
     #[test]
-    fn parse_vid_hex_length_and_case() {
+    fn parse_hex16_length_and_case() {
         assert_eq!(
-            parse_vid_hex("0xAABBCCDDEEFF00112233445566778899"),
+            parse_hex16("0xAABBCCDDEEFF00112233445566778899"),
             Some([
                 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
                 0x88, 0x99
             ])
         );
-        assert_eq!(parse_vid_hex(&"a".repeat(31)), None);
-        assert_eq!(parse_vid_hex(&"a".repeat(33)), None);
+        assert_eq!(parse_hex16(&"a".repeat(31)), None);
+        assert_eq!(parse_hex16(&"a".repeat(33)), None);
     }
 
     // ── next_with / ranges_with semantics ─────────────────────────
@@ -1760,7 +2158,7 @@ mod tests {
         mf.record(0, 250, SectorStatus::Finished).unwrap();
         mf.record(250, 250, SectorStatus::Unreadable).unwrap();
         mf.record(500, 250, SectorStatus::NonTrimmed).unwrap();
-        // NonTried (500..750? no) leftover is [750,1000).
+        // [750, 1000) is still NonTried.
         let s = mf.stats();
         assert_eq!(
             s.bytes_good + s.bytes_unreadable + s.bytes_pending,
@@ -2015,6 +2413,105 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    fn invalid_kind(e: &io::Error) -> Option<&'static str> {
+        match e.get_ref()?.downcast_ref::<libfreemkv::error::Error>()? {
+            libfreemkv::error::Error::MapfileInvalid { kind } => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn load_text(tag: &str, text: &str) -> io::Result<Mapfile> {
+        let p = tmpfile(tag);
+        std::fs::write(&p, text).unwrap();
+        let r = Mapfile::load(&p);
+        let _ = std::fs::remove_file(&p);
+        r
+    }
+
+    // M28: a hand-edited or foreign (ddrescue) file with split same-status runs loads as the
+    // canonical maximal-run partition `record()` relies on.
+    #[test]
+    fn load_coalesces_adjacent_same_status_runs() {
+        let mf = load_text(
+            "load_coalesce",
+            "0x0  ?  1\n0x0 0x100 +\n0x100 0x100 +\n0x200 0x80 -\n0x280 0x80 -\n0x300 0x100 +\n",
+        )
+        .unwrap();
+        let got: Vec<_> = mf
+            .entries()
+            .iter()
+            .map(|e| (e.pos, e.size, e.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 0x200, SectorStatus::Finished),
+                (0x200, 0x100, SectorStatus::Unreadable),
+                (0x300, 0x100, SectorStatus::Finished),
+            ]
+        );
+        assert_eq!(mf.stats().num_bad_ranges, 1);
+        assert_canonical(&mf);
+    }
+
+    // M28: an oversized file (a wrong file at the mapfile path) is refused before it is read.
+    #[test]
+    fn load_refuses_an_oversized_file() {
+        let p = tmpfile("load_oversized");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_MAPFILE_BYTES + 1).unwrap();
+        drop(f);
+        let e = Mapfile::load(&p).map(|_| ()).unwrap_err();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(invalid_kind(&e), Some("too_large"), "{e}");
+    }
+
+    // M3: ddrescue's current-line status also has `F` (filling) and `G` (generating).
+    #[test]
+    fn load_accepts_ddrescue_fill_and_generate_current_lines() {
+        for cur in ["0x00100000  F  1", "0x00100000  G  1", "0x0  F"] {
+            let mf = load_text(
+                "load_current_fg",
+                &format!("# Rescue Logfile. Created by GNU ddrescue\n{cur}\n0x0 0x800 +\n"),
+            )
+            .unwrap_or_else(|e| panic!("{cur}: {e}"));
+            assert_eq!(mf.entries().len(), 1, "{cur}");
+            assert_eq!(mf.total_size(), 0x800, "{cur}");
+        }
+        // A bare-hex data line whose size is `F` is still a data line.
+        let mf = load_text("load_size_f", "0 F +\nF 1 -\n").unwrap();
+        assert_eq!(mf.total_size(), 0x10);
+        assert_eq!(mf.stats().bytes_good, 0xF);
+    }
+
+    // N12: a zero-size mapfile round-trips (no zero-size entry that load() refuses).
+    #[test]
+    fn a_zero_size_mapfile_round_trips() {
+        let p = tmpfile("zero_size_create");
+        let mf = Mapfile::create(&p, 0, "test").unwrap();
+        let back = Mapfile::load(&p).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&p);
+        let back = back.unwrap();
+        assert!(mf.entries().is_empty());
+        assert_eq!((back.total_size(), back.entries().len()), (0, 0));
+        assert_eq!(back.stats(), mf.stats());
+    }
+
+    // M26: a data line is exactly `pos size status`, the status one character.
+    #[test]
+    fn load_refuses_a_malformed_status_field() {
+        for (line, kind) in [
+            ("0x0 0x800 +garbage", "status_char"),
+            ("0x0 0x800 +?", "status_char"),
+            ("0x0 0x800 + extra", "long_line"),
+        ] {
+            let e = load_text("load_status_field", &format!("0x0 ? 1\n{line}\n"))
+                .map(|_| ())
+                .unwrap_err();
+            assert_eq!(invalid_kind(&e), Some(kind), "{line}: {e}");
+        }
+    }
+
     // ── write_to_disk format ──────────────────────────────────────
     // Entries round-trip through load() with the fixed header block
     // (Created by / Current pos / column header) intact for external tools.
@@ -2216,14 +2713,152 @@ pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfi
 mod write_to_disk_cleanup_tests {
     use super::*;
 
+    fn tmp_of(path: &Path) -> PathBuf {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    }
+
+    // R1/M2: an abandoned (disowned) writer paused mid-write, then the resumed owner of the
+    // same path writes. The stale snapshot must never reach the path, whichever runs first.
+    #[test]
+    fn a_disowned_writer_cannot_clobber_the_resumed_owners_mapfile() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("race.mapfile");
+        let mut stale = Mapfile::create(&path, 4096, "abandoned-pass").unwrap();
+        stale.record(0, 2048, SectorStatus::Unreadable).unwrap();
+        let disown = stale.disown_handle();
+
+        let (at_tx, at_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        WRITE_HOOKS.lock().unwrap().push((
+            path.clone(),
+            HookAt::TmpBuffered,
+            Box::new(move || {
+                at_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+            }),
+        ));
+        let abandoned = std::thread::spawn(move || stale.flush());
+        at_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the abandoned writer never reached the hook");
+        let tmp = tmp_of(&path);
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().len(),
+            0,
+            "fixture: still buffered"
+        );
+
+        // The stop disowns it; the resume builds a fresh mapfile on the same path.
+        disown.disown();
+        let owner_path = path.clone();
+        let owner = std::thread::spawn(move || {
+            Mapfile::create(&owner_path, 4096, "resumed-pass").map(|m| m.total_size())
+        });
+        let waited = std::time::Instant::now();
+        while !owner.is_finished() && waited.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        go_tx.send(()).unwrap();
+        abandoned
+            .join()
+            .unwrap()
+            .expect("a disowned flush reports success");
+        assert_eq!(owner.join().unwrap().expect("the owner's write"), 4096);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("Created by resumed-pass") && !text.contains("abandoned-pass"),
+            "the abandoned writer's stale snapshot reached the resumed owner's mapfile:\n{text}"
+        );
+        assert_eq!(Mapfile::load(&path).unwrap().stats().bytes_unreadable, 0);
+        assert!(!tmp.exists(), "no tmp left behind");
+    }
+
+    // M2: the abandoned writer passed its disowned check and stalls before its rename while
+    // the resumed owner writes. The owner must wait for that rename, not race it.
+    #[test]
+    fn a_resumed_owner_waits_for_a_stalled_disowned_rename() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("rename-race.mapfile");
+        let mut stale = Mapfile::create(&path, 4096, "abandoned-pass").unwrap();
+        stale.record(0, 2048, SectorStatus::Unreadable).unwrap();
+        let disown = stale.disown_handle();
+
+        let pause = |at: HookAt| {
+            let (at_tx, at_rx) = mpsc::channel::<()>();
+            let (go_tx, go_rx) = mpsc::channel::<()>();
+            let hook: Box<dyn FnOnce() + Send> = Box::new(move || {
+                let _ = at_tx.send(());
+                let _ = go_rx.recv();
+            });
+            WRITE_HOOKS.lock().unwrap().push((path.clone(), at, hook));
+            (at_rx, go_tx)
+        };
+        let (a_at, a_go) = pause(HookAt::PreRename);
+        let abandoned = std::thread::spawn(move || stale.flush());
+        a_at.recv_timeout(Duration::from_secs(30))
+            .expect("the abandoned writer never reached its rename");
+        disown.disown();
+
+        let (b_at, b_go) = pause(HookAt::PreRename);
+        let owner_path = path.clone();
+        let owner = std::thread::spawn(move || {
+            Mapfile::create(&owner_path, 4096, "resumed-pass").map(|m| m.total_size())
+        });
+        // Without the lock the owner reaches its own rename; with it, it waits on the lock.
+        let _ = b_at.recv_timeout(Duration::from_millis(500));
+        a_go.send(()).unwrap();
+        abandoned.join().unwrap().expect("the abandoned rename");
+        b_go.send(()).unwrap();
+        assert_eq!(owner.join().unwrap().expect("the owner's write"), 4096);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("Created by resumed-pass"), "{text}");
+        assert!(!tmp_of(&path).exists(), "no tmp left behind");
+    }
+
+    // M27: a bare relative mapfile name syncs the current directory, not `""` (ENOENT).
+    #[test]
+    fn a_relative_mapfile_syncs_the_current_directory() {
+        for p in ["rel.mapfile", "sub/rel.mapfile", "/abs/rel.mapfile"] {
+            let dir = parent_dir(Path::new(p)).unwrap();
+            assert!(!dir.as_os_str().is_empty(), "{p}");
+        }
+        let dir = parent_dir(Path::new("rel.mapfile")).unwrap();
+        libfreemkv::io::fsync::dir_checked(dir).expect("fsync the current directory");
+    }
+
+    // N2: a symlink planted at the predictable tmp name is replaced, never written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_at_the_tmp_name_is_not_followed() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("m.mapfile");
+        let victim = td.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, tmp_of(&path)).unwrap();
+        Mapfile::create(&path, 4096, "test").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the mapfile must be a regular file"
+        );
+        assert_eq!(Mapfile::load(&path).unwrap().total_size(), 4096);
+    }
+
     // A failed write must not leave `<path>.tmp` behind: every `?` between
     // `File::create(&tmp)` and the final `rename` used to orphan the tmp file.
     // Reachable via a directory sitting on the destination name (rename fails).
     #[test]
     fn a_failed_write_does_not_orphan_the_tmp_file() {
-        let dir = std::env::temp_dir().join(format!("fmkv-tmpclean-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path();
 
         // Occupy the mapfile's own name with a non-empty DIRECTORY, so the
         // rename at the end of `write_to_disk` cannot succeed.
@@ -2244,7 +2879,6 @@ mod write_to_disk_cleanup_tests {
             !tmp.exists(),
             "a partially-written tmp was left behind at {tmp:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2254,12 +2888,9 @@ mod load_if_present_tests {
 
     #[test]
     fn absent_is_none_not_an_error() {
-        let dir = std::env::temp_dir().join(format!("fmkv-lip-absent-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("nope.map");
-        let _ = std::fs::remove_file(&p);
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("nope.map");
         assert!(load_if_present(&p).unwrap().is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The distinction the three call sites kept re-deriving: a mapfile that
@@ -2267,9 +2898,8 @@ mod load_if_present_tests {
     /// "nothing here".
     #[test]
     fn corrupt_is_an_error_not_none() {
-        let dir = std::env::temp_dir().join(format!("fmkv-lip-corrupt-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("bad.map");
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.map");
         std::fs::write(&p, b"# Rescue Logfile. Created by test\n0x00 0xZZZZ +\n").unwrap();
         match load_if_present(&p) {
             Err(e) => assert_ne!(
@@ -2279,7 +2909,6 @@ mod load_if_present_tests {
             ),
             Ok(_) => panic!("a corrupt mapfile must not load, nor read as absent"),
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -2612,6 +3241,45 @@ mod ku_identity_tests {
         let mut clear = disc_with(HASH_A, [0; 16]);
         clear.aacs = None;
         assert!(ok(&map_with(&p, None, None, &[]), &clear));
+    }
+
+    /// Rule 2's fallback: a disc whose scan has no VID is identified by the key set's VID,
+    /// both when stamped and when checked; the disc's own VID still wins when it has one.
+    #[test]
+    fn identity_falls_back_to_the_key_sets_vid() {
+        let (_d, p) = scratch("set_vid");
+        let fx = bd_image(&[Some(K1)], 1);
+        let f = crate::test_fixtures::factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+        let opts = ResolveKeysOptions {
+            vid: Some(VID),
+            ..Default::default()
+        };
+        let set = ResolvedKeySet::resolve(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0]),
+            &f,
+            opts,
+        )
+        .unwrap()
+        .keys;
+        let other_vid = [0x33; 16];
+        let no_vid = disc_with(HASH_A, [0; 16]);
+        let check = |map_vid: [u8; 16], d: &libfreemkv::Disc| {
+            check_mapfile_identity(&map_with(&p, None, Some(map_vid), &[]), d, Some(&set)).is_ok()
+        };
+        assert!(check(VID, &no_vid));
+        assert!(!check(other_vid, &no_vid), "the set's VID is compared");
+        assert!(
+            check(other_vid, &disc_with(HASH_A, other_vid)),
+            "the disc's own VID wins"
+        );
+
+        let mut mf = map_with(&p, None, None, &[]);
+        stamp_identity(&mut mf, &no_vid, Some(&set));
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+        stamp_identity(&mut mf, &disc_with(HASH_A, other_vid), Some(&set));
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&other_vid)));
     }
 
     /// EK3 rule 3 (KU §4.4, coord 4): legacy key fingerprints are checked ONLY when the set

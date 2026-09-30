@@ -1,9 +1,10 @@
 //! What to rip, and how — the front-end's request to the engine.
 //!
 //! A [`Job`] is pure data: a front-end builds one from CLI args, a web POST, or
-//! GUI selections, hands it to [`crate::preflight()`] to check it, then to
-//! [`crate::run`] to execute it. It carries no I/O handles and no callbacks —
-//! those arrive separately as the [`crate::Sink`].
+//! GUI selections, hands it to [`crate::preflight()`] to check it, then to an
+//! entry point ([`crate::multipass_rip`], [`crate::recover_to_iso`],
+//! [`crate::mux_title`]) to execute it. It carries no I/O handles and no
+//! callbacks — those arrive separately as the [`crate::Sink`].
 
 use crate::streams::SubtitleFilter;
 

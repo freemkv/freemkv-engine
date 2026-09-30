@@ -3,7 +3,6 @@
 
 use super::*;
 use libfreemkv::Error;
-use std::time::{Duration, Instant};
 
 struct Cancels(AtomicBool);
 impl Sink for Cancels {
@@ -78,8 +77,23 @@ fn linked_follows_op_extra_and_sink() {
     EngineHalt::legacy(Some(flag.clone())).linked(|lh| assert!(Arc::ptr_eq(lh.as_arc(), &flag)));
 }
 
-// ET8 `engine_outcome_mapping` — §2.6: "`EngineOutcome` maps `Halted` → `Stopped` only when
-// the op token is cancelled"; "`TimedOut` → **Failed** always".
+// A bridged call returns when its work ends, not after the bridge's next poll slice.
+#[test]
+fn a_bridged_call_returns_without_waiting_for_the_next_slice() {
+    let h = EngineHalt::new(&Halt::new(), Some(Arc::new(AtomicBool::new(false))));
+    let t0 = Instant::now();
+    for _ in 0..10 {
+        h.linked(|_| std::thread::sleep(Duration::from_millis(2)));
+    }
+    let took = t0.elapsed();
+    assert!(
+        took < WAIT_SLICE * 5,
+        "10 short calls took {took:?}: each waited out a {WAIT_SLICE:?} slice"
+    );
+}
+
+// ET8 `engine_outcome_mapping` — §2.6: `Halted` → `Stopped` only on a cancel (the op token,
+// or the narrower flag and Sink the engine also honours, §4.2); "`TimedOut` → **Failed** always".
 #[test]
 fn engine_outcome_mapping() {
     let op = Halt::new();
@@ -104,13 +118,37 @@ fn engine_outcome_mapping() {
         matches!(r, EngineOutcome::Failed(_)),
         "TimedOut stays Failed after a Stop"
     );
+    let extra = Arc::new(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), Some(extra));
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, never);
+    assert!(r.is_stopped(), "a narrower-flag cancel is a Stop: {r:?}");
+    let sink = Cancels(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, never);
+    assert!(r.is_stopped(), "a Sink cancel is a Stop: {r:?}");
 }
 
-// ET8, last case — §2.6: "Otherwise it `debug_assert!`s and maps to `Failed`."
+// ET8, last case — §2.6: "Otherwise it … maps to `Failed`", in every build profile. A
+// non-sticky `should_cancel` or a source's own `Halted` reach it, so it must not panic.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Halted with no cancel")]
-fn halted_without_a_cancel_is_a_debug_panic() {
+fn halted_without_a_cancel_is_failed() {
     let h = EngineHalt::new(&Halt::new(), None);
-    let _ = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    assert!(matches!(r, EngineOutcome::Failed(Error::Halted)), "{r:?}");
+}
+
+// A Stop the engine observed stays a Stop even if a non-sticky `should_cancel` flips back.
+#[test]
+fn an_observed_cancel_is_sticky() {
+    struct Once(AtomicBool);
+    impl Sink for Once {
+        fn should_cancel(&self) -> bool {
+            self.0.swap(false, Ordering::SeqCst)
+        }
+    }
+    let sink = Once(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    assert!(h.is_cancelled());
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    assert!(r.is_stopped(), "{r:?}");
 }

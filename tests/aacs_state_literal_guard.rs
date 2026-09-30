@@ -9,7 +9,9 @@
 //! (a `let` or `Some(..)` that names the type with braces). Reading the key state field
 //! by field outside libfreemkv is the coupling KU-X2 removes with those fields.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 
 /// Characters before a match that decide whether it is a signature (§2.2).
 const LOOKBEHIND: usize = 80;
@@ -103,28 +105,13 @@ fn literal_lines(src: &str) -> Vec<usize> {
     hits
 }
 
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
 /// Guard: no `AacsState` struct literal anywhere in this crate's `src/` or `tests/`.
 /// Build one with `libfreemkv::test_util::aacs_state()` (KU design §2.2, KU-P1).
 #[test]
 fn no_aacs_state_struct_literals_outside_test_util() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    rs_files(&root.join("src"), &mut files);
-    rs_files(&root.join("tests"), &mut files);
+    let mut files = common::rs_files(&root.join("src"));
+    files.extend(common::rs_files(&root.join("tests")));
     assert!(
         files
             .iter()
@@ -149,12 +136,12 @@ fn no_aacs_state_struct_literals_outside_test_util() {
     );
 }
 
-/// Self-test: the 7 signature shapes of the §2.2 proof never match; a literal does.
+/// Self-test: the signature shapes of the §2.2 proof (return types, definitions, impl
+/// headers) never match; a literal or a destructuring pattern does.
 #[test]
 fn the_guard_skips_signatures_and_catches_literals() {
     let ty = "AacsState";
-    // engine recovery_copy_dispatch.rs:115, resolve.rs:199, preflight.rs:249,
-    // recovery/mapfile.rs:2358; freemkv pipe.rs:5785, engine.rs:3257, disc_capture.rs:529.
+    // Return-type shapes as the §2.2 proof listed them from engine and freemkv test helpers.
     let signatures = [
         format!("fn aacs_with(unit_keys: Vec<(u32, [u8; 16])>) -> {ty} {{"),
         format!("    fn aacs(origin: libfreemkv::KeyOrigin) -> libfreemkv::{ty} {{"),
@@ -163,7 +150,6 @@ fn the_guard_skips_signatures_and_catches_literals() {
             "    fn aacs_with(\n        unit_keys: Vec<(u32, [u8; 16])>,\n        \
              volume_id: [u8; 16],\n    ) -> libfreemkv::disc::{ty} {{"
         ),
-        format!("    pub(super) fn aacs(unit_keys: Vec<(u32, [u8; 16])>) -> libfreemkv::{ty} {{"),
         format!("    pub(super) fn aacs(unit_keys: Vec<(u32, [u8; 16])>) -> libfreemkv::{ty} {{"),
         format!("    fn aacs_with_secrets(disc_hash: &str) -> {ty} {{"),
         // Definition and impl headers; another type whose name ends in the type's.
@@ -176,7 +162,8 @@ fn the_guard_skips_signatures_and_catches_literals() {
     for s in &signatures {
         assert!(literal_lines(s).is_empty(), "signature matched: {s}");
     }
-    // Literals, including ones near the words impl/struct, and patterns (banned).
+    // Literals, including names that contain `impl`/`struct` (simple, destruct), and
+    // patterns (banned).
     let literals = [
         format!("let a = {ty} {{ version: 1, .. }};"),
         format!("let simple = {ty} {{ version: 1, .. }};"),
