@@ -11,7 +11,9 @@
 //! A fresh `io::Error` construction (`source: std::io::Error::new(..)`) and a `{ .. }`
 //! pattern are not flagged.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 
 fn is_word(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -57,18 +59,6 @@ fn pass_through_lines(text: &str) -> Vec<usize> {
         .collect()
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    for entry in entries {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|x| x == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn the_matcher_flags_only_the_pass_through_shape() {
     assert_eq!(pass_through_lines("Error::IoError { source: e }"), [1]);
@@ -93,9 +83,7 @@ fn the_matcher_flags_only_the_pass_through_shape() {
 #[test]
 fn no_io_error_is_rewrapped_by_hand_under_src() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    rust_files(&root.join("src"), &mut files);
-    files.sort();
+    let files = common::rs_files(&root.join("src"));
     assert!(!files.is_empty(), "no sources scanned");
     let hits: Vec<String> = files
         .iter()

@@ -12,7 +12,9 @@
 //! sanctioned test helper `libfreemkv::test_util::decrypt_unit` is not the library door.
 //! Per spec; do not change without a spec citation proving otherwise.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use std::path::Path;
 
 // The mapfile line prefixes, assembled so this file never spells them.
 const UK: &str = concat!("freemkv", "-uk");
@@ -181,28 +183,13 @@ fn hits(rel: &str, src: &str) -> Vec<(usize, &'static str)> {
     out
 }
 
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            rs_files(&p, out);
-        } else if p.extension().is_some_and(|x| x == "rs") {
-            out.push(p);
-        }
-    }
-}
-
 /// EK9 structural half (KU §2.2, KU-X1): no legacy key API in `src/` or `tests/` outside
 /// `recovery/mapfile.rs` fn `parse_legacy_key_lines`.
 #[test]
 fn no_legacy_key_api_outside_parse_legacy_key_lines() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    rs_files(&root.join("src"), &mut files);
-    rs_files(&root.join("tests"), &mut files);
+    let mut files = common::rs_files(&root.join("src"));
+    files.extend(common::rs_files(&root.join("tests")));
     let mapfile = std::fs::read_to_string(root.join("src/recovery/mapfile.rs")).unwrap();
     let (_, bare) = lex(&mapfile);
     assert_eq!(
