@@ -12,7 +12,7 @@ use libfreemkv::aacs::trace::ResolutionTrace;
 use libfreemkv::keys::{DecryptStatus, KeyScope, ResolveKeysOptions, ResolvedKeySet};
 
 /// Already-resolved key configuration, boundary-normalized by the calling
-/// shell. See the module docs for what each field means and does NOT mean.
+/// shell. Each field's doc says what it means and does NOT mean.
 #[derive(Clone, Default)]
 pub struct KeyParams {
     /// The local keydb path to consult, or `None` to skip the local source
@@ -20,12 +20,9 @@ pub struct KeyParams {
     /// chain or `shellexpand` its shell uses — this module does no further
     /// resolution of the path itself.
     pub keydb_path: Option<String>,
-    /// The online key-service URL, or `None` to skip it. Checked here without DNS
-    /// ([`freemkv_keysources::check_keyserver_url_static`]); a URL wrong on its face is
-    /// silently dropped (the local source, if any, still applies). Its host is looked up and
-    /// SSRF-guarded at the first query (J10), on the source's worker; that query does not yet
-    /// see the rip's Stop (it runs under its own `Halt` until ST-K1b wires `ctx.halt()`).
-    /// The visible warning is the CLI's job.
+    /// The online key-service URL, or `None` to skip it. One wrong on its face is dropped
+    /// here without DNS (see [`key_url_rejection`]); the local source still applies. Its host
+    /// is looked up and SSRF-guarded at the first query (J10).
     pub key_url: Option<String>,
     /// Bearer token for the online service, if any.
     pub key_auth: Option<String>,
@@ -36,13 +33,20 @@ pub struct KeyParams {
 
 /// Build the ordered `KeySource` list, **local-first**: the keydb (unless
 /// `online_only`) then the online service (unless its URL is absent or
-/// permanently SSRF-rejected). Quiet: it emits no warnings.
+/// permanently SSRF-rejected). Prints nothing: a dropped URL is a `freemkv::keys`
+/// tracing warning and [`key_url_rejection`]'s typed verdict.
 ///
 /// KU J10: no DNS lookup here (a factory build has no Stop). The host is looked up at the
 /// first query, which is not yet Stop-aware (ST-K1b wires `ctx.halt()` into it); `resolve`'s
 /// own retry waits are. A lookup with no answer is retried up front until 60 s pass with no
 /// answer (J13); one that finds a non-public address is refused.
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
+    warn_dropped_url(p);
+    sources_quiet(p)
+}
+
+// `key_sources` without the dropped-URL warning (a factory warns once, at build).
+fn sources_quiet(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
     if !p.online_only
@@ -51,9 +55,7 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
         sources.push(Box::new(freemkv_keysources::KeydbSource::new(path.clone())));
     }
 
-    if let Some(url) = &p.key_url
-        && freemkv_keysources::check_keyserver_url_static(url).is_ok()
-    {
+    if let (Some(url), None) = (&p.key_url, key_url_rejection(p)) {
         sources.push(Box::new(freemkv_keysources::OnlineSource::new(
             url.clone(),
             p.key_auth.clone().unwrap_or_default(),
@@ -63,11 +65,31 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
     sources
 }
 
+// Neither the URL nor the check's text: a URL may carry credentials.
+fn warn_dropped_url(p: &KeyParams) {
+    if let Some(r) = key_url_rejection(p) {
+        tracing::warn!(
+            target: "freemkv::keys",
+            fault = ?r.fault,
+            "key_url dropped by the static check"
+        );
+    }
+}
+
+/// Why [`key_sources`] leaves `p.key_url` out, if it does: the static check's typed verdict
+/// (no DNS lookup), for a front-end to localize. `None` when no URL is set or it passes.
+pub fn key_url_rejection(p: &KeyParams) -> Option<freemkv_keysources::KeyserverUrlRejection> {
+    let url = p.key_url.as_deref()?;
+    freemkv_keysources::check_keyserver_url_static(url).err()
+}
+
 /// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] calls to build
 /// the ordered sources from `p`, with the J10 transient-URL rule of [`key_sources`].
+/// A dropped `key_url` is warned once, here, not on every call.
 pub fn key_source_factory(p: &KeyParams) -> libfreemkv::KeySourceFactory {
+    warn_dropped_url(p);
     let p = p.clone();
-    std::sync::Arc::new(move || key_sources(&p))
+    std::sync::Arc::new(move || sources_quiet(&p))
 }
 
 /// What a rip writes, which decides what it must decrypt (KU §2.5).
@@ -371,8 +393,9 @@ mod tests {
         assert_eq!(rip_scope(d, &[1], RipOutput::RawImage), KeyScope::None);
     }
 
-    /// EK6 (J10): a key-service URL whose host lookup fails TRANSIENTLY keeps the online
-    /// source (resolve retries it, J13); a permanently rejected one is still dropped.
+    /// EK6 (J10): a key-service URL whose host may not resolve yet keeps the online source
+    /// (the build does no lookup; resolve retries it, J13); a permanently rejected one is
+    /// still dropped. No test here depends on the machine's resolver.
     #[test]
     fn transient_url_keeps_online_source() {
         let p = KeyParams {
@@ -381,12 +404,7 @@ mod tests {
             key_auth: None,
             online_only: false,
         };
-        let url = p.key_url.as_deref().unwrap();
-        let rejected = freemkv_keysources::check_keyserver_url(url).unwrap_err();
-        assert!(
-            rejected.is_temporary(),
-            "`.test` (RFC 2606) never resolves: {rejected}"
-        );
+        assert!(key_url_rejection(&p).is_none(), "passes without a lookup");
         let labels: Vec<&str> = key_source_factory(&p)().iter().map(|s| s.label()).collect();
         assert_eq!(labels, ["keydb", "online"], "the online source is kept");
         let loopback = KeyParams {
@@ -398,6 +416,25 @@ mod tests {
             .map(|s| s.label())
             .collect();
         assert_eq!(labels, ["keydb"], "a permanent rejection still drops it");
+    }
+
+    /// A key_url the static check rejects is dropped from the sources, and
+    /// `key_url_rejection` says so (typed, no DNS); one that passes is kept.
+    #[test]
+    fn a_dropped_key_url_says_why() {
+        let url = |u: &str| KeyParams {
+            key_url: Some(u.into()),
+            ..Default::default()
+        };
+        for bad in ["http://keys.example.test/k", "https://169.254.169.254/k"] {
+            let rejected = key_url_rejection(&url(bad)).expect(bad);
+            assert!(!rejected.is_temporary(), "{bad}");
+            assert!(key_sources(&url(bad)).is_empty(), "{bad}");
+        }
+        let ok = url("https://keys.example.test/k");
+        assert!(key_url_rejection(&ok).is_none());
+        assert_eq!(key_sources(&ok).len(), 1);
+        assert!(key_url_rejection(&KeyParams::default()).is_none());
     }
 
     /// Stop rule (stall-based only; Stop can interrupt every wait): a factory build has no
@@ -548,23 +585,5 @@ mod tests {
             key_status(&clear, &ResolvedKeySet::none()),
             DecryptStatus::NotEncrypted
         ));
-    }
-
-    /// `open_scan` (KU §3.2): the raw drive bring-up, no key call; signature pinned.
-    #[test]
-    fn open_scan_signature() {
-        let _: fn(
-            libfreemkv::DeviceTarget,
-            Option<libfreemkv::DriveCredentials>,
-            bool,
-        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> = crate::mux::open_scan;
-        type OpenScanWith = fn(
-            libfreemkv::DeviceTarget,
-            Option<libfreemkv::DriveCredentials>,
-            bool,
-            &libfreemkv::Halt,
-            &libfreemkv::halt::Progress,
-        ) -> Result<libfreemkv::DiscSession, libfreemkv::Error>;
-        let _: OpenScanWith = crate::mux::open_scan_with;
     }
 }

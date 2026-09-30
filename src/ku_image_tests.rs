@@ -14,14 +14,19 @@ use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use libfreemkv::{Error, SectorSource};
 use std::path::Path;
 
-// Zero the sectors a sweep can leave unread in a staged ISO: every MPLS and
-// `/AACS/Unit_Key_RO.inf` (EK13).
-fn damage_metadata(fx: &Fx, iso: &Path) {
+// Zero `(lba, sectors)` ranges of the image at `iso`.
+fn zero_sectors(iso: &Path, ranges: &[(u32, u32)]) {
     let mut bytes = std::fs::read(iso).unwrap();
-    for &(s, n) in &fx.metadata {
+    for &(s, n) in ranges {
         bytes[s as usize * 2048..(s + n) as usize * 2048].fill(0);
     }
     std::fs::write(iso, bytes).unwrap();
+}
+
+// Zero the sectors a sweep can leave unread in a staged ISO: every MPLS and
+// `/AACS/Unit_Key_RO.inf` (EK13).
+fn damage_metadata(fx: &Fx, iso: &Path) {
+    zero_sectors(iso, &fx.metadata);
 }
 
 // The staged image's sidecar mapfile: the disc's hash, every sector Finished except
@@ -81,10 +86,11 @@ fn staged_iso_with_damaged_udf_muxes_from_drive_scanned_title() {
     let staged = fx.write(dir.path(), "staged.iso");
     damage_metadata(&fx, &staged);
     staged_sidecar(&fx, &staged, &fx.metadata);
+    let rescan = crate::scan_image(&ImageSource::Iso(staged.clone())).map(|(d, _)| d.titles);
     assert!(
-        crate::scan_image(&ImageSource::Iso(staged.clone()))
-            .map_or(true, |(d, _)| d.titles.is_empty()),
-        "fixture: a rescan of the staged image finds no title"
+        rescan.as_ref().is_ok_and(Vec::is_empty),
+        "fixture: a rescan of the staged image scans and finds no title: {:?}",
+        rescan.map(|t| t.len())
     );
     let asked = calls.len();
 
@@ -588,11 +594,7 @@ fn a_prescanned_disc_refuses_an_image_it_cannot_identify() {
         };
         open_image_with(&ImageSource::Iso(iso.to_path_buf()), opts).map(|_| ())
     };
-    let zero_inf = |iso: &Path| {
-        let mut b = std::fs::read(iso).unwrap();
-        b[inf.0 as usize * 2048..(inf.0 + inf.1) as usize * 2048].fill(0);
-        std::fs::write(iso, b).unwrap();
-    };
+    let zero_inf = |iso: &Path| zero_sectors(iso, &[inf]);
     let dir = tempfile::tempdir().unwrap();
     // No sidecar, key file unreadable: refused.
     let bare = fx.write(dir.path(), "bare.iso");
@@ -935,6 +937,29 @@ fn a_failed_top_up_is_remembered_not_reported_as_no_key() {
     assert_eq!(calls.len(), asked, "the ask was spent: not asked again");
 }
 
+/// A top-up refused for a cause other than Missing (E7028) keeps that refusal when the
+/// sidecar has since turned unreadable (only a Missing reads it, for E7034), and remembers it.
+#[test]
+fn an_unreadable_sidecar_does_not_replace_a_top_up_refusal() {
+    let fx = bd_image(&[Some(K1), Some(K2), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    let f = factory(
+        &[(Answer::Keydb, &[K1]), (Answer::Unavailable, &[])],
+        &Calls::default(),
+    );
+    let opened =
+        open_image_with(&ImageSource::Iso(iso.clone()), OpenImageOptions::resolve(f)).unwrap();
+    std::fs::write(mapfile_path_for(&iso), "# freemkv-vidfp: zz\n0x0 0x800 +\n").unwrap();
+    let code = |t: usize| opened.keys_for(&[t], None).map(|_| ()).unwrap_err().code();
+    let e7028 = libfreemkv::error::E_KEY_SERVICE_UNAVAILABLE;
+    assert_eq!(
+        (code(1), code(2)),
+        (e7028, e7028),
+        "not MapfileInvalid, then E7022"
+    );
+}
+
 /// B1: a top-up that made no request (a Stop before it, or an image that would not open)
 /// has not spent the ask: the next call asks and succeeds.
 #[test]
@@ -1007,14 +1032,10 @@ fn a_pending_only_gap_is_not_re_resolved() {
     assert_eq!(calls.len(), asked, "keydb not re-asked");
 }
 
-// A staged copy of `fx` whose key file is zeroed and whose sidecar (written by `side`) is
-// then adjusted as each test needs; `open` opens it with the drive disc and `set`.
+// `fx` written to `dir/name` with its key file zeroed, as a sweep leaves one it did not read.
 fn staged_with(fx: &Fx, dir: &Path, name: &str) -> std::path::PathBuf {
     let iso = fx.write(dir, name);
-    let inf = *fx.metadata.last().unwrap();
-    let mut b = std::fs::read(&iso).unwrap();
-    b[inf.0 as usize * 2048..(inf.0 + inf.1) as usize * 2048].fill(0);
-    std::fs::write(&iso, b).unwrap();
+    zero_sectors(&iso, &[*fx.metadata.last().unwrap()]);
     iso
 }
 
@@ -1273,7 +1294,11 @@ fn a_remembered_stop_does_not_cancel_a_later_call() {
     assert_eq!(out, RipOutcome::Halted, "stopped during the retry");
     let asked = calls.len();
     let out = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &crate::NoopSink);
-    assert_ne!(out, RipOutcome::Halted, "nobody stopped this call");
+    assert_eq!(
+        out,
+        RipOutcome::NoKey,
+        "nobody stopped this call: the spent ask leaves t1 Missing (E7022), no Stop re-raised"
+    );
     assert_eq!(calls.len(), asked, "the ask was spent");
 }
 

@@ -64,6 +64,16 @@ pub enum KeyInput {
     Seeded(KeySourceFactory, ResolvedKeySet),
 }
 
+impl KeyInput {
+    // The set the caller holds, if any.
+    fn held(&self) -> Option<&ResolvedKeySet> {
+        match self {
+            KeyInput::Known(set) | KeyInput::Seeded(_, set) => Some(set),
+            KeyInput::Resolve(_) => None,
+        }
+    }
+}
+
 /// Options for [`open_image_with`].
 pub struct OpenImageOptions {
     pub keys: KeyInput,
@@ -218,10 +228,7 @@ fn open_image_inner(
         }
         Some(disc) => {
             let mut reader = raw_reader(src)?;
-            let held = match &keys {
-                KeyInput::Known(set) | KeyInput::Seeded(_, set) => Some(set),
-                KeyInput::Resolve(_) => None,
-            };
+            let held = keys.held();
             let in_hand = in_hand_vid_fingerprint(&disc, vid, held);
             let proven = held
                 .map(|s| s.proven_key_fingerprints())
@@ -238,11 +245,7 @@ fn open_image_inner(
             &crate::Selection::MainMovie,
         ))
     });
-    let seed = match &keys {
-        KeyInput::Known(set) | KeyInput::Seeded(_, set) => Some(set),
-        KeyInput::Resolve(_) => None,
-    };
-    let vid_in_hand = in_hand_vid_fingerprint(&disc, vid, seed);
+    let vid_in_hand = in_hand_vid_fingerprint(&disc, vid, keys.held());
     if let Some(map) = &sidecar {
         let identity = DiscIdentity {
             vidfp: vid_in_hand,
@@ -326,6 +329,8 @@ impl TopUp {
 struct Remembered {
     code: u16,
     data: String,
+    // An OS error's kind and errno: its `E5000: <errno|kind>` text alone rebuilds `Other`.
+    io: Option<(std::io::ErrorKind, Option<i32>)>,
 }
 
 impl Remembered {
@@ -340,9 +345,14 @@ impl Remembered {
         let data = crate::parse_error_code(&text)
             .map_or("", |(_, d)| d)
             .to_string();
+        let io = match e {
+            Error::IoError { source, .. } => Some((source.kind(), source.raw_os_error())),
+            _ => None,
+        };
         Some(Remembered {
             code: e.code(),
             data,
+            io,
         })
     }
 
@@ -350,6 +360,13 @@ impl Remembered {
     // key refusals; any other kept as an I/O error carrying its `E<code>: <data>` text.
     fn rebuild(&self) -> Error {
         use libfreemkv::error as c;
+        if let Some((kind, errno)) = self.io {
+            let os = errno.map_or_else(
+                || std::io::Error::from(kind),
+                std::io::Error::from_raw_os_error,
+            );
+            return Error::from(os);
+        }
         let d = self.data.clone();
         match self.code {
             c::E_KEY_SERVICE_UNAVAILABLE => Error::KeyServiceUnavailable,
@@ -437,8 +454,13 @@ impl OpenedImage {
                 if let (false, true, Some(kept)) = (ask, missing, &held.failure) {
                     return Err(kept.rebuild());
                 }
-                let sidecar = load_sidecar(&self.source)?;
-                let e = vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref());
+                // Only a Missing can become E7034 by the sidecar; any other refusal stays itself.
+                let e = if missing {
+                    let sidecar = load_sidecar(&self.source)?;
+                    vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref())
+                } else {
+                    e
+                };
                 if requested {
                     held.failure = Remembered::of(&e);
                 }
@@ -500,17 +522,19 @@ fn check_prescanned(
     }
     let norm = |h: &str| libfreemkv::hex::strip_hex_prefix(h).to_ascii_lowercase();
     let disc_hash = disc.aacs.as_ref().map(|a| norm(&a.disc_hash));
-    let unread = key_file_unread(sidecar, reader);
-    let image_hash = if unread {
-        None
-    } else {
-        let inf = libfreemkv::read_filesystem(reader)
-            .and_then(|fs| fs.read_file(reader, KEY_FILE))
-            .ok();
-        let hash = |inf: Vec<u8>| {
-            libfreemkv::aacs::inf::disc_hash_hex(&libfreemkv::aacs::inf::disc_hash(&inf))
-        };
-        inf.map(|inf| norm(&hash(inf)))
+    // One UDF parse serves both reads. An OS error reading the image is that error, never
+    // "a different disc"; a key file the image does not hold (or zeroed metadata) is.
+    let fs = not_os_error(libfreemkv::read_filesystem(reader))?;
+    let unread = key_file_unread(sidecar, fs.as_ref(), reader)?;
+    let image_hash = match fs {
+        Some(fs) if !unread => {
+            let inf = not_os_error(fs.read_file(reader, KEY_FILE))?;
+            let hash = |inf: Vec<u8>| {
+                libfreemkv::aacs::inf::disc_hash_hex(&libfreemkv::aacs::inf::disc_hash(&inf))
+            };
+            inf.map(|inf| norm(&hash(inf)))
+        }
+        _ => None,
     };
     let hash_ok = match (&image_hash, &disc_hash) {
         (Some(i), Some(d)) => i == d,
@@ -543,24 +567,39 @@ fn identifies(map: &Mapfile, vid_in_hand: Option<[u8; 32]>, proven: &[[u8; 8]]) 
 
 const KEY_FILE: &str = "/AACS/Unit_Key_RO.inf";
 
+// `Ok(None)` for a read that failed on the image's contents; an OS error stays an error.
+fn not_os_error<T>(r: crate::Result<T>) -> crate::Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e @ Error::IoError { .. }) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 // Whether the sidecar marks any sector of `/AACS/Unit_Key_RO.inf` not read (a sweep zero-
 // fills those). If the UDF cannot locate the file, only when the sidecar marks any sector so.
-fn key_file_unread(map: Option<&Mapfile>, reader: &mut dyn libfreemkv::SectorSource) -> bool {
+fn key_file_unread(
+    map: Option<&Mapfile>,
+    fs: Option<&libfreemkv::UdfFs>,
+    reader: &mut dyn libfreemkv::SectorSource,
+) -> crate::Result<bool> {
     use crate::SectorStatus as S;
     let Some(map) = map else {
-        return false;
+        return Ok(false);
     };
     let unread = map.ranges_with(&[S::NonTried, S::NonTrimmed, S::NonScraped, S::Unreadable]);
-    let extents =
-        libfreemkv::read_filesystem(reader).and_then(|fs| fs.file_extents(reader, KEY_FILE));
-    let Ok(extents) = extents else {
-        return !unread.is_empty();
+    let extents = match fs {
+        Some(fs) => not_os_error(fs.file_extents(reader, KEY_FILE))?,
+        None => None,
+    };
+    let Some(extents) = extents else {
+        return Ok(!unread.is_empty());
     };
     let file: Vec<(u64, u64)> = extents
         .iter()
         .map(|&(s, n)| (s as u64 * 2048, n as u64 * 2048))
         .collect();
-    !crate::recovery::mapfile::intersect(&unread, &file).is_empty()
+    Ok(!crate::recovery::mapfile::intersect(&unread, &file).is_empty())
 }
 
 // The image's sidecar mapfile, read-only. Absent is no identity; an unparseable one is
@@ -684,24 +723,20 @@ pub(crate) fn vid_needs_disc(
 
 /// The numeric code of a libfreemkv error that went through `io::Error`, or
 /// `None` when it carries none (an OS error, a front-end's own message).
+/// [`libfreemkv::error_code`], re-exported so a front-end needs only the engine.
 pub fn error_code(e: &std::io::Error) -> Option<u16> {
-    parse_error_code(&e.to_string()).map(|(code, _)| code)
+    libfreemkv::error_code(e)
 }
 
 /// Split a libfreemkv error's display form, `E<code>` or `E<code>: <data>`,
-/// into the code and its (trimmed) data. A code wider than `u16` saturates:
-/// it still names an error rather than reading as "no code".
+/// into the code and its (trimmed) data. The code reads as [`error_code`]
+/// reads it: one wider than `u16` is no libfreemkv code (`None`).
 pub fn parse_error_code(s: &str) -> Option<(u16, &str)> {
     let rest = s.strip_prefix('E')?;
     let end = rest
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
-    if end == 0 {
-        return None;
-    }
-    let code = rest[..end]
-        .parse::<u32>()
-        .map_or(u16::MAX, |v| v.min(u16::MAX as u32) as u16);
+    let code = rest[..end].parse::<u16>().ok()?;
     let data = rest[end..].strip_prefix(':').map_or("", str::trim);
     Some((code, data))
 }
@@ -709,19 +744,24 @@ pub fn parse_error_code(s: &str) -> Option<(u16, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_fixtures::{K1, bd_image};
 
     #[test]
     fn parse_error_code_splits_code_and_data() {
         assert_eq!(parse_error_code("E6009"), Some((6009, "")));
         assert_eq!(parse_error_code("E7022: abcdef"), Some((7022, "abcdef")));
         assert_eq!(parse_error_code("E5000: 13"), Some((5000, "13")));
-        assert_eq!(parse_error_code("E99999"), Some((u16::MAX, "")));
+        assert_eq!(
+            parse_error_code("E99999"),
+            None,
+            "no libfreemkv code is wider than u16"
+        );
         assert_eq!(parse_error_code("No drive found"), None);
         assert_eq!(parse_error_code("E"), None);
         assert_eq!(parse_error_code("Eabc"), None);
     }
 
-    // Agrees with the library's own reading of every error it renders.
+    // Agrees with the library's own reading of every error it renders, and of any text.
     #[test]
     fn error_code_matches_the_library() {
         for e in [
@@ -735,6 +775,11 @@ mod tests {
             assert_eq!(error_code(&io), libfreemkv::error_code(&io));
         }
         assert_eq!(error_code(&std::io::Error::other("disk full")), None);
+        for s in ["E99999", "E65536: x", "E65535", "E7022: a", "E", "E-1", "x"] {
+            let io = std::io::Error::other(s);
+            assert_eq!(error_code(&io), libfreemkv::error_code(&io), "{s}");
+            assert_eq!(parse_error_code(s).map(|(c, _)| c), error_code(&io), "{s}");
+        }
     }
 
     #[test]
@@ -752,13 +797,77 @@ mod tests {
     #[test]
     fn open_image_reports_a_missing_image_as_a_scan_error() {
         let src = ImageSource::Iso("/nonexistent/freemkv/none.iso".into());
-        assert!(open_image(&src, &KeyParams::default()).is_err());
+        let err = open_image(&src, &KeyParams::default())
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::IoError { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
     }
-}
 
-#[cfg(test)]
-mod remembered_tests {
-    use super::*;
+    // Counts reads of the UDF anchor (LBA 256); reads touching `fail` fail with EIO.
+    struct Probe<S> {
+        inner: S,
+        anchor_reads: usize,
+        fail: Option<(u32, u32)>,
+    }
+
+    impl<S: libfreemkv::SectorSource> libfreemkv::SectorSource for Probe<S> {
+        fn capacity_sectors(&self) -> u32 {
+            self.inner.capacity_sectors()
+        }
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            count: u16,
+            buf: &mut [u8],
+            recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            let end = lba + count as u32;
+            if (lba..end).contains(&256) {
+                self.anchor_reads += 1;
+            }
+            if self.fail.is_some_and(|(s, e)| s < end && lba < e) {
+                return Err(Error::from(std::io::Error::from_raw_os_error(5)));
+            }
+            self.inner.read_sectors(lba, count, buf, recovery)
+        }
+    }
+
+    // An OS error reading the image's key file is that I/O error, not "a different disc".
+    #[test]
+    fn a_key_file_read_error_is_an_io_error_not_a_disc_mismatch() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let inf = *fx.metadata.last().unwrap();
+        let mut r = Probe {
+            inner: fx.source(),
+            anchor_reads: 0,
+            fail: Some((inf.0, inf.0 + inf.1)),
+        };
+        let err = check_prescanned(&fx.disc, &mut r, None, None, &[]).unwrap_err();
+        assert!(
+            matches!(&err, Error::IoError { source, .. } if source.raw_os_error() == Some(5)),
+            "{err:?}"
+        );
+    }
+
+    // With a sidecar, the pre-scanned check parses the image's UDF once.
+    #[test]
+    fn a_prescanned_check_parses_the_udf_once() {
+        let fx = bd_image(&[Some(K1)], 1);
+        let dir = tempfile::tempdir().unwrap();
+        let total = fx.img.image.len() as u64;
+        let mut map = Mapfile::create(&dir.path().join("d.mapfile"), total, "t").unwrap();
+        map.record(0, total, crate::SectorStatus::Finished).unwrap();
+        let mut r = Probe {
+            inner: fx.source(),
+            anchor_reads: 0,
+            fail: None,
+        };
+        check_prescanned(&fx.disc, &mut r, Some(&map), None, &[]).unwrap();
+        assert_eq!(r.anchor_reads, 1);
+    }
 
     // Every refusal a top-up keeps comes back with its own code and text; Missing and a
     // Stop are never kept.
@@ -783,6 +892,8 @@ mod remembered_tests {
                 scheme: "ftp".into(),
             },
             Error::KeydbTooManyRedirects,
+            Error::from(std::io::Error::from_raw_os_error(28)),
+            Error::from(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
         ];
         for e in kept {
             let back = Remembered::of(&e).expect("kept").rebuild();
@@ -794,5 +905,19 @@ mod remembered_tests {
         assert!(Remembered::of(&missing).is_none());
         assert!(Remembered::of(&Error::WholeDiscKeyMissing).is_none());
         assert!(Remembered::of(&Error::Halted).is_none());
+    }
+
+    // A kept OS error keeps its kind and errno: `RipOutcome::Failed.kind` reads them.
+    #[test]
+    fn a_kept_io_refusal_keeps_its_os_error() {
+        let errors = [
+            std::io::Error::from_raw_os_error(28),
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ];
+        for io in errors {
+            let want = (io.kind(), io.raw_os_error());
+            let back: std::io::Error = Remembered::of(&Error::from(io)).unwrap().rebuild().into();
+            assert_eq!((back.kind(), back.raw_os_error()), want);
+        }
     }
 }

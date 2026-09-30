@@ -1,6 +1,7 @@
 //! The executors' decrypt gate (KU §3.5): the rip's up-front key set decides, and nothing
 //! else. Key status as data is [`crate::keys::key_status`] over that set.
 
+use libfreemkv::Error;
 use libfreemkv::keys::{KeyScope, ResolvedKeySet, check_decryptable};
 
 // KU §8.2 KU-X1: "Remove the legacy gate fallback". With no set the gate reads the empty
@@ -27,24 +28,17 @@ fn ensure_decryptable_without_a_set(disc: &libfreemkv::Disc, raw: bool) -> crate
     )?;
     if disc.encrypted && !raw && disc.css.is_none() {
         // A key SOURCE failure keeps its own verdict: "retry / fix the token", not "no key".
-        match disc.aacs_error {
-            Some(libfreemkv::Error::KeyServiceUnavailable) => {
-                return Err(libfreemkv::Error::KeyServiceUnavailable);
-            }
-            Some(libfreemkv::Error::KeyServiceUnauthorized) => {
-                return Err(libfreemkv::Error::KeyServiceUnauthorized);
-            }
-            Some(libfreemkv::Error::KeyServiceRateLimited) => {
-                return Err(libfreemkv::Error::KeyServiceRateLimited);
-            }
-            _ => {}
-        }
-        return Err(libfreemkv::error::Error::NoDiscKey {
-            disc_hash: disc
-                .aacs
-                .as_ref()
-                .map(|a| a.disc_hash.clone())
-                .unwrap_or_default(),
+        return Err(match disc.aacs_error {
+            Some(Error::KeyServiceUnavailable) => Error::KeyServiceUnavailable,
+            Some(Error::KeyServiceUnauthorized) => Error::KeyServiceUnauthorized,
+            Some(Error::KeyServiceRateLimited) => Error::KeyServiceRateLimited,
+            _ => Error::NoDiscKey {
+                disc_hash: disc
+                    .aacs
+                    .as_ref()
+                    .map(|a| a.disc_hash.clone())
+                    .unwrap_or_default(),
+            },
         });
     }
     Ok(())

@@ -17,7 +17,18 @@ project follows semantic versioning.
 
 - `copy`, `sweep`, `patch`, `ensure_whole_image` and `ensure_titles_staged` return libfreemkv's typed error instead of the generic I/O error (E5000) when an I/O error carries one: a mapfile for another disc is E6011 (`disc-mismatch`), a damaged mapfile E6011, and a stalled or lost output flush E9056/E9057. An output flush stall is no longer read as a drive transport failure.
 
+- Remux: a Stop before the rename ends Halted with the target untouched; once the rename has happened, a failed folder sync is only a warning and the remux is Done (`replaced`, `Event::Replaced`). The staged copy to the library folder stops on Stop and fails E9073 after 60 s with no bytes written; a stopped or stalled copy empties the local staging file at once. A non-UTF-8 mux destination (the target's `.partial`, or the staging file) is refused with E9002 before anything is written, as is a non-UTF-8 disc folder source (before it is opened). A remux waiting on `<target>.lock` no longer times out (E9073) while the holder's sync or verify is making progress. Refusing an existing target (`AlreadyExists`) now carries only the quoted path as its message, so a file name beginning `E<digits>` is not read as that error code.
+
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
+
+- A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
+
+- A per-title key top-up keeps its original refusal (e.g. E7028, or an OS error's kind and errno) instead of E7022 or E6011 on later titles; an OS error reading an image's key file is reported as that error, not a disc mismatch.
+
+- A multipass re-run on the same image resumes from its mapfile instead of wiping it: sectors already recovered are not read again. A mapfile this version wrote for another disc (known disc hash or VID fingerprint) is refused (E6011 `disc-mismatch`) while its image exists; with the image missing or empty it is dropped and the rip starts fresh. Multipass still starts fresh over a mapfile written by an older version or by a decrypting rip.
+- Mapfiles record whether the image is raw or decrypted (`# freemkv-raw:`). A rip in the other mode overwrites the existing image, with a warning, instead of mixing raw and decrypted sectors in it.
+- Multipass loss and convergence are measured over the titles `Job::selection` picks, not always the first title.
+- Halted or wedged multipass results report `main_lost_ms` as NaN (unmeasured) when damaged or pending bytes remain, instead of 0.0.
 
 ### Added
 
@@ -28,8 +39,9 @@ project follows semantic versioning.
 - E7034: an image whose keys need the disc's Volume ID (its sidecar mapfile has a VID fingerprint) stops before writing anything and asks for the disc, instead of E7022.
 - `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
 - `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
-- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
+- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form; they read codes exactly as `libfreemkv::error_code` does.
 - `open_scan(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
+- `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged once per factory, fault kind only).
 
 ### Removed
 

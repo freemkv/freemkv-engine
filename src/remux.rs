@@ -10,10 +10,11 @@ use crate::engine_halt::{EngineHalt, HaltSink};
 use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
 use crate::job::{Selection, StreamChoice};
 use crate::keys::{KeyParams, key_source_factory};
-use crate::mux::{RipOutcome, TitleResult, classify_title_error, mux_title, resolve_selection};
-use crate::mux::{mux_iso_title, run_titles};
-use crate::sink::Level;
-use crate::sink::{Event, Sink};
+use crate::mux::{
+    RipOutcome, TitleResult, classify_title_error, mux_iso_title, mux_title, resolve_selection,
+    run_titles,
+};
+use crate::sink::{Event, Level, Sink};
 use libfreemkv::Halt;
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
 use libfreemkv::io::ArtifactLock;
@@ -21,7 +22,7 @@ use libfreemkv::keys::{KeyScope, ResolvedKeySet};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The mux options every front-end rips with; `raw` passes ciphertext through.
@@ -196,6 +197,7 @@ fn mux_opened_title(
             mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)
         }
         ImageSource::Dir(_) => {
+            utf8_source(&opened.source)?;
             let input = libfreemkv::InputOptions {
                 keys: Some(keys.clone()),
                 ..opened.input_options(idx, selection)
@@ -203,6 +205,16 @@ fn mux_opened_title(
             let url = opened.source.url();
             mux_title(&url, dest, input, mux, title.size_bytes, sink)
         }
+    }
+}
+
+// A `dir://` title muxes through a String URL: a non-UTF-8 folder cannot be named in one.
+fn utf8_source(source: &ImageSource) -> io::Result<()> {
+    match source {
+        ImageSource::Dir(p) if p.to_str().is_none() => {
+            Err(libfreemkv::Error::StreamUrlInvalid { url: source.url() }.into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -216,11 +228,17 @@ const RUNTIME_SLACK_FRACTION: f64 = 0.02;
 /// a title's declared Duration in the header, so only the Cues reflect what was
 /// muxed; a file without Cues falls back to the header Duration.
 pub fn verify_mkv(path: &Path, title: &libfreemkv::DiscTitle) -> io::Result<libfreemkv::MkvProbe> {
-    if std::fs::metadata(path)?.len() == 0 {
-        return Err(verify_failed(path, "file is empty"));
-    }
+    nonempty_len(path)?;
     let file = io::BufReader::new(std::fs::File::open(path)?);
     check_probe(path, title, libfreemkv::probe_mkv_with_cues(file)?)
+}
+
+// The file's length; an empty file fails verify.
+fn nonempty_len(path: &Path) -> io::Result<u64> {
+    match std::fs::metadata(path)?.len() {
+        0 => Err(verify_failed(path, "file is empty")),
+        len => Ok(len),
+    }
 }
 
 fn check_probe(
@@ -348,6 +366,7 @@ fn remux_iso_sources_at(
         halt: &halt,
     };
     refuse_existing(job)?;
+    utf8_source(&job.iso)?;
     sink.event(&Event::Phase { name: "open" });
     // The open, its title and its key top-up all run under one halt (KU §2.3 step 13).
     let open = |h: &Halt| -> io::Result<_> {
@@ -398,12 +417,14 @@ fn target_present(path: &Path) -> io::Result<bool> {
 
 fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     if !job.replace && target_present(&job.target)? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} exists", job.target.display()),
-        ));
+        return Err(target_exists(&job.target));
     }
     Ok(())
+}
+
+// The quoted path only: a bare path starting `E<digits>` would parse as that error code.
+fn target_exists(target: &Path) -> io::Error {
+    io::Error::new(io::ErrorKind::AlreadyExists, format!("{target:?}"))
 }
 
 // The requested title, or the main title by the same rule a rip's default uses.
@@ -448,12 +469,18 @@ impl Drop for DeleteOnDrop {
 }
 
 // Removes the partial file unless disarmed — every early return and a panic included.
-struct PartialFile<'a>(&'a Path, bool);
+struct PartialFile<'a>(Option<&'a Path>);
+
+impl PartialFile<'_> {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
 
 impl Drop for PartialFile<'_> {
     fn drop(&mut self) {
-        if !self.1 {
-            let _ = std::fs::remove_file(self.0);
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -463,15 +490,21 @@ impl Drop for PartialFile<'_> {
 pub(crate) struct RemuxTiming {
     /// T30: §3.1 "60 s with no bytes read (HR1)".
     pub(crate) verify_stall: Duration,
+    /// The staged copy's bound, as T30: 60 s with no bytes written (HR1).
+    pub(crate) copy_stall: Duration,
     /// §4.4: "rate-limited to one call per 250 ms".
     pub(crate) activity_every: Duration,
+    /// How often real sync/verify progress refreshes the file's mtime for a lock waiter (T10).
+    pub(crate) lock_beat: Duration,
 }
 
 impl Default for RemuxTiming {
     fn default() -> Self {
         Self {
             verify_stall: Duration::from_secs(60),
+            copy_stall: Duration::from_secs(60),
             activity_every: Duration::from_millis(250),
+            lock_beat: libfreemkv::io::artifact_lock::ARTIFACT_LOCK_WINDOW / 10,
         }
     }
 }
@@ -491,6 +524,8 @@ pub(crate) trait RemuxIo: Sync {
     ) -> io::Result<()>;
     /// Open `path` for the verify reads.
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>>;
+    /// Create `path` for the staged copy; an existing file is refused, never truncated.
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>>;
     fn timing(&self) -> RemuxTiming;
 }
 
@@ -511,6 +546,14 @@ impl RemuxIo for OsRemuxIo {
 
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
         Ok(Box::new(std::fs::File::open(path)?))
+    }
+
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Box::new(file))
     }
 
     fn timing(&self) -> RemuxTiming {
@@ -540,6 +583,11 @@ fn land_verified(
             "invalid remux staging path",
         ));
     }
+    // The mux takes a String URL: a non-UTF-8 path would be written under a lossy name.
+    let Some(partial_str) = partial.to_str() else {
+        let url = format!("mkv://{}", partial.display());
+        return Err(libfreemkv::Error::StreamUrlInvalid { url }.into());
+    };
     // §4.2: "`land_verified` … takes `<target>.lock` (the §2.5 acquire loop) **before**
     // creating `.partial`"; "deleted while held on every exit" (dropped last).
     // libfreemkv's lock watches `<target>.partial` as the holder's T10 progress.
@@ -547,10 +595,10 @@ fn land_verified(
     let lock = halt.linked(|h| ArtifactLock::acquire(&job.target, &watch, h))?;
     let _lock = DeleteOnDrop(Some(lock));
     remove_stale_partial(partial)?;
-    let mut guard = PartialFile(partial, false);
+    let mut guard = PartialFile(Some(partial));
 
     sink.event(&Event::Phase { name: "mux" });
-    let dest = format!("mkv://{}", partial.display());
+    let dest = format!("mkv://{partial_str}");
     sink.event(&Event::TitleStart { idx, dest: &dest });
     let result = mux(&dest);
     sink.event(&Event::TitleDone {
@@ -585,8 +633,8 @@ fn land_verified(
     if staged_partial.is_some() {
         sink.event(&Event::Phase { name: "copy" });
         remove_stale_partial(&target_partial)?;
-        remote_guard = Some(PartialFile(&target_partial, false));
-        copy_staged(partial, &target_partial, halt, sink, timing)?;
+        remote_guard = Some(PartialFile(Some(&target_partial)));
+        copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
         verify_watched(&target_partial, title, halt, sink, rio, timing)?;
@@ -601,20 +649,25 @@ fn land_verified(
     } else {
         partial
     };
-    std::fs::rename(landing, &job.target)?;
-    if let Some(g) = &mut remote_guard {
-        g.1 = true;
-    } else {
-        guard.1 = true;
+    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`"; the rename
+    // is the commit, so a Stop that arrived before it leaves the target untouched.
+    if halt.is_cancelled() {
+        return Err(libfreemkv::Error::Halted.into());
     }
-    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`": the rename
-    // committed, so a Stop during the folder sync cuts only the sync short (§4.4).
+    std::fs::rename(landing, &job.target)?;
+    remote_guard.as_mut().unwrap_or(&mut guard).disarm();
+    // The rename committed: a Stop or a failure during the folder sync cuts only the sync
+    // short (§2.6, §4.4), and the caller is still told the target was replaced.
     match sync_parent(rio, &job.target, halt) {
         Err(e) if libfreemkv::is_halt(&e) => sink.log(
             Level::Warn,
             "stopped during the folder sync after the target was replaced; the rename may not be durable yet",
         ),
-        r => r?,
+        Err(e) => sink.log(
+            Level::Warn,
+            &format!("the target was replaced but its folder sync failed: {e}"),
+        ),
+        Ok(()) => {}
     }
     if replaced {
         sink.event(&Event::Replaced { path: &job.target });
@@ -627,25 +680,80 @@ fn land_verified(
     })
 }
 
+// The staged copy on a worker, waited on as verify is: Stop within a slice, and
+// `TimedOut { op: "copy" }` after `copy_stall` with no bytes written (§3.1 HR1).
 fn copy_staged(
     source: &Path,
     destination: &Path,
     halt: &EngineHalt<'_>,
     sink: &dyn Sink,
+    rio: &dyn RemuxIo,
     timing: RemuxTiming,
 ) -> io::Result<()> {
     let mut src = std::fs::File::open(source)?;
     let total = src.metadata()?.len();
-    let mut dst = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
+    let mut dst = rio.create_new(destination)?;
+    let copied = Arc::new(AtomicU64::new(0));
+    let quit = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (count, stop) = (copied.clone(), quit.clone());
+    std::thread::Builder::new()
+        .name("freemkv-remux-copy".into())
+        .spawn(move || {
+            let result = copy_all(&mut src, &mut *dst, &count, &stop);
+            drop((src, dst));
+            let _ = tx.send(result);
+        })?;
+    let started = Instant::now();
+    let report = |done: u64| {
+        let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+        crate::sink::Progress {
+            speed_bps: speed,
+            eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
+            ..activity("copy", done, total)
+        }
+    };
+    let beat = LockBeat::new(None, timing.lock_beat);
+    let watched = watch_worker(
+        &rx,
+        &copied,
+        "copy",
+        timing.copy_stall,
+        halt,
+        sink,
+        timing,
+        beat,
+        &report,
+    );
+    // A leaked worker holds both files until its write returns: empty the local stage so its
+    // blocks free now (never the NAS side, which may be the hung mount).
+    if watched.is_err() {
+        quit.store(true, Ordering::Relaxed);
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(source) {
+            let _ = f.set_len(0);
+        }
+    }
+    let done = watched??;
+    if done != total || std::fs::metadata(destination)?.len() != total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "remux copy size mismatch",
+        ));
+    }
+    Ok(())
+}
+
+// The copy worker's loop; `copied` is its progress, `quit` set once the caller gave up.
+fn copy_all(
+    src: &mut std::fs::File,
+    dst: &mut dyn Write,
+    copied: &AtomicU64,
+    quit: &AtomicBool,
+) -> io::Result<u64> {
     let mut buf = vec![0u8; 1024 * 1024];
     let mut done = 0u64;
-    let mut every = Activity::new(timing.activity_every);
-    let started = Instant::now();
     loop {
-        if halt.is_cancelled() {
+        if quit.load(Ordering::Relaxed) {
             return Err(libfreemkv::Error::Halted.into());
         }
         let n = src.read(&mut buf)?;
@@ -654,22 +762,10 @@ fn copy_staged(
         }
         dst.write_all(&buf[..n])?;
         done += n as u64;
-        if every.due(done, done == total) {
-            let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
-            sink.progress(&crate::sink::Progress {
-                speed_bps: speed,
-                eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
-                ..activity("copy", done, total)
-            });
-        }
+        copied.store(done, Ordering::Relaxed);
     }
-    if done != total || dst.metadata()?.len() != total {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "remux copy size mismatch",
-        ));
-    }
-    Ok(())
+    dst.flush()?;
+    Ok(done)
 }
 
 // A `Sink::progress` of `pass` (§4.4 "`Progress.pass` values are stable keys").
@@ -712,6 +808,35 @@ impl Activity {
     }
 }
 
+// T10 (§2.5): a waiter on `<target>.lock` sees the holder live only while the `.partial`
+// changes size or mtime. Sync and verify change neither, so their real progress bumps the
+// mtime of the file they work on, at most once per `every` (best effort).
+struct LockBeat {
+    file: Option<std::fs::File>,
+    every: Duration,
+    last: Option<Instant>,
+}
+
+impl LockBeat {
+    fn new(file: Option<std::fs::File>, every: Duration) -> Self {
+        Self {
+            file,
+            every,
+            last: None,
+        }
+    }
+
+    fn progressed(&mut self) {
+        if self.last.is_some_and(|t| t.elapsed() < self.every) {
+            return;
+        }
+        if let Some(f) = &self.file {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+        self.last = Some(Instant::now());
+    }
+}
+
 // T12b: the `.partial`'s durable sync, preceded by `Event::Phase { name: "sync" }` (§4.4).
 fn durable_sync(
     rio: &dyn RemuxIo,
@@ -727,8 +852,10 @@ fn durable_sync(
         .write(true)
         .open(partial)?;
     let mut every = Activity::new(timing.activity_every);
+    let mut beat = LockBeat::new(file.try_clone().ok(), timing.lock_beat);
     halt.linked(|h| {
         rio.sync(&file, h, &mut |done, total| {
+            beat.progressed();
             if every.due(done, done >= total) {
                 sink.progress(&activity("sync", done, total));
             }
@@ -784,10 +911,7 @@ fn verify_watched(
     rio: &dyn RemuxIo,
     timing: RemuxTiming,
 ) -> io::Result<libfreemkv::MkvProbe> {
-    let total = std::fs::metadata(path)?.len();
-    if total == 0 {
-        return Err(verify_failed(path, "file is empty"));
-    }
+    let total = nonempty_len(path)?;
     let read = Arc::new(AtomicU64::new(0));
     let reader = Counting {
         inner: io::BufReader::new(rio.open_read(path)?),
@@ -799,23 +923,56 @@ fn verify_watched(
         .spawn(move || {
             let _ = tx.send(libfreemkv::probe_mkv_with_cues(reader));
         })?;
+    let beat_file = std::fs::OpenOptions::new().write(true).open(path).ok();
+    let beat = LockBeat::new(beat_file, timing.lock_beat);
+    let report = |done| activity("verify", done, total);
+    let probe = watch_worker(
+        &rx,
+        &read,
+        "verify",
+        timing.verify_stall,
+        halt,
+        sink,
+        timing,
+        beat,
+        &report,
+    )?;
+    check_probe(path, title, probe?)
+}
+
+// Waits halt-aware on a worker whose forward progress is the byte count `moved`, reported
+// through `report` and `beat`: `Halted` on a cancel, `TimedOut { op }` after `stall` with no
+// progress. Either return leaks the worker.
+#[allow(clippy::too_many_arguments)]
+fn watch_worker<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    moved: &AtomicU64,
+    op: &'static str,
+    stall: Duration,
+    halt: &EngineHalt<'_>,
+    sink: &dyn Sink,
+    timing: RemuxTiming,
+    mut beat: LockBeat,
+    report: &dyn Fn(u64) -> crate::sink::Progress,
+) -> io::Result<T> {
     let progress = libfreemkv::halt::Progress::new();
-    let mut timer = StallTimer::new(timing.verify_stall, &progress);
+    let mut timer = StallTimer::new(stall, &progress);
     let (mut every, mut seen) = (Activity::new(timing.activity_every), 0);
     loop {
         let done = rx.recv_timeout(WAIT_SLICE);
-        let now = read.load(Ordering::Relaxed);
+        let now = moved.load(Ordering::Relaxed);
         if now > seen {
             seen = now;
             progress.bump();
+            beat.progressed();
         }
         if every.due(now, done.is_ok()) {
-            sink.progress(&activity("verify", now, total));
+            sink.progress(&report(now));
         }
         match done {
-            Ok(probe) => return check_probe(path, title, probe?),
+            Ok(result) => return Ok(result),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("verify worker lost"));
+                return Err(io::Error::other(format!("{op} worker lost")));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -823,7 +980,7 @@ fn verify_watched(
             return Err(libfreemkv::Error::Halted.into());
         }
         if timer.poll(&progress) == Stall::Expired {
-            return Err(libfreemkv::Error::TimedOut { op: "verify" }.into());
+            return Err(libfreemkv::Error::TimedOut { op }.into());
         }
     }
 }
@@ -897,10 +1054,70 @@ mod tests {
             Some(&local_partial),
             writes(mkv(600.0, Some(598), 2), false),
         );
-        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(
+            !libfreemkv::is_halt(&e),
+            "an incomplete mux is a failure: {e}"
+        );
+        assert_eq!(e.kind(), io::ErrorKind::Other);
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!local_partial.exists());
         assert!(!partial_path(&target).exists());
+    }
+
+    // A staged partial that is the target or `<target>.partial` would overwrite the library
+    // file or delete its own source: refused before the lock, the mux or any file change.
+    #[test]
+    fn a_staging_path_on_the_target_or_its_partial_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        std::fs::write(&target, b"old").unwrap();
+        let target_partial = partial_path(&target);
+        for staged in [&target, &target_partial] {
+            let sink = Events::default();
+            let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+            let muxed = AtomicBool::new(false);
+            let e = land_verified(
+                &job(target.clone(), true),
+                0,
+                &title(600.0),
+                &sink,
+                &halt,
+                &OsRemuxIo,
+                Some(staged),
+                |dest| {
+                    muxed.store(true, Ordering::SeqCst);
+                    writes(mkv(600.0, Some(598), 2), true)(dest)
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                e.kind(),
+                io::ErrorKind::InvalidInput,
+                "{}",
+                staged.display()
+            );
+            assert!(!muxed.load(Ordering::SeqCst));
+            assert_eq!(std::fs::read(&target).unwrap(), b"old");
+            assert!(!target_partial.exists());
+        }
+    }
+
+    // The public staged entry: an image that cannot open leaves no partial anywhere.
+    #[test]
+    fn remux_iso_staged_with_an_unopenable_image_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("Movie.mkv");
+        let staged = dir.path().join("7.mkv.partial");
+        std::fs::write(&target, b"old").unwrap();
+        let sink = Events::default();
+        let keys = KeyParams::default();
+        let e = remux_iso_staged(&job(target.clone(), true), &keys, &sink, &staged).unwrap_err();
+        assert!(!libfreemkv::is_halt(&e), "{e}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert!(!staged.exists() && !partial_path(&target).exists());
+        let refused = remux_iso_staged(&job(target.clone(), false), &keys, &sink, &staged);
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[test]
@@ -913,8 +1130,8 @@ mod tests {
         let token = Halt::new();
         let sink = Events::default();
         let halt = EngineHalt::new(&token, None).with_sink(&sink);
-        let err =
-            copy_staged(&source, &destination, &halt, &sink, RemuxTiming::default()).unwrap_err();
+        let timing = RemuxTiming::default();
+        let err = copy_staged(&source, &destination, &halt, &sink, &OsRemuxIo, timing).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
     }
@@ -951,7 +1168,11 @@ mod tests {
             Some(&local_partial),
             writes(mkv(600.0, Some(598), 2), true),
         );
-        assert!(result.is_err());
+        let e = result.unwrap_err();
+        assert!(
+            libfreemkv::is_halt(&e),
+            "a Stop is Halted, not a failure: {e}"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
         assert!(!local_partial.exists());
         assert!(!partial_path(&target).exists());
@@ -1057,6 +1278,13 @@ mod tests {
     fn an_unreadable_target_folder_is_refused_not_taken_as_empty() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
+        // ENOTDIR (a file where the folder should be) holds as root too.
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        let under_file = file.join("Title.mkv");
+        let err = refuse_existing(&job(under_file.clone(), false)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotADirectory);
+        assert!(target_present(&under_file).is_err());
         let locked = dir.path().join("locked");
         std::fs::create_dir(&locked).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1064,7 +1292,7 @@ mod tests {
         let probe = std::fs::symlink_metadata(&target);
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         if probe.is_ok() || probe.as_ref().unwrap_err().kind() == io::ErrorKind::NotFound {
-            return; // running as root: permissions are not enforced
+            return; // root: permissions are not enforced (ENOTDIR above still ran)
         }
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let refused = refuse_existing(&job(target.clone(), false));
@@ -1091,6 +1319,41 @@ mod tests {
         assert!(verify_mkv(&p, &title(200.0)).is_err());
         // A title with no declared duration skips the runtime check.
         assert!(verify_mkv(&p, &title(0.0)).is_ok());
+    }
+
+    // Slack is max(10 s, 2 %) either side; a title with a runtime needs a finite one.
+    #[test]
+    fn verify_runtime_slack_is_the_larger_of_ten_seconds_and_two_percent() {
+        let probe = |last_cue: Option<f64>, duration: Option<f64>| libfreemkv::MkvProbe {
+            tracks: vec![libfreemkv::MkvProbeTrack {
+                number: 1,
+                kind: libfreemkv::MkvTrackKind::Video,
+                codec_id: "V_MPEG4/ISO/AVC".into(),
+                language: "und".into(),
+            }],
+            last_cue_secs: last_cue,
+            duration_secs: duration,
+            ..Default::default()
+        };
+        let ok = |t: f64, runtime: f64| {
+            check_probe(Path::new("a"), &title(t), probe(Some(runtime), None)).is_ok()
+        };
+        // 2 h title: 2 % = 144 s.
+        assert!(ok(7200.0, 7200.0 - 143.0) && ok(7200.0, 7200.0 + 143.0));
+        assert!(!ok(7200.0, 7200.0 - 145.0) && !ok(7200.0, 7200.0 + 145.0));
+        // 100 s title: 2 % = 2 s, so the 10 s floor applies.
+        assert!(ok(100.0, 91.0) && ok(100.0, 109.0));
+        assert!(!ok(100.0, 89.0) && !ok(100.0, 111.0));
+        assert!(!ok(100.0, f64::NAN) && !ok(100.0, f64::INFINITY));
+        let t = title(100.0);
+        assert!(
+            check_probe(Path::new("a"), &t, probe(None, None)).is_err(),
+            "no runtime"
+        );
+        assert!(
+            check_probe(Path::new("a"), &t, probe(None, Some(100.0))).is_ok(),
+            "header Duration"
+        );
     }
 
     #[test]
@@ -1206,6 +1469,58 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    // A sink URL is a String: a non-UTF-8 partial path would mux to a different, lossy name.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_partial_path_is_refused_before_the_mux() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(std::ffi::OsStr::from_bytes(b"Caf\xe9"));
+        let _ = std::fs::create_dir(&folder); // APFS refuses the name; the check comes first
+        let target = folder.join("Movie.mkv");
+        let muxed = AtomicBool::new(false);
+        let e = land(
+            &job(target.clone(), true),
+            0,
+            &title(60.0),
+            &Events::default(),
+            |_| {
+                muxed.store(true, Ordering::SeqCst);
+                Ok(outcome(true))
+            },
+        )
+        .unwrap_err();
+        let code = libfreemkv::error::E_STREAM_URL_INVALID;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert!(!muxed.load(Ordering::SeqCst));
+        assert!(!partial_path(&target).exists());
+    }
+
+    // A `dir://` source muxes through a String URL: a non-UTF-8 folder is refused up front.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_disc_folder_is_refused_before_opening() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(std::ffi::OsStr::from_bytes(b"Disc\xe9"));
+        let mut j = job(dir.path().join("Movie.mkv"), true);
+        j.iso = ImageSource::Dir(folder);
+        let sink = Events::default();
+        let e = remux_iso(&j, &KeyParams::default(), &sink).unwrap_err();
+        let code = libfreemkv::error::E_STREAM_URL_INVALID;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
+    }
+
+    // A relative target named like a libfreemkv code must not read as that code.
+    #[test]
+    fn an_existing_target_named_like_an_error_code_is_not_that_code() {
+        let e = target_exists(Path::new("E7022 Movie.mkv"));
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(crate::error_code(&e), None, "{e}");
+        assert!(e.to_string().contains("E7022 Movie.mkv"), "{e}");
     }
 
     #[test]

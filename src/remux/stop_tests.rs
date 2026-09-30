@@ -33,10 +33,34 @@ struct ReadPlan {
     block_after: Option<u64>,
 }
 
+// What the folder sync after the rename does.
+#[derive(Default)]
+enum DirSync {
+    #[default]
+    Ok,
+    // Cancels this op token, then waits for the cancel to reach the sync.
+    Stop(Halt),
+    Fail,
+}
+
+#[derive(Default)]
+struct WritePlan {
+    // Bytes accepted before every later write blocks until `release`.
+    block_after: Option<u64>,
+    // Reports each write whole but drops its last byte.
+    short: bool,
+    // Writes zeros in place of the data.
+    zeros: bool,
+}
+
 struct FakeIo {
     timing: RemuxTiming,
     sync: SyncPlan,
     read: ReadPlan,
+    write: WritePlan,
+    dir_sync: DirSync,
+    // The folder sync saw the cancel through its halt.
+    dir_halted: AtomicBool,
     in_sync: AtomicBool,
     returned: Arc<AtomicU64>,
     release: Arc<AtomicBool>,
@@ -47,10 +71,15 @@ impl FakeIo {
         Self {
             timing: RemuxTiming {
                 verify_stall: WINDOW,
+                copy_stall: WINDOW,
                 activity_every: Duration::from_millis(10),
+                lock_beat: Duration::from_millis(10),
             },
             sync,
             read,
+            write: WritePlan::default(),
+            dir_sync: DirSync::default(),
+            dir_halted: AtomicBool::new(false),
             in_sync: AtomicBool::new(false),
             returned: Arc::default(),
             release: Arc::default(),
@@ -64,6 +93,27 @@ impl Drop for FakeIo {
     }
 }
 
+impl FakeIo {
+    fn sync_dir(&self, halt: &Halt) -> io::Result<()> {
+        match &self.dir_sync {
+            DirSync::Ok => Ok(()),
+            DirSync::Fail => Err(io::Error::from_raw_os_error(5)),
+            DirSync::Stop(op) => {
+                op.cancel();
+                let t0 = Instant::now();
+                while t0.elapsed() < STOP_LATENCY {
+                    if let Err(e) = halt.check() {
+                        self.dir_halted.store(true, Ordering::SeqCst);
+                        return Err(e.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl RemuxIo for FakeIo {
     fn sync(
         &self,
@@ -72,6 +122,9 @@ impl RemuxIo for FakeIo {
         on: &mut dyn FnMut(u64, u64),
     ) -> io::Result<()> {
         let m = file.metadata()?;
+        if m.is_dir() {
+            return self.sync_dir(halt);
+        }
         if !m.is_file() || self.sync.pieces == 0 {
             return Ok(());
         }
@@ -108,8 +161,64 @@ impl RemuxIo for FakeIo {
         }))
     }
 
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Box::new(Faulty {
+            inner: file,
+            block_after: self.write.block_after,
+            short: self.write.short,
+            zeros: self.write.zeros,
+            written: 0,
+            release: self.release.clone(),
+        }))
+    }
+
     fn timing(&self) -> RemuxTiming {
         self.timing
+    }
+}
+
+// A copy destination per `WritePlan`.
+struct Faulty {
+    inner: std::fs::File,
+    block_after: Option<u64>,
+    short: bool,
+    zeros: bool,
+    written: u64,
+    release: Arc<AtomicBool>,
+}
+
+impl Write for Faulty {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.block_after.is_some_and(|b| self.written >= b) {
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let n = match self.block_after {
+            Some(b) => buf.len().min(
+                usize::try_from(b.saturating_sub(self.written))
+                    .unwrap()
+                    .max(1),
+            ),
+            None => buf.len(),
+        };
+        let data = if self.zeros {
+            vec![0; n]
+        } else {
+            buf[..n].to_vec()
+        };
+        let kept = if self.short { n - 1 } else { n };
+        self.inner.write_all(&data[..kept])?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -549,18 +658,19 @@ fn remux_sync_emits_activity_while_healthy() {
     };
     let rio = FakeIo::new(healthy, ReadPlan::default());
     let w = Watch::default();
-    let started = Instant::now();
     run(&target, &w, &Halt::new(), &rio, writes(good(), true)).unwrap();
     let phases = w.phases.lock().unwrap().clone();
     assert_eq!(phases, ["mux", "sync", "verify", "replace"]);
     let sync = w.of("sync");
     assert!(sync.len() >= 10, "{} sync calls", sync.len());
-    // Scaled "at least every 3 s" for ~2 s pieces: 5 × margin over the 20 ms pieces.
-    let mut last = sync[0].2.max(started);
-    for &(_, _, at) in &sync[1..] {
-        assert!(at - last < Duration::from_millis(150), "a silent gap");
-        last = at;
-    }
+    // Pieces land >= 20 ms apart and the rate limit is 10 ms: every piece is reported, so no
+    // step skips one (bytes, not wall clock: scheduler stalls delay both sides alike).
+    let piece = (good().len() as u64).div_ceil(40);
+    assert!(sync[0].0 <= piece, "a silent first piece");
+    assert!(
+        sync.windows(2).all(|p| p[1].0 - p[0].0 <= piece),
+        "a silent gap"
+    );
     assert!(
         sync.windows(2).all(|p| p[0].0 < p[1].0),
         "bytes_done is monotonic"
@@ -612,10 +722,11 @@ fn remux_verify_emits_activity_while_healthy() {
     run(&target, &w, &Halt::new(), &rio, writes(good(), true)).unwrap();
     let verify = w.of("verify");
     assert!(verify.len() >= 5, "{} verify calls", verify.len());
+    // Polled reports carry scheduler jitter; the contract is a report within the stall window.
     assert!(
         verify
             .windows(2)
-            .all(|p| p[0].0 < p[1].0 && p[1].2 - p[0].2 < Duration::from_millis(150))
+            .all(|p| p[0].0 < p[1].0 && p[1].2 - p[0].2 < WINDOW)
     );
     let (done, total, _) = *verify.last().unwrap();
     assert_eq!(total, std::fs::metadata(&target).unwrap().len());
@@ -731,10 +842,10 @@ fn artifact_lock_survives_real_mapfile_flush() {
     assert_eq!(lock.path(), sidecar_for(&iso));
 }
 
-// §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`" — a Stop that
-// lands once the rename has replaced the target (during the folder sync) is Done, not Halted.
+// §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`" — the rename is
+// the commit, so a Stop that lands before it is Halted with the target untouched.
 #[test]
-fn a_stop_after_the_rename_is_done() {
+fn a_stop_before_the_rename_leaves_the_target() {
     struct CancelAtReplace(AtomicBool);
     impl Sink for CancelAtReplace {
         fn event(&self, e: &Event<'_>) {
@@ -747,17 +858,265 @@ fn a_stop_after_the_rename_is_done() {
         }
     }
     let dir = tempfile::tempdir().unwrap();
-    let (target, _) = old_target(dir.path());
+    let (target, mtime) = old_target(dir.path());
     let sink = CancelAtReplace(AtomicBool::new(false));
-    let r = run(
+    let e = run(
         &target,
         &sink,
         &Halt::new(),
         &OsRemuxIo,
         writes(good(), true),
     )
-    .expect("the target was replaced before the Stop: Done");
+    .unwrap_err();
+    assert!(libfreemkv::is_halt(&e), "{e}");
+    untouched(&target, mtime);
+}
+
+// §2.6 and §4.4: a Stop during the folder sync lands after the rename committed, so it cuts
+// only the sync short and the remux is Done.
+#[cfg(unix)]
+#[test]
+fn a_stop_after_the_rename_is_done() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let op = Halt::new();
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Stop(op.clone());
+    let sink = Events::default();
+    let r = run(&target, &sink, &op, &rio, writes(good(), true))
+        .expect("the target was replaced before the Stop: Done");
+    assert!(
+        rio.dir_halted.load(Ordering::SeqCst),
+        "the Stop reached the folder sync"
+    );
     assert!(r.replaced);
+    assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
     assert_eq!(std::fs::read(&target).unwrap(), good());
     assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
+}
+
+// Once the rename committed, a failed folder sync cannot undo it: the caller is told the
+// target was replaced (Done, with `Event::Replaced`), not that the remux failed.
+#[cfg(unix)]
+#[test]
+fn a_failed_folder_sync_after_the_rename_still_reports_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Fail;
+    let sink = Events::default();
+    let r = run(&target, &sink, &Halt::new(), &rio, writes(good(), true))
+        .expect("the rename committed: Done");
+    assert!(r.replaced);
+    assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
+    assert_eq!(std::fs::read(&target).unwrap(), good());
+    assert!(!partial_path(&target).exists() && !sidecar_for(&target).exists());
+}
+
+// T10 (§2.5, §3.1): a waiter on `<target>.lock` reads the holder's progress as the size or
+// mtime of `<target>.partial`, so a slow but healthy sync and verify must keep changing it.
+#[test]
+fn remux_holder_stays_observable_during_sync_and_verify() {
+    struct Stamps {
+        partial: PathBuf,
+        at: Mutex<Vec<(String, std::time::SystemTime)>>,
+    }
+    impl Sink for Stamps {
+        fn event(&self, e: &Event<'_>) {
+            if let Event::Phase { name } = e {
+                let m = std::fs::metadata(&self.partial).and_then(|m| m.modified());
+                if let Ok(m) = m {
+                    self.at.lock().unwrap().push((name.to_string(), m));
+                }
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let slow_sync = SyncPlan {
+        pieces: 10,
+        gap: Duration::from_millis(20),
+        stall_at: None,
+    };
+    let slow_read = ReadPlan {
+        chunk: 8,
+        delay: Duration::from_millis(5),
+        block_after: None,
+    };
+    let rio = FakeIo::new(slow_sync, slow_read);
+    let sink = Stamps {
+        partial: partial_path(&target),
+        at: Mutex::default(),
+    };
+    run(&target, &sink, &Halt::new(), &rio, writes(good(), true)).unwrap();
+    let at = sink.at.lock().unwrap().clone();
+    let names: Vec<&str> = at.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["sync", "verify", "replace"]);
+    assert_ne!(
+        at[0].1, at[1].1,
+        "no holder progress visible during the sync"
+    );
+    assert_ne!(at[1].1, at[2].1, "no holder progress visible during verify");
+}
+
+// `run` for the staged path: mux into `stage`, copy beside the target, then replace.
+fn run_staged(
+    target: &Path,
+    stage: &Path,
+    sink: &dyn Sink,
+    op: &Halt,
+    rio: &dyn RemuxIo,
+    mux: impl FnOnce(&str) -> io::Result<libfreemkv::MuxOutcome>,
+) -> io::Result<RemuxReport> {
+    let halt = EngineHalt::new(op, None).with_sink(sink);
+    let j = job(target.to_path_buf(), true);
+    land_verified(&j, 0, &title(600.0), sink, &halt, rio, Some(stage), mux)
+}
+
+// The staged copy to the library share is a wait like every other (§3.1 HR1, §4.2): a Stop
+// ends a copy blocked in a write within the Stop latency, a copy with no bytes written for
+// the window fails E9073, and the target is untouched either way.
+#[test]
+fn remux_staged_copy_is_stall_based_and_stoppable() {
+    // Stops 50 ms into the copy phase, holding the stage open to see its blocks freed.
+    struct StopInCopy {
+        stage: PathBuf,
+        copy_at: Mutex<Option<Instant>>,
+        held: Mutex<Option<std::fs::File>>,
+    }
+    impl Sink for StopInCopy {
+        fn event(&self, e: &Event<'_>) {
+            if matches!(e, Event::Phase { name: "copy" }) {
+                *self.held.lock().unwrap() = std::fs::File::open(&self.stage).ok();
+                *self.copy_at.lock().unwrap() = Some(Instant::now());
+            }
+        }
+        fn should_cancel(&self) -> bool {
+            let at = *self.copy_at.lock().unwrap();
+            at.is_some_and(|t| t.elapsed() >= Duration::from_millis(50))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.block_after = Some(16);
+    // Unblocks the write long after the Stop, so a copy that ignores Stop still ends.
+    let release = rio.release.clone();
+    cancel_later(
+        move || release.store(true, Ordering::SeqCst),
+        STOP_LATENCY * 3,
+    );
+    let sink = StopInCopy {
+        stage: stage.clone(),
+        copy_at: Mutex::default(),
+        held: Mutex::default(),
+    };
+    let e = run_staged(
+        &target,
+        &stage,
+        &sink,
+        &Halt::new(),
+        &rio,
+        writes(good(), true),
+    );
+    let copy_at = sink.copy_at.lock().unwrap().expect("the copy phase ran");
+    let held = sink.held.lock().unwrap().take().expect("the stage existed");
+    assert_eq!(
+        held.metadata().unwrap().len(),
+        0,
+        "a leaked copy pins the stage"
+    );
+    let e = e.unwrap_err();
+    assert!(libfreemkv::is_halt(&e), "{e}");
+    assert!(
+        copy_at.elapsed() < STOP_LATENCY,
+        "the Stop waited out the blocked write"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.block_after = Some(16);
+    let never = Halt::new();
+    let t0 = Instant::now();
+    let e = run_staged(
+        &target,
+        &stage,
+        &Events::default(),
+        &never,
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    let stalled = libfreemkv::Error::TimedOut { op: "copy" };
+    assert_eq!(e.to_string(), stalled.to_string());
+    assert!(t0.elapsed() < WINDOW + STOP_LATENCY);
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+}
+
+// A staged copy that lands short fails before its sync, and the old target stays.
+#[test]
+fn remux_staged_copy_size_mismatch_keeps_old_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.short = true;
+    let sink = Events::default();
+    let e = run_staged(
+        &target,
+        &stage,
+        &sink,
+        &Halt::new(),
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e}");
+    let events = sink.0.lock().unwrap().clone();
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("phase:copy"),
+        "{events:?}"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
+}
+
+// The library copy is verified itself: a copy that fails verify never replaces the target.
+#[test]
+fn remux_staged_copy_that_fails_verify_keeps_old_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, mtime) = old_target(dir.path());
+    let stage = dir.path().join("7.mkv.partial");
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.write.zeros = true;
+    let sink = Events::default();
+    let e = run_staged(
+        &target,
+        &stage,
+        &sink,
+        &Halt::new(),
+        &rio,
+        writes(good(), true),
+    );
+    let e = e.unwrap_err();
+    assert!(!libfreemkv::is_halt(&e), "{e}");
+    let events = sink.0.lock().unwrap().clone();
+    let tail: Vec<&str> = events
+        .iter()
+        .rev()
+        .take(3)
+        .rev()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        tail,
+        ["verify:true", "phase:copy", "phase:sync"],
+        "{events:?}"
+    );
+    untouched(&target, mtime);
+    assert!(!stage.exists());
 }

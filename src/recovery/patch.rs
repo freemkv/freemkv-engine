@@ -31,8 +31,8 @@ const PER_HANDLER_BUDGET_SECS: u64 = 60;
 const PROGRESS_TICK_MS: u64 = 250;
 
 // Bridges [`RecoverySink`] onto the patch consumer pipe: each recovered span
-// becomes a [`PatchItem::Recovered`]. `recovered` can't return an error (the
-// trait is infallible), so a pipe-closed / halt error is captured in `err`.
+// becomes a [`PatchItem::Recovered`]. A dead / stalled consumer is returned as
+// `Err`, which ends the handler chain Fatal instead of reading on.
 struct PatchRecoverySink<'a> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
     /// Cancellation token for the send below — the caller's external Stop bit
@@ -40,14 +40,10 @@ struct PatchRecoverySink<'a> {
     /// to observe a Stop at all: `WRITE_THROUGH_DEPTH` is 1, so a consumer
     /// stalled inside its write parks the producer in `send` indefinitely.
     halt: &'a libfreemkv::halt::Halt,
-    err: Option<Error>,
 }
 
 impl RecoverySink for PatchRecoverySink<'_> {
-    fn recovered(&mut self, pos: u64, buf: &[u8]) {
-        if self.err.is_some() {
-            return;
-        }
+    fn recovered(&mut self, pos: u64, buf: &[u8]) -> Result<()> {
         match super::send_bounded(
             self.pipe,
             PatchItem::Recovered {
@@ -56,12 +52,11 @@ impl RecoverySink for PatchRecoverySink<'_> {
             },
             self.halt,
         ) {
-            Ok(()) => {}
-            // Halt is an outcome, not an error: the latch that released this send
-            // already drives the handler chain to `Halted`. Recording an error here
-            // would turn a Stop into a failed pass; the in-flight span stays bad.
-            Err(super::SendStall::Halted) => {}
-            Err(stall) => self.err = Some(stall.into_error()),
+            Ok(()) => Ok(()),
+            // Ok on halt: not written, the mapfile keeps it bad (only the in-memory
+            // set drops it); the chain ends Halted. An Err would fail a Stop.
+            Err(super::SendStall::Halted) => Ok(()),
+            Err(stall) => Err(stall.into_error()),
         }
     }
 }
@@ -73,15 +68,6 @@ pub(super) enum PatchItem {
     /// producer side if `opts.decrypt` was set). Consumer seeks to
     /// `pos`, writes `buf`, records the range as `Finished`.
     Recovered { pos: u64, buf: Vec<u8> },
-
-    /// Producer exhausted retries on `[pos, pos+len)`. Consumer records
-    /// the range as `Unreadable`. No file write — the existing zero-fill
-    /// from sweep is preserved in place.
-    ///
-    /// Currently unused by `Disc::patch` itself; kept for the orchestrator-side end-of-recovery
-    /// promotion.
-    #[allow(dead_code)]
-    Unreadable { pos: u64, len: u64 },
 
     /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH the per-range skip-limit
     /// case (remaining bytes never tried) AND individual sector failures (tried-but-failed
@@ -197,15 +183,16 @@ impl PatchSink {
     }
 
     fn publish_now(&self) {
-        // Best-effort lock — only the producer reads, only the consumer writes,
-        // so it's never poisoned in practice. If it ever did poison, propagate
-        // the panic rather than continue with stale shared state.
-        let mut guard = self
-            .shared
-            .lock()
-            .expect("PatchSink shared state mutex poisoned");
-        *guard = SharedPatchState::from_map(&self.map, self.title.as_ref());
+        // Build outside the lock (it walks the whole damage set), then swap.
+        let next = SharedPatchState::from_map(&self.map, self.title.as_ref());
+        *lock_snapshot(&self.shared) = next;
     }
+}
+
+// The snapshot is only ever replaced whole, so a poisoned lock still holds a
+// complete (if stale) value: take it rather than cascade the panic.
+fn lock_snapshot(m: &Mutex<SharedPatchState>) -> std::sync::MutexGuard<'_, SharedPatchState> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // No `close_stopped` override (the default `close`): this sink renames nothing, and a
@@ -222,11 +209,6 @@ impl Sink<PatchItem> for PatchSink {
                 self.file.write_all(&buf).map_err(Error::from)?;
                 self.map
                     .record(pos, len, SectorStatus::Finished)
-                    .map_err(Error::from)?;
-            }
-            PatchItem::Unreadable { pos, len } => {
-                self.map
-                    .record(pos, len, SectorStatus::Unreadable)
                     .map_err(Error::from)?;
             }
             PatchItem::NonTrimmed { pos, len } => {
@@ -272,10 +254,6 @@ impl Sink<PatchItem> for PatchSink {
     }
 }
 
-// Disc::patch + bytes_bad_in_title — extracted from disc/mod.rs in 0.20.1.
-// Behavior unchanged; the move splits the 3,900-line mod.rs into a
-// cleaner-to-read file.
-
 use super::{PatchOptions, PatchOutcome};
 use crate::engine_halt::EngineHalt;
 use libfreemkv::disc::bytes_bad_in_title;
@@ -287,26 +265,24 @@ use libfreemkv::sector::SectorSource;
 // See `PatchCtx::run` and `build_tier_handlers`.
 const PATCH_TIERS: usize = 3;
 
-// Phase A pre-snapshot: captures the fields the patch loop needs after the
-// live `Mapfile` moves into the consumer thread. Returned `Mapfile` is the
-// same object loaded; caller passes ownership into `PatchSink::new`.
-#[allow(clippy::type_complexity)]
+// Phase A pre-snapshot: the fields the patch loop needs after the live
+// `Mapfile` moves into the consumer thread (`map` is the object loaded).
+pub(super) struct InitialState {
+    pub map: Mapfile,
+    pub stats: MapStats,
+    pub total_bytes: u64,
+    pub bad_ranges: Vec<(u64, u64)>,
+    pub work_total: u64,
+    pub is_regular: bool,
+}
+
 pub(super) fn compute_initial_state(
     path: &std::path::Path,
     mapfile_path: &std::path::Path,
-) -> Result<(
-    Mapfile,
-    MapStats,
-    Vec<mapfile::MapEntry>,
-    u64,
-    Vec<(u64, u64)>,
-    u64,
-    bool,
-)> {
+) -> Result<InitialState> {
     let map = mapfile::Mapfile::load(mapfile_path).map_err(Error::from)?;
     let total_bytes = map.total_size();
     let initial_stats = map.stats();
-    let initial_entries: Vec<_> = map.entries().to_vec();
     // Retry passes act on NonTrimmed/NonScraped/Unreadable (a failed sector gets
     // a fresh shot next pass); NonTried is excluded since a preceding sweep pass
     // covers it. Not reversed for `opts.reverse`: `PatchCtx::run` sorts this list.
@@ -319,15 +295,14 @@ pub(super) fn compute_initial_state(
     // `sync_all` failure surfaces rather than gets swallowed. `/dev/null` and
     // pipes still map to `false`; only a genuine metadata error hits the default.
     let is_regular = super::output_is_regular(std::fs::metadata(path));
-    Ok((
+    Ok(InitialState {
         map,
-        initial_stats,
-        initial_entries,
+        stats: initial_stats,
         total_bytes,
         bad_ranges,
         work_total,
         is_regular,
-    ))
+    })
 }
 
 // One recovery read of `[lba, lba+count)` into `buf[..count*2048]`. `recovery` selects the SCSI
@@ -358,12 +333,6 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
 pub(super) struct SubRanges {
     /// (pos, len) pairs, sorted by pos, non-overlapping, all non-zero len.
     ranges: Vec<(u64, u64)>,
-}
-
-// Widen a mapfile byte-range outward to whole 2048-byte sectors: the single ingress
-// establishing the "all offsets are sector multiples" invariant.
-fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
-    super::snap_to_sectors(pos, len)
 }
 
 impl SubRanges {
@@ -452,7 +421,7 @@ pub(super) fn log_patch_start_snapshot(
                 phase = "patch.mapfile.entry.start",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
-                status_char = entry.status.to_char() as u8 as i32,
+                status_char = %entry.status.to_char(),
                 "Mapfile entry"
             );
         }
@@ -470,7 +439,7 @@ pub(super) fn log_patch_start_snapshot(
                 phase = "patch.mapfile.entry.end",
                 pos_hex = format!("0x{:09x}", entry.pos),
                 size_mb = entry.size as f64 / 1_048_576.0,
-                status_char = format!("{}", entry.status.to_char()),
+                status_char = %entry.status.to_char(),
                 "Mapfile entry"
             );
         }
@@ -539,8 +508,6 @@ pub(super) struct PatchLoopState {
     pub now: fn() -> std::time::Instant,
     // Snapshot at construction — these stay constant for the whole pass.
     pub bytes_good_before: u64,
-    // (No `total_bytes` here — it was carried but never read; the orchestrator
-    // takes the pass denominator from `PatchCtx`'s own `total_bytes` instead.)
     pub initial_batch: u16,
     pub work_total: u64,
 }
@@ -670,7 +637,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                 timeout: TimeoutPref::Deep,
             };
             vec![
-                // SlowSpin: Linear fwd + rev at min speed.
+                // Slow spin: Linear fwd + rev at min speed.
                 Box::new(Linear {
                     direction: Direction::Reverse,
                     params: min_deep,
@@ -679,7 +646,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                     direction: Direction::Forward,
                     params: min_deep,
                 }),
-                // FuaRetry: Linear fwd + rev + Bisect under FUA (multiple physical
+                // FUA retry: Linear fwd + rev + Bisect under FUA (multiple physical
                 // attempts per marginal sector).
                 Box::new(Linear {
                     direction: Direction::Forward,
@@ -690,7 +657,7 @@ fn build_tier_handlers(tier: usize) -> Vec<Box<dyn SectionHandler>> {
                     params: fua_deep,
                 }),
                 Box::new(Bisect { params: fua_deep }),
-                // SlowFua: the hardest sector — min speed AND FUA.
+                // Slow + FUA: the hardest sector — min speed AND FUA.
                 Box::new(Linear {
                     direction: Direction::Forward,
                     params: slow_fua,
@@ -830,7 +797,8 @@ impl PatchCtx<'_, '_> {
         let mut sections: Vec<SubRanges> = ordered
             .iter()
             .map(|&(p, l)| {
-                let (p, l) = snap_to_sectors(p, l);
+                // The single ingress establishing "all offsets are sector multiples".
+                let (p, l) = super::snap_to_sectors(p, l);
                 SubRanges::from_section(p, l)
             })
             .collect();
@@ -955,7 +923,6 @@ impl PatchCtx<'_, '_> {
         let mut sink = PatchRecoverySink {
             pipe: self.pipe,
             halt: &pass_halt,
-            err: None,
         };
 
         let bad_before = bad.total_len();
@@ -1025,8 +992,8 @@ impl PatchCtx<'_, '_> {
             (o, ctx.wedge_streak, ctx.fatal.take())
         };
         self.wedge_streak = wedge_after;
-        // A non-read error ended the chain: fail the pass with it, before any
-        // residue is recorded NonTrimmed as if it were unreadable media.
+        // A non-read error (or a sink that can no longer write) ended the chain: fail
+        // the pass with it, before any residue is recorded NonTrimmed as damage.
         if let Some(e) = fatal {
             return Err(e);
         }
@@ -1043,12 +1010,6 @@ impl PatchCtx<'_, '_> {
             recovered = bad_before.saturating_sub(bad.total_len()),
             "region tier finished"
         );
-
-        // A pipe-closed / halt error captured while emitting recovered spans is
-        // fatal to the pass.
-        if let Some(e) = sink.err.take() {
-            return Err(e);
-        }
 
         // On the FINAL tier, whatever is still bad is this pass's residue: record
         // NonTrimmed and account the range once. A later pass gets another shot;
@@ -1090,8 +1051,13 @@ impl PatchCtx<'_, '_> {
                 Ok(RegionOutcome::Halted)
             }
             // Bridge/transport crash: end the pass so the orchestrator can
-            // spin-cycle the drive and resume from the mapfile next pass.
-            HandlerOutcome::TransportFault => {
+            // spin-cycle the drive and resume from the mapfile next pass. `Fatal`
+            // returned its error above; ending the pass is the safe reading if not.
+            HandlerOutcome::TransportFault | HandlerOutcome::Fatal => {
+                debug_assert!(
+                    outcome != HandlerOutcome::Fatal,
+                    "a Fatal chain end must carry its error in ctx.fatal"
+                );
                 self.state.wedged_exit = true;
                 Ok(RegionOutcome::TransportFault)
             }
@@ -1116,9 +1082,7 @@ pub(super) fn report_patch_progress(
     // They used to be computed from a range list capped at 8192 entries, which
     // silently under-reported at-risk bytes on a disc fragmented past that cap.
     let (s, main_title_bad, located) = {
-        let g = shared
-            .lock()
-            .expect("PatchSink shared state mutex poisoned");
+        let g = lock_snapshot(shared);
         (g.stats, g.bad_bytes_in_title, g.located.clone())
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
@@ -1154,7 +1118,7 @@ pub(super) fn report_patch_progress(
 
 /// Bytes of bad/unreadable data in a title's extents, from a mapfile.
 ///
-/// Consumers (CLI, autorip) call this after a rip pass to determine
+/// Front ends call this after a rip pass to determine
 /// how much damage affects a particular title — useful for showing
 /// "42s lost (12s in main movie)" in the UI.
 pub fn bytes_bad_in_title_from_mapfile(
@@ -1251,8 +1215,14 @@ fn patch_linked(
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
-    let (map, initial_stats, initial_entries, total_bytes, bad_ranges, work_total, is_regular) =
-        compute_initial_state(path, &mapfile_path)?;
+    let InitialState {
+        map,
+        stats: initial_stats,
+        total_bytes,
+        bad_ranges,
+        work_total,
+        is_regular,
+    } = compute_initial_state(path, &mapfile_path)?;
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
     // stream file". A scoped (MKV-staging) map only re-reads its scope, where none is lost.
     if map.scope().is_none() {
@@ -1300,7 +1270,6 @@ fn patch_linked(
         "begin"
     );
     let bytes_good_before = initial_stats.bytes_good;
-    let bytes_good_start = bytes_good_before;
 
     // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim); AACS
     // reads widen onto each file's unit grid. Bad sectors = PHYSICAL read failure.
@@ -1312,6 +1281,8 @@ fn patch_linked(
         opts.keys.as_ref(),
     )?;
     let reader = &mut reader;
+    // Logged from the live map before it moves into the sink (no entry copy).
+    log_patch_start_snapshot(map.entries(), &initial_stats, bytes_good_before);
 
     // Spawn the consumer: `WritebackFile`/`Mapfile` move into the sink; the shared
     // snapshot lets producer callbacks read consumer effects. Disown taken
@@ -1341,7 +1312,6 @@ fn patch_linked(
     // only as informational PassKind labels; clamp to ≥1 to avoid underflow.
     let initial_batch = initial_batch_of(opts);
     let recovery = opts.full_recovery;
-    log_patch_start_snapshot(&initial_entries, &initial_stats, bytes_good_before);
 
     tracing::info!(
         target: "freemkv::disc",
@@ -1360,13 +1330,13 @@ fn patch_linked(
         wedged_threshold = opts.wedged_threshold,
         num_ranges = bad_ranges.len(),
         work_total,
-        bytes_good_start,
+        bytes_good_start = bytes_good_before,
         "Disc::patch entered"
     );
 
-    // Drive the recovery: build the per-pass context, then walk the
-    // ordered bad ranges. `run` owns inter-range cooldown + the
-    // pass-ending conditions; `patch_region` owns one range's loop.
+    // Drive the recovery: build the per-pass context, then walk the ordered bad
+    // ranges. `run` owns the tier / range walk and the pass-ending conditions;
+    // `recover_section` runs one tier's handler chain over one range.
     let mut ctx = PatchCtx {
         disc,
         reader,
@@ -1403,7 +1373,7 @@ fn patch_linked(
             phase = "patch.finish.dropped",
             pass_error = %e,
             close_error = %close_err,
-            "patch: consumer close failed while the pass was already failing —              the mapfile on disk may be incomplete"
+            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
         );
     }
     run_result?;
@@ -1570,14 +1540,15 @@ mod tests {
         mf.flush().unwrap();
         std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
 
-        // Nothing bad to patch, so this returns without reading a sector — the
-        // point is only that it did NOT return ImageTruncated.
+        // Nothing bad to patch, so this returns without reading a sector; any
+        // refusal at all (not just ImageTruncated) fails the healthy resume.
         let opts = PatchOptions::for_patch_pass(true, None, None);
-        let r = patch(&disc, &mut NoReader, &iso, &opts);
-        assert!(
-            !matches!(r, Err(Error::ImageTruncated { .. })),
-            "an image of exactly the right length must not be refused"
-        );
+        let out = match patch(&disc, &mut NoReader, &iso, &opts) {
+            Ok(out) => out,
+            Err(e) => panic!("an image of exactly the right length must be accepted: {e:?}"),
+        };
+        assert_eq!((out.bytes_total, out.bytes_good), (full, full));
+        assert!(!out.halted && !out.wedged_exit);
 
         let _ = std::fs::remove_file(&mapfile_path);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2031,11 +2002,126 @@ mod tests {
         let err = sink.close().err().expect("a halted fsync must fail");
         assert!(matches!(err, Error::Halted), "got {err:?}");
     }
+
+    // The snapshot is replaced whole, so a panic elsewhere while holding its lock
+    // leaves nothing half-written: publishing and reporting keep going, no cascade.
+    #[test]
+    fn a_poisoned_snapshot_lock_does_not_cascade_the_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+        let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
+        let (sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
+        let poisoner = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the snapshot lock");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+
+        sink.publish_now();
+        let calls = std::cell::Cell::new(0u32);
+        let reporter = |_: &libfreemkv::progress::PassProgress| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let opts = PatchOptions::for_patch_pass(true, Some(&reporter), None);
+        let state = PatchLoopState::new(0, 1, 0);
+        assert!(!report_patch_progress(
+            &guard_disc(4),
+            &state,
+            &opts,
+            8192,
+            &shared
+        ));
+        assert_eq!(calls.get(), 1, "the reporter still hears the snapshot");
+    }
+
+    /// Fails every read with one fixed error, counting the reads.
+    struct FixedErrReader {
+        err: fn(u32) -> Error,
+        reads: u32,
+    }
+    impl libfreemkv::sector::SectorSource for FixedErrReader {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _decrypt: bool,
+        ) -> std::result::Result<usize, libfreemkv::Error> {
+            self.reads += 1;
+            Err((self.err)(lba))
+        }
+    }
+
+    /// One real patch pass over single-sector bad ranges at `lbas` (a 2000-sector disc).
+    fn patch_bad_sectors(tag: &str, lbas: &[u32], reader: &mut FixedErrReader) -> PatchOutcome {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join(format!("{tag}.iso"));
+        let disc = guard_disc(2000);
+        let full = disc.capacity_bytes;
+        let mapfile_path = disc.mapfile_for(&iso);
+        let mut mf = mapfile::Mapfile::create(&mapfile_path, full, "vTEST").unwrap();
+        mf.record(0, full, mapfile::SectorStatus::Finished).unwrap();
+        for &lba in lbas {
+            mf.record(lba as u64 * 2048, 2048, mapfile::SectorStatus::NonTrimmed)
+                .unwrap();
+        }
+        mf.flush().unwrap();
+        std::fs::write(&iso, vec![0u8; full as usize]).unwrap();
+        let opts = PatchOptions::for_patch_pass(false, None, None);
+        patch(&disc, reader, &iso, &opts).expect("a dead bus ends the pass, it does not fail it")
+    }
+
+    // A bridge crash (status 0xFF) on the first read ends the whole pass wedged, with
+    // no further reads: the orchestrator spin-cycles the drive before the next pass.
+    #[test]
+    fn a_transport_failure_ends_the_patch_pass_after_one_read() {
+        let mut reader = FixedErrReader {
+            err: |lba| Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                sense: None,
+            },
+            reads: 0,
+        };
+        let out = patch_bad_sectors("transport", &[100, 200, 300], &mut reader);
+        assert!(out.wedged_exit, "a dead bus must end the pass wedged");
+        assert!(!out.halted);
+        assert_eq!(reader.reads, 1, "no read after the transport failure");
+        assert_eq!(out.bytes_recovered_this_pass, 0);
+    }
+
+    // The wedge streak is carried across ranges: 1-sector ranges each see only a
+    // few fast wedge senses, yet the pass aborts once 16 accumulate in total.
+    #[test]
+    fn the_wedge_streak_carries_across_ranges_to_abort_the_pass() {
+        let mut reader = FixedErrReader {
+            err: |lba| Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION),
+                sense: Some(libfreemkv::scsi::ScsiSense {
+                    sense_key: libfreemkv::scsi::SENSE_KEY_ILLEGAL_REQUEST,
+                    asc: 0x21,
+                    ascq: 0x00,
+                }),
+            },
+            reads: 0,
+        };
+        let lbas: Vec<u32> = (1..=10).map(|i| i * 100).collect();
+        let out = patch_bad_sectors("wedge", &lbas, &mut reader);
+        assert!(out.wedged_exit, "a wedged drive must end the pass");
+        // Tier 0 reads each 1-sector range 4 times (one per scout): the 16th wedge
+        // sense lands in the 4th range. Without the carry nothing trips until tier 2.
+        assert_eq!(reader.reads, 16);
+    }
 }
 
-// The live progress drilldown is built from `SharedPatchState`, whose range
-// list is CAPPED; everything `report_patch_progress` derives from it is a
-// TOTAL that must not silently shrink when a disc fragments past the cap.
+// The live progress drilldown is built from `SharedPatchState` over the COMPLETE
+// damage set; the totals `report_patch_progress` derives must not shrink when a
+// disc fragments past libfreemkv's display cap (or the old 8192-entry one).
 #[cfg(test)]
 mod truncated_range_reporting_tests {
     use super::*;
@@ -2082,7 +2168,7 @@ mod truncated_range_reporting_tests {
     }
 
     #[test]
-    fn snapshot_totals_account_for_the_capped_range_list() {
+    fn snapshot_totals_cover_every_range_of_a_fragmented_disc() {
         let d = std::env::temp_dir().join(format!("fmkv-trunc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -2244,7 +2330,7 @@ mod bytes_bad_from_mapfile_tests {
 
 #[cfg(test)]
 mod snap_tests {
-    use super::snap_to_sectors;
+    use crate::recovery::snap_to_sectors;
 
     /// An already-aligned range is untouched.
     #[test]
