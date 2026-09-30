@@ -496,6 +496,68 @@ fn run_passes(
     out
 }
 
+/// A set with no AACS keys (`ResolvedKeySet::none()`) on an AACS disc: the engine's gate
+/// refuses E7022 before any output. The library's whole-disc reader takes such a set's
+/// non-AACS branch and would write ciphertext at exit 0.
+#[test]
+fn a_non_aacs_set_on_an_aacs_disc_refuses_up_front() {
+    let fx = bd(None);
+    let d = disc(&fx);
+    let tmp = tempfile::tempdir().unwrap();
+    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(ResolvedKeySet::none())) {
+        assert_refused_before_output(&iso, r, libfreemkv::error::E_NO_DISC_KEY);
+    }
+    let iso = tmp.path().join("patch.iso");
+    prep_patch(&iso, &fx.expected, &[(fx.files[ORPHAN].0, UNIT_SECTORS)]);
+    let map_path = freemkv_engine::mapfile_path_for(&iso);
+    let (iso_before, map_before) = (
+        std::fs::read(&iso).unwrap(),
+        std::fs::read(&map_path).unwrap(),
+    );
+    let r = freemkv_engine::patch(
+        &d,
+        &mut MemDisc::new(&fx.source),
+        &iso,
+        &patch_opts(ResolvedKeySet::none()),
+    );
+    assert_eq!(
+        r.map(|_| ()).unwrap_err().code(),
+        libfreemkv::error::E_NO_DISC_KEY
+    );
+    assert!(std::fs::read(&iso).unwrap() == iso_before, "ISO untouched");
+    assert_eq!(std::fs::read(&map_path).unwrap(), map_before);
+}
+
+/// Resuming a scoped (MKV-staging) image with no key set: `copy` refuses E7022 before it
+/// widens the mapfile's scope, so the staged image stays as it was.
+#[test]
+fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
+    let fx = bd(None);
+    let d = disc(&fx);
+    let tmp = tempfile::tempdir().unwrap();
+    let iso = tmp.path().join("staged.iso");
+    let total = fx.source.len() as u64;
+    let map_path = freemkv_engine::mapfile_path_for(&iso);
+    let mut mf = Mapfile::create(&map_path, total, "test").unwrap();
+    mf.record(0, total / 2, SectorStatus::Finished).unwrap();
+    mf.set_scope(vec![(0, total / 2)]);
+    mf.flush().unwrap();
+    std::fs::write(&iso, &fx.expected[..total as usize / 2]).unwrap();
+    let map_before = std::fs::read(&map_path).unwrap();
+    let opts = freemkv_engine::CopyOptions {
+        decrypt: true,
+        multipass: true,
+        keys: None,
+        ..Default::default()
+    };
+    let r = freemkv_engine::copy(&d, &mut MemDisc::new(&fx.source), &iso, &opts);
+    assert_eq!(
+        r.map(|_| ()).unwrap_err().code(),
+        libfreemkv::error::E_NO_DISC_KEY
+    );
+    assert_eq!(std::fs::read(&map_path).unwrap(), map_before, "scope kept");
+}
+
 /// A non-title file no held key opens is unprovable: the rip's up-front resolve refuses
 /// it (E7032) on a multi-CPS, single-CPS, no-`Unit_Key_RO.inf` and FMTS disc. The passes
 /// themselves never run without a set covering the whole disc: handed none (E7022) or one
