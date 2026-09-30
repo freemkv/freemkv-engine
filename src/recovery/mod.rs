@@ -897,7 +897,7 @@ fn sweep_linked(
                     }
                 }
             }
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 // Mapfile exists but is corrupt/unparseable. resume=true would hand
                 // garbage to open_or_create and mis-track progress; downgrade so the
                 // `!resume` path below drops it and the rip restarts clean.
@@ -907,6 +907,9 @@ fn sweep_linked(
                 );
                 resume = false;
             }
+            // EIO/EACCES/ESTALE say nothing about the contents: a fresh sweep would
+            // delete a good mapfile and truncate the ISO, so surface them.
+            Err(e) => return Err(Error::from(e)),
         }
     }
     if !resume {
@@ -2722,6 +2725,112 @@ mod patch_preset_tests {
             !outcome.wedged_exit,
             "the threshold alone must not mark a pass wedged — `wedged_exit` \
              comes from a handler's TransportFault, nothing counts against 50"
+        );
+    }
+}
+
+// End-to-end sweep contracts over a synthetic reader: resume reconciliation, stops,
+// progress and the consumer hand-off.
+#[cfg(test)]
+mod sweep_contract_tests {
+    use super::*;
+    use libfreemkv::disc::DiscRegion;
+    use libfreemkv::{ContentFormat, Disc, DiscFormat};
+
+    type FailAt = Box<dyn FnMut(u32) -> Option<Error> + Send>;
+
+    // A reader that fills every sector with 0xAA unless `fail` answers an error for the
+    // batch starting at that LBA; records every `SET CD SPEED`.
+    struct Reader {
+        sectors: u32,
+        fail: FailAt,
+        speeds: Vec<u16>,
+    }
+
+    impl SectorSource for Reader {
+        fn read_sectors(&mut self, lba: u32, count: u16, buf: &mut [u8], _: bool) -> Result<usize> {
+            if let Some(e) = (self.fail)(lba) {
+                return Err(e);
+            }
+            let n = count as usize * 2048;
+            buf[..n].fill(0xAA);
+            Ok(n)
+        }
+        fn capacity_sectors(&self) -> u32 {
+            self.sectors
+        }
+        fn set_speed(&mut self, kbs: u16) {
+            self.speeds.push(kbs);
+        }
+    }
+
+    fn reader(sectors: u32, fail: impl FnMut(u32) -> Option<Error> + Send + 'static) -> Reader {
+        Reader {
+            sectors,
+            fail: Box::new(fail),
+            speeds: Vec::new(),
+        }
+    }
+
+    fn disc(sectors: u32) -> Disc {
+        Disc {
+            volume_id: "SWEEPCONTRACT".into(),
+            meta_title: None,
+            format: DiscFormat::Uhd,
+            capacity_sectors: sectors,
+            capacity_bytes: sectors as u64 * 2048,
+            layers: 1,
+            titles: Vec::new(),
+            region: DiscRegion::Free,
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: ContentFormat::BdTs,
+        }
+    }
+
+    fn opts(resume: bool, skip_on_error: bool) -> SweepOptions<'static> {
+        SweepOptions {
+            resume,
+            skip_on_error,
+            ..Default::default()
+        }
+    }
+
+    // R10: only a corrupt mapfile (InvalidData) downgrades a resume to a fresh sweep. An
+    // unreadable one (EACCES here; EIO on a flaky mount) must fail the pass, not be deleted
+    // along with a truncated ISO.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_whose_mapfile_cannot_be_read_fails_instead_of_starting_over() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("ioerr.iso");
+        let sectors = 500u32;
+        let total = sectors as u64 * 2048;
+        let d = disc(sectors);
+        let mf = d.mapfile_for(&iso);
+        std::fs::write(&iso, vec![0x5Au8; total as usize]).unwrap();
+        std::fs::write(&mf, b"# Rescue Logfile\n").unwrap();
+        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&mf).is_ok() {
+            return; // root: permissions are not enforced
+        }
+
+        let r = sweep(&d, &mut reader(sectors, |_| None), &iso, &opts(true, true));
+        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            r.is_err(),
+            "an unreadable mapfile must fail the resume: {r:?}"
+        );
+        assert!(mf.exists(), "the unreadable mapfile must not be deleted");
+        let img = std::fs::read(&iso).unwrap();
+        assert_eq!(img.len() as u64, total, "the ISO must not be truncated");
+        assert!(
+            img.iter().all(|&b| b == 0x5A),
+            "the ISO must not be rewritten"
         );
     }
 }
