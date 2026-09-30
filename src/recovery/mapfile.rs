@@ -245,11 +245,15 @@ impl Mapfile {
     pub fn create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         let mut mf = Self {
             path: path.to_path_buf(),
-            entries: vec![MapEntry {
-                pos: 0,
-                size: total_size,
-                status: SectorStatus::NonTried,
-            }],
+            // No entry for an empty image: load() refuses a zero-size one.
+            entries: (total_size > 0)
+                .then_some(MapEntry {
+                    pos: 0,
+                    size: total_size,
+                    status: SectorStatus::NonTried,
+                })
+                .into_iter()
+                .collect(),
             total_size,
             version: version.to_string(),
             stats: MapStats {
@@ -2415,6 +2419,19 @@ mod tests {
         let mf = load_text("load_size_f", "0 F +\nF 1 -\n").unwrap();
         assert_eq!(mf.total_size(), 0x10);
         assert_eq!(mf.stats().bytes_good, 0xF);
+    }
+
+    // N12: a zero-size mapfile round-trips (no zero-size entry that load() refuses).
+    #[test]
+    fn a_zero_size_mapfile_round_trips() {
+        let p = tmpfile("zero_size_create");
+        let mf = Mapfile::create(&p, 0, "test").unwrap();
+        let back = Mapfile::load(&p).map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&p);
+        let back = back.unwrap();
+        assert!(mf.entries().is_empty());
+        assert_eq!((back.total_size(), back.entries().len()), (0, 0));
+        assert_eq!(back.stats(), mf.stats());
     }
 
     // M26: a data line is exactly `pos size status`, the status one character.
