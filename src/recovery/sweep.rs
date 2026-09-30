@@ -117,6 +117,10 @@ impl Sink<WorkItem> for SweepSink {
     type Output = ConsumerSummary;
 
     fn apply(&mut self, item: WorkItem) -> Result<Flow, Error> {
+        // Abandoned by teardown: a resumed pass owns the image now.
+        if self.map.is_disowned() {
+            return Ok(Flow::Stop);
+        }
         match item {
             WorkItem::Good { pos, buf } => {
                 // Decrypt is on the producer; consumer assumes plaintext.
@@ -131,6 +135,10 @@ impl Sink<WorkItem> for SweepSink {
                 // seek-elision keeps them on the writeback pipeline path.
                 let mut filled = 0u64;
                 while filled < len {
+                    // A fill can run GBs; stop mid-way if teardown abandons us.
+                    if self.map.is_disowned() {
+                        return Ok(Flow::Stop);
+                    }
                     let chunk = (len - filled).min(self.zero.len() as u64) as usize;
                     self.file.write_all(&self.zero[..chunk])?;
                     filled += chunk as u64;
@@ -413,6 +421,28 @@ mod tests {
         assert!(
             reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
             "a range whose data never reached disk was persisted Finished"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R2: once teardown abandons this consumer (mapfile disowned), a resumed pass owns the
+    // image; an in-flight zero-fill must not go on writing zeros over what it recovers.
+    #[test]
+    fn a_disowned_sink_writes_nothing_more_to_the_image() {
+        let dir = scratch("disowned");
+        let total = 4 * ZERO_CHUNK as u64;
+        let (mut sink, iso) = sink_over(&dir, total);
+        sink.map.disown_handle().disown();
+        let _ = sink.apply(WorkItem::GapFill { pos: 0, len: total });
+        let _ = sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        });
+        drop(sink);
+        let got = std::fs::read(&iso).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 0xAA),
+            "an abandoned consumer overwrote the image a resumed pass now owns"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

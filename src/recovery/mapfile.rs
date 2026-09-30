@@ -538,6 +538,12 @@ impl Mapfile {
         MapfileDisown(Arc::clone(&self.disowned))
     }
 
+    /// Whether a [`MapfileDisown`] handle has revoked this mapfile: its owner was
+    /// abandoned and must touch neither this file nor the image it describes.
+    pub(crate) fn is_disowned(&self) -> bool {
+        self.disowned.load(Ordering::Acquire)
+    }
+
     /// Persist any pending in-memory changes to disk. No-op if clean.
     /// Callers (sweep/patch finalisation) invoke this after their last
     /// `record()` to guarantee state is durable before returning.
