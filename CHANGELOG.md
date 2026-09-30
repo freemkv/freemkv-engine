@@ -20,7 +20,8 @@ project follows semantic versioning.
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
 
 - A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
-- Opening an image keeps the original key refusal (e.g. E7028) and an OS error's kind instead of reporting E7022 or a disc mismatch; `error_code`/`parse_error_code` read codes exactly as libfreemkv does (a code wider than u16 is none).
+
+- A per-title key top-up keeps its original refusal (e.g. E7028, or an OS error's kind and errno) instead of E7022 or E6011 on later titles; an OS error reading an image's key file is reported as that error, not a disc mismatch.
 
 ### Added
 
@@ -31,10 +32,9 @@ project follows semantic versioning.
 - E7034: an image whose keys need the disc's Volume ID (its sidecar mapfile has a VID fingerprint) stops before writing anything and asks for the disc, instead of E7022.
 - `mux_image_titles` (the desktop app's image mux loop, with `MuxPlan` and `mux_options`), `verify_mkv` (size, tracks, and the muxed runtime from the file's Cues against the title) and `remux_iso`: mux one title to `<target>.partial`, fsync, verify, then rename over the target; on failure the partial file is removed and the target left untouched.
 - `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
-- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
+- `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form; they read codes exactly as `libfreemkv::error_code` does.
 - `open_scan(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
-
-- `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged, fault kind only).
+- `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged once per factory, fault kind only).
 
 ### Removed
 
