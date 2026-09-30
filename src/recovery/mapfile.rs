@@ -1385,6 +1385,26 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
+    // The `# freemkv-raw:` stamp round-trips through promote(), the writer and strict load().
+    #[test]
+    fn the_raw_stamp_survives_promote_and_a_strict_reload() {
+        for raw in [false, true] {
+            let p = tmpfile("raw_stamp_promote");
+            let mut mf = Mapfile::create(&p, 8 * 2048, "test").unwrap();
+            mf.set_raw(raw);
+            mf.record(0, 2048, SectorStatus::NonTrimmed).unwrap();
+            mf.record(2048, 2048, SectorStatus::Finished).unwrap();
+            mf.promote(&[SectorStatus::NonTrimmed], SectorStatus::Unreadable)
+                .unwrap();
+            mf.flush().unwrap();
+            let back = Mapfile::load(&p).map_err(|e| e.to_string());
+            let _ = std::fs::remove_file(&p);
+            let back = back.unwrap();
+            assert_eq!(back.raw(), Some(raw));
+            assert_eq!(back.entries(), mf.entries());
+        }
+    }
+
     // P6: `promote()` is the per-range `record()` loop in one pass: same entries, same stats.
     #[test]
     fn promote_matches_recording_each_range() {
