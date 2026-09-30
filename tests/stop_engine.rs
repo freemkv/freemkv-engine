@@ -149,49 +149,69 @@ fn no_raw_halt_loads_in_production() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let files = common::rs_files(&src);
     let test_only = test_only_modules(&files);
-    let mut hits = Vec::new();
+    let (mut hits, mut used) = (Vec::new(), [false; NOT_A_HALT.len()]);
     for path in &files {
         let rel = path
             .strip_prefix(&src)
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
-        let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
-        if HALT_EXEMPT.contains(&rel.as_str()) || test_only.contains(&stem) {
+        if HALT_EXEMPT.contains(&rel.as_str()) || test_only.contains(path) {
             continue;
         }
         let text = std::fs::read_to_string(path).unwrap();
         for (line, receiver) in atomic_loads(&text) {
-            if !NOT_A_HALT.contains(&(rel.as_str(), receiver.as_str())) {
-                hits.push(format!("{rel}:{line}: {receiver}.load("));
+            let entry = (rel.as_str(), receiver.as_str());
+            match NOT_A_HALT.iter().position(|e| *e == entry) {
+                Some(i) => used[i] = true,
+                None => hits.push(format!("{rel}:{line}: {receiver}.load(")),
             }
         }
     }
-    assert!(hits.is_empty(), "raw atomic loads:\n{}", hits.join("\n"));
+    assert!(
+        hits.is_empty(),
+        "raw atomic loads: poll EngineHalt::is_cancelled, or list a non-halt load in \
+         NOT_A_HALT:\n{}",
+        hits.join("\n")
+    );
+    let stale: Vec<_> = NOT_A_HALT.iter().zip(used).filter(|(_, u)| !u).collect();
+    assert!(
+        stale.is_empty(),
+        "NOT_A_HALT entries no load matches: {stale:?}"
+    );
 }
 
 // `EngineHalt` itself and the patch latch (§4.2) read the raw flag by design.
 const HALT_EXEMPT: [&str; 2] = ["engine_halt.rs", "recovery/section_recover.rs"];
 
 // Production atomic loads that are not a halt, as (file, receiver); list a new one here.
-const NOT_A_HALT: [(&str, &str); 5] = [
+// remux.rs `quit` is the copy worker's give-up flag, set by its halt-aware watcher.
+const NOT_A_HALT: [(&str, &str); 6] = [
     ("run.rs", "watcher_done"),
     ("mux.rs", "watcher_done"),
     ("image.rs", "help"),
-    ("remux.rs", "read"),
+    ("remux.rs", "moved"),
+    ("remux.rs", "quit"),
     ("recovery/mapfile.rs", "disowned"),
 ];
 
-// File stems declared `#[cfg(test)] mod name;` anywhere under `src/`.
-fn test_only_modules(files: &[std::path::PathBuf]) -> Vec<String> {
+// Files of the modules declared `#[cfg(test)] mod name;` anywhere under `src/`.
+fn test_only_modules(files: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for path in files {
+        let stem = path.file_stem().unwrap().to_string_lossy();
+        let dir = path.parent().unwrap();
+        let base = match stem.as_ref() {
+            "mod" | "lib" | "main" => dir.to_path_buf(),
+            s => dir.join(s),
+        };
         let text = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         for w in lines.windows(2) {
             let decl = w[1].strip_prefix("mod ").and_then(|m| m.strip_suffix(';'));
             if let (true, Some(name)) = (w[0] == "#[cfg(test)]", decl) {
-                out.push(name.to_string());
+                out.push(base.join(format!("{name}.rs")));
+                out.push(base.join(name).join("mod.rs"));
             }
         }
     }
