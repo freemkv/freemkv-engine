@@ -23,10 +23,11 @@
 //! Persisted to disk in time-batched intervals; see [`FLUSH_INTERVAL`] and
 //! [`Mapfile`] for the flush policy.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 // Minimum interval between mapfile persists (else on `flush()`/`Drop`).
@@ -730,6 +731,12 @@ impl Mapfile {
     }
 
     fn write_to_disk(&self) -> io::Result<()> {
+        with_commit_lock(&self.path, || self.write_locked())
+    }
+
+    // Only under `with_commit_lock`: the disowned checks, tmp write and rename are then one
+    // step against any other writer of this path, so a stale snapshot can't land after a resume.
+    fn write_locked(&self) -> io::Result<()> {
         // DISOWNED: owner was abandoned; someone else records this path now. Checked
         // here (the single commit point) so one check covers flush/record/Drop.
         // Reported as success: not writing is correct, and no caller remains.
@@ -749,7 +756,13 @@ impl Mapfile {
         // a single cleanup covers every early return.
         let write_tmp = |tmp: &std::path::Path| -> io::Result<()> {
             {
-                let file = std::fs::File::create(tmp)?;
+                // Unlink, then create exclusively: a symlink planted at the tmp name is
+                // removed, never written through.
+                let _ = std::fs::remove_file(tmp);
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(tmp)?;
                 let mut w = std::io::BufWriter::new(file);
                 writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
                 // Identity lines (KU §4.1): a disc hash and fingerprints only, never a key
@@ -785,6 +798,8 @@ impl Mapfile {
                         e.status.to_char()
                     )?;
                 }
+                #[cfg(test)]
+                fire_tmp_written_hook(&self.path);
                 w.flush()?;
                 // fsync the tmp file before the rename so bytes are durable (notably on
                 // NFS, where a rename can reach the server before the data does).
@@ -801,9 +816,8 @@ impl Mapfile {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        // Re-check at the commit point: the entry check above can be stale, since
-        // writing/fsyncing the tmp hangs on the mount this mechanism exists for.
-        // Narrows (not closes) the race; true fix needs an atomic check-and-rename.
+        // Re-check at the commit point: the tmp write may have hung (on the mount this
+        // exists for) past a disown. The commit lock makes check-then-rename atomic.
         if self.disowned.load(Ordering::Acquire) {
             let _ = std::fs::remove_file(&tmp);
             return Ok(());
@@ -829,6 +843,51 @@ impl Drop for Mapfile {
     fn drop(&mut self) {
         let _ = self.flush();
     }
+}
+
+// Test seam: runs once, inside `write_to_disk` for `.0`, after the tmp's lines are buffered.
+#[cfg(test)]
+type TmpWrittenHook = (PathBuf, Box<dyn FnOnce() + Send>);
+#[cfg(test)]
+static TMP_WRITTEN_HOOK: std::sync::Mutex<Option<TmpWrittenHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn fire_tmp_written_hook(path: &Path) {
+    let hook = {
+        let mut slot = TMP_WRITTEN_HOOK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match slot.take() {
+            Some((p, f)) if p == path => Some(f),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(f) = hook {
+        f();
+    }
+}
+
+type CommitLocks = HashMap<PathBuf, Arc<Mutex<()>>>;
+
+// Runs `f` holding this process's lock for `path` (keyed as spelled: every pass builds its
+// mapfile path the same way). Per path, so one hung mount never stalls another rip's writes.
+fn with_commit_lock<T>(path: &Path, f: impl FnOnce() -> T) -> T {
+    static LOCKS: LazyLock<Mutex<CommitLocks>> = LazyLock::new(Default::default);
+    let locks = || LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+    let lock = Arc::clone(locks().entry(path.to_path_buf()).or_default());
+    let out = {
+        let _held = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        f()
+    };
+    drop(lock);
+    let mut map = locks();
+    if map.get(path).is_some_and(|l| Arc::strong_count(l) == 1) {
+        map.remove(path);
+    }
+    out
 }
 
 fn invalid(kind: &'static str) -> io::Error {
@@ -2565,6 +2624,89 @@ pub(crate) fn load_if_present(path: &std::path::Path) -> io::Result<Option<Mapfi
 #[cfg(test)]
 mod write_to_disk_cleanup_tests {
     use super::*;
+
+    fn tmp_of(path: &Path) -> PathBuf {
+        let mut s = path.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    }
+
+    // R1/M2: an abandoned (disowned) writer paused mid-write, then the resumed owner of the
+    // same path writes. The stale snapshot must never reach the path, whichever runs first.
+    #[test]
+    fn a_disowned_writer_cannot_clobber_the_resumed_owners_mapfile() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("race.mapfile");
+        let mut stale = Mapfile::create(&path, 4096, "abandoned-pass").unwrap();
+        stale.record(0, 2048, SectorStatus::Unreadable).unwrap();
+        let disown = stale.disown_handle();
+
+        let (at_tx, at_rx) = mpsc::channel::<()>();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        *TMP_WRITTEN_HOOK.lock().unwrap() = Some((
+            path.clone(),
+            Box::new(move || {
+                at_tx.send(()).unwrap();
+                let _ = go_rx.recv();
+            }),
+        ));
+        let abandoned = std::thread::spawn(move || stale.flush());
+        at_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the abandoned writer never reached the hook");
+        let tmp = tmp_of(&path);
+        assert_eq!(
+            std::fs::metadata(&tmp).unwrap().len(),
+            0,
+            "fixture: still buffered"
+        );
+
+        // The stop disowns it; the resume builds a fresh mapfile on the same path.
+        disown.disown();
+        let owner_path = path.clone();
+        let owner = std::thread::spawn(move || {
+            Mapfile::create(&owner_path, 4096, "resumed-pass").map(|m| m.total_size())
+        });
+        let waited = std::time::Instant::now();
+        while !owner.is_finished() && waited.elapsed() < Duration::from_millis(500) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        go_tx.send(()).unwrap();
+        abandoned
+            .join()
+            .unwrap()
+            .expect("a disowned flush reports success");
+        assert_eq!(owner.join().unwrap().expect("the owner's write"), 4096);
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("Created by resumed-pass") && !text.contains("abandoned-pass"),
+            "the abandoned writer's stale snapshot reached the resumed owner's mapfile:\n{text}"
+        );
+        assert_eq!(Mapfile::load(&path).unwrap().stats().bytes_unreadable, 0);
+        assert!(!tmp.exists(), "no tmp left behind");
+    }
+
+    // N2: a symlink planted at the predictable tmp name is replaced, never written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_planted_at_the_tmp_name_is_not_followed() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("m.mapfile");
+        let victim = td.path().join("victim");
+        std::fs::write(&victim, b"precious").unwrap();
+        std::os::unix::fs::symlink(&victim, tmp_of(&path)).unwrap();
+        Mapfile::create(&path, 4096, "test").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the mapfile must be a regular file"
+        );
+        assert_eq!(Mapfile::load(&path).unwrap().total_size(), 4096);
+    }
 
     // A failed write must not leave `<path>.tmp` behind: every `?` between
     // `File::create(&tmp)` and the final `rename` used to orphan the tmp file.
