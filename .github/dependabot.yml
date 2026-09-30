@@ -51,7 +51,7 @@ updates:
       # NOT a dependency: `dtolnay/rust-toolchain` is versioned by the RUST
       # release it installs. Dependabot reads those tags as semver and proposed
       # 1.90.0 -> 1.100.0, a Rust version that does not exist: permanently-red
-      # PRs regenerated weekly. The workflows pin its `master` commit by SHA and
+      # PRs regenerated weekly. The workflows track `@master`/`@stable` and
       # choose the Rust version via `toolchain:` (MSRV from Cargo.toml, or
-      # stable); bump that SHA by hand.
+      # stable), per freemkv-private CI.md.
       - dependency-name: dtolnay/rust-toolchain

@@ -23,11 +23,11 @@ on:
     branches: [qa]
   workflow_dispatch:
 
-# A newer qa push queues behind an in-progress run rather than cancelling it:
-# a cancel could kill rc-tag mid-push and leave a candidate with no verdict.
+# An in-progress qa run is never cancelled (that could kill rc-tag mid-push);
+# a newer push waits, and a still-pending run is replaced by the latest one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_name == 'dev' || github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 # Least privilege by default; only rc-tag is granted contents: write.
 permissions:
@@ -112,7 +112,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -143,7 +143,7 @@ jobs:
           patch: libfreemkv freemkv-keysources
       # clippy runs on stable (matches ci.yml's lint job); build/test stay on
       # the MSRV pin. See ci.yml for why the lint toolchain need not be the MSRV.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy
@@ -171,7 +171,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

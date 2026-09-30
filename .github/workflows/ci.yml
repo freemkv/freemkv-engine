@@ -10,8 +10,8 @@ on:
     branches: [main, dev, qa]
   pull_request:
 
-# Rapid dev/PR pushes supersede their own in-progress runs instead of
-# stacking; qa/main runs (release candidates and release commits) always finish.
+# Rapid dev/PR pushes supersede their own in-progress runs; an in-progress
+# qa/main run is never cancelled (a queued one may be replaced by a newer push).
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_name == 'dev' || github.event_name == 'pull_request' }}
@@ -110,11 +110,11 @@ jobs:
       # stable makes new-lint debt a BLOCKING gate the pinned version would hide.
       # The MSRV pin is installed second so it stays the default (fmt uses it
       # implicitly); clippy is invoked explicitly with `+stable`.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
           components: clippy
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: rustfmt
@@ -141,7 +141,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -167,7 +167,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
@@ -196,7 +196,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -234,7 +234,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -269,7 +269,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -330,7 +330,7 @@ jobs:
       # the binaries always float to the highest supported Rust. Build them on
       # `stable` so this job satisfies that floor; the engine's own lower MSRV
       # (verified by the `test` job) cannot compile them.
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -361,7 +361,7 @@ jobs:
           self: freemkv-engine
           checkout: libfreemkv freemkv-keysources freemkv-unlock
           patch: libfreemkv freemkv-keysources
-      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.resolve-msrv.outputs.v }}
           components: llvm-tools-preview
