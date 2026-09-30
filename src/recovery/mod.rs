@@ -34,8 +34,9 @@ pub(crate) fn is_key_stop(err: &Error) -> bool {
     matches!(err, Error::NoDiscKey { .. } | Error::WholeDiscKeyMissing)
 }
 
-/// Whether a failed read may enter skip-on-error damage handling. `Halted`
-/// keeps its existing route there pending the unified stop redesign.
+/// Whether a failed read may enter damage handling. The sweep takes `Halted` as a stop
+/// before asking; `section_recover` leaves the span bad and its handler's halt check ends
+/// the chain `Halted` (a Fatal there would turn a patch Stop into `Err(Halted)`).
 pub(crate) fn is_damage_candidate(err: &Error) -> bool {
     !is_key_stop(err) && (is_read_fault(err) || matches!(err, Error::Halted))
 }
@@ -1125,6 +1126,12 @@ fn sweep_linked(
                     bytes_good_done = bytes_good_done.saturating_add(block_bytes);
                     bytes_done = bytes_done.saturating_add(block_bytes);
                     pos += block_bytes;
+                }
+                // A Stop that landed mid-read (the drive's LD3 `Halted`): the pass ends
+                // halted and the block stays NonTried, never zero-filled as damage.
+                Err(Error::Halted) => {
+                    halt_requested = true;
+                    break 'outer;
                 }
                 // Not skipping, or not disc damage (e.g. a decrypt refusal): abort
                 // with the real cause rather than zero-filling it as NonTrimmed.
@@ -2803,5 +2810,50 @@ mod sweep_contract_tests {
             img.iter().all(|&b| b == 0x5A),
             "the ISO must not be rewritten"
         );
+    }
+
+    // R6: a Stop that lands mid-read comes back from the drive as `Error::Halted`. That
+    // is a stop, not damage: no zero-fill, no NonTrimmed, no drop to minimum speed, and
+    // the pass ends halted (not `Err(Halted)`) whether or not it skips errors.
+    #[test]
+    fn a_read_the_stop_interrupts_is_a_stop_not_damage() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for skip_on_error in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let iso = dir.path().join("stop.iso");
+            let sectors = 4096u32;
+            let d = disc(sectors);
+            let flag = Arc::new(AtomicBool::new(false));
+            let raised = flag.clone();
+            let mut r = reader(sectors, move |lba| {
+                (lba >= 1024).then(|| {
+                    raised.store(true, Ordering::SeqCst);
+                    Error::Halted
+                })
+            });
+            let mut o = opts(false, skip_on_error);
+            o.halt = Some(flag);
+            o.batch_sectors = Some(32); // 1024 is a batch boundary in both modes
+            let res = sweep(&d, &mut r, &iso, &o);
+            let res =
+                res.unwrap_or_else(|e| panic!("skip={skip_on_error}: a stop is not Err: {e:?}"));
+            assert!(res.halted, "skip={skip_on_error}: the pass must end halted");
+            assert!(
+                !r.speeds.contains(&0),
+                "skip={skip_on_error}: a stop is not a damage zone"
+            );
+            let map = mapfile::Mapfile::load(&d.mapfile_for(&iso)).unwrap();
+            assert!(
+                map.ranges_with(&mapfile::damage_sector_statuses())
+                    .is_empty(),
+                "skip={skip_on_error}: the stop was recorded as damage"
+            );
+            assert_eq!(
+                map.ranges_with(&[mapfile::SectorStatus::NonTried]),
+                vec![(1024 * 2048, (sectors as u64 - 1024) * 2048)],
+                "skip={skip_on_error}: everything from the interrupted read on stays NonTried"
+            );
+        }
     }
 }
