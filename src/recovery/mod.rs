@@ -548,6 +548,15 @@ impl SendStall {
             SendStall::Stalled => Error::PipelineJoinTimeout,
         }
     }
+
+    /// What a failed hand-off makes of the pass: `None` for a Stop (a parked send is a
+    /// halt, not a failure), else the error that fails it.
+    pub(crate) fn pass_error(self) -> Option<Error> {
+        match self {
+            SendStall::Halted => None,
+            stall => Some(stall.into_error()),
+        }
+    }
 }
 
 // Halt-aware, deadline-bounded replacement for `pipe.send(item)`. Fixes a plain
@@ -817,7 +826,6 @@ fn sweep_linked(
     lib: &libfreemkv::Halt,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
-    use libfreemkv::sector::SectorSource;
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
     // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
@@ -984,6 +992,9 @@ fn sweep_linked(
     // Halt token for `send_bounded` below: the op's; with none wired, a never-cancelled
     // token keeps SEND_DEADLINE as the only bound.
     let send_halt = lib.clone();
+    // One hand-off; `Err` ends the read loop (see `SendStall::pass_error`).
+    let send =
+        |item: WorkItem| send_bounded(&pipe, item, &send_halt).map_err(SendStall::pass_error);
 
     let mut buf = vec![0u8; batch as usize * 2048];
     // POSITION: how far the producer's cursor has advanced, good bytes and
@@ -1103,23 +1114,13 @@ fn sweep_linked(
                     }
                     // bridge_degradation_count already reset inside on_success() above.
 
-                    // Plaintext: DecryptingSectorSource decrypted in-place during read.
+                    // Plaintext: the whole-disc reader decrypted in place during the read.
 
                     // Fresh owned Vec into the channel; producer's `buf` is reused.
                     let send_buf = buf[..block_bytes as usize].to_vec();
-                    match send_bounded(&pipe, WorkItem::Good { pos, buf: send_buf }, &send_halt) {
-                        Ok(()) => {}
-                        // A Stop that lands while this send is parked is a
-                        // halt, not a failure: same outcome as the loop-top
-                        // check that used to be the only place it could land.
-                        Err(SendStall::Halted) => {
-                            halt_requested = true;
-                            break 'outer;
-                        }
-                        Err(stall) => {
-                            producer_err = Some(stall.into_error());
-                            break 'outer;
-                        }
+                    if let Err(e) = send(WorkItem::Good { pos, buf: send_buf }) {
+                        (halt_requested, producer_err) = (e.is_none(), e);
+                        break 'outer;
                     }
                     bytes_good_done = bytes_good_done.saturating_add(block_bytes);
                     bytes_done = bytes_done.saturating_add(block_bytes);
@@ -1143,23 +1144,13 @@ fn sweep_linked(
                             }
                         }
                         read_error::ReadAction::SkipBlock { pause_secs } => {
-                            match send_bounded(
-                                &pipe,
-                                WorkItem::SkipFill {
-                                    pos,
-                                    len: block_bytes,
-                                },
-                                &send_halt,
-                            ) {
-                                Ok(()) => {}
-                                Err(SendStall::Halted) => {
-                                    halt_requested = true;
-                                    break 'outer;
-                                }
-                                Err(stall) => {
-                                    producer_err = Some(stall.into_error());
-                                    break 'outer;
-                                }
+                            let fill = WorkItem::SkipFill {
+                                pos,
+                                len: block_bytes,
+                            };
+                            if let Err(e) = send(fill) {
+                                (halt_requested, producer_err) = (e.is_none(), e);
+                                break 'outer;
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
                             if sleep_secs_or_halt(pause_secs, halt) {
@@ -1172,23 +1163,13 @@ fn sweep_linked(
                             sectors,
                             pause_secs,
                         } => {
-                            match send_bounded(
-                                &pipe,
-                                WorkItem::SkipFill {
-                                    pos,
-                                    len: block_bytes,
-                                },
-                                &send_halt,
-                            ) {
-                                Ok(()) => {}
-                                Err(SendStall::Halted) => {
-                                    halt_requested = true;
-                                    break 'outer;
-                                }
-                                Err(stall) => {
-                                    producer_err = Some(stall.into_error());
-                                    break 'outer;
-                                }
+                            let fill = WorkItem::SkipFill {
+                                pos,
+                                len: block_bytes,
+                            };
+                            if let Err(e) = send(fill) {
+                                (halt_requested, producer_err) = (e.is_none(), e);
+                                break 'outer;
                             }
                             bytes_done = bytes_done.saturating_add(block_bytes);
 
@@ -1215,23 +1196,13 @@ fn sweep_linked(
                             // `>= 0` here is an equivalent mutant: a zero-length GapFill is a
                             // no-op end to end.
                             if gap_bytes > 0 {
-                                match send_bounded(
-                                    &pipe,
-                                    WorkItem::GapFill {
-                                        pos: gap_start,
-                                        len: gap_bytes,
-                                    },
-                                    &send_halt,
-                                ) {
-                                    Ok(()) => {}
-                                    Err(SendStall::Halted) => {
-                                        halt_requested = true;
-                                        break 'outer;
-                                    }
-                                    Err(stall) => {
-                                        producer_err = Some(stall.into_error());
-                                        break 'outer;
-                                    }
+                                let fill = WorkItem::GapFill {
+                                    pos: gap_start,
+                                    len: gap_bytes,
+                                };
+                                if let Err(e) = send(fill) {
+                                    (halt_requested, producer_err) = (e.is_none(), e);
+                                    break 'outer;
                                 }
                                 bytes_done = bytes_done.saturating_add(gap_bytes);
                             }
