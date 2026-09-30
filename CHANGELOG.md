@@ -19,6 +19,9 @@ project follows semantic versioning.
 
 - `copy`, `sweep` and `patch` refuse up front with E6021, naming the file(s), when the drive's bus map could not locate a bus-encrypted stream file (its File Entry was unreadable), raw copies included: the image would carry those sectors still bus-encrypted. MKV rips and `extract_tree` still run on such a disc.
 
+- A mux's final progress tick (sync/mux 100%) is delivered instead of dropped; disc-borne text (playlist name, failure detail) reaches `Sink::log` with control characters escaped.
+- Opening an image keeps the original key refusal (e.g. E7028) and an OS error's kind instead of reporting E7022 or a disc mismatch; `error_code`/`parse_error_code` read codes exactly as libfreemkv does (a code wider than u16 is none).
+
 ### Added
 
 - `multipass_rip_staged`, `mkv_staging_scope`, `sweep_scoped` and `ensure_whole_image`: an image staged for an MKV rip reads only UDF, nav/AACS files and the chosen titles (AACS BD Pre-recorded 0.953 §3.7: none of it bus-encrypted), so a disc with an unlocatable bus-encrypted stream file still rips to MKV. The scope is recorded in the mapfile (`# freemkv-scope:`), where `stats()` leaves the unread rest out of pending. `copy` and a whole-disc `sweep` over a scoped mapfile refuse with E6021 until every stream file is located, then fill the rest; `patch` re-reads only in-scope damage. `ensure_whole_image` refuses a staged image as a whole-disc source with E6022, and `ensure_titles_staged` refuses (E6022) muxing a title from it whose extents lie outside its scope. A staging image is whole only when it is kept and every stream file was located.
@@ -30,6 +33,8 @@ project follows semantic versioning.
 - `Sink::event` with typed `Event`s (phase, title start/done, verify, replaced); the default ignores them.
 - `error_code` and `parse_error_code`: the one reader of libfreemkv's `E<code>[: data]` error form.
 - `open_scan(.., raw_copy)`: a raw disc→ISO copy scans on past an unreadable AACS key file (E7031), as the CLI's `--raw` does.
+
+- `keys::key_url_rejection`: why a configured `key_url` was dropped (it is also logged, fault kind only).
 
 ### Removed
 
