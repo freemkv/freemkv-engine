@@ -120,10 +120,9 @@ fn aacs_v2() -> AacsState {
 }
 
 // A multipass copy over a damaged region completes rather than erroring.
-// (Historic name: this once wrote to `/dev/null`; it writes to a regular
-// file now — `sweep_to_dev_null_real` below covers the character device.)
+// (`sweep_to_dev_null_real` below covers the `/dev/null` character device.)
 #[test]
-fn sweep_to_dev_null_no_enodev() {
+fn multipass_copy_over_bad_sectors_returns_a_damage_report_not_an_error() {
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("test.iso");
     let sectors: u32 = 1000;
@@ -234,7 +233,7 @@ fn copy_raw_aacs_no_key_proceeds() {
     assert_eq!(result.bytes_good, sectors as u64 * 2048);
 }
 
-// `/dev/null` is a POSIX character device; these three tests exercise writing
+// `/dev/null` is a POSIX character device; the `*dev_null*` tests exercise writing
 // to it where `set_len` returns ENODEV. Windows has no equivalent, so these
 // tests are gated to unix rather than pretend the coverage is cross-platform.
 #[cfg(unix)]
@@ -258,7 +257,7 @@ fn sweep_to_dev_null_real() {
     let result = freemkv_engine::copy(&disc, &mut reader, std::path::Path::new("/dev/null"), &opts)
         .expect("sweep to /dev/null must not fail with ENODEV");
     // `is_ok()` alone constrained nothing; this is the character-device
-    // sibling of `sweep_to_dev_null_no_enodev`. Accounting must match a
+    // sibling of `multipass_copy_over_bad_sectors_returns_a_damage_report_not_an_error`. Accounting must match a
     // regular file: the sink swallows bytes, it does not excuse bookkeeping.
     assert!(
         !result.complete,
@@ -612,6 +611,56 @@ fn sweep_fresh_aborts_when_stale_mapfile_unremovable() {
     );
 }
 
+// The removal failure itself must abort: a loadable stale mapfile that cannot be deleted
+// (read-only directory) must not be loaded and inherited by the fresh sweep. Unix-only;
+// skipped when permission bits do not bind (running as root).
+#[cfg(unix)]
+#[test]
+fn sweep_fresh_refuses_to_inherit_a_stale_mapfile_it_cannot_remove() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("ro");
+    std::fs::create_dir(&dir).unwrap();
+    let iso_path = dir.join("stale.iso");
+    let sectors: u32 = 64;
+    let disc = make_test_disc(sectors, "STALE");
+    let mf_path = disc.mapfile_for(&iso_path);
+    {
+        let mut mf = Mapfile::create(&mf_path, sectors as u64 * 2048, "test").unwrap();
+        mf.record(0, sectors as u64 * 2048, SectorStatus::Finished)
+            .unwrap();
+        mf.flush().unwrap();
+    }
+    std::fs::write(&iso_path, vec![0u8; sectors as usize * 2048]).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let restore = || std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
+    if std::fs::write(dir.join("probe"), b"x").is_ok() {
+        restore().unwrap();
+        return;
+    }
+
+    let mut reader = MockReader {
+        total_sectors: sectors,
+        bad_sectors: std::collections::HashSet::new(),
+    };
+    let r = freemkv_engine::sweep(
+        &disc,
+        &mut reader,
+        &iso_path,
+        &plain_sweep_opts(false, true),
+    );
+    let img = std::fs::read(&iso_path).unwrap();
+    restore().unwrap();
+    assert!(
+        r.is_err(),
+        "a stale mapfile that cannot be removed must abort the fresh sweep"
+    );
+    assert!(
+        img.iter().all(|&b| b == 0),
+        "nothing may be swept into the image under the stale mapfile"
+    );
+}
+
 #[cfg(unix)]
 struct CleanupGuard(std::path::PathBuf);
 #[cfg(unix)]
@@ -621,9 +670,8 @@ impl Drop for CleanupGuard {
     }
 }
 
-// `/dev/null` is a POSIX character device; these three tests exercise writing
-// to it where `set_len` returns ENODEV. Windows has no equivalent, so these
-// tests are gated to unix rather than pretend the coverage is cross-platform.
+// A full-good sweep to `/dev/null` (see the `/dev/null` note at
+// `sweep_to_dev_null_real`; unix-only).
 #[cfg(unix)]
 #[test]
 fn sweep_dev_null_full_good() {
@@ -825,10 +873,10 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
 
     let got = reads.lock().unwrap();
     // The NonTried tail [100..200) MUST have been read by the resume sweep.
-    let tail_read = (100u32..200).any(|lba| got.contains(&lba));
+    let tail_unread: Vec<u32> = (100u32..200).filter(|lba| !got.contains(lba)).collect();
     assert!(
-        tail_read,
-        "plain copy must resume-sweep the NonTried tail; tail sectors were never read"
+        tail_unread.is_empty(),
+        "plain copy must resume-sweep the whole NonTried tail; never read: {tail_unread:?}"
     );
     // The Finished prefix [0..100) must NOT be re-read — that would mean a
     // restart-from-zero (the bug), not a resume.
@@ -845,10 +893,23 @@ fn plain_copy_resumes_nontried_tail_after_interrupt() {
         0,
         "resume sweep must clear the NonTried tail"
     );
+
+    // The bytes must land too: the tail carries the reader's data, the
+    // already-Finished prefix keeps what the interrupted run left there.
+    let img = std::fs::read(&iso_path).unwrap();
+    assert_eq!(img.len(), sectors as usize * 2048);
+    assert!(
+        img[100 * 2048..].iter().all(|&b| b == 0xAA),
+        "the resumed tail must hold the data the sweep read"
+    );
+    assert!(
+        img[..100 * 2048].iter().all(|&b| b == 0),
+        "the Finished prefix must be left untouched"
+    );
 }
 
 #[test]
-fn patch_dev_null_after_sweep() {
+fn a_second_copy_pass_clears_the_damage_a_sweep_left() {
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("test.iso");
     let sectors: u32 = 500;
@@ -866,11 +927,16 @@ fn patch_dev_null_after_sweep() {
         halt: None,
         keys: None,
     };
-    let sweep_result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &sweep_opts);
+    let sweep_result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &sweep_opts)
+        .expect("a sweep over bad sectors is a result, not an Err");
+    // Without this the second pass could "complete" a rip that never had damage.
     assert!(
-        sweep_result.is_ok(),
-        "sweep should succeed: {:?}",
-        sweep_result.err()
+        !sweep_result.complete,
+        "three dead sectors must leave the first pass incomplete"
+    );
+    assert!(
+        sweep_result.bytes_unreadable + sweep_result.bytes_pending > 0,
+        "the first pass must leave damage for the second to clear"
     );
 
     let mut reader2 = MockReader {
@@ -896,6 +962,8 @@ fn patch_dev_null_after_sweep() {
         "patch should complete: bytes_pending={}",
         pr.bytes_pending
     );
+    assert_eq!(pr.bytes_unreadable, 0);
+    assert_eq!(pr.bytes_good, sectors as u64 * 2048);
 }
 
 // A patch pass to the `/dev/null` sink shares one mapfile with the prior
@@ -1217,6 +1285,7 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         total_sectors: u32,
         bad: std::collections::HashSet<u32>,
         reads: Arc<AtomicUsize>,
+        served: Arc<AtomicUsize>,
     }
     impl libfreemkv::sector::SectorSource for CountingReader {
         fn read_sectors(
@@ -1242,6 +1311,7 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
             }
             let n = count as usize * 2048;
             buf[..n].fill(0xAA);
+            self.served.fetch_add(n, Ordering::Relaxed);
             Ok(n)
         }
         fn capacity_sectors(&self) -> u32 {
@@ -1279,10 +1349,12 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
 
     // Pass N: patch that bad range with a reporter that cancels immediately.
     let reads = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(AtomicUsize::new(0));
     let mut reader = CountingReader {
         total_sectors: sectors,
         bad: bad.clone(),
         reads: Arc::clone(&reads),
+        served: Arc::clone(&served),
     };
     let reporter = CancelNow;
     let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None);
@@ -1290,11 +1362,13 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
 
     let n = reads.load(Ordering::Relaxed);
     assert!(out.halted, "a cancelling reporter must halt the pass");
-    assert!(
-        n <= 8,
+    // The first read ticks at once and the reporter cancels there, so the
+    // handler's next inter-read check must end the chain: exactly one read.
+    assert_eq!(
+        n, 1,
         "cancel must stop the handler chain at the next inter-read check; \
-         took {n} reads (the whole chain grinds on when the tick's halt answer \
-         is discarded)"
+         took {n} reads (a cancel honoured only between handlers or after the \
+         whole chain costs a handler's stall streak or more)"
     );
 
     // Promptness alone was checked above; also verify a cancel doesn't corrupt
@@ -1322,11 +1396,13 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
          got {} pending",
         out.bytes_pending
     );
-    assert!(
-        out.bytes_recovered_this_pass <= n as u64 * 2048,
-        "the pass claims {} recovered bytes from {n} reads — a halted pass \
-         cannot report more progress than it could physically have made",
-        out.bytes_recovered_this_pass
+    // The damage-jump gap around the bad set holds readable sectors, so the
+    // one read may land data; the pass must report exactly what was served.
+    assert_eq!(
+        out.bytes_recovered_this_pass,
+        served.load(Ordering::Relaxed) as u64,
+        "a halted pass must report exactly the bytes the drive served, no more \
+         and no less"
     );
 
     // And the persisted record has to say the same thing: the mapfile is what
@@ -1436,9 +1512,10 @@ fn encrypted_disc_with_no_cipher_state_is_refused_not_written_as_ciphertext() {
     let r = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
 
     assert!(
-        r.is_err(),
+        matches!(r, Err(libfreemkv::Error::NoDiscKey { .. })),
         "a decrypting copy of an encrypted disc with no usable cipher state \
-         must refuse, not emit ciphertext at complete:true"
+         must refuse with NoDiscKey, not emit ciphertext at complete:true; got {:?}",
+        r.err()
     );
     let wrote = std::fs::metadata(&iso_path).map(|m| m.len()).unwrap_or(0);
     assert_eq!(wrote, 0, "nothing may be written before the refusal");
@@ -1516,8 +1593,9 @@ fn mapfile_from_a_different_disc_is_refused() {
     );
 }
 
-// ── Survivors from the full-crate mutation run, killed here ──────────────── A PLAIN copy must
-// ABORT on the first unreadable sector, not zero-fill and carry on.
+// ── Survivors from the full-crate mutation run, killed here ────────────────
+
+// A PLAIN copy must ABORT on the first unreadable sector, not zero-fill and carry on.
 #[test]
 fn a_plain_copy_aborts_on_the_first_bad_sector_instead_of_holing_the_iso() {
     let sectors: u32 = 1000;
@@ -1871,29 +1949,79 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
 }
 
 // KU §4.1 (J6): the mapfile holds no key byte and no raw VID, only fingerprints, even from a
-// disc whose scan banked a key and read its VID.
+// disc whose rip resolved a real unit key and read its VID. The sweep decrypts with that key,
+// so the key is demonstrably in play when the mapfile is checked.
 #[test]
 fn the_mapfile_header_never_carries_the_unit_keys() {
-    let sectors: u32 = 64;
+    use libfreemkv::aacs::types::UnitKey;
+    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    use libfreemkv::test_util::{BdFile, encrypted_bd_image, unit_key_ro};
+
+    struct Pool([u8; 16]);
+    impl libfreemkv::KeySource for Pool {
+        fn get_unit_keys(
+            &self,
+            _ctx: &dyn libfreemkv::keysource::ResolveCtx,
+        ) -> libfreemkv::Result<Vec<UnitKey>> {
+            Ok(vec![UnitKey::new(1, self.0)])
+        }
+        fn label(&self) -> &'static str {
+            "keydb"
+        }
+    }
+
+    const KEY: [u8; 16] = [0xAB; 16];
+    let uk_ro = unit_key_ro(libfreemkv::aacs::mkb::AacsVersion::V10, &[[0u8; 16]], &[1]);
+    let fx = encrypted_bd_image(
+        &[BdFile::new("BDMV/STREAM/00001.m2ts", 30, Some(KEY))],
+        &uk_ro,
+    );
+    let sectors = (fx.image.len() / 2048) as u32;
     let mut disc = make_test_disc(sectors, "KEYED");
-    let mut aacs = aacs_v2();
-    aacs.volume_id = [0x11; 16];
-    disc.aacs = Some(aacs);
+    disc.format = DiscFormat::BluRay;
+    disc.encrypted = true;
+    disc.aacs = Some(
+        libfreemkv::test_util::aacs_state()
+            .uk_ro(uk_ro)
+            .volume_id([0x11; 16])
+            .build(),
+    );
+    let mut reader = fx.source();
+    let factory: libfreemkv::KeySourceFactory =
+        std::sync::Arc::new(|| vec![Box::new(Pool(KEY)) as Box<dyn libfreemkv::KeySource>]);
+    let keys = ResolvedKeySet::resolve(
+        &disc,
+        &mut reader,
+        KeyScope::WholeDisc,
+        &factory,
+        Default::default(),
+    )
+    .expect("the pool's key opens the fixture's keyed file")
+    .keys;
+
     let tmp = tempfile::tempdir().unwrap();
     let iso_path = tmp.path().join("keyed.iso");
-    let mut reader = MockReader {
-        total_sectors: sectors,
-        bad_sectors: std::collections::HashSet::new(),
+    let opts = SweepOptions {
+        decrypt: true,
+        keys: Some(keys),
+        ..plain_sweep_opts(false, true)
     };
-    let opts = plain_sweep_opts(false, true);
     freemkv_engine::sweep(&disc, &mut reader, &iso_path, &opts).expect("sweep");
+
+    let img = std::fs::read(&iso_path).unwrap();
+    let (start, _) = fx.files[0];
+    let at = start as usize * 2048;
+    assert_ne!(
+        img[at..at + 6144],
+        fx.image[at..at + 6144],
+        "fixture precondition: the key was used (the keyed unit is no longer ciphertext)"
+    );
 
     let text = std::fs::read_to_string(disc.mapfile_for(&iso_path)).unwrap();
     assert!(!text.contains("freemkv-uk"), "{text}");
-    assert!(
-        !text.contains(&"ab".repeat(16)),
-        "no key byte on disk: {text}"
-    );
+    for needle in ["ab".repeat(16), "AB".repeat(16), "11".repeat(16)] {
+        assert!(!text.contains(&needle), "key/VID bytes on disk: {text}");
+    }
     let mf = Mapfile::load(&disc.mapfile_for(&iso_path)).unwrap();
     assert!(mf.legacy_key_fingerprints().is_empty());
 }
@@ -1975,10 +2103,9 @@ fn the_drive_retry_lever_is_the_inverse_of_skip_on_error() {
 // reader ignores `set_speed`, so no other test noticed.
 #[test]
 fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
-    // Damage early, then a long clean tail so the exit threshold (16
-    // consecutive good batches) is reached before EOF. The jump-ahead lands
-    // well inside the disc rather than overshooting EOF.
-    let sectors: u32 = 200_000;
+    // One-sector batches keep the damage-jump at 1024 sectors, so a clean tail
+    // long enough for 16 good batches fits in a small disc.
+    let sectors: u32 = 4_000;
     let bad: std::collections::HashSet<u32> = [320u32].into_iter().collect();
     let events: std::sync::Arc<std::sync::Mutex<Vec<DriveEvent>>> = Default::default();
     let mut reader = InstrumentedReader {
@@ -1993,7 +2120,10 @@ fn damage_drops_the_drive_speed_and_a_clean_run_restores_it() {
         &disc,
         &mut reader,
         &iso_path,
-        &plain_sweep_opts(false, true),
+        &SweepOptions {
+            batch_sectors: Some(1),
+            ..plain_sweep_opts(false, true)
+        },
     )
     .expect("sweep");
 
@@ -2113,9 +2243,9 @@ fn a_disc_whose_damage_is_all_permanent_is_not_patched_again() {
 fn equal_pending_and_unreadable_counts_still_route_to_a_patch_pass() {
     let sectors: u32 = 200;
     let total = sectors as u64 * SEC;
-    let disc = make_test_disc(sectors, "CANCEL");
+    let disc = make_test_disc(sectors, "EQUAL");
     let tmp = tempfile::tempdir().unwrap();
-    let iso_path = tmp.path().join("cancel.iso");
+    let iso_path = tmp.path().join("equal.iso");
 
     std::fs::write(&iso_path, vec![0u8; total as usize]).unwrap();
     {
@@ -2289,6 +2419,7 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
     let img = std::fs::read(&iso_path).expect("read iso");
     assert_eq!(img.len() as u64, sectors as u64 * SEC);
 
+    let css = disc.css.as_ref().expect("fixture has a CSS state");
     let mut changed = 0usize;
     for lba in 0..sectors {
         let got = &img[(lba as u64 * SEC) as usize..((lba as u64 + 1) * SEC) as usize];
@@ -2297,6 +2428,20 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
             if got != raw.as_slice() {
                 changed += 1;
             }
+            // Not merely "different": exactly the library's descramble of the
+            // scrambled sector, with the scramble flag bits cleared.
+            let mut expected = raw;
+            libfreemkv::css::descramble_sector(css, &mut expected);
+            assert_ne!(
+                expected, raw,
+                "fixture precondition: descrambling changes it"
+            );
+            assert_eq!(
+                got,
+                expected.as_slice(),
+                "scrambled sector {lba} is not the plaintext"
+            );
+            assert_eq!(got[0x14] & 0x30, 0, "sector {lba} keeps its scramble flag");
         } else {
             assert_eq!(
                 got,
