@@ -969,6 +969,24 @@ fn run_staged(
 // the window fails E9073, and the target is untouched either way.
 #[test]
 fn remux_staged_copy_is_stall_based_and_stoppable() {
+    // Stops 50 ms into the copy phase, holding the stage open to see its blocks freed.
+    struct StopInCopy {
+        stage: PathBuf,
+        copy_at: Mutex<Option<Instant>>,
+        held: Mutex<Option<std::fs::File>>,
+    }
+    impl Sink for StopInCopy {
+        fn event(&self, e: &Event<'_>) {
+            if matches!(e, Event::Phase { name: "copy" }) {
+                *self.held.lock().unwrap() = std::fs::File::open(&self.stage).ok();
+                *self.copy_at.lock().unwrap() = Some(Instant::now());
+            }
+        }
+        fn should_cancel(&self) -> bool {
+            let at = *self.copy_at.lock().unwrap();
+            at.is_some_and(|t| t.elapsed() >= Duration::from_millis(50))
+        }
+    }
     let dir = tempfile::tempdir().unwrap();
     let (target, mtime) = old_target(dir.path());
     let stage = dir.path().join("7.mkv.partial");
@@ -980,22 +998,30 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
         move || release.store(true, Ordering::SeqCst),
         STOP_LATENCY * 3,
     );
-    let op = Halt::new();
-    let o = op.clone();
-    cancel_later(move || o.cancel(), Duration::from_millis(100));
-    let t0 = Instant::now();
+    let sink = StopInCopy {
+        stage: stage.clone(),
+        copy_at: Mutex::default(),
+        held: Mutex::default(),
+    };
     let e = run_staged(
         &target,
         &stage,
-        &Events::default(),
-        &op,
+        &sink,
+        &Halt::new(),
         &rio,
         writes(good(), true),
+    );
+    let copy_at = sink.copy_at.lock().unwrap().expect("the copy phase ran");
+    let held = sink.held.lock().unwrap().take().expect("the stage existed");
+    assert_eq!(
+        held.metadata().unwrap().len(),
+        0,
+        "a leaked copy pins the stage"
     );
     let e = e.unwrap_err();
     assert!(libfreemkv::is_halt(&e), "{e}");
     assert!(
-        t0.elapsed() < STOP_LATENCY,
+        copy_at.elapsed() < STOP_LATENCY,
         "the Stop waited out the blocked write"
     );
     untouched(&target, mtime);

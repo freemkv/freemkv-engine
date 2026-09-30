@@ -713,8 +713,13 @@ fn copy_staged(
         beat,
         &report,
     );
+    // A leaked worker holds both files until its write returns: empty the local stage so its
+    // blocks free now (never the NAS side, which may be the hung mount).
     if watched.is_err() {
         quit.store(true, Ordering::Relaxed);
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(source) {
+            let _ = f.set_len(0);
+        }
     }
     let done = watched??;
     if done != total || std::fs::metadata(destination)?.len() != total {
