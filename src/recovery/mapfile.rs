@@ -612,9 +612,9 @@ impl Mapfile {
             .collect()
     }
 
-    /// Snapshot of the incrementally-maintained summary statistics.
-    /// O(1) — returns the cached `MapStats`. On a scoped mapfile the never-read bytes
-    /// outside the scope are not pending: they are not part of this image's job.
+    /// Snapshot of the incrementally-maintained summary statistics: O(1) on a whole-disc map.
+    /// On a scoped mapfile the never-read bytes outside the scope are not pending (not this
+    /// image's job); that adjustment is one O(entries + scope ranges) walk, allocation-free.
     pub fn stats(&self) -> MapStats {
         let mut s = self.stats;
         if self.scope.is_some() {
@@ -629,18 +629,27 @@ impl Mapfile {
         let Some(scope) = &self.scope else {
             return 0;
         };
-        let nontried: u64 = self
+        let end = |p: u64, n: u64| p.saturating_add(n);
+        let mut outside = 0u64;
+        let mut first = 0;
+        for e in self
             .entries
             .iter()
             .filter(|e| e.status == SectorStatus::NonTried)
-            .map(|e| e.size)
-            .sum();
-        let inside: u64 = self
-            .ranges_with(&[SectorStatus::NonTried])
-            .iter()
-            .map(|&r| intersect(&[r], scope).iter().map(|&(_, n)| n).sum::<u64>())
-            .sum();
-        nontried - inside
+        {
+            let e_end = end(e.pos, e.size);
+            // Scope is sorted and merged: ranges ending at or before this run end before later ones.
+            while scope.get(first).is_some_and(|&(p, n)| end(p, n) <= e.pos) {
+                first += 1;
+            }
+            let inside: u64 = scope[first..]
+                .iter()
+                .take_while(|&&(p, _)| p < e_end)
+                .map(|&(p, n)| end(p, n).min(e_end) - p.max(e.pos))
+                .sum();
+            outside = outside.saturating_add(e.size.saturating_sub(inside));
+        }
+        outside
     }
 
     /// The byte ranges a scoped (MKV-staging) image covers; `None` = the whole disc.
@@ -1950,6 +1959,38 @@ mod tests {
                 .contains("freemkv-scope")
         );
         let _ = std::fs::remove_file(&p);
+    }
+
+    // M7: a scoped stats() is one merge walk over entries and scope, not entries x scope.
+    #[test]
+    fn scoped_stats_is_linear_in_entries_plus_scope() {
+        const N: u64 = 40_000;
+        let p = tmpfile("scoped_stats_linear");
+        let mut mf = Mapfile::create(&p, 2 * N * 2048, "test").unwrap();
+        let _ = std::fs::remove_file(&p);
+        mf.entries = (0..2 * N)
+            .map(|i| MapEntry {
+                pos: i * 2048,
+                size: 2048,
+                status: if i % 2 == 0 {
+                    SectorStatus::Finished
+                } else {
+                    SectorStatus::NonTried
+                },
+            })
+            .collect();
+        mf.stats = Mapfile::compute_stats(&mf.entries, mf.total_size);
+        // Scope: the first half of every NonTried run, plus one range spanning two runs.
+        let mut scope: Vec<(u64, u64)> = (0..N).map(|i| ((2 * i + 1) * 2048, 1024)).collect();
+        scope.push((3 * 2048 + 1024, 2 * 2048));
+        mf.set_scope(scope);
+        let t = Instant::now();
+        let st = mf.stats();
+        let took = t.elapsed();
+        assert_eq!(st.bytes_nontried, N * 1024 + 1024);
+        assert_eq!(st.bytes_pending, st.bytes_nontried);
+        assert!(took < Duration::from_millis(100), "stats() took {took:?}");
+        mf.dirty = false;
     }
 
     // Dropping a malformed scope would present a partial image as a whole one.
