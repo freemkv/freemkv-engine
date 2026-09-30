@@ -41,6 +41,12 @@ pub struct KeyParams {
 /// own retry waits are. A lookup with no answer is retried up front until 60 s pass with no
 /// answer (J13); one that finds a non-public address is refused.
 pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
+    warn_dropped_url(p);
+    sources_quiet(p)
+}
+
+// `key_sources` without the dropped-URL warning (a factory warns once, at build).
+fn sources_quiet(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     let mut sources: Vec<Box<dyn freemkv_keysources::KeySource>> = Vec::new();
 
     if !p.online_only
@@ -49,25 +55,27 @@ pub fn key_sources(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>>
         sources.push(Box::new(freemkv_keysources::KeydbSource::new(path.clone())));
     }
 
-    match (&p.key_url, key_url_rejection(p)) {
-        (Some(url), None) => sources.push(Box::new(freemkv_keysources::OnlineSource::new(
+    if let (Some(url), None) = (&p.key_url, key_url_rejection(p)) {
+        sources.push(Box::new(freemkv_keysources::OnlineSource::new(
             url.clone(),
             p.key_auth.clone().unwrap_or_default(),
-        ))),
-        // Neither the URL nor the check's text: a URL may carry credentials.
-        (Some(_), Some(r)) => tracing::warn!(
-            target: "freemkv::keys",
-            fault = ?r.fault,
-            "key_url dropped by the static check"
-        ),
-        (None, _) => {}
+        )));
     }
 
     sources
 }
 
-/// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] calls to build
-/// the ordered sources from `p`, with the J10 transient-URL rule of [`key_sources`].
+// Neither the URL nor the check's text: a URL may carry credentials.
+fn warn_dropped_url(p: &KeyParams) {
+    if let Some(r) = key_url_rejection(p) {
+        tracing::warn!(
+            target: "freemkv::keys",
+            fault = ?r.fault,
+            "key_url dropped by the static check"
+        );
+    }
+}
+
 /// Why [`key_sources`] leaves `p.key_url` out, if it does: the static check's typed verdict
 /// (no DNS lookup), for a front-end to localize. `None` when no URL is set or it passes.
 pub fn key_url_rejection(p: &KeyParams) -> Option<freemkv_keysources::KeyserverUrlRejection> {
@@ -75,9 +83,13 @@ pub fn key_url_rejection(p: &KeyParams) -> Option<freemkv_keysources::KeyserverU
     freemkv_keysources::check_keyserver_url_static(url).err()
 }
 
+/// Build the [`libfreemkv::KeySourceFactory`] a rip's [`resolve_for_rip`] calls to build
+/// the ordered sources from `p`, with the J10 transient-URL rule of [`key_sources`].
+/// A dropped `key_url` is warned once, here, not on every call.
 pub fn key_source_factory(p: &KeyParams) -> libfreemkv::KeySourceFactory {
+    warn_dropped_url(p);
     let p = p.clone();
-    std::sync::Arc::new(move || key_sources(&p))
+    std::sync::Arc::new(move || sources_quiet(&p))
 }
 
 /// What a rip writes, which decides what it must decrypt (KU §2.5).
