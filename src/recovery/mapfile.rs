@@ -3176,6 +3176,45 @@ mod ku_identity_tests {
         assert!(ok(&map_with(&p, None, None, &[]), &clear));
     }
 
+    /// Rule 2's fallback: a disc whose scan has no VID is identified by the key set's VID,
+    /// both when stamped and when checked; the disc's own VID still wins when it has one.
+    #[test]
+    fn identity_falls_back_to_the_key_sets_vid() {
+        let (_d, p) = scratch("set_vid");
+        let fx = bd_image(&[Some(K1)], 1);
+        let f = crate::test_fixtures::factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+        let opts = ResolveKeysOptions {
+            vid: Some(VID),
+            ..Default::default()
+        };
+        let set = ResolvedKeySet::resolve(
+            &fx.disc,
+            &mut fx.source(),
+            KeyScope::Titles(vec![0]),
+            &f,
+            opts,
+        )
+        .unwrap()
+        .keys;
+        let other_vid = [0x33; 16];
+        let no_vid = disc_with(HASH_A, [0; 16]);
+        let check = |map_vid: [u8; 16], d: &libfreemkv::Disc| {
+            check_mapfile_identity(&map_with(&p, None, Some(map_vid), &[]), d, Some(&set)).is_ok()
+        };
+        assert!(check(VID, &no_vid));
+        assert!(!check(other_vid, &no_vid), "the set's VID is compared");
+        assert!(
+            check(other_vid, &disc_with(HASH_A, other_vid)),
+            "the disc's own VID wins"
+        );
+
+        let mut mf = map_with(&p, None, None, &[]);
+        stamp_identity(&mut mf, &no_vid, Some(&set));
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&VID)));
+        stamp_identity(&mut mf, &disc_with(HASH_A, other_vid), Some(&set));
+        assert_eq!(mf.vid_fingerprint(), Some(vid_fingerprint(&other_vid)));
+    }
+
     /// EK3 rule 3 (KU §4.4, coord 4): legacy key fingerprints are checked ONLY when the set
     /// proved a base key; a set that proved none (every piece Lazy or Clear) cannot check
     /// them, and that is not a mismatch.
