@@ -1242,6 +1242,41 @@ mod tests {
         assert!(verify_mkv(&p, &title(0.0)).is_ok());
     }
 
+    // Slack is max(10 s, 2 %) either side; a title with a runtime needs a finite one.
+    #[test]
+    fn verify_runtime_slack_is_the_larger_of_ten_seconds_and_two_percent() {
+        let probe = |last_cue: Option<f64>, duration: Option<f64>| libfreemkv::MkvProbe {
+            tracks: vec![libfreemkv::MkvProbeTrack {
+                number: 1,
+                kind: libfreemkv::MkvTrackKind::Video,
+                codec_id: "V_MPEG4/ISO/AVC".into(),
+                language: "und".into(),
+            }],
+            last_cue_secs: last_cue,
+            duration_secs: duration,
+            ..Default::default()
+        };
+        let ok = |t: f64, runtime: f64| {
+            check_probe(Path::new("a"), &title(t), probe(Some(runtime), None)).is_ok()
+        };
+        // 2 h title: 2 % = 144 s.
+        assert!(ok(7200.0, 7200.0 - 143.0) && ok(7200.0, 7200.0 + 143.0));
+        assert!(!ok(7200.0, 7200.0 - 145.0) && !ok(7200.0, 7200.0 + 145.0));
+        // 100 s title: 2 % = 2 s, so the 10 s floor applies.
+        assert!(ok(100.0, 91.0) && ok(100.0, 109.0));
+        assert!(!ok(100.0, 89.0) && !ok(100.0, 111.0));
+        assert!(!ok(100.0, f64::NAN) && !ok(100.0, f64::INFINITY));
+        let t = title(100.0);
+        assert!(
+            check_probe(Path::new("a"), &t, probe(None, None)).is_err(),
+            "no runtime"
+        );
+        assert!(
+            check_probe(Path::new("a"), &t, probe(None, Some(100.0))).is_ok(),
+            "header Duration"
+        );
+    }
+
     #[test]
     fn verify_rejects_empty_trackless_and_foreign_files() {
         let dir = tempfile::tempdir().unwrap();
