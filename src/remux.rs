@@ -558,6 +558,11 @@ fn land_verified(
             "invalid remux staging path",
         ));
     }
+    // The mux takes a String URL: a non-UTF-8 path would be written under a lossy name.
+    let Some(partial_str) = partial.to_str() else {
+        let url = format!("mkv://{}", partial.display());
+        return Err(libfreemkv::Error::StreamUrlInvalid { url }.into());
+    };
     // §4.2: "`land_verified` … takes `<target>.lock` (the §2.5 acquire loop) **before**
     // creating `.partial`"; "deleted while held on every exit" (dropped last).
     // libfreemkv's lock watches `<target>.partial` as the holder's T10 progress.
@@ -568,7 +573,7 @@ fn land_verified(
     let mut guard = PartialFile(partial, false);
 
     sink.event(&Event::Phase { name: "mux" });
-    let dest = format!("mkv://{}", partial.display());
+    let dest = format!("mkv://{partial_str}");
     sink.event(&Event::TitleStart { idx, dest: &dest });
     let result = mux(&dest);
     sink.event(&Event::TitleDone {
@@ -1344,6 +1349,27 @@ mod tests {
         assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
         assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
         assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    }
+
+    // A sink URL is a String: a non-UTF-8 partial path would mux to a different, lossy name.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_partial_path_is_refused_before_the_mux() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(std::ffi::OsStr::from_bytes(b"Caf\xe9"));
+        let _ = std::fs::create_dir(&folder); // APFS refuses the name; the check comes first
+        let target = folder.join("Movie.mkv");
+        let muxed = AtomicBool::new(false);
+        let e = land(&job(target.clone(), true), 0, &title(60.0), &Events::default(), |_| {
+            muxed.store(true, Ordering::SeqCst);
+            Ok(outcome(true))
+        })
+        .unwrap_err();
+        let code = libfreemkv::error::E_STREAM_URL_INVALID;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert!(!muxed.load(Ordering::SeqCst));
+        assert!(!partial_path(&target).exists());
     }
 
     // A relative target named like a libfreemkv code must not read as that code.
