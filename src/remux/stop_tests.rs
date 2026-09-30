@@ -649,14 +649,6 @@ fn remux_verify_stall_goes_silent_then_fails() {
     untouched(&target, mtime);
 }
 
-// ET15 `engine_mux_options_have_no_frame_deadline` — T27: "`Some(60 s)` → none (ST-F1, ST-E1)".
-#[test]
-fn engine_mux_options_have_no_frame_deadline() {
-    assert_eq!(mux_options(false).send_deadline, None);
-    assert_eq!(mux_options(true).send_deadline, None);
-    assert_eq!(MuxPlan::new(vec![0]).mux.send_deadline, None);
-}
-
 // §4.2: "ST-E1 adds … `mux_image_titles_with(.., &Halt)`; the old functions call them with a
 // never-cancelled private `Halt`".
 #[test]
