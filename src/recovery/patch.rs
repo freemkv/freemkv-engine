@@ -234,6 +234,8 @@ impl Sink<PatchItem> for PatchSink {
                     error_kind = ?e.kind(),
                     "patch: sync_all failed"
                 );
+                // The data is not durable: the dropped map must not flush it as Finished.
+                self.map.disown_handle().disown();
                 return Err(Error::from(e));
             }
             tracing::debug!(
@@ -2116,6 +2118,36 @@ mod tests {
         // Tier 0 reads each 1-sector range 4 times (one per scout): the 16th wedge
         // sense lands in the 4th range. Without the carry nothing trips until tier 2.
         assert_eq!(reader.reads, 16);
+    }
+
+    // R3: a failed `sync_all` means the recovered data is not durable, so the dropped
+    // sink must not flush a Finished record for it.
+    #[test]
+    fn sync_failure_on_close_does_not_persist_finished() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 4096]).unwrap();
+        let mapfile_path = dir.path().join("out.iso.mapfile");
+        let mut mf = Mapfile::create(&mapfile_path, 4096, "vTEST").unwrap();
+        mf.record(0, 4096, SectorStatus::NonTrimmed).unwrap();
+        mf.flush().unwrap();
+
+        let (mut sink, _shared) = PatchSink::new(&iso, mf, true, None).unwrap();
+        sink.apply(PatchItem::Recovered {
+            pos: 0,
+            buf: vec![7u8; 2048],
+        })
+        .unwrap();
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        assert!(sink.close().is_err(), "sync_all must fail under a halt");
+
+        let reloaded = Mapfile::load(&mapfile_path).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a non-durable sector must not be recorded Finished"
+        );
     }
 }
 

@@ -162,6 +162,8 @@ impl Sink<WorkItem> for SweepSink {
         if let Err(e) = self.file.sync_all()
             && self.is_regular
         {
+            // The data is not durable: the dropped map must not flush it as Finished.
+            self.map.disown_handle().disown();
             return Err(Error::from(e));
         }
         // Non-regular outputs (/dev/null, pipes) always fail
@@ -389,6 +391,29 @@ mod tests {
         sink.file.set_halt(halt);
         let err = sink.close().err().expect("a halted fsync must fail");
         assert!(matches!(err, Error::Halted), "got {err:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // R3: a failed fsync means the bytes behind this close's Finished records are not
+    // durable, so dropping the sink must not flush those records.
+    #[test]
+    fn a_failed_close_does_not_persist_finished_for_unsynced_data() {
+        let dir = scratch("syncfail-drop");
+        let (mut sink, _iso) = sink_over(&dir, 8192);
+        sink.apply(WorkItem::Good {
+            pos: 0,
+            buf: vec![0x5Au8; 2048],
+        })
+        .unwrap();
+        let halt = libfreemkv::halt::Halt::new();
+        halt.cancel();
+        sink.file.set_halt(halt);
+        assert!(sink.close().is_err(), "a halted fsync must fail");
+        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+        assert!(
+            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+            "a range whose data never reached disk was persisted Finished"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
