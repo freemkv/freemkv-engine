@@ -120,16 +120,15 @@ fn synthetic_title(sector_count: u32) -> DiscTitle {
     }
 }
 
-// ── 2. copy() on_progress callback fires (regression guard) ───────────────
+// ── copy() on_progress callback fires (regression guard) ───────────────
 
 #[test]
 fn test_disc_copy_progress_callback_fires() {
     let disc = synthetic_disc(64);
     let mut reader = ZeroSectorReader::new(64);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp); // we want the path, not the file handle
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let calls = Arc::new(AtomicU64::new(0));
     let last_bytes = Arc::new(AtomicU64::new(0));
@@ -158,10 +157,6 @@ fn test_disc_copy_progress_callback_fires() {
 
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy ok");
 
-    // Cleanup any sidecar mapfile + ISO before assertions.
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
-
     assert!(result.complete, "copy should be complete");
     let n = calls.load(Ordering::Relaxed);
     let last = last_bytes.load(Ordering::Relaxed);
@@ -172,7 +167,7 @@ fn test_disc_copy_progress_callback_fires() {
     );
 }
 
-// ── 3. Halt aborts disc copy promptly ─────────────────────────────────────
+// ── Halt aborts disc copy promptly ─────────────────────────────────────
 
 #[test]
 fn test_halt_aborts_disc_copy_promptly() {
@@ -192,9 +187,8 @@ fn test_halt_aborts_disc_copy_promptly() {
     };
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -202,10 +196,6 @@ fn test_halt_aborts_disc_copy_promptly() {
         ..Default::default()
     };
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts);
-
-    // Cleanup
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     let copy_result = result.expect("copy returns Ok with halted=true on halt");
     assert!(
@@ -236,7 +226,7 @@ fn test_halt_aborts_disc_copy_promptly() {
     );
 }
 
-// ── 5. FileSectorSource round trip ────────────────────────────────────────
+// ── FileSectorSource round trip ────────────────────────────────────────
 
 #[test]
 fn test_file_sector_reader_round_trip() {
@@ -285,7 +275,7 @@ fn test_file_sector_reader_round_trip() {
     assert_eq!(all, data, "bulk read mismatch");
 }
 
-// ── 6. Pass 1 sweeps the entire disc even when every read fails ───────────
+// ── Pass 1 sweeps the entire disc even when every read fails ───────────
 // copy() must reach disc end regardless of read failures; only halt exits
 // early. Expect: all NonTrimmed, bytes_good=0, bytes_unreadable=0, incomplete.
 
@@ -353,18 +343,16 @@ impl SectorSource for FailingSectorReader {
 
 #[test]
 fn test_disc_copy_completes_full_disc_with_failing_reader() {
-    // 1024 sectors = 2 MB. Reader fails every read. With skip_on_error +
-    // skip_on_error, Pass 1 must mark every sector NonTrimmed and return
-    // cleanly — no bail, no hang.
+    // 1024 sectors = 2 MB. Reader fails every read. A multipass sweep skips on
+    // error, so Pass 1 must mark every sector NonTrimmed and return cleanly.
     let capacity_sectors: u32 = 1024;
     let total_bytes: u64 = capacity_sectors as u64 * SECTOR_SIZE as u64;
 
     let mut reader = FailingSectorReader::new(capacity_sectors);
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -378,10 +366,6 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
         freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy returns Ok");
     let elapsed = t0.elapsed();
 
-    // Cleanup
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
-
     // Hard bound — Pass 1 must NOT infinite-loop on a fully-failing reader.
     // Accommodates the wedge-avoidance pause (5 s/failed batch); well-bounded
     // total (~20-30 s typical), not "completes in milliseconds."
@@ -390,8 +374,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
         "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 60 s (not infinite)"
     );
 
-    // Per RIP_DESIGN.md §2.1: Pass 1 must reach end of disc regardless of
-    // read outcomes.
+    // Pass 1 must reach end of disc regardless of read outcomes.
     assert_eq!(
         result.bytes_total, total_bytes,
         "bytes_total must match disc capacity"
@@ -402,7 +385,7 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
     );
     assert_eq!(
         result.bytes_unreadable, 0,
-        "Pass 1 does not mark Unreadable; only Pass 2 (Disc::patch) does"
+        "Pass 1 does not mark Unreadable; the multipass loop promotes after its last patch pass"
     );
     assert_eq!(
         result.bytes_pending, total_bytes,
@@ -415,13 +398,9 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
         "complete=false because NonTrimmed regions remain (work for Pass 2)"
     );
     assert!(!result.halted, "no halt was set; halted must be false");
-
-    // ISO should be full disc size on disk (sparse zeros where reads failed).
-    // tempfile was dropped above so the file may not still exist; we only
-    // assert what CopyResult itself reports.
 }
 
-// ── 7. Halt during Pass 1 skip-forward path returns promptly (deterministic) ─
+// ── Halt during Pass 1 skip-forward path returns promptly (deterministic) ─
 // Halt is the only legitimate early exit from Pass 1, even mid skip-forward.
 // Fixture: reader signals halt on read #1, avoiding any wallclock race.
 
@@ -433,9 +412,8 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     let mut reader = FailingSectorReader::with_halt_on_first_read(capacity_sectors, halt.clone());
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -450,10 +428,6 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
         .expect("copy returns Ok on halt");
     let elapsed = t0.elapsed();
     let reads = reader.reads;
-
-    // Cleanup
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     // The primary, clock-free assertion: the halt raised during read #1 means
     // read #2 never happens. The sweep polls `halt` at the top of every batch
@@ -483,7 +457,7 @@ fn test_disc_copy_halts_promptly_on_failing_reader() {
     );
 }
 
-// ── 8. Hysteresis recovers data the drive can read individually ──────────
+// ── Hysteresis recovers data the drive can read individually ──────────
 // Pass 1 reads in 32-sector batches; a reader whose multi-sector reads all
 // fail must mark every ECC block NonTrimmed, with zero bytes_good.
 
@@ -532,9 +506,8 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     };
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -545,9 +518,6 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
 
     let result =
         freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy returns Ok");
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     // Pass 1 is "fast, get the most data" — it never retries a failed batch
     // sector-by-sector (that's Pass N's job). BlockSizeFailingReader fails
@@ -566,7 +536,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
     );
 }
 
-// ── 9. PassProgress carries separate unreadable vs pending byte counts ─────
+// ── PassProgress carries separate unreadable vs pending byte counts ─────
 // 2026-05-11 design: failed reads stay NonTrimmed for retry, not Unreadable,
 // until the orchestrator promotes them after the final pass.
 
@@ -578,9 +548,8 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
     let mut reader = FailingSectorReader::new(capacity_sectors);
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -636,9 +605,6 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
 
     let pass2 = freemkv_engine::copy(&disc, &mut reader, &iso_path, &pass2_opts).expect("pass2 ok");
 
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
-
     assert_eq!(
         pass2.bytes_good, 0,
         "pass2: still no good sectors (reader always fails)"
@@ -648,7 +614,7 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
     // is an orchestrator (autorip) concern, not the patch loop's.
     assert_eq!(
         pass2.bytes_unreadable, 0,
-        "pass2: Disc::patch never marks Unreadable mid-multipass — orchestrator promotes after final pass"
+        "pass2: a patch pass never marks Unreadable mid-multipass — the loop promotes after its final pass"
     );
     // bytes_pending stays at total_bytes because everything still
     // failed and nothing got recovered or promoted out of pending.
@@ -677,7 +643,7 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
     );
 }
 
-// ── 9b. The patch pass's live drilldown is located against the main title ──
+// ── The patch pass's live drilldown is located against the main title ──
 // `located`/`bytes_bad_in_main_title` intersect damage with the main title's
 // extents; zero would mean the title never reached the consumer.
 
@@ -692,9 +658,8 @@ fn test_patch_progress_locates_damage_against_the_main_title() {
     title.duration_secs = 60.0;
     disc.titles = vec![title];
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
     let opts = CopyOptions {
         decrypt: false,
@@ -736,9 +701,6 @@ fn test_patch_progress_locates_damage_against_the_main_title() {
         ..Default::default()
     };
     freemkv_engine::copy(&disc, &mut reader, &iso_path, &pass2_opts).expect("pass2 ok");
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     // Every sector of the title is damaged and the title covers the whole
     // disc, so the drilldown must account for all of it.
@@ -789,54 +751,88 @@ impl SectorSource for MarginalSectorReader {
     }
 }
 
+/// The four totals of the tick that accounted for the FEWEST bytes: the worst case for the
+/// partition assertion. `None` until a tick arrives, so an all-zero tick is kept, not unset.
+#[derive(Default)]
+struct WorstTick(std::sync::Mutex<Option<(u64, Totals)>>);
+
+/// good, unreadable, pending, retryable.
+type Totals = (u64, u64, u64, u64);
+
+impl WorstTick {
+    fn note(&self, p: &libfreemkv::progress::PassProgress) {
+        let t = (
+            p.bytes_good_total,
+            p.bytes_unreadable_total,
+            p.bytes_pending_total,
+            p.bytes_retryable_total,
+        );
+        let sum = t.0 + t.1 + t.2 + t.3;
+        let mut w = self.0.lock().unwrap();
+        if w.is_none_or(|(s, _)| sum < s) {
+            *w = Some((sum, t));
+        }
+    }
+    fn totals(&self) -> Option<Totals> {
+        self.0.lock().unwrap().map(|(_, t)| t)
+    }
+}
+
+/// Remembers the HIGHEST `bytes_good_total` any tick ever claimed, and the worst tick.
+struct MaxGoodReporter {
+    max_good: Arc<AtomicU64>,
+    worst: Arc<WorstTick>,
+}
+
+impl libfreemkv::progress::Progress for MaxGoodReporter {
+    fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+        self.max_good
+            .fetch_max(p.bytes_good_total, Ordering::Relaxed);
+        self.worst.note(p);
+        true
+    }
+}
+
+// An all-zero tick is the worst case and must survive a later, fuller one.
+#[test]
+fn the_worst_tick_tracker_keeps_an_all_zero_tick() {
+    let tick = |pending| libfreemkv::progress::PassProgress {
+        kind: libfreemkv::progress::PassKind::Sweep,
+        work_done: 0,
+        work_total: 0,
+        bytes_good_total: 0,
+        bytes_unreadable_total: 0,
+        bytes_pending_total: pending,
+        bytes_retryable_total: 0,
+        bytes_total_disc: 0,
+        disc_duration_secs: None,
+        bytes_bad_in_main_title: 0,
+        main_title_duration_secs: None,
+        main_title_size_bytes: None,
+        located: Default::default(),
+    };
+    let w = WorstTick::default();
+    w.note(&tick(0));
+    w.note(&tick(4096));
+    assert_eq!(w.totals(), Some((0, 0, 0, 0)));
+}
+
 #[test]
 fn live_progress_never_reports_zero_filled_damage_as_good_bytes() {
-    let capacity_sectors: u32 = 60; // one batch: the sweep's optical default
+    let capacity_sectors: u32 = 60; // two batches: a skipping sweep reads 32-sector ECC blocks
     let mut reader = MarginalSectorReader {
         capacity: capacity_sectors,
     };
     let disc = synthetic_disc(capacity_sectors);
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile create");
-    let iso_path = tmp.path().to_path_buf();
-    drop(tmp);
+    let dir = tempfile::tempdir().expect("tempdir create");
+    let iso_path = dir.path().join("d.iso");
 
-    /// Remembers the HIGHEST `bytes_good_total` any tick ever claimed, and
-    /// the four totals from the tick that accounted for the FEWEST bytes —
-    /// the worst case for the partition assertion below.
-    struct MaxGoodReporter {
-        max_good: Arc<AtomicU64>,
-        worst_sum: Arc<AtomicU64>,
-        worst: Arc<std::sync::Mutex<(u64, u64, u64, u64)>>,
-    }
-    impl libfreemkv::progress::Progress for MaxGoodReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-            self.max_good
-                .fetch_max(p.bytes_good_total, Ordering::Relaxed);
-            let sum = p.bytes_good_total
-                + p.bytes_unreadable_total
-                + p.bytes_pending_total
-                + p.bytes_retryable_total;
-            let prev = self.worst_sum.load(Ordering::Relaxed);
-            if prev == 0 || sum < prev {
-                self.worst_sum.store(sum, Ordering::Relaxed);
-                *self.worst.lock().unwrap() = (
-                    p.bytes_good_total,
-                    p.bytes_unreadable_total,
-                    p.bytes_pending_total,
-                    p.bytes_retryable_total,
-                );
-            }
-            true
-        }
-    }
     let max_good = Arc::new(AtomicU64::new(0));
-    let worst_sum = Arc::new(AtomicU64::new(0));
-    let worst_totals = Arc::new(std::sync::Mutex::new((0u64, 0u64, 0u64, 0u64)));
+    let worst = Arc::new(WorstTick::default());
     let reporter = MaxGoodReporter {
         max_good: max_good.clone(),
-        worst_sum: worst_sum.clone(),
-        worst: worst_totals.clone(),
+        worst: worst.clone(),
     };
 
     let opts = CopyOptions {
@@ -847,9 +843,6 @@ fn live_progress_never_reports_zero_filled_damage_as_good_bytes() {
     };
 
     let result = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy ok");
-
-    let _ = std::fs::remove_file(&iso_path);
-    let _ = std::fs::remove_file(freemkv_engine::mapfile_path_for(&iso_path));
 
     // Fixture check: every sector must really have failed, or the assertion
     // below is vacuous.
@@ -870,7 +863,7 @@ fn live_progress_never_reports_zero_filled_damage_as_good_bytes() {
     // `good`: the four totals partition the disc, so on a tick with nothing
     // recovered, every byte must be unreadable, retryable, or pending.
     let total = capacity_sectors as u64 * SECTOR_SIZE as u64;
-    let (g, u, p, r) = *worst_totals.lock().unwrap();
+    let (g, u, p, r) = worst.totals().expect("at least one tick");
     assert_eq!(
         g + u + p + r,
         total,
