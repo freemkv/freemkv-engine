@@ -23,6 +23,8 @@ pub struct EngineHalt<'a> {
     extra: Option<Arc<AtomicBool>>,
     // §4.2: "The sink probe is an internal `pub(crate)` field of `EngineHalt`".
     pub(crate) sink: Option<&'a dyn Sink>,
+    // A cancel once observed stays observed: a non-sticky `should_cancel` stays a Stop.
+    seen: AtomicBool,
 }
 
 impl std::fmt::Debug for EngineHalt<'_> {
@@ -32,6 +34,7 @@ impl std::fmt::Debug for EngineHalt<'_> {
             .field("op_private", &self.op_private)
             .field("extra", &self.extra)
             .field("sink", &self.sink.is_some())
+            .field("seen", &self.seen)
             .finish()
     }
 }
@@ -44,6 +47,7 @@ impl EngineHalt<'static> {
             op_private: false,
             extra,
             sink: None,
+            seen: AtomicBool::new(false),
         }
     }
 
@@ -54,6 +58,7 @@ impl EngineHalt<'static> {
             op_private: true,
             extra,
             sink: None,
+            seen: AtomicBool::new(false),
         }
     }
 }
@@ -69,17 +74,25 @@ impl<'a> EngineHalt<'a> {
             op_private: self.op_private,
             extra: self.extra,
             sink: Some(sink),
+            seen: self.seen,
         }
     }
 
-    /// `op || extra || sink.should_cancel()`.
+    /// `op || extra || sink.should_cancel()`, sticky once true.
     pub fn is_cancelled(&self) -> bool {
-        self.op.is_cancelled()
+        if self.seen.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = self.op.is_cancelled()
             || self
                 .extra
                 .as_ref()
                 .is_some_and(|e| e.load(Ordering::Acquire))
-            || self.sink.is_some_and(|s| s.should_cancel())
+            || self.sink.is_some_and(|s| s.should_cancel());
+        if now {
+            self.seen.store(true, Ordering::Release);
+        }
+        now
     }
 
     /// The caller's op token (a private, never-cancelled one for a legacy entry).

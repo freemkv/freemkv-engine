@@ -136,3 +136,19 @@ fn halted_without_a_cancel_is_failed() {
     let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
     assert!(matches!(r, EngineOutcome::Failed(Error::Halted)), "{r:?}");
 }
+
+// A Stop the engine observed stays a Stop even if a non-sticky `should_cancel` flips back.
+#[test]
+fn an_observed_cancel_is_sticky() {
+    struct Once(AtomicBool);
+    impl Sink for Once {
+        fn should_cancel(&self) -> bool {
+            self.0.swap(false, Ordering::SeqCst)
+        }
+    }
+    let sink = Once(AtomicBool::new(true));
+    let h = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    assert!(h.is_cancelled());
+    let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
+    assert!(r.is_stopped(), "{r:?}");
+}
