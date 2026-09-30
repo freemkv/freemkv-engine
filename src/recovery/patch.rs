@@ -70,15 +70,6 @@ pub(super) enum PatchItem {
     /// `pos`, writes `buf`, records the range as `Finished`.
     Recovered { pos: u64, buf: Vec<u8> },
 
-    /// Producer exhausted retries on `[pos, pos+len)`. Consumer records
-    /// the range as `Unreadable`. No file write — the existing zero-fill
-    /// from sweep is preserved in place.
-    ///
-    /// Currently unused by `Disc::patch` itself; kept for the orchestrator-side end-of-recovery
-    /// promotion.
-    #[allow(dead_code)]
-    Unreadable { pos: u64, len: u64 },
-
     /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH the per-range skip-limit
     /// case (remaining bytes never tried) AND individual sector failures (tried-but-failed
     /// within a pass). Both stay "hopeful" — a later pass retries them; promotion to true
@@ -221,11 +212,6 @@ impl Sink<PatchItem> for PatchSink {
                     .record(pos, len, SectorStatus::Finished)
                     .map_err(Error::from)?;
             }
-            PatchItem::Unreadable { pos, len } => {
-                self.map
-                    .record(pos, len, SectorStatus::Unreadable)
-                    .map_err(Error::from)?;
-            }
             PatchItem::NonTrimmed { pos, len } => {
                 self.map
                     .record(pos, len, SectorStatus::NonTrimmed)
@@ -268,10 +254,6 @@ impl Sink<PatchItem> for PatchSink {
         })
     }
 }
-
-// Disc::patch + bytes_bad_in_title — extracted from disc/mod.rs in 0.20.1.
-// Behavior unchanged; the move splits the 3,900-line mod.rs into a
-// cleaner-to-read file.
 
 use super::{PatchOptions, PatchOutcome};
 use crate::engine_halt::EngineHalt;
@@ -352,12 +334,6 @@ pub(super) fn recovery_read<R: SectorSource + ?Sized>(
 pub(super) struct SubRanges {
     /// (pos, len) pairs, sorted by pos, non-overlapping, all non-zero len.
     ranges: Vec<(u64, u64)>,
-}
-
-// Widen a mapfile byte-range outward to whole 2048-byte sectors: the single ingress
-// establishing the "all offsets are sector multiples" invariant.
-fn snap_to_sectors(pos: u64, len: u64) -> (u64, u64) {
-    super::snap_to_sectors(pos, len)
 }
 
 impl SubRanges {
@@ -533,8 +509,6 @@ pub(super) struct PatchLoopState {
     pub now: fn() -> std::time::Instant,
     // Snapshot at construction — these stay constant for the whole pass.
     pub bytes_good_before: u64,
-    // (No `total_bytes` here — it was carried but never read; the orchestrator
-    // takes the pass denominator from `PatchCtx`'s own `total_bytes` instead.)
     pub initial_batch: u16,
     pub work_total: u64,
 }
@@ -824,7 +798,8 @@ impl PatchCtx<'_, '_> {
         let mut sections: Vec<SubRanges> = ordered
             .iter()
             .map(|&(p, l)| {
-                let (p, l) = snap_to_sectors(p, l);
+                // The single ingress establishing "all offsets are sector multiples".
+                let (p, l) = super::snap_to_sectors(p, l);
                 SubRanges::from_section(p, l)
             })
             .collect();
@@ -1140,7 +1115,7 @@ pub(super) fn report_patch_progress(
 
 /// Bytes of bad/unreadable data in a title's extents, from a mapfile.
 ///
-/// Consumers (CLI, autorip) call this after a rip pass to determine
+/// Front ends call this after a rip pass to determine
 /// how much damage affects a particular title — useful for showing
 /// "42s lost (12s in main movie)" in the UI.
 pub fn bytes_bad_in_title_from_mapfile(
@@ -1356,9 +1331,9 @@ fn patch_linked(
         "Disc::patch entered"
     );
 
-    // Drive the recovery: build the per-pass context, then walk the
-    // ordered bad ranges. `run` owns inter-range cooldown + the
-    // pass-ending conditions; `patch_region` owns one range's loop.
+    // Drive the recovery: build the per-pass context, then walk the ordered bad
+    // ranges. `run` owns the tier / range walk and the pass-ending conditions;
+    // `recover_section` runs one tier's handler chain over one range.
     let mut ctx = PatchCtx {
         disc,
         reader,
@@ -1395,7 +1370,7 @@ fn patch_linked(
             phase = "patch.finish.dropped",
             pass_error = %e,
             close_error = %close_err,
-            "patch: consumer close failed while the pass was already failing —              the mapfile on disk may be incomplete"
+            "patch: consumer close failed while the pass was already failing; the mapfile on disk may be incomplete"
         );
     }
     run_result?;
@@ -2060,9 +2035,9 @@ mod tests {
     }
 }
 
-// The live progress drilldown is built from `SharedPatchState`, whose range
-// list is CAPPED; everything `report_patch_progress` derives from it is a
-// TOTAL that must not silently shrink when a disc fragments past the cap.
+// The live progress drilldown is built from `SharedPatchState` over the COMPLETE
+// damage set; the totals `report_patch_progress` derives must not shrink when a
+// disc fragments past libfreemkv's display cap (or the old 8192-entry one).
 #[cfg(test)]
 mod truncated_range_reporting_tests {
     use super::*;
@@ -2109,7 +2084,7 @@ mod truncated_range_reporting_tests {
     }
 
     #[test]
-    fn snapshot_totals_account_for_the_capped_range_list() {
+    fn snapshot_totals_cover_every_range_of_a_fragmented_disc() {
         let d = std::env::temp_dir().join(format!("fmkv-trunc-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -2271,7 +2246,7 @@ mod bytes_bad_from_mapfile_tests {
 
 #[cfg(test)]
 mod snap_tests {
-    use super::snap_to_sectors;
+    use crate::recovery::snap_to_sectors;
 
     /// An already-aligned range is untouched.
     #[test]
