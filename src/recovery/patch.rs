@@ -193,15 +193,16 @@ impl PatchSink {
     }
 
     fn publish_now(&self) {
-        // Best-effort lock — only the producer reads, only the consumer writes,
-        // so it's never poisoned in practice. If it ever did poison, propagate
-        // the panic rather than continue with stale shared state.
-        let mut guard = self
-            .shared
-            .lock()
-            .expect("PatchSink shared state mutex poisoned");
-        *guard = SharedPatchState::from_map(&self.map, self.title.as_ref());
+        // Build outside the lock (it walks the whole damage set), then swap.
+        let next = SharedPatchState::from_map(&self.map, self.title.as_ref());
+        *lock_snapshot(&self.shared) = next;
     }
+}
+
+// The snapshot is only ever replaced whole, so a poisoned lock still holds a
+// complete (if stale) value: take it rather than cascade the panic.
+fn lock_snapshot(m: &Mutex<SharedPatchState>) -> std::sync::MutexGuard<'_, SharedPatchState> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 // No `close_stopped` override (the default `close`): this sink renames nothing, and a
@@ -1106,9 +1107,7 @@ pub(super) fn report_patch_progress(
     // They used to be computed from a range list capped at 8192 entries, which
     // silently under-reported at-risk bytes on a disc fragmented past that cap.
     let (s, main_title_bad, located) = {
-        let g = shared
-            .lock()
-            .expect("PatchSink shared state mutex poisoned");
+        let g = lock_snapshot(shared);
         (g.stats, g.bad_bytes_in_title, g.located.clone())
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
@@ -2020,6 +2019,41 @@ mod tests {
         sink.file.set_halt(halt);
         let err = sink.close().err().expect("a halted fsync must fail");
         assert!(matches!(err, Error::Halted), "got {err:?}");
+    }
+
+    // The snapshot is replaced whole, so a panic elsewhere while holding its lock
+    // leaves nothing half-written: publishing and reporting keep going, no cascade.
+    #[test]
+    fn a_poisoned_snapshot_lock_does_not_cascade_the_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("out.iso");
+        std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+        let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
+        let (sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
+        let poisoner = shared.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = poisoner.lock().unwrap();
+            panic!("poison the snapshot lock");
+        })
+        .join();
+        assert!(shared.is_poisoned());
+
+        sink.publish_now();
+        let calls = std::cell::Cell::new(0u32);
+        let reporter = |_: &libfreemkv::progress::PassProgress| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let opts = PatchOptions::for_patch_pass(true, Some(&reporter), None);
+        let state = PatchLoopState::new(0, 1, 0);
+        assert!(!report_patch_progress(
+            &guard_disc(4),
+            &state,
+            &opts,
+            8192,
+            &shared
+        ));
+        assert_eq!(calls.get(), 1, "the reporter still hears the snapshot");
     }
 }
 
