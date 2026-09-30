@@ -197,6 +197,7 @@ fn mux_opened_title(
             mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)
         }
         ImageSource::Dir(_) => {
+            utf8_source(&opened.source)?;
             let input = libfreemkv::InputOptions {
                 keys: Some(keys.clone()),
                 ..opened.input_options(idx, selection)
@@ -204,6 +205,16 @@ fn mux_opened_title(
             let url = opened.source.url();
             mux_title(&url, dest, input, mux, title.size_bytes, sink)
         }
+    }
+}
+
+// A `dir://` title muxes through a String URL: a non-UTF-8 folder cannot be named in one.
+fn utf8_source(source: &ImageSource) -> io::Result<()> {
+    match source {
+        ImageSource::Dir(p) if p.to_str().is_none() => {
+            Err(libfreemkv::Error::StreamUrlInvalid { url: source.url() }.into())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -355,6 +366,7 @@ fn remux_iso_sources_at(
         halt: &halt,
     };
     refuse_existing(job)?;
+    utf8_source(&job.iso)?;
     sink.event(&Event::Phase { name: "open" });
     // The open, its title and its key top-up all run under one halt (KU §2.3 step 13).
     let open = |h: &Halt| -> io::Result<_> {
@@ -1484,6 +1496,22 @@ mod tests {
         assert_eq!(crate::error_code(&e), Some(code), "{e}");
         assert!(!muxed.load(Ordering::SeqCst));
         assert!(!partial_path(&target).exists());
+    }
+
+    // A `dir://` source muxes through a String URL: a non-UTF-8 folder is refused up front.
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_disc_folder_is_refused_before_opening() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(std::ffi::OsStr::from_bytes(b"Disc\xe9"));
+        let mut j = job(dir.path().join("Movie.mkv"), true);
+        j.iso = ImageSource::Dir(folder);
+        let sink = Events::default();
+        let e = remux_iso(&j, &KeyParams::default(), &sink).unwrap_err();
+        let code = libfreemkv::error::E_STREAM_URL_INVALID;
+        assert_eq!(crate::error_code(&e), Some(code), "{e}");
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing was opened");
     }
 
     // A relative target named like a libfreemkv code must not read as that code.
