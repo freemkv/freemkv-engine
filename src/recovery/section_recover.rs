@@ -300,7 +300,17 @@ fn read_span(
             ctx.wedge_streak = 0;
             ReadHit::Bad
         }
-        Err(e) if e.is_scsi_transport_failure() => ReadHit::Transport,
+        Err(e) if e.is_scsi_transport_failure() => {
+            tracing::warn!(
+                target: "freemkv::disc",
+                phase = "section_recover.transport",
+                lba,
+                code = e.code(),
+                error = %e,
+                "transport failure during recovery; ending the pass"
+            );
+            ReadHit::Transport
+        }
         // Not disc damage: stop the chain now (as a transport fault would) and
         // hand the real error to the caller via `ctx.fatal`.
         Err(e) if !super::is_damage_candidate(&e) => {
@@ -327,6 +337,15 @@ fn read_span(
             if sense_is_wedge && fast_fail {
                 ctx.wedge_streak = ctx.wedge_streak.saturating_add(1);
                 if ctx.wedge_streak >= WEDGE_ABORT_STREAK {
+                    tracing::warn!(
+                        target: "freemkv::disc",
+                        phase = "section_recover.wedge_abort",
+                        lba,
+                        streak = ctx.wedge_streak,
+                        code = e.code(),
+                        sense = ?e.scsi_sense(),
+                        "consecutive fast-fail wedge senses; ending the pass as a transport fault"
+                    );
                     ReadHit::Transport
                 } else {
                     ReadHit::Bad
