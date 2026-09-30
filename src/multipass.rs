@@ -558,7 +558,9 @@ pub struct MultipassOpts {
     /// convergence loop, no abort-on-loss gate.
     pub max_passes: u32,
     /// Seconds of playback loss in the ripped titles ([`Job::selection`]) tolerated once
-    /// patch retries are exhausted. `0` requires a perfect rip (any residual loss aborts).
+    /// patch retries are exhausted, summed per title: a clip two selected titles share (a
+    /// "play all" and its episodes) counts once for each, as each muxed file loses it.
+    /// `0` requires a perfect rip (any residual loss aborts).
     /// Forced to `0` when `is_iso_output` regardless of the configured value
     /// (see [`effective_abort_secs`]) — an ISO deliverable is a whole-disc
     /// backup and always requires 100%.
