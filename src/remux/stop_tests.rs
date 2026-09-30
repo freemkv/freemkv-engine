@@ -59,6 +59,8 @@ struct FakeIo {
     read: ReadPlan,
     write: WritePlan,
     dir_sync: DirSync,
+    // The folder sync saw the cancel through its halt.
+    dir_halted: AtomicBool,
     in_sync: AtomicBool,
     returned: Arc<AtomicU64>,
     release: Arc<AtomicBool>,
@@ -77,6 +79,7 @@ impl FakeIo {
             read,
             write: WritePlan::default(),
             dir_sync: DirSync::default(),
+            dir_halted: AtomicBool::new(false),
             in_sync: AtomicBool::new(false),
             returned: Arc::default(),
             release: Arc::default(),
@@ -99,7 +102,10 @@ impl FakeIo {
                 op.cancel();
                 let t0 = Instant::now();
                 while t0.elapsed() < STOP_LATENCY {
-                    halt.check()?;
+                    if let Err(e) = halt.check() {
+                        self.dir_halted.store(true, Ordering::SeqCst);
+                        return Err(e.into());
+                    }
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 Ok(())
@@ -879,7 +885,10 @@ fn a_stop_after_the_rename_is_done() {
     let sink = Events::default();
     let r = run(&target, &sink, &op, &rio, writes(good(), true))
         .expect("the target was replaced before the Stop: Done");
-    assert!(op.is_cancelled(), "the Stop reached the folder sync");
+    assert!(
+        rio.dir_halted.load(Ordering::SeqCst),
+        "the Stop reached the folder sync"
+    );
     assert!(r.replaced);
     assert!(sink.0.lock().unwrap().contains(&"replaced".to_string()));
     assert_eq!(std::fs::read(&target).unwrap(), good());
