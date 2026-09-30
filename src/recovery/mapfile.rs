@@ -31,6 +31,10 @@ use std::time::{Duration, Instant};
 // one interval's worth of records.
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 
+// Load refuses a larger file (MapfileInvalid "too_large"): ~2M runs at ~32 bytes a line, far
+// past any real damage map, so a wrong or planted file fails fast instead of filling memory.
+const MAX_MAPFILE_BYTES: u64 = 64 << 20;
+
 /// Mapfile path for a regular output file: appends `.mapfile` to the output
 /// path.
 ///
@@ -269,7 +273,7 @@ impl Mapfile {
 
     /// Load an existing mapfile from disk.
     pub fn load(path: &Path) -> io::Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let text = read_capped(path)?;
         let mut entries = Vec::new();
         let mut saw_current_line = false;
         let mut version = String::from("unknown");
@@ -384,14 +388,18 @@ impl Mapfile {
             }
             if e.pos > cursor {
                 // Leading or internal gap — fill it as NonTried.
-                filled.push(MapEntry {
-                    pos: cursor,
-                    size: e.pos - cursor,
-                    status: SectorStatus::NonTried,
-                });
+                push_coalesced(
+                    &mut filled,
+                    MapEntry {
+                        pos: cursor,
+                        size: e.pos - cursor,
+                        status: SectorStatus::NonTried,
+                    },
+                );
             }
             cursor = e.pos.saturating_add(e.size);
-            filled.push(e);
+            // Coalesced so a loaded map meets the maximal-run invariant `record()` relies on.
+            push_coalesced(&mut filled, e);
         }
         let entries = filled;
         let total_size = entries
@@ -472,14 +480,7 @@ impl Mapfile {
                 e.status = to;
                 hit = true;
             }
-            if let Some(last) = merged.last_mut()
-                && last.pos.saturating_add(last.size) == e.pos
-                && last.status == e.status
-            {
-                last.size = last.size.saturating_add(e.size);
-                continue;
-            }
-            merged.push(e);
+            push_coalesced(&mut merged, e);
         }
         self.entries = merged;
         if !hit {
@@ -709,14 +710,7 @@ impl Mapfile {
         }
         let mut merged: Vec<MapEntry> = Vec::with_capacity(pieces.len());
         for e in pieces {
-            if let Some(last) = merged.last_mut()
-                && run_end(last) == e.pos
-                && last.status == e.status
-            {
-                last.size = last.size.saturating_add(e.size);
-                continue;
-            }
-            merged.push(e);
+            push_coalesced(&mut merged, e);
         }
         for e in window {
             tally(&mut self.stats, e, false);
@@ -1005,6 +999,21 @@ pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64
     out
 }
 
+// Reads a mapfile's text, refusing one over `MAX_MAPFILE_BYTES` without reading it all.
+fn read_capped(path: &Path) -> io::Result<String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > MAX_MAPFILE_BYTES {
+        return Err(invalid("too_large"));
+    }
+    let mut text = String::new();
+    file.take(MAX_MAPFILE_BYTES + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_MAPFILE_BYTES {
+        return Err(invalid("too_large"));
+    }
+    Ok(text)
+}
+
 fn single_char(field: &str) -> Option<char> {
     let mut chars = field.chars();
     match (chars.next(), chars.next()) {
@@ -1027,6 +1036,17 @@ fn is_current_line(fields: &[&str]) -> bool {
             .is_some_and(|s| SectorStatus::from_char(s).is_some()),
         _ => SectorStatus::from_char(c).is_some(),
     }
+}
+
+fn push_coalesced(out: &mut Vec<MapEntry>, e: MapEntry) {
+    if let Some(last) = out.last_mut()
+        && last.pos.saturating_add(last.size) == e.pos
+        && last.status == e.status
+    {
+        last.size = last.size.saturating_add(e.size);
+        return;
+    }
+    out.push(e);
 }
 
 fn parse_hex(s: &str) -> io::Result<u64> {
@@ -2281,6 +2301,44 @@ mod tests {
         let r = Mapfile::load(&p);
         let _ = std::fs::remove_file(&p);
         r
+    }
+
+    // M28: a hand-edited or foreign (ddrescue) file with split same-status runs loads as the
+    // canonical maximal-run partition `record()` relies on.
+    #[test]
+    fn load_coalesces_adjacent_same_status_runs() {
+        let mf = load_text(
+            "load_coalesce",
+            "0x0  ?  1\n0x0 0x100 +\n0x100 0x100 +\n0x200 0x80 -\n0x280 0x80 -\n0x300 0x100 +\n",
+        )
+        .unwrap();
+        let got: Vec<_> = mf
+            .entries()
+            .iter()
+            .map(|e| (e.pos, e.size, e.status))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 0x200, SectorStatus::Finished),
+                (0x200, 0x100, SectorStatus::Unreadable),
+                (0x300, 0x100, SectorStatus::Finished),
+            ]
+        );
+        assert_eq!(mf.stats().num_bad_ranges, 1);
+        assert_canonical(&mf);
+    }
+
+    // M28: an oversized file (a wrong file at the mapfile path) is refused before it is read.
+    #[test]
+    fn load_refuses_an_oversized_file() {
+        let p = tmpfile("load_oversized");
+        let f = std::fs::File::create(&p).unwrap();
+        f.set_len(MAX_MAPFILE_BYTES + 1).unwrap();
+        drop(f);
+        let e = Mapfile::load(&p).map(|_| ()).unwrap_err();
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(invalid_kind(&e), Some("too_large"), "{e}");
     }
 
     // M3: ddrescue's current-line status also has `F` (filling) and `G` (generating).
