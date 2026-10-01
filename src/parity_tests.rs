@@ -10,7 +10,7 @@ use crate::{
     CopyOptions, Job, MultipassOpts, NoopSink, PatchOptions, RemuxJob, Selection, StreamChoice,
     SweepOptions,
 };
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::test_util::Golden;
 use std::path::Path;
 
@@ -34,14 +34,15 @@ fn record_file(g: &mut Golden, key: &str, path: &Path) {
     g.bytes(key, &bytes);
 }
 
-fn keys_for(fx: &Fx, pool: &[[u8; 16]], scope: KeyScope) -> libfreemkv::Result<ResolvedKeySet> {
+fn keys_for(fx: &Fx, pool: &[[u8; 16]], scope: KeyScope) -> libfreemkv::Result<KeyRing> {
     let f = factory(&[(Answer::Keydb, pool)], &Calls::default());
-    ResolvedKeySet::resolve(
+    KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         scope,
         &f,
-        libfreemkv::keys::ResolveKeysOptions::default(),
+        libfreemkv::keys::AcquireOptions::default(),
+        &libfreemkv::Ctx::default(),
     )
     .map(|r| r.keys)
 }
@@ -250,7 +251,7 @@ fn parity_engine_extract_tree() {
     g.check();
 }
 
-fn copy_opts(decrypt: bool, keys: Option<ResolvedKeySet>) -> CopyOptions<'static> {
+fn copy_opts(decrypt: bool, keys: Option<KeyRing>) -> CopyOptions<'static> {
     CopyOptions {
         decrypt,
         multipass: false,

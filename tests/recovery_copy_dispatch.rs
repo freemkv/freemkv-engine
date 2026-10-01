@@ -1964,7 +1964,7 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
 #[test]
 fn the_mapfile_header_never_carries_the_unit_keys() {
     use libfreemkv::aacs::types::UnitKey;
-    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{KeyRing, KeyScope};
     use libfreemkv::test_util::{BdFile, encrypted_bd_image, unit_key_ro};
 
     struct Pool([u8; 16]);
@@ -1999,12 +1999,13 @@ fn the_mapfile_header_never_carries_the_unit_keys() {
     let mut reader = fx.source();
     let factory: libfreemkv::KeySourceFactory =
         std::sync::Arc::new(|| vec![Box::new(Pool(KEY)) as Box<dyn libfreemkv::KeySource>]);
-    let keys = ResolvedKeySet::resolve(
+    let keys = KeyRing::acquire_for_disc(
         &disc,
         &mut reader,
         KeyScope::WholeDisc,
         &factory,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .expect("the pool's key opens the fixture's keyed file")
     .keys;

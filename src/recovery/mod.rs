@@ -1516,7 +1516,7 @@ pub struct CopyOptions<'a> {
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1573,7 +1573,7 @@ pub struct SweepOptions<'a> {
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 
 /// Options for [`patch()`] (Pass N retry pass over bad ranges).
@@ -1602,7 +1602,7 @@ pub struct PatchOptions<'a> {
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 impl<'a> PatchOptions<'a> {
     /// THE tuning preset for a Pass-N patch pass, shared by both entry points

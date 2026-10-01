@@ -970,14 +970,14 @@ fn sha256(tag: &[u8], bytes: &[u8]) -> [u8; 32] {
 }
 
 /// `SHA-256("freemkv-vid-fp-v1" ‖ VID)`: the only form of a Volume ID a mapfile may hold
-/// (KU §4.1, `# freemkv-vidfp:`); equal to libfreemkv's `ResolvedKeySet::vid_fingerprint`.
+/// (KU §4.1, `# freemkv-vidfp:`); equal to libfreemkv's `KeyRing::vid_fingerprint`.
 /// A fingerprint to compute or verify a `vidfp` with; the VID never leaves memory.
 pub fn vid_fingerprint(vid: &[u8; 16]) -> [u8; 32] {
     sha256(b"freemkv-vid-fp-v1", vid)
 }
 
 /// `SHA-256("freemkv-key-fp-v1" ‖ key)[..8]`: a legacy key's identity (KU §4.1); equal to
-/// libfreemkv's `ResolvedKeySet::proven_key_fingerprints` for the same key.
+/// libfreemkv's `KeyRing::proven_key_fingerprints` for the same key.
 pub(crate) fn key_fingerprint(key: &[u8; 16]) -> [u8; 8] {
     let d = sha256(b"freemkv-key-fp-v1", key);
     let mut fp = [0u8; 8];
@@ -2917,7 +2917,7 @@ mod load_if_present_tests {
 pub(crate) fn stamp_identity(
     map: &mut Mapfile,
     disc: &libfreemkv::Disc,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
 ) {
     if let Some(a) = &disc.aacs {
         map.set_disc_hash(&a.disc_hash);
@@ -2930,7 +2930,7 @@ pub(crate) fn stamp_identity(
 // The VID fingerprint of the disc in hand: its scanned VID, else the key set's in-memory one.
 fn disc_vid_fingerprint(
     disc: &libfreemkv::Disc,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> Option<[u8; 32]> {
     disc.aacs
         .as_ref()
@@ -2951,10 +2951,7 @@ pub(crate) struct DiscIdentity {
 impl DiscIdentity {
     /// `disc`'s identity with the rip's `keys` (their VID and proven keys). With no set nothing
     /// is proven: KU §4.4 rule 3 is "checked **only if** the set proved at least one base key".
-    pub(crate) fn of(
-        disc: &libfreemkv::Disc,
-        keys: Option<&libfreemkv::keys::ResolvedKeySet>,
-    ) -> Self {
+    pub(crate) fn of(disc: &libfreemkv::Disc, keys: Option<&libfreemkv::keys::KeyRing>) -> Self {
         let proven = keys.map_or_else(Vec::new, |set| set.proven_key_fingerprints());
         DiscIdentity {
             disc_hash: disc
@@ -2971,7 +2968,7 @@ impl DiscIdentity {
 pub(crate) fn check_mapfile_identity(
     map: &Mapfile,
     disc: &libfreemkv::Disc,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> io::Result<()> {
     check_identity(map, &DiscIdentity::of(disc, keys))
 }
@@ -3017,7 +3014,7 @@ mod ku_identity_tests {
 
     use super::*;
     use crate::test_fixtures::{Answer, Calls, K1, K2, VID, bd_image, resolve};
-    use libfreemkv::keys::{KeyScope, ResolveKeysOptions, ResolvedKeySet};
+    use libfreemkv::keys::{AcquireOptions, KeyRing, KeyScope};
 
     fn hex(b: &[u8]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
@@ -3035,15 +3032,16 @@ mod ku_identity_tests {
     fn fingerprints_match_the_key_set() {
         let fx = bd_image(&[Some(K1)], 1);
         let f = crate::test_fixtures::factory(&[(Answer::Keydb, &[K1])], &Calls::default());
-        let set = ResolvedKeySet::resolve(
+        let set = KeyRing::acquire_for_disc(
             &fx.disc,
             &mut fx.source(),
             KeyScope::Titles(vec![0]),
             &f,
-            ResolveKeysOptions {
+            AcquireOptions {
                 vid: Some(VID),
                 ..Default::default()
             },
+            &libfreemkv::Ctx::default(),
         )
         .unwrap()
         .keys;
@@ -3250,16 +3248,17 @@ mod ku_identity_tests {
         let (_d, p) = scratch("set_vid");
         let fx = bd_image(&[Some(K1)], 1);
         let f = crate::test_fixtures::factory(&[(Answer::Keydb, &[K1])], &Calls::default());
-        let opts = ResolveKeysOptions {
+        let opts = AcquireOptions {
             vid: Some(VID),
             ..Default::default()
         };
-        let set = ResolvedKeySet::resolve(
+        let set = KeyRing::acquire_for_disc(
             &fx.disc,
             &mut fx.source(),
             KeyScope::Titles(vec![0]),
             &f,
             opts,
+            &libfreemkv::Ctx::default(),
         )
         .unwrap()
         .keys;
@@ -3307,7 +3306,7 @@ mod ku_identity_tests {
         .unwrap();
         assert!(proved_none.proven_key_fingerprints().is_empty());
         let d = &fx.disc;
-        let check = |keys: &[[u8; 16]], set: Option<&ResolvedKeySet>| {
+        let check = |keys: &[[u8; 16]], set: Option<&KeyRing>| {
             check_mapfile_identity(&map_with(&p, None, None, keys), d, set).is_ok()
         };
         assert!(
@@ -3320,7 +3319,7 @@ mod ku_identity_tests {
             check(&[K2], Some(&proved_none)),
             "no proven key: cannot check"
         );
-        assert!(check(&[K2], Some(&ResolvedKeySet::none())));
+        assert!(check(&[K2], Some(&KeyRing::none())));
         assert!(
             check(&[], Some(&proved_k1)),
             "no stored fingerprint: nothing to check"

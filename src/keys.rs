@@ -3,13 +3,13 @@
 //! Both the CLI and the desktop UI build the SAME local-first ordered
 //! [`freemkv_keysources::KeySource`] list ([`key_source_factory`]) and resolve a rip's keys
 //! through ONE call, [`resolve_for_rip`], before any output (keys-upfront design, KU §2.1):
-//! the resulting [`ResolvedKeySet`] lives in memory only and is handed to every pass and
+//! the resulting [`KeyRing`] lives in memory only and is handed to every pass and
 //! mux of the rip, which never ask a source again.
 //!
 //! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted here.
 
 use libfreemkv::aacs::trace::ResolutionTrace;
-use libfreemkv::keys::{DecryptStatus, KeyScope, ResolveKeysOptions, ResolvedKeySet};
+use libfreemkv::keys::{AcquireOptions, DecryptStatus, KeyRing, KeyScope};
 
 /// Already-resolved key configuration, boundary-normalized by the calling
 /// shell. Each field's doc says what it means and does NOT mean.
@@ -129,9 +129,9 @@ pub fn resolve_for_rip(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-) -> crate::Result<ResolvedKeySet> {
+) -> crate::Result<KeyRing> {
     resolve_for_rip_traced(disc, reader, scope, sources, seed, halt).0
 }
 
@@ -143,10 +143,10 @@ pub fn resolve_for_rip_observed(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
     progress: &libfreemkv::halt::Liveness,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     resolve_traced(disc, reader, scope, sources, seed, halt, Some(progress))
 }
 
@@ -158,9 +158,9 @@ pub fn resolve_for_rip_traced(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     resolve_traced(disc, reader, scope, sources, seed, halt, None)
 }
 
@@ -173,7 +173,7 @@ pub fn resolve_loose_clip(
     clip: &std::path::Path,
     sources: &libfreemkv::KeySourceFactory,
     halt: Option<&libfreemkv::Halt>,
-) -> (crate::Result<Option<ResolvedKeySet>>, ResolutionTrace) {
+) -> (crate::Result<Option<KeyRing>>, ResolutionTrace) {
     let Some(root) = libfreemkv::disc_root_of(clip) else {
         return (Ok(None), ResolutionTrace::new());
     };
@@ -225,24 +225,21 @@ fn resolve_traced(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
     progress: Option<&libfreemkv::halt::Liveness>,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     let scope_log = format!("{scope:?}");
     let walk = std::sync::Mutex::new(ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
-        halt,
+    let req = Acquire {
         seed,
         vid: None,
-        vid_would_help: None,
-        trace: Some(&walk),
+        halt,
+        progress,
     };
-    let r = match progress {
-        Some(p) => ResolvedKeySet::resolve_with_progress(disc, reader, scope, sources, opts, p),
-        None => ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
-    }
-    .map(|r| r.keys);
+    let r = acquire(disc, reader, &scope, sources, req, &walk)
+        .map(|r| r.keys)
+        .map_err(|(e, _)| e);
     let walk = walk.into_inner().unwrap_or_else(|e| e.into_inner());
     match &r {
         Ok(keys) => log_status(keys, &scope_log),
@@ -257,8 +254,41 @@ fn resolve_traced(
     (r, walk)
 }
 
+// What one acquisition is asked with, beyond the disc and its scope.
+#[derive(Default)]
+pub(crate) struct Acquire<'a> {
+    pub(crate) seed: Option<&'a KeyRing>,
+    pub(crate) vid: Option<[u8; 16]>,
+    pub(crate) halt: Option<&'a libfreemkv::Halt>,
+    pub(crate) progress: Option<&'a libfreemkv::halt::Liveness>,
+}
+
+// The engine's one key acquisition (drive and image rips alike): evidence from the scanned
+// disc over its raw reader, then `KeyRing::acquire`. `Err` carries whether a VID would
+// have helped (KU J23).
+pub(crate) fn acquire(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: &KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    req: Acquire<'_>,
+    walk: &std::sync::Mutex<ResolutionTrace>,
+) -> Result<libfreemkv::keys::KeyResolution, (libfreemkv::Error, bool)> {
+    let help = std::sync::atomic::AtomicBool::new(false);
+    let opts = AcquireOptions {
+        seed: req.seed,
+        vid: req.vid,
+        vid_would_help: Some(&help),
+        trace: Some(walk),
+        liveness: req.progress,
+    };
+    let ctx = libfreemkv::Ctx::new(req.halt.cloned().unwrap_or_default());
+    KeyRing::acquire_for_disc(disc, reader, scope.clone(), sources, opts, &ctx)
+        .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
 // The qa key log line (KU §7.6): counts only, never a key or the VID.
-pub(crate) fn log_status(keys: &ResolvedKeySet, scope: &str) {
+pub(crate) fn log_status(keys: &KeyRing, scope: &str) {
     let st = keys.status();
     tracing::info!(
         target: "freemkv::keys",
@@ -275,7 +305,7 @@ pub(crate) fn log_status(keys: &ResolvedKeySet, scope: &str) {
 
 /// Whether `disc` can be decrypted from the rip's `set` (KU §12.2: `Ready`, Missing as
 /// `AacsKeysMissing`, `ForensicPending`); CSS and clear discs as the library reads them.
-pub fn key_status(disc: &libfreemkv::Disc, set: &ResolvedKeySet) -> DecryptStatus {
+pub fn key_status(disc: &libfreemkv::Disc, set: &KeyRing) -> DecryptStatus {
     libfreemkv::keys::decrypt_status(disc, Some(set))
 }
 
@@ -420,7 +450,7 @@ mod tests {
     // ── KU-E1: the front door (KU §3.2) ─────────────────────────────────────
 
     use crate::test_fixtures::{Answer, Calls, K1, K2, bd_image, factory};
-    use libfreemkv::keys::{DecryptStatus, KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{DecryptStatus, KeyRing, KeyScope};
 
     /// EK5 (KU §2.5): MKV/M2TS/MP4/… → `Titles(selected)`, a plain rip `Titles([main])`;
     /// decrypted ISO or folder → `WholeDisc`; raw copy → `None` (no key call).
@@ -664,14 +694,14 @@ mod tests {
     fn key_status_reads_the_set() {
         let fx = bd_image(&[Some(K1)], 1);
         assert!(matches!(
-            key_status(&fx.disc, &ResolvedKeySet::none()),
+            key_status(&fx.disc, &KeyRing::none()),
             DecryptStatus::AacsKeysMissing(_)
         ));
         let mut clear = bd_image(&[None], 1).disc;
         clear.aacs = None;
         clear.encrypted = false;
         assert!(matches!(
-            key_status(&clear, &ResolvedKeySet::none()),
+            key_status(&clear, &KeyRing::none()),
             DecryptStatus::NotEncrypted
         ));
     }

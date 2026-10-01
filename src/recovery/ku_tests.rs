@@ -5,24 +5,25 @@
 use super::read_error::CLASSIFIED;
 use crate::test_fixtures::{Answer, Calls, Damage, Drive, Fx, K1, bd_image, factory, resolve};
 use crate::{CopyOptions, Job, PatchOptions, SweepOptions};
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::test_util::CountingSource;
 use std::sync::Arc;
 
 // Two clips of one key, K1: clip 0 proves it; clip 1 is left Lazy when every probe of it
 // faults at resolve time (KU §2.3 step 9.5), to be proven on arrival (§2.4).
-fn lazy_fixture() -> (Fx, Drive, ResolvedKeySet) {
+fn lazy_fixture() -> (Fx, Drive, KeyRing) {
     let fx = bd_image(&[Some(K1), Some(K1)], 2);
     let drive = Drive::new(&fx.img.image);
     let (s, n) = fx.clip(1);
     drive.set(Damage::Range(s, s + n));
     let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut drive.clone(),
         KeyScope::WholeDisc,
         &f,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -48,7 +49,7 @@ fn assert_image_is_plain(fx: &Fx, iso: &std::path::Path, clip: usize) {
     );
 }
 
-fn sweep_opts<'a>(keys: Option<ResolvedKeySet>) -> SweepOptions<'a> {
+fn sweep_opts<'a>(keys: Option<KeyRing>) -> SweepOptions<'a> {
     SweepOptions {
         decrypt: true,
         batch_sectors: Some(1),
@@ -130,12 +131,13 @@ fn passes_share_one_set_and_never_ask() {
     let fx = bd_image(&[Some(K1), Some(K1)], 2);
     let calls = Calls::default();
     let f = factory(&[(Answer::Online, &[K1])], &calls);
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::WholeDisc,
         &f,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -187,7 +189,7 @@ fn copy_refuses_decrypting_aacs_without_a_set() {
 
 // Every engine decrypt gate over `disc`: copy, sweep, patch, preflight, recover_to_iso and
 // a single-pass multipass_rip, each decrypting, each with `keys` (via `Job.keys`).
-fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<ResolvedKeySet>) {
+fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<KeyRing>) {
     let dir = tempfile::tempdir().unwrap();
     let iso = |n: &str| dir.path().join(n);
     let copy = CopyOptions {

@@ -189,7 +189,7 @@ const HALT_EXEMPT: [&str; 2] = ["engine_halt.rs", "recovery/section_recover.rs"]
 const NOT_A_HALT: [(&str, &str); 6] = [
     ("run.rs", "watcher_done"),
     ("mux.rs", "watcher_done"),
-    ("image.rs", "help"),
+    ("keys.rs", "help"),
     ("remux.rs", "moved"),
     ("remux.rs", "quit"),
     ("recovery/mapfile.rs", "disowned"),

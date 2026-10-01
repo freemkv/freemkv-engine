@@ -17,7 +17,7 @@ use crate::mux::{
 use crate::sink::{Event, Level, Sink};
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
 use libfreemkv::io::ArtifactLock;
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::{Halt, RemuxVerifyKind};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ fn refused_up_front(
 // a `dir://` folder through `input()` with the same set.
 fn mux_opened_title(
     opened: &OpenedImage,
-    keys: &ResolvedKeySet,
+    keys: &KeyRing,
     idx: usize,
     selection: libfreemkv::StreamSelection,
     dest: &str,

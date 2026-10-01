@@ -370,7 +370,7 @@ pub(crate) fn mux_iso_title(
     path: &std::path::Path,
     title: libfreemkv::DiscTitle,
     format: libfreemkv::ContentFormat,
-    keys: &libfreemkv::keys::ResolvedKeySet,
+    keys: &libfreemkv::keys::KeyRing,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
     sink: &dyn Sink,

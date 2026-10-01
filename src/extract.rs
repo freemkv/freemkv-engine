@@ -35,7 +35,7 @@ pub fn extract_tree_with(
     reader: &mut dyn libfreemkv::SectorSource,
     dest: &Path,
     force: bool,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
     sink: &dyn Sink,
 ) -> crate::Result<libfreemkv::ExtractResult> {
     // One should_cancel → halt bridge for the whole engine (see `with_cancel_watcher`), so

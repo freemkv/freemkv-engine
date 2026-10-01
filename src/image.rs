@@ -5,7 +5,7 @@
 
 use crate::keys::{KeyParams, key_source_factory, log_status};
 use crate::recovery::mapfile::{DiscIdentity, Mapfile, check_identity, vid_fingerprint};
-use libfreemkv::keys::{KeyScope, ResolveKeysOptions, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::{Error, KeySourceFactory};
 use std::path::{Path, PathBuf};
 
@@ -58,15 +58,15 @@ pub enum KeyInput {
     /// A set the caller already holds (the drive's up-front set, FMTS forensic keys
     /// included): used as-is, with no key-service call. Anything it does not cover refuses
     /// (E7022, or E7026 for Pending forensic keys).
-    Known(ResolvedKeySet),
+    Known(KeyRing),
     /// Use the set, and ask the sources only for what it does not cover (e.g. the forensic
     /// anchor it left Pending), with its in-memory VID.
-    Seeded(KeySourceFactory, ResolvedKeySet),
+    Seeded(KeySourceFactory, KeyRing),
 }
 
 impl KeyInput {
     // The set the caller holds, if any.
-    fn held(&self) -> Option<&ResolvedKeySet> {
+    fn held(&self) -> Option<&KeyRing> {
         match self {
             KeyInput::Known(set) | KeyInput::Seeded(_, set) => Some(set),
             KeyInput::Resolve(_) => None,
@@ -96,12 +96,12 @@ impl OpenImageOptions {
     }
 
     /// Use `set` as-is, with no key-service call.
-    pub fn known(set: ResolvedKeySet) -> Self {
+    pub fn known(set: KeyRing) -> Self {
         Self::with(KeyInput::Known(set))
     }
 
     /// Use `set`, asking `sources` only for what it lacks.
-    pub fn seeded(sources: KeySourceFactory, set: ResolvedKeySet) -> Self {
+    pub fn seeded(sources: KeySourceFactory, set: KeyRing) -> Self {
         Self::with(KeyInput::Seeded(sources, set))
     }
 
@@ -124,7 +124,7 @@ pub struct OpenedImage {
     /// A raw reader over the image (still open; e.g. for a whole-image copy).
     pub reader: Box<dyn libfreemkv::SectorSource>,
     /// The rip's up-front key set: memory only, never written (KU §2.1).
-    pub keys: ResolvedKeySet,
+    pub keys: KeyRing,
     /// The sources, kept only for [`crate::mux_image_titles`]' one scope top-up before its
     /// first output byte; `None` for [`KeyInput::Known`].
     pub sources: Option<KeySourceFactory>,
@@ -258,7 +258,9 @@ fn open_image_inner(
     let halt = halt.as_ref();
     let (set, sources, trace) = match keys {
         KeyInput::Known(set) => (known(&disc, set, &scope)?, None, Default::default()),
-        KeyInput::Seeded(f, seed) if seed.is_for(&disc) && covers(&seed, &disc, &scope) => {
+        KeyInput::Seeded(f, seed)
+            if seed.is_for(&disc.media_id()) && covers(&seed, &disc, &scope) =>
+        {
             (seed, Some(f), Default::default())
         }
         KeyInput::Seeded(f, seed) => {
@@ -303,14 +305,14 @@ fn open_image_inner(
 // An opened image's key state after its top-ups: the held set and the titles it was
 // resolved over, whether the one asking top-up made a request, and that top-up's failure.
 struct TopUp {
-    keys: ResolvedKeySet,
+    keys: KeyRing,
     titles: Vec<usize>,
     asked: bool,
     failure: Option<Remembered>,
 }
 
 impl TopUp {
-    fn new(keys: ResolvedKeySet, scope: &KeyScope) -> Self {
+    fn new(keys: KeyRing, scope: &KeyScope) -> Self {
         let titles = match scope {
             KeyScope::Titles(v) => v.clone(),
             _ => Vec::new(),
@@ -404,7 +406,7 @@ impl OpenedImage {
         &self,
         titles: &[usize],
         halt: Option<&libfreemkv::Halt>,
-    ) -> crate::Result<ResolvedKeySet> {
+    ) -> crate::Result<KeyRing> {
         let mut held = self.top_up.lock().unwrap_or_else(|e| e.into_inner());
         if keys_scope(&held.keys, &self.disc, &KeyScope::Titles(titles.to_vec())) {
             return Ok(held.keys.clone());
@@ -477,7 +479,7 @@ impl OpenedImage {
     pub(crate) fn for_test(
         iso: &Path,
         disc: libfreemkv::Disc,
-        keys: ResolvedKeySet,
+        keys: KeyRing,
         sources: Option<KeySourceFactory>,
         titles: Vec<usize>,
     ) -> Self {
@@ -625,7 +627,7 @@ fn load_sidecar(src: &ImageSource) -> crate::Result<Option<Mapfile>> {
 fn in_hand_vid_fingerprint(
     disc: &libfreemkv::Disc,
     vid: Option<[u8; 16]>,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
 ) -> Option<[u8; 32]> {
     let real = |v: &[u8; 16]| *v != [0u8; 16];
     let disc_vid = disc.aacs.as_ref().map(|a| a.volume_id).filter(real);
@@ -643,23 +645,19 @@ fn identity_ok(map: &Mapfile, identity: &DiscIdentity) -> crate::Result<()> {
 
 // Whether `set` keys `scope` of `disc`. A set with no AACS key (`none()`) never keys an
 // AACS disc's titles, though `covers(scope)` (no disc) says so; a clear disc needs none.
-fn keys_scope(set: &ResolvedKeySet, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+fn keys_scope(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
     let aacs_needed = disc.aacs.is_some() && *scope != KeyScope::None;
     (set.is_aacs() || !aacs_needed) && set.covers(scope)
 }
 
 // `keys_scope`, and no forensic keys left Pending.
-fn covers(set: &ResolvedKeySet, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+fn covers(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
     keys_scope(set, disc, scope) && !set.forensic_pending()
 }
 
 // KU §3.2 `Known`: the set as-is; what it does not cover refuses, with no request.
-fn known(
-    disc: &libfreemkv::Disc,
-    set: ResolvedKeySet,
-    scope: &KeyScope,
-) -> crate::Result<ResolvedKeySet> {
-    if !set.is_for(disc) {
+fn known(disc: &libfreemkv::Disc, set: KeyRing, scope: &KeyScope) -> crate::Result<KeyRing> {
+    if !set.is_for(&disc.media_id()) {
         tracing::error!(target: "freemkv::keys", "a Known key set for another disc (caller bug)");
         return Err(Error::DecryptFailed);
     }
@@ -682,21 +680,18 @@ pub(crate) fn resolve(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: &KeyScope,
     sources: &KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     vid: Option<[u8; 16]>,
     halt: Option<&libfreemkv::Halt>,
     walk: &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
 ) -> Result<libfreemkv::keys::KeyResolution, (Error, bool)> {
-    let help = std::sync::atomic::AtomicBool::new(false);
-    let opts = ResolveKeysOptions {
-        halt,
+    let req = crate::keys::Acquire {
         seed,
         vid,
-        vid_would_help: Some(&help),
-        trace: Some(walk),
+        halt,
+        progress: None,
     };
-    ResolvedKeySet::resolve(disc, reader, scope.clone(), sources, opts)
-        .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))
+    crate::keys::acquire(disc, reader, scope, sources, req, walk)
 }
 
 /// KU §4.2 J11, J23: a Missing piece (E7022/E7032) becomes E7034 when no VID is in hand,

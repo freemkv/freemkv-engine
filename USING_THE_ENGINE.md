@@ -4,7 +4,7 @@
 decrypt, mux, raw reads) and the front-ends. **The UI needs no direct
 libfreemkv dependency for the disc model and cancellation**: the engine
 re-exports them. A few types are not re-exported (`DeviceTarget`,
-`DriveCredentials`, `SectorSource`, `keys::ResolvedKeySet`, `DecryptStatus`), so
+`DriveCredentials`, `SectorSource`, `keys::KeyRing`, `DecryptStatus`), so
 add `libfreemkv = "1.7"` (with the same `[patch.crates-io]` block) to name them.
 
 ```

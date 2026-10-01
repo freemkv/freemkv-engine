@@ -10,7 +10,7 @@ use freemkv_engine::{Mapfile, SectorStatus, SweepOptions};
 use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::disc::DiscRegion;
 use libfreemkv::error::Error;
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{ContentFormat, Disc, DiscFormat, DiscTitle, Extent};
 
@@ -311,15 +311,11 @@ impl libfreemkv::KeySource for Pool {
 /// The rip's up-front key set for `d` from its pool, resolved over `reader` (the same
 /// drive the pass reads) with scope `WholeDisc` through the engine's one front door, as a
 /// decrypted-image rip does.
-fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<ResolvedKeySet> {
+fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<KeyRing> {
     keyed_over(d, reader, KeyScope::WholeDisc)
 }
 
-fn keyed_over(
-    d: &Disc,
-    reader: &mut MemDisc,
-    scope: KeyScope,
-) -> libfreemkv::Result<ResolvedKeySet> {
+fn keyed_over(d: &Disc, reader: &mut MemDisc, scope: KeyScope) -> libfreemkv::Result<KeyRing> {
     let two = d.aacs.as_ref().is_some_and(|a| a.uk_ro == unit_key_ro(2));
     let pool = if two {
         vec![(1, UNIT_KEY), (2, SECOND_KEY)]
@@ -332,7 +328,7 @@ fn keyed_over(
     freemkv_engine::keys::resolve_for_rip(d, reader, scope, &f, None, None)
 }
 
-fn sweep_opts<'a>(keys: impl Into<Option<ResolvedKeySet>>) -> SweepOptions<'a> {
+fn sweep_opts<'a>(keys: impl Into<Option<KeyRing>>) -> SweepOptions<'a> {
     SweepOptions {
         decrypt: true,
         resume: false,
@@ -469,7 +465,7 @@ fn run_passes(
     tmp: &tempfile::TempDir,
     d: &Disc,
     source: &[u8],
-    keys: Option<ResolvedKeySet>,
+    keys: Option<KeyRing>,
 ) -> Vec<(
     std::path::PathBuf,
     libfreemkv::error::Result<freemkv_engine::CopyResult>,
@@ -496,7 +492,7 @@ fn run_passes(
     out
 }
 
-/// A set with no AACS keys (`ResolvedKeySet::none()`) on an AACS disc: the engine's gate
+/// A set with no AACS keys (`KeyRing::none()`) on an AACS disc: the engine's gate
 /// refuses E7022 before any output. The library's whole-disc reader takes such a set's
 /// non-AACS branch and would write ciphertext at exit 0.
 #[test]
@@ -504,7 +500,7 @@ fn a_non_aacs_set_on_an_aacs_disc_refuses_up_front() {
     let fx = bd(None);
     let d = disc(&fx);
     let tmp = tempfile::tempdir().unwrap();
-    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(ResolvedKeySet::none())) {
+    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(KeyRing::none())) {
         assert_refused_before_output(&iso, r, libfreemkv::error::E_NO_DISC_KEY);
     }
     let iso = tmp.path().join("patch.iso");
@@ -518,7 +514,7 @@ fn a_non_aacs_set_on_an_aacs_disc_refuses_up_front() {
         &d,
         &mut MemDisc::new(&fx.source),
         &iso,
-        &patch_opts(ResolvedKeySet::none()),
+        &patch_opts(KeyRing::none()),
     );
     assert_eq!(
         r.map(|_| ()).unwrap_err().code(),
@@ -829,7 +825,7 @@ fn prep_patch(iso: &std::path::Path, image: &[u8], bad: &[(u32, u32)]) {
     std::fs::write(iso, &seeded).unwrap();
 }
 
-fn patch_opts<'a>(keys: ResolvedKeySet) -> freemkv_engine::PatchOptions<'a> {
+fn patch_opts<'a>(keys: KeyRing) -> freemkv_engine::PatchOptions<'a> {
     freemkv_engine::PatchOptions {
         keys: Some(keys),
         ..freemkv_engine::PatchOptions::for_patch_pass(true, None, None)
