@@ -71,8 +71,8 @@ impl MuxPlan {
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`,
 /// under the [`run_titles`] loop policy. Each title is bracketed by
 /// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails into a
-/// file sink has its partial file removed (a directory sink, ending in `/`,
-/// is left alone).
+/// file sink has its partial file removed, unless the title never touched the file (a
+/// directory sink, ending in `/`, is left alone).
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
 /// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
@@ -108,9 +108,11 @@ pub fn mux_image_titles_with(
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
         let selection = plan.selection_for(idx);
+        let out_path = libfreemkv::parse_url(&dest).path_str().to_string();
+        let before = output_stamp(&out_path);
         let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink);
         if result.is_err() && !dest.ends_with('/') {
-            let _ = std::fs::remove_file(libfreemkv::parse_url(&dest).path_str());
+            remove_failed_output(&out_path, before);
         }
         sink.event(&Event::TitleDone {
             idx,
@@ -119,6 +121,20 @@ pub fn mux_image_titles_with(
         });
         result.map(|_| ())
     })
+}
+
+// Length and mtime of the file at `path`; `None` when absent.
+fn output_stamp(path: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()))
+}
+
+// Remove the file a failed mux left at `path`, unless it is the one `before` saw: an error
+// before the output opened must not delete an earlier rip.
+fn remove_failed_output(path: &str, before: Option<(u64, Option<std::time::SystemTime>)>) {
+    if output_stamp(path) != before {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // A key refusal before any title started (E7022/E7026/E7034, or a halt), as the loop would
@@ -1014,6 +1030,28 @@ mod stop_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_title_removes_only_an_output_it_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.mkv");
+        let path = p.to_str().unwrap();
+        // Absent before, written by the failed title: removed.
+        let before = output_stamp(path);
+        std::fs::write(&p, b"partial").unwrap();
+        remove_failed_output(path, before);
+        assert!(!p.exists());
+        // Present before and untouched: kept.
+        std::fs::write(&p, b"earlier rip").unwrap();
+        let before = output_stamp(path);
+        remove_failed_output(path, before);
+        assert_eq!(std::fs::read(&p).unwrap(), b"earlier rip");
+        // Present before and rewritten by the failed title: removed.
+        let before = output_stamp(path);
+        std::fs::write(&p, b"partial rewrite").unwrap();
+        remove_failed_output(path, before);
+        assert!(!p.exists());
+    }
+
     use super::*;
     use std::sync::Mutex;
 

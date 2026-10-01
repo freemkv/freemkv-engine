@@ -1336,3 +1336,32 @@ fn a_top_up_remembers_a_keydb_failure() {
     let e8002 = Some(libfreemkv::error::E_KEYDB_INVALID);
     assert_eq!(*sink.0.lock().unwrap(), [e8002, e8002]);
 }
+
+// A one-title keyed image opened for the keep-out tests.
+fn keepout_opened(dir: &Path) -> crate::OpenedImage {
+    let fx = bd_image(&[Some(K1)], 1);
+    let iso = fx.write(dir, "d.iso");
+    let f = factory(&[(Answer::Online, &[K1])], &Calls::default());
+    open_image_with(&ImageSource::Iso(iso), OpenImageOptions::resolve(f)).unwrap()
+}
+
+/// A title that fails before its output opens leaves the file already at that path.
+#[test]
+fn a_title_failing_before_output_keeps_the_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let opened = keepout_opened(dir.path());
+    let out = dir.path().join("t0.mkv");
+    std::fs::write(&out, b"earlier rip").unwrap();
+    // An audio PID the title lacks is refused before the output opens.
+    let mut plan = MuxPlan::new(vec![0]);
+    plan.streams = vec![(
+        0,
+        libfreemkv::StreamSelection {
+            audio: libfreemkv::PidFilter::Only(vec![0xFFFE]),
+            ..Default::default()
+        },
+    )];
+    let res = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &crate::NoopSink);
+    assert!(matches!(res, RipOutcome::Failed { .. }), "{res:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"earlier rip");
+}
