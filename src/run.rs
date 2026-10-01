@@ -11,13 +11,6 @@ use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
-// The error both recovery entry points return for a decrypting multipass job.
-// One constructor so the two call sites can't describe the same refusal two
-// different ways.
-pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
-    libfreemkv::Error::MultipassRequiresRaw
-}
-
 /// The run context the engine hands every libfreemkv stage: the op's `halt`, no events yet,
 /// and the developer diagnostics read once from the environment.
 pub(crate) fn ctx(halt: &libfreemkv::Halt) -> libfreemkv::Ctx {
@@ -171,13 +164,6 @@ pub fn recover_to_iso(
     job: &Job,
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
-    // Multipass implies raw — refuse before touching the drive. `preflight`
-    // reports this as data, but a front-end may skip that optional check; this
-    // enforcement can't be bypassed and avoids handing back an undecrypted ISO.
-    if matches!(job.mode, RipMode::Multi) && !job.raw {
-        return Err(multipass_requires_raw());
-    }
-
     let bridge = ProgressBridge::new(sink);
 
     sink.log(
@@ -670,22 +656,18 @@ mod tests {
         );
     }
 
-    // A decrypting multipass job is refused with its own code (E9082), before any read.
+    // Decryption is orthogonal to the read policy (EO6): a decrypting multipass job runs.
     #[test]
-    fn a_decrypting_multipass_job_is_refused_with_its_code() {
+    fn a_decrypting_multipass_job_runs() {
         let dir = tempfile::tempdir().unwrap();
-        let iso = dir.path().join("never-written.iso");
+        let iso = dir.path().join("decrypted.iso");
         let disc = clean_disc(64);
         let mut reader = ZeroReader { capacity: 64 };
         let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
         job.mode = RipMode::Multi;
-        let e =
-            recover_to_iso(&disc, &mut reader, &iso, &job, &CountingSink::default()).unwrap_err();
-        assert!(
-            matches!(e, libfreemkv::Error::MultipassRequiresRaw),
-            "{e:?}"
-        );
-        assert_eq!(e.to_string(), "E9082");
-        assert!(!iso.exists());
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CountingSink::default())
+            .expect("a decrypting multipass recovery is allowed");
+        assert!(r.complete, "{r:?}");
+        assert_eq!(std::fs::metadata(&iso).unwrap().len(), 64 * 2048);
     }
 }

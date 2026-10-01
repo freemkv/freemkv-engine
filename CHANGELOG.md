@@ -8,7 +8,8 @@ project follows semantic versioning.
 
 ### Changed
 
-- Remux and multipass refusals carry libfreemkv error codes instead of English text: verify failure E9077 (`<kind> [<have>/<want>] <path>`), incomplete mux E9078, invalid staging path E9079, staged copy size mismatch E9080 (`have/want`), lost copy/verify worker E9081, existing target E9084, and a decrypting multipass job E9082 (was E5000). An unknown stream language is E9083 (`StreamSelError` converts into `libfreemkv::Error`). A non-finite muxed runtime fails verify as `no-runtime`.
+- **A multipass recovery decrypts unless raw** (CLI, GUI, server): decryption is no longer tied to the read policy, so `recover_to_iso` and `multipass_rip` run a decrypting multipass job (sweep and patch passes decrypt in place) instead of refusing it with E9082, and `preflight` no longer reports `multipass-requires-raw`.
+- Remux and multipass refusals carry libfreemkv error codes instead of English text: verify failure E9077 (`<kind> [<have>/<want>] <path>`), incomplete mux E9078, invalid staging path E9079, staged copy size mismatch E9080 (`have/want`), lost copy/verify worker E9081, and existing target E9084. An unknown stream language is E9083 (`StreamSelError` converts into `libfreemkv::Error`). A non-finite muxed runtime fails verify as `no-runtime`.
 - Mapfiles no longer store keys or the raw Volume ID: only the disc hash (`# freemkv-disc:`) and a Volume ID fingerprint (`# freemkv-vidfp:`). Key and VID lines in an older mapfile become fingerprints and are removed the next time it is written. `build_key_fetch` and `OpenedImage::key_fetch` are removed; `OpenedImage` carries `keys`, `sources` and `prescanned`.
 - A key service whose address lookup fails for a moment is kept and retried before the rip starts, instead of being dropped.
 - The on-arrival key stop (E7022, E7032) ends every pass: it is never retried, skipped or recorded as disc damage.

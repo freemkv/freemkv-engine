@@ -178,11 +178,9 @@ pub fn resolve_loose_clip(
         return (Ok(None), ResolutionTrace::new());
     };
     // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
-    // refuses E7022 in `input()`. `dir://` refuses an encrypted folder (E9063), which is
-    // exactly the folder whose keys a clip needs, so that verdict scans it as is.
+    // refuses E7022 in `input()`.
     let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
         Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
-        Err(libfreemkv::Error::DirImageEncrypted) => encrypted_folder(&root),
         r => r,
     };
     let (disc, mut reader) = match scanned {
@@ -207,16 +205,6 @@ pub fn resolve_loose_clip(
     let scope = KeyScope::Titles(titles);
     let (set, trace) = resolve_traced(&disc, reader.as_mut(), scope, sources, None, halt, None);
     (set.map(Some), trace)
-}
-
-// An encrypted disc folder scanned with its AACS verdict kept (`scan_dir` refuses it).
-fn encrypted_folder(
-    root: &std::path::Path,
-) -> crate::Result<(libfreemkv::Disc, Box<dyn libfreemkv::SectorSource>)> {
-    let mut reader = libfreemkv::DirImage::open(root)?;
-    let cap = libfreemkv::SectorSource::capacity_sectors(&reader);
-    let disc = libfreemkv::Disc::scan_image(&mut reader, cap, &libfreemkv::ScanOptions::default())?;
-    Ok((disc, Box::new(reader)))
 }
 
 #[allow(clippy::too_many_arguments)]

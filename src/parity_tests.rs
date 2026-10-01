@@ -348,7 +348,7 @@ fn parity_engine_patch() {
     g.check();
 }
 
-// `multipass_rip`: a decrypting job is refused when it asks for passes, a raw job converges
+// `multipass_rip`: a decrypting job runs its passes decrypting, a raw job converges
 // on a clean drive for muxed and ISO scope, and single-pass over a dead range fails like copy.
 #[test]
 fn parity_engine_multipass() {

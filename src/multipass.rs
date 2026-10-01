@@ -669,12 +669,6 @@ fn multipass_rip_inner(
 ) -> crate::Result<MultipassResult> {
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
 
-    // Multipass implies raw — gated on the RESOLVED PLAN, not the entry point:
-    // `max_passes: 0` takes the single-pass (decrypting) branch and must stay
-    // allowed. Enforced here too since `preflight` is advisory and skippable.
-    if plan.multipass && !job.raw {
-        return Err(crate::run::multipass_requires_raw());
-    }
     // The recovery sweeps an image of the other raw/decrypt mode fresh; say so where users see it.
     if Mapfile::load(&disc.mapfile_for(iso_path))
         .is_ok_and(|m| m.raw().is_some_and(|r| r != job.raw))
@@ -3600,11 +3594,11 @@ mod tests {
         );
     }
 
-    // Multipass implies raw, enforced by the engine itself (preflight is skippable): a
-    // decrypting multipass job is refused before any pass reads or writes anything.
+    // Decryption is orthogonal to the read policy (EO6): a decrypting multipass rip reads
+    // and writes its image like a raw one.
     #[test]
-    fn a_decrypting_multipass_job_is_refused_before_any_read() {
-        let (_dir, iso) = scratch_iso("multipass-needs-raw");
+    fn a_decrypting_multipass_job_runs() {
+        let (_dir, iso) = scratch_iso("multipass-decrypting");
         let disc = test_disc(256, vec![]);
         let (mut reader, reads) = stamp_reader(0xA1);
         let job = Job::new("disc:///dev/null", iso.to_string_lossy());
@@ -3614,7 +3608,7 @@ mod tests {
             abort_on_lost_secs: 0,
             is_iso_output: true,
         };
-        let err = multipass_rip(
+        multipass_rip(
             &disc,
             &mut reader,
             &iso,
@@ -3622,12 +3616,8 @@ mod tests {
             &opts,
             &crate::sink::NoopSink,
         )
-        .expect_err("a decrypting multipass rip must be refused");
-        assert_eq!(err.to_string(), "E9082");
-        assert!(
-            reads.lock().unwrap().is_empty(),
-            "the refused rip read the disc"
-        );
-        assert!(!iso.exists(), "the refused rip created its output");
+        .expect("a decrypting multipass rip is allowed");
+        assert!(!reads.lock().unwrap().is_empty(), "the rip read the disc");
+        assert!(iso.exists(), "the rip wrote its image");
     }
 }
