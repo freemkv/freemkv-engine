@@ -4,7 +4,7 @@
 //! file-write + mapfile fsync on the generic [`libfreemkv::io::Pipeline`] +
 //! [`libfreemkv::io::Sink`] primitive. This module is the sweep-specific
 //! `Sink` impl; the producer-side state machine stays with the producer —
-//! the free `sweep` fn in `recovery/mod.rs`.
+//! `sweep_internal` in `recovery/mod.rs`.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -14,8 +14,7 @@ use libfreemkv::io::{Flow, Sink};
 
 use super::mapfile::{MapStats, Mapfile, SectorStatus};
 
-/// Reusable zero buffer for SkipFill / GapFill. 64 KB matches the
-/// existing zero_gap chunk size used by the pre-split sweep loop.
+/// Reusable zero buffer for SkipFill / GapFill writes.
 const ZERO_CHUNK: usize = 64 * 1024;
 
 /// Producer → Consumer messages. The consumer applies these in FIFO
@@ -128,6 +127,9 @@ impl Sink<WorkItem> for SweepSink {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
+                if self.map.persist_due() && self.is_regular {
+                    self.file.sync_all().map_err(lost)?;
+                }
                 self.map.record(pos, len, SectorStatus::Finished)?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
@@ -412,17 +414,25 @@ mod tests {
     // durable, so dropping the sink must not flush those records.
     #[test]
     fn a_failed_close_does_not_persist_finished_for_unsynced_data() {
-        let dir = scratch("syncfail-drop");
-        let (mut sink, _iso) = sink_over(&dir, 8192);
-        let fresh = freshly_flushed(&mut sink.map);
-        sink.apply(WorkItem::Good {
-            pos: 0,
-            buf: vec![0x5Au8; 2048],
-        })
-        .unwrap();
-        if fresh.elapsed() >= FLUSH_WINDOW {
-            return; // the periodic persist already ran: inconclusive, not a failure
+        for _ in 0..ATTEMPTS {
+            let dir = scratch("syncfail-drop");
+            let (mut sink, _iso) = sink_over(&dir, 8192);
+            let fresh = freshly_flushed(&mut sink.map);
+            sink.apply(WorkItem::Good {
+                pos: 0,
+                buf: vec![0x5Au8; 2048],
+            })
+            .unwrap();
+            if fresh.elapsed() >= FLUSH_WINDOW {
+                continue; // the periodic persist already ran: try again
+            }
+            failed_close_case(sink, &dir);
+            return;
         }
+        panic!("no attempt stayed inside the mapfile's flush window");
+    }
+
+    fn failed_close_case(mut sink: SweepSink, dir: &std::path::Path) {
         let halt = libfreemkv::halt::Halt::new();
         halt.cancel();
         sink.file.set_halt(halt);
@@ -432,8 +442,11 @@ mod tests {
             reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
             "a range whose data never reached disk was persisted Finished"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(dir);
     }
+
+    // A timing-guarded case retries rather than passing silently on a slow runner.
+    const ATTEMPTS: usize = 5;
 
     // R2: once teardown abandons this consumer (mapfile disowned), a resumed pass owns the
     // image; an in-flight zero-fill must not go on writing zeros over what it recovers.
@@ -472,26 +485,49 @@ mod tests {
     // the Finished records before it may not be on disk: the dropped sink must not flush them.
     #[test]
     fn a_failed_write_does_not_persist_earlier_finished_records() {
-        let dir = scratch("writefail-drop");
-        let (mut sink, iso) = sink_over(&dir, 8192);
-        let read_only = std::fs::File::open(&iso).unwrap();
-        sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
-        let fresh = freshly_flushed(&mut sink.map);
-        sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
-        let r = sink.apply(WorkItem::Good {
-            pos: 2048,
-            buf: vec![0x5Au8; 2048],
-        });
-        if fresh.elapsed() >= FLUSH_WINDOW {
-            return; // inconclusive, as above
+        for _ in 0..ATTEMPTS {
+            let dir = scratch("writefail-drop");
+            let (mut sink, iso) = sink_over(&dir, 8192);
+            let read_only = std::fs::File::open(&iso).unwrap();
+            sink.file = libfreemkv::io::WritebackFile::new(read_only).unwrap();
+            let fresh = freshly_flushed(&mut sink.map);
+            sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+            let r = sink.apply(WorkItem::Good {
+                pos: 2048,
+                buf: vec![0x5Au8; 2048],
+            });
+            if fresh.elapsed() >= FLUSH_WINDOW {
+                continue; // try again, as above
+            }
+            assert!(r.is_err(), "a write to a read-only handle must fail");
+            drop(sink);
+            let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
+            assert!(
+                reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
+                "a failed write left earlier, possibly lost, ranges persisted Finished"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
         }
-        assert!(r.is_err(), "a write to a read-only handle must fail");
+        panic!("no attempt stayed inside the mapfile's flush window");
+    }
+
+    // R2's in-loop check: a fill already under way stops when teardown disowns the map.
+    #[test]
+    fn a_fill_stops_when_disowned_mid_way() {
+        const FILL: u64 = 256 << 20;
+        let dir = scratch("disowned-mid");
+        let (mut sink, iso) = sink_over(&dir, 8192);
+        let disown = sink.map.disown_handle();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            disown.disown();
+        });
+        let _ = sink.apply(WorkItem::GapFill { pos: 0, len: FILL });
+        t.join().unwrap();
         drop(sink);
-        let reloaded = Mapfile::load(&dir.join("out.map")).unwrap();
-        assert!(
-            reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
-            "a failed write left earlier, possibly lost, ranges persisted Finished"
-        );
+        let len = std::fs::metadata(&iso).unwrap().len();
+        assert!(len < FILL, "the fill ran on past the disown ({len} bytes)");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

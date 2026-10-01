@@ -52,13 +52,15 @@ pub(crate) struct ReadCtx {
     /// Multiplier applied to damage-jump distance. Doubles each jump,
     /// resets to 1 after `damage_window_max` consecutive good reads.
     pub(crate) jump_multiplier: u64,
-    /// NOT_READY retries used so far for the current LBA. Reset to 0
-    /// on any non-NOT_READY response.
+    /// NOT_READY retries used so far for the current LBA. Reset to 0 once the
+    /// position moves on (a success, or a NOT_READY past its budget) and on any
+    /// other response.
     pub(crate) not_ready_retries: u32,
     /// Bridge-degradation cooldowns used so far.
     pub(crate) bridge_degradation_count: u32,
     /// Which pass this context belongs to: `false` = Pass 1 sweep,
-    /// `true` = a Pass N patch. It selects the wedge-skip distance
+    /// `true` = a Pass N patch (`for_patch`, test-only today: the shipped Pass N
+    /// reads through `section_recover`). It selects the wedge-skip distance
     /// (Pass 1 jumps `WEDGE_JUMP_SECTORS`; Pass N only
     /// `WEDGE_PASS_N_SKIP_SECTORS`, because it is already grinding a
     /// single known-bad range), exempts Pass N from the zone-entry
@@ -102,9 +104,10 @@ pub(crate) struct ReadCtx {
     /// good reads after the last error in the cluster." Used to count
     /// zone entries and to bound zone_reads accurately.
     pub(crate) in_damage_zone: bool,
-    /// Count of long-streak pause escalations taken this pass — the `consecutive_failures >=
-    /// CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD` branch of the pause selection. Reported in the
-    /// pass summary so an operator can see how often the drive was in a long failure streak.
+    /// Count of failures this pass inside a long failure streak — the `consecutive_failures >=
+    /// CONSECUTIVE_FAIL_LONG_PAUSE_THRESHOLD` branch of the pause selection, whose pause is
+    /// today the standard one. Reported in the pass summary so an operator can see how often
+    /// the drive was in a long failure streak.
     pub(crate) long_pause_escalations: u64,
     /// Count of RECOVERED ERROR (marginal) reads the drive reported this pass
     /// (surfaced by the PER=1 mode-select at drive-prep). Each is distrusted and
@@ -116,9 +119,9 @@ pub(crate) struct ReadCtx {
 
 impl ReadCtx {
     /// Initial context for a Pass 1 sweep: `batch` sectors per read. Tuned for "fast and
-    /// accurate" — a failed batch becomes `SkipBlock` (NonTrimmed, left for Pass N to revisit),
-    /// and the damage-jump fast path triggers after just 1 consecutive outer-batch failure so
-    /// Pass 1 jumps immediately rather than grinding the same LBA. Transient errors still get a
+    /// accurate" — the damage-jump fast path triggers after just 1 outer-batch failure, so
+    /// every failed batch jumps ahead (zero-filled NonTrimmed, left for Pass N to revisit)
+    /// rather than grinding the same LBA. Transient errors still get a
     /// small bounded number of retries (`NOT_READY_MAX_RETRIES` /
     /// `BRIDGE_DEGRADATION_MAX_RETRIES`).
     pub(crate) fn for_sweep(batch: u16) -> Self {
@@ -214,7 +217,7 @@ impl ReadCtx {
             self.last_error_family = None;
             // Reset the jump multiplier so the NEXT zone starts at the base
             // distance — otherwise it carries over the prior zone's inflation
-            // (up to 64x) and the next zone's first jump skips recoverable data.
+            // (up to MAX_JUMP_MULTIPLIER) and the next zone's first jump skips recoverable data.
             self.jump_multiplier = 1;
         }
     }
@@ -276,7 +279,7 @@ pub(crate) enum ReadAction {
 const FAIL_PAUSE_SECS: u64 = 5;
 // Long cooldown on the FIRST failure after a clean run, before retries can push the drive
 // toward firmware fast-fail.
-pub(crate) const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
+const ZONE_ENTRY_COOLDOWN_SECS: u64 = 30;
 // Cooldown for a long failure streak; same value as FAIL_PAUSE_SECS,
 // kept as a separate name so the escalation is explicit at call sites.
 const CONSECUTIVE_FAIL_LONG_PAUSE_SECS: u64 = 5;
@@ -290,6 +293,8 @@ const BRIDGE_DEGRADATION_MAX_RETRIES: u32 = 5;
 // Base of the damage-jump formula: jump_sectors = JUMP_BASE_SECTORS * batch * jump_multiplier.
 // Sized so the first jump clears a whole damage cluster in ~2 doublings.
 const JUMP_BASE_SECTORS: u64 = 1024;
+// The jump multiplier's cap (a saturated one once produced a 56 GB jump).
+const MAX_JUMP_MULTIPLIER: u64 = 64;
 
 // Firmware-wedge skip policy: a damaged drive's firmware can latch into
 // returning HARDWARE_ERROR/ILLEGAL_REQUEST for every later read; instead of
@@ -448,9 +453,8 @@ pub(crate) fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
             pause_secs: NOT_READY_PAUSE_SECS,
         };
     }
-    if sense_key != scsi::SENSE_KEY_NOT_READY {
-        ctx.not_ready_retries = 0;
-    }
+    // Past here the block is skipped or jumped: the next LBA gets its own budget.
+    ctx.not_ready_retries = 0;
 
     // Zone-entry tracking: latch the clean->damaged transition AFTER every
     // early-return branch (transport failure, bridge, NOT_READY), not before —
@@ -547,10 +551,9 @@ pub(crate) fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         FAIL_PAUSE_SECS
     };
 
-    // 7. Damage-jump: too many failures → skip ahead by an escalating gap,
-    //    capped (a saturated multiplier once produced a 56 GB jump), sized to
-    //    clear 100+ MB clusters in ~2 jumps via fast-entry (Pass 1) or window (Pass N).
-    const MAX_JUMP_MULTIPLIER: u64 = 64;
+    // 6. Damage-jump: too many failures → skip ahead by an escalating gap,
+    //    capped at MAX_JUMP_MULTIPLIER, sized to clear 100+ MB clusters in ~2
+    //    jumps via fast-entry (Pass 1) or window (Pass N).
     let fast_trigger = ctx.consecutive_outer_failures >= ctx.fast_jump_threshold;
     let window_trigger =
         ctx.damage_window.len() >= ctx.damage_window_max && bad_pct >= ctx.damage_threshold_pct;
@@ -571,7 +574,7 @@ pub(crate) fn handle_read_error(err: &Error, ctx: &mut ReadCtx) -> ReadAction {
         };
     }
 
-    // 8. Default: zero-fill the failed batch as NonTrimmed and pause
+    // 7. Default: zero-fill the failed batch as NonTrimmed and pause
     //    before the next read.
     ReadAction::SkipBlock { pause_secs }
 }
@@ -1308,7 +1311,7 @@ mod tests {
             match a {
                 ReadAction::Retry { pause_secs } => {
                     assert_eq!(
-                        pause_secs, BRIDGE_DEGRADATION_PAUSE_SECS,
+                        pause_secs, 15,
                         "bridge retry {i} should use the bridge cooldown"
                     );
                 }
@@ -1352,12 +1355,8 @@ mod tests {
         match handle_read_error(&err, &mut ctx) {
             ReadAction::Retry { pause_secs } => {
                 assert_eq!(
-                    pause_secs, NOT_READY_PAUSE_SECS,
+                    pause_secs, 3,
                     "04/3E must use the generic NOT_READY pause, not the bridge cooldown"
-                );
-                assert_ne!(
-                    pause_secs, BRIDGE_DEGRADATION_PAUSE_SECS,
-                    "04/3E must not take the bridge-degradation branch"
                 );
                 // Confirm it really went through the NOT_READY path.
                 assert_eq!(ctx.not_ready_retries, 1);
@@ -1367,11 +1366,32 @@ mod tests {
         }
     }
 
+    // A block whose NOT_READY outlasts the budget is skipped; the next one gets its own.
+    #[test]
+    fn a_not_ready_budget_is_per_block() {
+        let mut ctx = ReadCtx::for_sweep(32);
+        for _ in 0..3 {
+            assert!(matches!(
+                handle_read_error(&not_ready_04_3e_err(), &mut ctx),
+                ReadAction::Retry { pause_secs: 3 }
+            ));
+        }
+        let moved_on = handle_read_error(&not_ready_04_3e_err(), &mut ctx);
+        assert!(
+            !matches!(moved_on, ReadAction::Retry { .. }),
+            "{moved_on:?}"
+        );
+        assert!(matches!(
+            handle_read_error(&not_ready_04_3e_err(), &mut ctx),
+            ReadAction::Retry { pause_secs: 3 }
+        ));
+    }
+
     #[test]
     fn jump_multiplier_caps_and_jump_distance_stays_bounded() {
-        // Step 7 of `handle_read_error`: multiplier doubles per jump but is capped at
-        // MAX_JUMP_MULTIPLIER=64 (the "4 GiB cap"), so a single jump can never
-        // grow unbounded and skip the rest of the disc; verify saturation holds.
+        // Step 6 of `handle_read_error`: multiplier doubles per jump but is capped at
+        // 64 (the "4 GiB cap"), so a single jump can never grow unbounded and skip
+        // the rest of the disc; verify saturation holds.
         const MAX_JUMP_MULTIPLIER: u64 = 64;
         let batch: u16 = 32;
         let mut ctx = ReadCtx::for_sweep(batch);

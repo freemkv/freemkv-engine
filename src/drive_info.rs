@@ -203,7 +203,14 @@ fn raw(
     len: usize,
 ) -> Option<Vec<u8>> {
     let mut buf = vec![0u8; len];
-    let r = session.scsi_execute(cdb, dir, &mut buf, 5_000).ok()?;
+    let r = match session.scsi_execute(cdb, dir, &mut buf, 5_000) {
+        Ok(r) => r,
+        Err(e) => {
+            // A transport fault, not a refusal: say so, or the capture reads as complete.
+            tracing::warn!(target: "freemkv::engine", "drive capture: CDB {:02x} failed: {e}", cdb[0]);
+            return None;
+        }
+    };
     (r.status == 0).then(|| buf[..r.bytes_transferred.min(buf.len())].to_vec())
 }
 

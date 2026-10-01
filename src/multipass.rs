@@ -3,9 +3,9 @@
 //! [`crate::recovery::copy`] performs ONE dispatch step (sweep, one patch
 //! pass, or a terminal result) chosen from mapfile state; this module's loop
 //! calls it repeatedly until the disc is clean or progress stalls, then
-//! applies the abort-on-loss gate mirroring autorip's `loss_aborts` (hard
-//! rule #6): `abort_on_lost_secs == 0` requires a perfect rip, a positive
-//! value tolerates that many seconds of loss, and NaN always fails safe.
+//! applies the abort-on-loss gate ([`loss_aborts`], hard rule #6):
+//! `abort_on_lost_secs == 0` requires a perfect rip, and a positive value
+//! tolerates that many seconds of loss; an untimeable loss never exceeds it.
 
 use crate::job::Job;
 use crate::recovery::mapfile::{MapStats, Mapfile, SectorStatus};
@@ -115,29 +115,25 @@ pub fn loss_verdict(
     let unscopable = titles
         .iter()
         .any(|t| loss_is_unscopable(is_iso_output, t, bad_ranges));
-    let lost_bytes = if unscopable {
+    let lost_bytes = if is_iso_output || unscopable {
         bad_ranges.iter().map(|(_, sz)| *sz).sum()
     } else {
         titles_abort_lost_bytes(is_iso_output, titles, bad_ranges)
     };
     let (lost_ms, _) = titles_lost_ms(true, titles, bad_ranges);
-    let aborts = if abort_on_lost_secs == 0 {
-        lost_bytes > 0
-    } else {
-        lost_ms.is_finite() && lost_ms > (abort_on_lost_secs as f64) * MILLIS_PER_SEC
-    };
     LossVerdict {
         lost_bytes,
         lost_ms,
-        aborts,
+        aborts: loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs),
     }
 }
 
-/// Does the residual loss exceed the tolerance and therefore abort the rip?
+/// Does the residual loss exceed the tolerance and therefore abort the rip? The gate
+/// [`loss_verdict`] applies.
 ///
-/// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
-/// any lost byte (or an unquantifiable NaN loss) aborts; exactly zero proceeds.
-/// A positive threshold switches to the seconds gate (bytes not consulted).
+/// `abort_on_lost_secs == 0` is byte-exact: any lost byte (or an unquantifiable NaN loss)
+/// aborts; exactly zero proceeds. A positive threshold switches to the seconds gate (bytes
+/// not consulted), where a NaN loss never aborts (a rip is never stopped for missing metadata).
 pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     if abort_on_lost_secs == 0 {
         lost_bytes > 0 || lost_ms.is_nan()
@@ -146,10 +142,10 @@ pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bo
     }
 }
 
-/// The seconds-threshold half of the gate: strictly-greater-than aborts, and a
-/// NaN (unquantifiable) loss fails safe to abort.
+/// The seconds-threshold half of the gate: strictly-greater-than aborts; a NaN
+/// (unquantifiable) loss does not.
 pub fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
-    lost_ms.is_nan() || lost_ms > abort_threshold_ms
+    lost_ms.is_finite() && lost_ms > abort_threshold_ms
 }
 
 /// An ISO-image output is a whole-disc backup and always requires 100% (the
@@ -198,9 +194,8 @@ pub(crate) fn loss_is_unscopable(
 /// Milliseconds of playback lost, scoped by [`abort_lost_bytes`] and converted
 /// via the title's own bytes/sec bitrate.
 ///
-/// Fails safe to NaN when the loss exists but cannot be measured — see [`loss_is_unscopable`].
-/// NaN aborts under EVERY threshold, including `u64::MAX`, which is a deliberate behaviour
-/// change from autorip's `.accept-loss` escape hatch.
+/// NaN when the loss exists but cannot be measured — see [`loss_is_unscopable`]. A NaN
+/// aborts only the perfect (`0`) gate, through its byte count ([`loss_aborts`]).
 pub fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -251,6 +246,8 @@ pub struct PassPlan {
 }
 
 pub fn plan_passes(max_retries: u8) -> PassPlan {
+    // Capped so `total_passes` (retries + 2) still fits a u8 and counts every pass.
+    let max_retries = max_retries.min(u8::MAX - 2);
     if max_retries > 0 {
         PassPlan {
             multipass: true,
@@ -402,20 +399,25 @@ pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity 
     if bad_sectors == 0 {
         return Clean;
     }
-    // An unquantifiable loss fails SAFE, matching `should_abort_for_loss`: every
-    // NaN comparison is false, so without this it fell through both tiers to
-    // Cosmetic — badging "Cosmetic" on the rip the abort gate is refusing.
+    // An unquantifiable loss badges Serious: every NaN comparison is false, so
+    // without this it fell through both tiers to Cosmetic.
     if lost_ms.is_nan() {
         return Serious;
     }
-    if bad_sectors >= 500 || lost_ms >= 30_000.0 {
+    if bad_sectors >= SERIOUS_SECTORS || lost_ms >= SERIOUS_LOST_MS {
         return Serious;
     }
-    if bad_sectors >= 51 || lost_ms >= 1_000.0 {
+    if bad_sectors >= MODERATE_SECTORS || lost_ms >= MODERATE_LOST_MS {
         return Moderate;
     }
     Cosmetic
 }
+
+// The damage tiers' thresholds (documented on `DamageSeverity`).
+const SERIOUS_SECTORS: u64 = 500;
+const SERIOUS_LOST_MS: f64 = 30_000.0;
+const MODERATE_SECTORS: u64 = 51;
+const MODERATE_LOST_MS: f64 = 1_000.0;
 
 // Whether a recovery pass decrypts in place, given the job's `raw` flag. Named so the
 // `!job.raw` policy shared by four call sites reads as a decision, not a stray `!`.
@@ -633,6 +635,7 @@ pub struct MultipassResult {
     pub main_lost_ms: f64,
     /// Unreadable bytes the loss verdict counted ([`LossVerdict::lost_bytes`]): the whole
     /// disc for an ISO, the ripped titles' otherwise. The loss when `main_lost_ms` is NaN.
+    /// A run with no verdict (halted, wedged, single pass) counts the whole image's.
     pub lost_bytes: u64,
     /// Damage classification from the residual loss.
     pub severity: crate::DamageSeverity,
@@ -870,9 +873,20 @@ pub(crate) fn recover(
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
 
     // The recovery sweeps an image of the other raw/decrypt mode fresh; say so where users see it.
-    let map_mode = Mapfile::load(&disc.mapfile_for(iso_path))
-        .ok()
-        .and_then(|m| m.raw());
+    // A missing or corrupt map starts fresh; an unreadable one (EIO, EACCES) fails the run.
+    let prior = match Mapfile::load(&disc.mapfile_for(iso_path)) {
+        Ok(m) => Some(m),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            None
+        }
+        Err(e) => return Err(libfreemkv::Error::from(e)),
+    };
+    let map_mode = prior.as_ref().and_then(|m| m.raw());
     if map_mode.is_some_and(|r| r != job.raw) {
         sink.log(
             Level::Warn,
@@ -885,10 +899,14 @@ pub(crate) fn recover(
         return single_pass(disc, host.reader(), iso_path, job, scope, sink, halt);
     }
 
-    // ── Pass 1: the sweep, resuming a mapfile of the run's raw/decrypt mode (or as the host
-    // decides); it re-reads only NonTried and refuses another disc's map. A transport fault
-    // the host recovers from sweeps again, resuming. ──
-    let resume = host.resume_sweep().unwrap_or(map_mode == Some(job.raw));
+    // ── Pass 1: the sweep over a mapfile this version wrote (or as the host decides): it
+    // refuses another disc's map, sweeps the other raw/decrypt mode fresh, else re-reads
+    // NonTried. A transport fault the host recovers from sweeps again, resuming. ──
+    let resume = host.resume_sweep().unwrap_or(map_mode.is_some());
+    let resumed = match (&prior, resume && map_mode == Some(job.raw)) {
+        (Some(m), true) => m.stats(),
+        _ => MapStats::default(),
+    };
     let mut passes = 0u32;
     let (mut last_good, mut last_unreadable, mut last_pending, mut halted);
     {
@@ -896,9 +914,9 @@ pub(crate) fn recover(
             sink,
             RecoveryEvent::PassStart {
                 pass: 1,
-                good: 0,
-                pending: 0,
-                unreadable: 0,
+                good: resumed.bytes_good,
+                pending: resumed.bytes_pending,
+                unreadable: resumed.bytes_unreadable,
             },
         );
         let scope = scope.map(crate::recovery::sector_scope_to_bytes);
@@ -1413,8 +1431,12 @@ mod tests {
             "exactly 1000ms at a 1s threshold proceeds (strictly greater-than aborts)"
         );
         assert!(
-            loss_aborts(0, f64::NAN, 30),
-            "NaN loss fails safe to abort on the seconds path too"
+            !loss_aborts(0, f64::NAN, 30),
+            "an untimeable loss never exceeds a seconds tolerance"
+        );
+        assert!(
+            loss_aborts(4096, f64::NAN, 0),
+            "the perfect gate aborts on its bytes"
         );
     }
 
@@ -1447,8 +1469,8 @@ mod tests {
         let ms = abort_lost_ms(false, &t, &damage, 0.0);
         assert!(ms.is_nan(), "zero-bitrate loss must be NaN, got {ms}");
         assert!(
-            loss_aborts(abort_lost_bytes(false, &t, &damage), ms, 30),
-            "an unquantifiable loss must abort even under a 30s tolerance"
+            loss_aborts(abort_lost_bytes(false, &t, &damage), ms, 0),
+            "an unquantifiable loss aborts the perfect gate"
         );
 
         // The scope hole: a title with NO EXTENTS can't be scoped, so
@@ -1514,15 +1536,10 @@ mod tests {
             end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage);
         assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
         assert!(why.is_some(), "an unquantifiable verdict must say why");
-        assert!(
-            loss_aborts(0, lost_ms, 30),
-            "unmeasurable loss must abort even under a 30s tolerance"
-        );
-        // What the gate used to answer, pinned so the regression is legible:
-        assert!(
-            !loss_aborts(0, 0.0, 30),
-            "0.0 passes a 30s tolerance — that was the bug"
-        );
+        // The verdict reports it in bytes: the whole disc's, since it cannot be scoped.
+        let v = loss_verdict(false, &[&empty], &damage, 0);
+        assert_eq!(v.lost_bytes, 8192);
+        assert!(v.aborts, "the perfect gate aborts on the unscoped bytes");
     }
 
     /// The gate must still produce a real number when the loss IS measurable —
@@ -1779,7 +1796,7 @@ mod tests {
         assert_eq!(
             classify_damage(10, f64::NAN),
             crate::DamageSeverity::Serious,
-            "NaN must fail safe here exactly as it does in should_abort_for_loss"
+            "an untimeable loss badges Serious"
         );
         // And a quantified small loss still classifies normally.
         assert_eq!(classify_damage(10, 0.0), crate::DamageSeverity::Cosmetic);
@@ -1791,7 +1808,11 @@ mod tests {
     #[test]
     fn the_pass_count_saturates_instead_of_wrapping() {
         let plan = plan_passes(u8::MAX);
-        assert_eq!(plan.patch_passes, u8::MAX);
+        assert_eq!(
+            plan.patch_passes,
+            u8::MAX - 2,
+            "capped so every pass is counted"
+        );
         assert_eq!(
             plan.total_passes,
             u8::MAX,

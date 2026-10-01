@@ -49,6 +49,17 @@ project follows semantic versioning.
 
 ### Fixed
 
+- `run` / `run_with`: a raw title off a drive acquires no key (it failed when no key was found); a stream filter on an `iso://`/`dir://` title is resolved against the image's scanned title (it was refused as an invalid source URL), and an unknown language is E9083; a raw `dir://` plan is refused with `DirRawRejected` instead of being extracted decrypted; a title run's Stop is watched from the start (drive open, scan and key lookup), not only once the mux starts. `KeyParamsData`'s `Debug` no longer prints the key-service token.
+- `mux_title` keeps the caller's `MuxOptions` raw flag and title index when the input options leave them unset (a raw `dir://` remux was decrypted). `mux_title_session` (no caller, no keys) is removed.
+- `run_episodes`: when every episode fails, the rip is `Failed` with the last failure, not `Ok { titles_written: 0 }`; each dropped episode is logged.
+- Multipass recovery: an existing mapfile it cannot read (EIO, EACCES) fails the run instead of being swept over; a mapfile of the other raw/decrypt mode goes through the sweep's own checks, so another disc's image is refused (E6011), not overwritten; pass 1 starts from the resumed map's counts. `loss_aborts` / `should_abort_for_loss` follow `loss_verdict`: an untimeable (NaN) loss never exceeds a positive tolerance. An ISO's `loss_verdict` counts the whole disc even with no titles. `plan_passes` caps retries at 253 so `total_passes` counts every pass.
+- Sweep and patch make the image durable before the mapfile's periodic save records those sectors Finished.
+- `copy` restarts clean over a damaged mapfile, as `sweep` does; a scoped sweep resuming a whole-disc mapfile no longer narrows it to the scope; `ensure_titles_staged` refuses a title the disc does not have (E6005); a device output is not mistaken for a missing image; the first sweep ticks keep zero-filled damage pending.
+- Patch: a prime read of an already-good sector neither rewrites it nor resets the early hand-off; patch progress counts only damage inside a staged image's scope; SET CD SPEED is sent only when the drive's speed changed. A NOT READY block past its retries no longer leaves the next block without any.
+- Preflight judges a multipass job's key set over the whole disc, as its passes do.
+- TV episodes: content dedup compares a title's whole extent list, so episodes sharing an opening clip are all kept.
+- An untagged stream is `und`: a request for `und` keeps it, as the refusal's "available: und" suggests.
+- A loose clip's disc folder that fails with an OS read error (EIO, EACCES) reports it instead of opening keyless; a top-up refusal is no longer replaced by an unreadable sidecar's error; a drive-capture transport failure is logged.
 - `preflight` counts a job's key set as usable only when it covers the selected titles, instead of reporting Ready for a title the set cannot decrypt.
 - `preflight` refuses a requested language tag that names no language with the new reason `unknown-language` (detail = the tag), instead of passing the job to fail after the image opens, or blaming the disc with `language-unmatched`.
 - `episode_titles` picks the largest group of similar lengths; between equal-size groups it keeps the longer unless that one is a play-all of the other (it plays their extents or runs their summed length), so an episode beside a play-all is kept and equal numbers of extras don't displace episodes. Titles with no extents are never dropped as duplicates.

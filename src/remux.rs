@@ -425,6 +425,25 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     Ok(())
 }
 
+// Move `landing` onto the target. Without `replace`, a hard link lands it only if the target
+// is still absent (a plain rename would overwrite one that appeared after the re-check); a
+// filesystem with no hard links falls back to the rename.
+fn land(landing: &Path, job: &RemuxJob) -> io::Result<()> {
+    if job.replace {
+        return std::fs::rename(landing, &job.target);
+    }
+    match std::fs::hard_link(landing, &job.target) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(landing) {
+                tracing::warn!(target: "freemkv::engine", "could not remove {}: {e}", landing.display());
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(target_exists(&job.target)),
+        Err(_) => std::fs::rename(landing, &job.target),
+    }
+}
+
 fn target_exists(target: &Path) -> io::Error {
     let path = target.display().to_string();
     libfreemkv::Error::RemuxTargetExists { path }.into()
@@ -616,18 +635,21 @@ fn land_verified(
     }
     durable_sync(rio, partial, halt, sink, timing)?;
 
-    sink.event(&Event::Phase { name: "verify" });
-    let verified = verify_watched(partial, title, halt, sink, rio, timing);
-    let stopped = verified.as_ref().is_err_and(libfreemkv::is_halt);
-    if !stopped {
-        sink.event(&Event::Verify {
-            path: partial,
-            ok: verified.is_ok(),
-            runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
-            expected_secs: title.duration_secs,
-        });
-    }
-    let verified = verified?;
+    // Each verify (the local file, then a staged NAS copy) is its own phase and verdict.
+    let verify = |path: &Path| {
+        sink.event(&Event::Phase { name: "verify" });
+        let verified = verify_watched(path, title, halt, sink, rio, timing);
+        if !verified.as_ref().is_err_and(libfreemkv::is_halt) {
+            sink.event(&Event::Verify {
+                path,
+                ok: verified.is_ok(),
+                runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
+                expected_secs: title.duration_secs,
+            });
+        }
+        verified
+    };
+    let verified = verify(partial)?;
 
     let mut remote_guard = None;
     if staged_partial.is_some() {
@@ -637,7 +659,7 @@ fn land_verified(
         copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
-        verify_watched(&target_partial, title, halt, sink, rio, timing)?;
+        verify(&target_partial)?;
     }
 
     sink.event(&Event::Phase { name: "replace" });
@@ -654,7 +676,7 @@ fn land_verified(
     if halt.is_cancelled() {
         return Err(libfreemkv::Error::Halted.into());
     }
-    std::fs::rename(landing, &job.target)?;
+    land(landing, job)?;
     remote_guard.as_mut().unwrap_or(&mut guard).disarm();
     // The rename committed: a Stop or a failure during the folder sync cuts only the sync
     // short (§2.6, §4.4), and the caller is still told the target was replaced.

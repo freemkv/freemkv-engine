@@ -368,6 +368,15 @@ fn a_staged_image_muxes_only_titles_its_scope_holds() {
         let err = freemkv_engine::ensure_titles_staged(&iso, &d, sel).unwrap_err();
         assert_eq!(err.code(), E_IMAGE_SCOPED, "{sel:?}");
     }
+    // A title the disc does not have is refused, not passed unchecked.
+    let err = freemkv_engine::ensure_titles_staged(&iso, &d, &[7]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            libfreemkv::Error::DiscTitleRange { index: 7, count: 3 }
+        ),
+        "{err:?}"
+    );
     let plain = tmp.path().join("plain.iso");
     freemkv_engine::ensure_titles_staged(&plain, &d, &[1]).expect("not a staged image");
 }

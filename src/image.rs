@@ -475,7 +475,8 @@ impl OpenedImage {
                 }
                 // Only a Missing can become E7034 by the sidecar; any other refusal stays itself.
                 let e = if missing {
-                    let sidecar = load_sidecar(&self.source)?;
+                    // An unreadable sidecar leaves the refusal as it is, never replaces it.
+                    let sidecar = load_sidecar(&self.source).ok().flatten();
                     vid_needs_disc((e, help), vid_in_hand, sidecar.as_ref())
                 } else {
                     e

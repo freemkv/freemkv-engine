@@ -177,14 +177,22 @@ pub fn resolve_loose_clip(
     let Some(root) = libfreemkv::disc_root_of(clip) else {
         return (Ok(None), ResolutionTrace::new());
     };
-    // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
-    // refuses E7022 in `input()`.
+    // A folder that is not a readable disc looks up nothing: a clear clip still opens, an
+    // encrypted one refuses E7022 in `input()`. An OS read error (EIO, EACCES) surfaces.
     let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
         Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
         r => r,
     };
     let (disc, mut reader) = match scanned {
         Ok(d) => d,
+        Err(libfreemkv::Error::IoError { source })
+            if !matches!(source.kind(), std::io::ErrorKind::NotFound) =>
+        {
+            return (
+                Err(libfreemkv::Error::IoError { source }),
+                ResolutionTrace::new(),
+            );
+        }
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
             return (Ok(None), ResolutionTrace::new());

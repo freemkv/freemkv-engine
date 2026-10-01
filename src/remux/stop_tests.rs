@@ -1114,7 +1114,7 @@ fn remux_staged_copy_that_fails_verify_keeps_old_target() {
         .collect();
     assert_eq!(
         tail,
-        ["verify:true", "phase:copy", "phase:sync"],
+        ["phase:sync", "phase:verify", "verify:false"],
         "{events:?}"
     );
     untouched(&target, mtime);

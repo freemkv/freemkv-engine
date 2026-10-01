@@ -777,9 +777,9 @@ fn extract_tree_reads_through_the_key_set() {
     assert!(mask(&got) == mask(want), "the stream file is decrypted");
 }
 
-/// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, and
-/// `RipOutcome::Failed` its data (here a failed top-up whose sidecar turned unreadable:
-/// `MapfileInvalid { kind: "vidfp" }`), not only the code.
+/// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, not
+/// only the code. A failed top-up whose sidecar turned unreadable stays the key refusal:
+/// the sidecar's own error never replaces it.
 #[test]
 fn an_up_front_refusal_keeps_the_whole_error() {
     #[derive(Default)]
@@ -810,12 +810,10 @@ fn an_up_front_refusal_keeps_the_whole_error() {
         &mkv_dest(dir.path()),
         &sink,
     );
-    let RipOutcome::Failed { data, .. } = &out else {
-        panic!("{out:?}")
-    };
-    assert_eq!(data, "vidfp");
+    assert!(matches!(out, RipOutcome::NoKey), "{out:?}");
     let events = sink.0.lock().unwrap();
-    assert_eq!(*events, [r#"Some(MapfileInvalid { kind: "vidfp" })"#]);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].starts_with("Some(NoDiscKey {"), "{events:?}");
 }
 
 /// J23 (amends J11 / SG28; KS-16 "Kvu = AES-G(Km, IDv)"): E7034 only when the VID would

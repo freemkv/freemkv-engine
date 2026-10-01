@@ -40,7 +40,8 @@ pub struct Plan {
 }
 
 /// [`KeyParams`] as plain comparable data, so a [`Plan`] can be compared across front ends.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Its `Debug` never prints the bearer token.
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct KeyParamsData {
     /// The local keydb (already resolved by the front end), or `None` to skip it.
     pub keydb_path: Option<String>,
@@ -52,6 +53,18 @@ pub struct KeyParamsData {
     pub online_only: bool,
     /// The keydb a live drive's AACS handshake takes host certificates from.
     pub cert_keydb: Option<String>,
+}
+
+impl std::fmt::Debug for KeyParamsData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyParamsData")
+            .field("keydb_path", &self.keydb_path)
+            .field("key_url", &self.key_url)
+            .field("key_auth", &self.key_auth.as_ref().map(|_| "<redacted>"))
+            .field("online_only", &self.online_only)
+            .field("cert_keydb", &self.cert_keydb)
+            .finish()
+    }
 }
 
 impl KeyParamsData {
@@ -69,7 +82,11 @@ impl KeyParamsData {
     fn credentials(&self) -> Option<libfreemkv::DriveCredentials> {
         let path = self.cert_keydb.as_ref()?;
         let host_certs = freemkv_keysources::KeydbSource::new(path.as_str()).host_certs();
-        (!host_certs.is_empty()).then_some(libfreemkv::DriveCredentials { host_certs })
+        if host_certs.is_empty() {
+            tracing::warn!(target: "freemkv::engine", "cert keydb {path}: no host certificate read");
+            return None;
+        }
+        Some(libfreemkv::DriveCredentials { host_certs })
     }
 }
 
@@ -204,14 +221,17 @@ pub fn run_with(plan: &Plan, with: RunWith<'_>, sink: &dyn Sink) -> crate::Resul
         .sources
         .clone()
         .unwrap_or_else(|| crate::keys::key_source_factory(&plan.keys.params()));
-    match plan.output() {
-        Output::Titles => title(plan, with, &sources, sink),
-        out => with_run_halt(sink, with.halt.clone(), |halt| match out {
+    with_run_halt(sink, with.halt.clone(), |halt| {
+        let with = RunWith {
+            halt: Some(halt.clone()),
+            ..with
+        };
+        match plan.output() {
+            Output::Titles => title(plan, with, &sources, sink),
             Output::Image { path, null } => image(plan, with, &path, null, &sources, halt, sink),
             Output::Tree { path } => tree(plan, with, &path, &sources, halt, sink),
-            Output::Titles => unreachable!("handled above"),
-        }),
-    }
+        }
+    })
 }
 
 // Run `f` under the run's halt: the front end's own token, or a fresh one. The Sink's
@@ -248,7 +268,7 @@ fn with_run_halt<T>(
     })
 }
 
-// An opened source: the scanned disc, its raw reader, and the drive's device path.
+// An opened source: the scanned disc, its raw reader, and the keys the run acquired.
 struct Opened {
     disc: libfreemkv::Disc,
     reader: Box<dyn libfreemkv::SectorSource>,
@@ -269,9 +289,14 @@ fn open(
         libfreemkv::StreamUrl::Disc { device } => {
             let mut session = open_drive(device, plan, halt)?;
             let device = session.device_path().to_string();
-            let disc = session.take_disc().expect("the scan populated the disc");
+            let disc = session.take_disc().ok_or(libfreemkv::Error::NoStreams)?;
             session.stage_drive_as_reader();
-            let mut reader = session.take_reader().expect("the drive was just staged");
+            let mut reader =
+                session
+                    .take_reader()
+                    .ok_or_else(|| libfreemkv::Error::DeviceNotReady {
+                        path: device.clone(),
+                    })?;
             sink.event(&Event::SourceOpened {
                 device: Some(&device),
                 disc: &disc,
@@ -512,7 +537,7 @@ fn image(
 }
 
 // The disc's decrypted file tree into `path` (every AACS file read through the whole-disc
-// key set), through the `dir://` tree sink.
+// key set), through the `dir://` tree sink. A raw tree is refused: ciphertext belongs in `iso://`.
 fn tree(
     plan: &Plan,
     with: RunWith<'_>,
@@ -521,6 +546,9 @@ fn tree(
     halt: &libfreemkv::Halt,
     sink: &dyn Sink,
 ) -> crate::Result<Report> {
+    if plan.raw {
+        return Err(libfreemkv::Error::DirRawRejected);
+    }
     let scope = libfreemkv::keys::KeyScope::WholeDisc;
     let RunWith { keys, held, .. } = with;
     let mut source = whole_source(plan, held, scope, sources, halt, sink)?;
@@ -593,8 +621,7 @@ fn title(
             })
         }
         Some(Held::Title { reader, title }) => {
-            let mut mux = opts(0, Some(&title.title))?;
-            mux.title_index = 0;
+            let mux = opts(0, Some(&title.title))?;
             let hint = title.title.size_bytes;
             let label = format!("disc title {}", title.title.playlist);
             let source = libfreemkv::Source::from_reader(reader, *title);
@@ -613,12 +640,14 @@ fn title(
             }
             _ => {
                 let idx = title_index(plan, None)?;
-                let mux = opts(idx, None)?;
-                let keys = match keys {
-                    Some(k) => Some(k),
-                    None if !plan.raw => url_keys(plan, idx, sources, &watch)?,
-                    None => None,
+                let need_keys = keys.is_none() && !plan.raw;
+                let need_title = topts.selection.is_none() && !plan.streams.is_all();
+                let (found, scanned) = match need_keys || need_title {
+                    true => url_source(plan, idx, need_keys, sources, &watch)?,
+                    false => (None, None),
                 };
+                let keys = keys.or(found);
+                let mux = opts(idx, scanned.as_ref())?;
                 watch.mux(&plan.source, 0, |ctx| {
                     libfreemkv::mux_url(&plan.source, keys.as_ref(), &plan.dest, &mux, ctx)
                 })
@@ -641,14 +670,13 @@ fn title_off_drive(
     watch: &Watch<'_>,
 ) -> crate::Result<Report> {
     let halt = watch.halt.clone().unwrap_or_default();
-    if watch.sink.should_cancel() {
-        halt.cancel();
-    }
     let mut session = open_drive(device, plan, &halt)?;
     let idx = title_index(plan, session.disc())?;
     let scope = libfreemkv::keys::KeyScope::Titles(vec![idx]);
+    // A raw title reads the ciphertext: no key is acquired.
     let keys = match keys {
-        Some(k) => k,
+        Some(k) => Some(k),
+        None if plan.raw => None,
         None => {
             let walk = std::sync::Mutex::new(libfreemkv::aacs::trace::ResolutionTrace::new());
             let opts = libfreemkv::keys::AcquireOptions {
@@ -664,13 +692,13 @@ fn title_off_drive(
                 trace: &trace,
                 ring: r.as_ref().ok(),
             });
-            r?
+            Some(r?)
         }
     };
     let disc = session.disc().ok_or(libfreemkv::Error::NoStreams)?;
-    libfreemkv::keys::check_decryptable(disc, plan.raw, Some(&keys), &scope)?;
+    libfreemkv::keys::check_decryptable(disc, plan.raw, keys.as_ref(), &scope)?;
     let with = RunWith {
-        keys: Some(keys),
+        keys,
         held: Some(Held::Session(&mut session)),
         title: topts.clone(),
         halt: Some(halt),
@@ -680,41 +708,57 @@ fn title_off_drive(
     title(plan, with, sources, watch.sink)
 }
 
-// The keys a title of a URL source reads with, when the front end holds none: an image or
-// folder's, acquired over the title; a loose clip's, from its disc folder; none for a
-// container or stream.
-fn url_keys(
+// A URL source's keys and scanned title for title `idx`: an image or folder is opened (its
+// keys acquired over the title when `need_keys`); a loose clip's keys come from its disc
+// folder; a container or stream has neither.
+#[allow(clippy::type_complexity)]
+fn url_source(
     plan: &Plan,
     idx: usize,
+    need_keys: bool,
     sources: &libfreemkv::KeySourceFactory,
     watch: &Watch<'_>,
-) -> crate::Result<Option<libfreemkv::keys::KeyRing>> {
+) -> crate::Result<(
+    Option<libfreemkv::keys::KeyRing>,
+    Option<libfreemkv::DiscTitle>,
+)> {
     let halt = watch.halt.clone().unwrap_or_default();
-    let (keys, trace) = match libfreemkv::parse_url(&plan.source) {
+    let (keys, title, trace) = match libfreemkv::parse_url(&plan.source) {
         libfreemkv::StreamUrl::Iso { .. } | libfreemkv::StreamUrl::Dir { .. } => {
             let src = crate::ImageSource::from_url(&plan.source).ok_or_else(|| {
                 libfreemkv::Error::StreamUrlInvalid {
                     url: plan.source.clone(),
                 }
             })?;
+            let scope = match need_keys {
+                true => libfreemkv::keys::KeyScope::Titles(vec![idx]),
+                false => libfreemkv::keys::KeyScope::None,
+            };
             let opts = crate::OpenImageOptions {
-                scope: Some(libfreemkv::keys::KeyScope::Titles(vec![idx])),
+                scope: Some(scope),
                 halt: Some(halt),
                 ..crate::OpenImageOptions::resolve(sources.clone())
             };
             let (opened, trace) = crate::open_image_with_traced(&src, opts);
-            (opened.map(|o| Some(o.keys)), trace)
+            let title = opened
+                .as_ref()
+                .ok()
+                .and_then(|o| o.disc.titles.get(idx).cloned());
+            (opened.map(|o| need_keys.then_some(o.keys)), title, trace)
         }
-        libfreemkv::StreamUrl::M2ts { path } => {
-            crate::keys::resolve_loose_clip(&path, sources, Some(&halt))
+        libfreemkv::StreamUrl::M2ts { path } if need_keys => {
+            let (keys, trace) = crate::keys::resolve_loose_clip(&path, sources, Some(&halt));
+            (keys, None, trace)
         }
-        _ => return Ok(None),
+        _ => return Ok((None, None)),
     };
-    watch.sink.event(&Event::Keys {
-        trace: &trace,
-        ring: keys.as_ref().ok().and_then(Option::as_ref),
-    });
-    keys
+    if need_keys {
+        watch.sink.event(&Event::Keys {
+            trace: &trace,
+            ring: keys.as_ref().ok().and_then(Option::as_ref),
+        });
+    }
+    Ok((keys?, title))
 }
 
 // The one title a title run muxes: `Titles([i])` is title `i`; `MainMovie` the disc's main
@@ -754,11 +798,7 @@ fn selection(
     let title = title.ok_or_else(|| libfreemkv::Error::StreamUrlInvalid {
         url: plan.source.clone(),
     })?;
-    plan.streams
-        .resolve(title)
-        .map_err(|_| libfreemkv::Error::StreamUrlInvalid {
-            url: plan.source.clone(),
-        })
+    plan.streams.resolve(title).map_err(libfreemkv::Error::from)
 }
 
 // A title mux's bridge to the front end: the Sink's progress and cancel, its own token and
@@ -968,5 +1008,84 @@ mod tests {
         )
         .expect_err("several titles");
         assert!(matches!(err, libfreemkv::Error::StreamUrlInvalid { .. }));
+    }
+
+    // Ciphertext belongs in `iso://`: a raw folder tree is refused, never written decrypted.
+    #[test]
+    fn a_raw_tree_plan_is_refused() {
+        let err = run_with(
+            &Plan {
+                raw: true,
+                ..plan("iso:///nowhere.iso", "dir:///o/tree")
+            },
+            with(std::sync::Arc::new(Vec::new)),
+            &crate::NoopSink,
+        )
+        .expect_err("a raw tree");
+        assert!(matches!(err, libfreemkv::Error::DirRawRejected), "{err:?}");
+    }
+
+    // An image's title is scanned for the plan's stream filter: an unknown language is its
+    // own refusal (E9083), not an invalid source URL.
+    #[test]
+    fn a_title_plan_resolves_its_stream_filter_against_the_image() {
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let dir = tempfile::tempdir().unwrap();
+        let src = fx.write(dir.path(), "src.iso");
+        let out = dir.path().join("t1.mkv");
+        let p = Plan {
+            titles: Selection::Titles(vec![1]),
+            streams: StreamChoice {
+                audio: crate::StreamFilter::Langs(vec!["Klingonish".into()]),
+                ..StreamChoice::default()
+            },
+            ..plan(
+                &format!("iso://{}", src.display()),
+                &format!("mkv://{}", out.display()),
+            )
+        };
+        let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+        let err = run_with(&p, with(f), &crate::NoopSink).expect_err("an unknown language");
+        assert!(
+            matches!(err, libfreemkv::Error::StreamLanguageUnknown { .. }),
+            "{err:?}"
+        );
+        assert!(!out.exists(), "nothing is written");
+    }
+
+    // A raw title of an image reads the ciphertext: no key source is asked.
+    #[test]
+    fn a_raw_title_plan_asks_no_key_source() {
+        let fx = bd_image(&[Some(K1), Some(K2)], 2);
+        let dir = tempfile::tempdir().unwrap();
+        let src = fx.write(dir.path(), "src.iso");
+        let out = dir.path().join("raw.mkv");
+        let p = Plan {
+            raw: true,
+            titles: Selection::Titles(vec![1]),
+            ..plan(
+                &format!("iso://{}", src.display()),
+                &format!("mkv://{}", out.display()),
+            )
+        };
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1, K2])], &calls);
+        let _ = run_with(&p, with(f), &crate::NoopSink);
+        assert_eq!(calls.len(), 0, "no key call for a raw title");
+    }
+
+    // The key-service token never reaches a `Debug` rendering of a plan.
+    #[test]
+    fn a_plan_debug_never_prints_the_key_token() {
+        let p = Plan {
+            keys: KeyParamsData {
+                key_auth: Some("s3cret-token".into()),
+                ..KeyParamsData::default()
+            },
+            ..Plan::default()
+        };
+        let shown = format!("{p:?}");
+        assert!(!shown.contains("s3cret-token"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 }
