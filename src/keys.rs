@@ -350,11 +350,11 @@ mod tests {
 
     #[test]
     fn ssrf_rejected_url_is_dropped() {
-        // Metadata / loopback endpoints fail `validate_keyserver_url` and must
+        // Unspecified/class-E endpoints fail `validate_keyserver_url` and must
         // not be added as a source; the keydb (if any) still applies.
         let p = KeyParams {
             keydb_path: Some("keydb.cfg".into()),
-            key_url: Some("http://169.254.169.254/latest/meta-data".into()),
+            key_url: Some("http://0.0.0.0/latest/meta-data".into()),
             key_auth: None,
             online_only: false,
         };
@@ -364,13 +364,13 @@ mod tests {
 
         let p_url_only = KeyParams {
             keydb_path: None,
-            key_url: Some("https://127.0.0.1:8443/keys".into()),
+            key_url: Some("https://240.0.0.1:8443/keys".into()),
             key_auth: None,
             online_only: false,
         };
         assert!(
             key_sources(&p_url_only).is_empty(),
-            "loopback url-only must yield zero sources"
+            "invalid-address url-only must yield zero sources"
         );
     }
 
@@ -462,11 +462,11 @@ mod tests {
         assert!(key_url_rejection(&p).is_none(), "passes without a lookup");
         let labels: Vec<&str> = key_source_factory(&p)().iter().map(|s| s.label()).collect();
         assert_eq!(labels, ["keydb", "online"], "the online source is kept");
-        let loopback = KeyParams {
-            key_url: Some("https://127.0.0.1:8443/keys".into()),
+        let invalid = KeyParams {
+            key_url: Some("https://240.0.0.1:8443/keys".into()),
             ..p
         };
-        let labels: Vec<&str> = key_source_factory(&loopback)()
+        let labels: Vec<&str> = key_source_factory(&invalid)()
             .iter()
             .map(|s| s.label())
             .collect();
@@ -481,7 +481,7 @@ mod tests {
             key_url: Some(u.into()),
             ..Default::default()
         };
-        for bad in ["http://keys.example.test/k", "https://169.254.169.254/k"] {
+        for bad in ["http://keys.example.test/k", "https://240.0.0.1/k"] {
             let rejected = key_url_rejection(&url(bad)).expect(bad);
             assert!(!rejected.is_temporary(), "{bad}");
             assert!(key_sources(&url(bad)).is_empty(), "{bad}");
@@ -497,8 +497,7 @@ mod tests {
     /// without one; the host lookup runs at the first query.
     #[test]
     fn a_factory_build_does_no_dns_lookup() {
-        // `localhost` resolves to loopback, which the DNS-backed check refuses: only a build
-        // that does no lookup keeps it (the address guard refuses it at the first query).
+        // A host name is kept without resolving it; the lookup happens at the first query.
         let resolves_to_loopback = KeyParams {
             key_url: Some("https://localhost/keys".into()),
             ..Default::default()
@@ -509,7 +508,7 @@ mod tests {
             .collect();
         assert_eq!(labels, ["online"], "no lookup at build time");
         let blocked = KeyParams {
-            key_url: Some("https://169.254.169.254/keys".into()),
+            key_url: Some("https://240.0.0.1/keys".into()),
             ..Default::default()
         };
         assert!(
