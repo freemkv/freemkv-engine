@@ -37,6 +37,8 @@ pub use recovery::{
 };
 #[cfg(test)]
 mod ku_image_tests;
+#[cfg(test)]
+mod parity_tests;
 mod remux;
 mod resolve;
 mod run;

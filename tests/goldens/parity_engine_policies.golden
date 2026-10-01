@@ -1,0 +1,52 @@
+loss_aborts(0, 0, 0) = false
+loss_aborts(1, 10, 0) = true
+loss_aborts(0, NaN, 0) = true
+loss_aborts(5, 999, 1) = false
+loss_aborts(5, 1000, 1) = false
+loss_aborts(5, 1001, 1) = true
+loss_aborts(5, NaN, 18446744073709551615) = true
+classify_damage(0, 0) = Clean
+classify_damage(1, 0) = Cosmetic
+classify_damage(50, 0) = Cosmetic
+classify_damage(51, 0) = Moderate
+classify_damage(499, 999) = Moderate
+classify_damage(499, 1000) = Moderate
+classify_damage(499, 29999) = Moderate
+classify_damage(499, 30000) = Serious
+classify_damage(500, 0) = Serious
+classify_damage(7, NaN) = Serious
+plan_passes(0) = PassPlan { multipass: false, sweep_passes: 0, patch_passes: 0, total_passes: 0 }
+plan_passes(1) = PassPlan { multipass: true, sweep_passes: 1, patch_passes: 1, total_passes: 3 }
+plan_passes(2) = PassPlan { multipass: true, sweep_passes: 1, patch_passes: 2, total_passes: 4 }
+plan_passes(255) = PassPlan { multipass: true, sweep_passes: 1, patch_passes: 255, total_passes: 255 }
+effective_abort_secs(true, 60) = 0
+effective_abort_secs(false, 60) = 60
+patch_pass_decision(0, None) = Converged
+patch_pass_decision(10, None) = Continue
+patch_pass_decision(10, Some(0)) = NoProgress
+patch_pass_decision(10, Some(5)) = Continue
+pass_exit(false, false) = Continue
+pass_exit(true, false) = Cancelled
+pass_exit(false, true) = Wedged
+pass_exit(true, true) = Cancelled
+decide_title(Ok, feature=true, multi=false, explicit=false) = Continue
+decide_title(Ok, feature=false, multi=true, explicit=false) = Continue
+decide_title(Ok, feature=false, multi=true, explicit=true) = Continue
+decide_title(DiscLevelNoKey, feature=true, multi=false, explicit=false) = StopNoKey
+decide_title(DiscLevelNoKey, feature=false, multi=true, explicit=false) = StopNoKey
+decide_title(DiscLevelNoKey, feature=false, multi=true, explicit=true) = StopNoKey
+decide_title(SkippableStub, feature=true, multi=false, explicit=false) = StopFatal
+decide_title(SkippableStub, feature=false, multi=true, explicit=false) = Skip
+decide_title(SkippableStub, feature=false, multi=true, explicit=true) = StopFatal
+decide_title(Failed, feature=true, multi=false, explicit=false) = StopFatal
+decide_title(Failed, feature=false, multi=true, explicit=false) = StopFatal
+decide_title(Failed, feature=false, multi=true, explicit=true) = StopFatal
+decide_title(Halted, feature=true, multi=false, explicit=false) = StopHalt
+decide_title(Halted, feature=false, multi=true, explicit=false) = StopHalt
+decide_title(Halted, feature=false, multi=true, explicit=true) = StopHalt
+loop all ok = Ok { titles_written: 3 }
+loop stub skipped = Failed { title_index: 1, code: Some(6009), kind: InvalidData, data: "" }
+loop stub explicit = Failed { title_index: 1, code: Some(6009), kind: InvalidData, data: "" }
+loop feature fails = Failed { title_index: 0, code: Some(7013), kind: PermissionDenied, data: "" }
+loop no key = NoKey
+loop empty = Ok { titles_written: 0 }
