@@ -67,12 +67,32 @@ impl libfreemkv::sector::SectorSource for MockReader {
                 });
             }
         }
-        buf[..n].fill(0xAA);
+        for i in 0..count as usize {
+            buf[i * 2048..(i + 1) * 2048].fill(lba_byte(lba + i as u32));
+        }
         Ok(n)
     }
 
     fn capacity_sectors(&self) -> u32 {
         self.total_sectors
+    }
+}
+
+// Per-LBA fill byte (never 0, so a hole is distinguishable from data).
+fn lba_byte(lba: u32) -> u8 {
+    (lba % 251) as u8 + 1
+}
+
+// Every sector in `lbas` of `img` must hold exactly the reader's pattern for its LBA.
+fn assert_lba_stamped(img: &[u8], lbas: std::ops::Range<u32>) {
+    for lba in lbas {
+        let s = &img[lba as usize * 2048..(lba as usize + 1) * 2048];
+        assert!(
+            s.iter().all(|&b| b == lba_byte(lba)),
+            "sector {lba} does not hold its own data (want {:#04x}, first byte {:#04x})",
+            lba_byte(lba),
+            s[0]
+        );
     }
 }
 
@@ -509,14 +529,10 @@ fn sweep_resume_downgrades_on_zero_iso_with_progress_mapfile() {
         "ISO must be re-sized + fully written, not left zero/holed"
     );
 
-    // The ISO must actually contain the swept data (0xAA) at LBA 0 — proof
-    // the formerly-Finished head range was re-read, not left as a hole.
+    // The ISO must hold the swept data at every LBA — proof the
+    // formerly-Finished head range was re-read, not left as a hole.
     let iso = std::fs::read(&iso_path).unwrap();
-    assert_eq!(
-        &iso[..2048],
-        &[0xAAu8; 2048][..],
-        "head sector must hold re-read data, not a zero hole"
-    );
+    assert_lba_stamped(&iso, 0..sectors);
 }
 
 // A resume against a CORRUPT/unparseable mapfile must DOWNGRADE to a fresh full sweep, not
@@ -971,6 +987,9 @@ fn a_second_copy_pass_clears_the_damage_a_sweep_left() {
     );
     assert_eq!(pr.bytes_unreadable, 0);
     assert_eq!(pr.bytes_good, sectors as u64 * 2048);
+    // The recovered sectors must hold their own data, not the sweep's zero fill.
+    let img = std::fs::read(&iso_path).unwrap();
+    assert_lba_stamped(&img, 0..sectors);
 }
 
 // A patch pass to the `/dev/null` sink shares one mapfile with the prior
@@ -1134,6 +1153,9 @@ fn copy_dispatch_routes_to_sweep_when_nontried_gt_zero() {
          (before fix: terminal returned with bytes_good={}, skipping {} NonTried bytes)",
         half_bytes, half_bytes
     );
+    // The NonTried half must hold the data at its own LBAs.
+    let img = std::fs::read(&iso_path).unwrap();
+    assert_lba_stamped(&img, sectors / 2..sectors);
 }
 
 // `copy()`'s "already complete, don't re-read a finished ISO" shortcut must verify the ISO is
@@ -1220,13 +1242,14 @@ fn resume_against_a_truncated_iso_re_reads_instead_of_leaving_a_hole() {
     // 10..100 were marked Finished but never actually written (zero-fill hole).
     let img = std::fs::read(&iso_path).unwrap();
     assert_eq!(img.len() as u64, disc_size, "ISO must be full length");
-    let first_hole = img.iter().position(|&b| b != 0xAA);
+    let first_hole = img.iter().position(|&b| b == 0);
     assert_eq!(
         first_hole, None,
         "hole at byte {:?}: a Finished range past the truncation point was \
          never re-read, so it stayed zero in an image the mapfile calls good",
         first_hole
     );
+    assert_lba_stamped(&img, 10..sectors);
     assert_eq!(r.bytes_good, disc_size);
 }
 
@@ -1491,10 +1514,12 @@ fn unaligned_mapfile_ranges_never_produce_unaligned_records() {
     );
     // And the payload landed at the SNAPPED offset, not the raw byte offset:
     // a shifted write keeps the record aligned while putting bytes at 205312.
+    // Sector 100 is stamped with its LBA; the neighbours must be untouched.
     let img = std::fs::read(&iso_path).unwrap();
+    assert_lba_stamped(&img, 100..101);
     assert!(
-        img[100 * 2048..101 * 2048].iter().any(|&b| b != 0),
-        "the recovered sector is still all zeros — the write went somewhere else"
+        img[101 * 2048..102 * 2048].iter().all(|&b| b == 0),
+        "sector 101 was written: the payload spilled past the snapped sector"
     );
 }
 

@@ -189,10 +189,14 @@ fn a_skipping_sweep_aborts_on_a_dead_bus() {
     }
 }
 
-// Pass N: a non-read error during recovery must abort the patch with its own
-// code instead of leaving the range NonTrimmed as if it were unreadable.
-#[test]
-fn a_patch_pass_aborts_on_a_non_read_error() {
+// Run a patch pass over a 4-sector NonTrimmed range at FAIL_LBA with `fault` on the read path.
+fn patch_with(
+    fault: fn() -> Error,
+) -> (
+    Result<freemkv_engine::PatchOutcome>,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
     let tmp = tempfile::tempdir().unwrap();
     let iso = tmp.path().join("patch.iso");
     let total = CAPACITY as u64 * SECTOR as u64;
@@ -203,16 +207,63 @@ fn a_patch_pass_aborts_on_a_non_read_error() {
             Mapfile::create(&freemkv_engine::mapfile_path_for(&iso), total, "test").unwrap();
         mf.record(0, total, SectorStatus::Finished).unwrap();
         mf.record(bad.0, bad.1, SectorStatus::NonTrimmed).unwrap();
+        mf.flush().unwrap();
     }
     let mut reader = FaultyReader {
-        fault: Fault::Err(|| Error::DecryptFailed),
+        fault: Fault::Err(fault),
     };
     let popts = PatchOptions::for_patch_pass(false, None, None);
-    let Err(err) = freemkv_engine::patch(&disc(CAPACITY), &mut reader, &iso, &popts) else {
+    let r = freemkv_engine::patch(&disc(CAPACITY), &mut reader, &iso, &popts);
+    (r, iso, tmp)
+}
+
+// The failing sector must stay NonTrimmed: never recorded Unreadable (lost)
+// or Finished (never written), and nothing may be dropped.
+fn assert_fail_sector_still_pending(iso: &std::path::Path) {
+    let map = Mapfile::load(&freemkv_engine::mapfile_path_for(iso)).unwrap();
+    let st = map.stats();
+    assert_eq!(st.bytes_unreadable, 0, "a fault is not an unreadable range");
+    assert_eq!(
+        st.bytes_good + st.bytes_pending,
+        CAPACITY as u64 * SECTOR as u64
+    );
+    let pos = FAIL_LBA as u64 * SECTOR as u64;
+    assert!(
+        map.ranges_with(&[SectorStatus::NonTrimmed])
+            .iter()
+            .any(|&(p, len)| p <= pos && pos < p + len),
+        "the failing sector must remain NonTrimmed"
+    );
+}
+
+// Pass N: a non-read error during recovery must abort the patch with its own
+// code instead of leaving the range NonTrimmed as if it were unreadable.
+#[test]
+fn a_patch_pass_aborts_on_a_non_read_error() {
+    let (r, iso, _t) = patch_with(|| Error::DecryptFailed);
+    let Err(err) = r else {
         panic!("a decrypt refusal must abort the patch pass");
     };
     assert_eq!(err.code(), Error::DecryptFailed.code(), "got {err}");
     assert_ne!(err.code(), E_DISC_READ);
+    assert_fail_sector_still_pending(&iso);
+}
+
+// A dead bus during patch must not mark the range bad either.
+#[test]
+fn a_patch_pass_never_marks_a_dead_bus_unreadable() {
+    let faults: [fn() -> Error; 2] = [
+        || Error::IoError {
+            source: std::io::Error::other("ENODEV"),
+        },
+        || Error::DeviceNotFound {
+            path: "/dev/sr0".into(),
+        },
+    ];
+    for fault in faults {
+        let (_r, iso, _t) = patch_with(fault);
+        assert_fail_sector_still_pending(&iso);
+    }
 }
 
 // A zero-capacity disc (READ CAPACITY swallowed to 0) must be refused before
