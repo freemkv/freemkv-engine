@@ -625,13 +625,11 @@ pub struct MultipassResult {
     /// Playback milliseconds lost in the ripped titles: those
     /// [`Job::selection`] resolves to, summed per title (title 0 for the default `MainMovie`).
     ///
-    /// ALWAYS scoped to those titles' own extents, even on an ISO rip whose
-    /// abort gate counts bytes across the whole disc — an unreadable menu or
-    /// trailer is not lost feature playback, and reporting it as such once
-    /// stamped `Serious` on a movie the drive had read perfectly. A title missing its size or
-    /// duration is timed at an estimated rate ([`title_bytes_per_sec`]). NaN when the loss
-    /// cannot be timed: a damaged title with no extents (the loss is in [`Self::lost_bytes`]),
-    /// a damage record that could not be read, or a run that stopped before the verdict.
+    /// Always scoped to those titles' own extents, even on an ISO rip (an unreadable menu is
+    /// not lost feature playback). A title missing its size or duration is timed at an
+    /// estimated rate ([`title_bytes_per_sec`]). NaN when the loss cannot be timed: a damaged
+    /// title with no extents (see [`Self::lost_bytes`]), an unreadable damage record, or a
+    /// run that stopped before the verdict.
     pub main_lost_ms: f64,
     /// Unreadable bytes the loss verdict counted ([`LossVerdict::lost_bytes`]): the whole
     /// disc for an ISO, the ripped titles' otherwise. The loss when `main_lost_ms` is NaN.
