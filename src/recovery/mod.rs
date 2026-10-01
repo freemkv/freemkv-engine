@@ -887,8 +887,7 @@ impl SweepBar {
             None => (
                 b.bytes_good.saturating_add(good),
                 b.bytes_unreadable,
-                // Damage this pass zero-filled is NonTrimmed: still pending.
-                b.bytes_pending.saturating_sub(good),
+                b.bytes_pending.saturating_sub(done),
                 b.bytes_retryable.saturating_add(done.saturating_sub(good)),
             ),
         };

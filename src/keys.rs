@@ -164,6 +164,11 @@ pub fn resolve_for_rip_traced(
     resolve_traced(disc, reader, scope, sources, seed, halt, None)
 }
 
+// An OS "not found": a folder that is not a disc, never a read failure.
+fn is_not_found(e: &libfreemkv::Error) -> bool {
+    matches!(*e, libfreemkv::Error::IoError { source: ref s } if s.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The keys for a loose Blu-ray clip (`m2ts://`), looked up the only way a loose file allows:
 /// walk up to its disc folder ([`libfreemkv::disc_root_of`]), scan it, and resolve once over
 /// the titles that play the clip (every title when none names it, so an unrelated keyless
@@ -185,13 +190,8 @@ pub fn resolve_loose_clip(
     };
     let (disc, mut reader) = match scanned {
         Ok(d) => d,
-        Err(libfreemkv::Error::IoError { source })
-            if !matches!(source.kind(), std::io::ErrorKind::NotFound) =>
-        {
-            return (
-                Err(libfreemkv::Error::IoError { source }),
-                ResolutionTrace::new(),
-            );
+        Err(e @ libfreemkv::Error::IoError { .. }) if !is_not_found(&e) => {
+            return (Err(e), ResolutionTrace::new());
         }
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
