@@ -232,10 +232,7 @@ mod tests {
         let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
         let err = extract_tree_with(&disc, &mut reader, &out_dir, false, None, &NoopSink)
             .expect_err("a non-empty destination without force");
-        assert!(
-            matches!(err, libfreemkv::Error::DirNotEmpty { .. }),
-            "{err:?}"
-        );
+        assert!(matches!(err, libfreemkv::Error::DirNotEmpty), "{err:?}");
         let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
         extract_tree_with(&disc, &mut reader, &out_dir, true, None, &NoopSink).expect("forced");
         assert_eq!(std::fs::read(out_dir.join("HELLO.TXT")).unwrap(), contents);
