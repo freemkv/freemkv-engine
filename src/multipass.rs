@@ -2949,8 +2949,7 @@ mod tests {
             sink.logs.lock().unwrap()
         );
         let cause = Mapfile::load(&mapfile)
-            .err()
-            .expect("still unreadable")
+            .expect_err("still unreadable")
             .to_string();
         assert!(
             sink.logged(Level::Error, &cause),

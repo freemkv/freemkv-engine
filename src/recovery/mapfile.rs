@@ -2603,8 +2603,7 @@ mod tests {
              0x000000080  0x00000100    -\n";
         std::fs::write(&p, corrupt).unwrap();
         let err = Mapfile::open_or_create(&p, 0x100, "test")
-            .err()
-            .expect("a corrupt mapfile is an error, not a reason to start over");
+            .expect_err("a corrupt mapfile is an error, not a reason to start over");
         assert_ne!(
             err.kind(),
             io::ErrorKind::NotFound,
