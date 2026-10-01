@@ -2362,16 +2362,13 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
                 .wrapping_mul(7)
                 .wrapping_add((i as u8).wrapping_mul(31));
         }
-        // Scrambled DVD sectors are MPEG-2 PS packs; descramble policy requires
-        // the pack start code plus the flag bits — byte 0x14 alone isn't
-        // sufficient to authorise descrambling in an IFO or UDF sector.
+        // A DVD-Video pack: pack header (no stuffing), a video PES at 0x0E whose MPEG-2
+        // flags byte (0x14) carries the CSS scramble bits 4-5; 0x14 alone is no evidence.
         s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         s[4] = 0x44; // '01': a 13818-1 pack (an 11172-1 pack cannot be CSS)
-        // Bits 4-5 of the sub-header byte are the CSS scramble flag.
-        s[0x14] &= !0x30;
-        if scrambled {
-            s[0x14] |= 0x30;
-        }
+        s[0x0D] = 0xF8;
+        s[0x0E..0x12].copy_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+        s[0x14] = if scrambled { 0xB0 } else { 0x80 };
         s
     }
 

@@ -116,6 +116,28 @@ impl Fx {
         p
     }
 
+    /// The image as a disc folder under `root` (`AACS/` + `BDMV/`); returns clip 0's path.
+    pub(crate) fn write_folder(&self, root: &Path) -> PathBuf {
+        let n = self.disc.titles.len();
+        let mut names = vec!["BDMV/index.bdmv".to_string()];
+        for (dir, ext) in [
+            ("PLAYLIST", "mpls"),
+            ("CLIPINF", "clpi"),
+            ("STREAM", "m2ts"),
+        ] {
+            names.extend((0..n).map(|i| format!("BDMV/{dir}/{i:05}.{ext}")));
+        }
+        let uk_ro = ("AACS/Unit_Key_RO.inf".to_string(), uk_ro_extent(&self.img));
+        let files = names.into_iter().zip(self.img.files.iter().copied());
+        for (rel, (start, sectors)) in files.chain([uk_ro]) {
+            let (a, len) = (start as usize * 2048, sectors as usize * 2048);
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, &self.img.image[a..a + len]).unwrap();
+        }
+        root.join("BDMV/STREAM/00000.m2ts")
+    }
+
     /// `(start, sectors)` of stream file `i` (clip `i`).
     pub(crate) fn clip(&self, i: usize) -> (u32, u32) {
         self.img.files[self.img.files.len() - self.disc.titles.len() + i]

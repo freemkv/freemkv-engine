@@ -178,17 +178,20 @@ pub fn resolve_loose_clip(
         return (Ok(None), ResolutionTrace::new());
     };
     // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
-    // refuses E7022 in `input()`.
-    let (disc, mut reader) = match crate::image::scan_image(&crate::ImageSource::Dir(root)) {
+    // refuses E7022 in `input()`. `dir://` refuses an encrypted folder (E9063), which is
+    // exactly the folder whose keys a clip needs, so that verdict scans it as is.
+    let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
+        Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
+        Err(libfreemkv::Error::DirImageEncrypted) => encrypted_folder(&root),
+        r => r,
+    };
+    let (disc, mut reader) = match scanned {
         Ok(d) => d,
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
             return (Ok(None), ResolutionTrace::new());
         }
     };
-    if disc.aacs.is_none() {
-        return (Ok(None), ResolutionTrace::new());
-    }
     let stem = clip
         .file_stem()
         .and_then(|s| s.to_str())
@@ -204,6 +207,16 @@ pub fn resolve_loose_clip(
     let scope = KeyScope::Titles(titles);
     let (set, trace) = resolve_traced(&disc, reader.as_mut(), scope, sources, None, halt, None);
     (set.map(Some), trace)
+}
+
+// An encrypted disc folder scanned with its AACS verdict kept (`scan_dir` refuses it).
+fn encrypted_folder(
+    root: &std::path::Path,
+) -> crate::Result<(libfreemkv::Disc, Box<dyn libfreemkv::SectorSource>)> {
+    let mut reader = libfreemkv::DirImage::open(root)?;
+    let cap = libfreemkv::SectorSource::capacity_sectors(&reader);
+    let disc = libfreemkv::Disc::scan_image(&mut reader, cap, &libfreemkv::ScanOptions::default())?;
+    Ok((disc, Box::new(reader)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -554,6 +567,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(set.unwrap().is_none());
         assert_eq!(calls.len(), 0);
+    }
+
+    /// 1.8.0: a clip in an encrypted disc folder (which `dir://` refuses, E9063) gets the
+    /// folder's keys; a decrypted folder that kept `AACS/` asks nothing.
+    #[test]
+    fn a_loose_clip_gets_its_encrypted_disc_folder_keys() {
+        let dir = std::env::temp_dir().join(format!("fe-loose-enc-{}", std::process::id()));
+        let enc = bd_image(&[Some(K1)], 1).write_folder(&dir.join("enc"));
+        let clear = bd_image(&[None], 1).write_folder(&dir.join("clear"));
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+        let (clear_set, _) = resolve_loose_clip(&clear, &f, None);
+        let asked_for_clear = calls.len();
+        let (set, _) = resolve_loose_clip(&enc, &f, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(clear_set.unwrap().is_none());
+        assert_eq!(asked_for_clear, 0);
+        assert!(set.unwrap().is_some_and(|s| s.is_aacs()));
+        assert!(calls.len() > 0);
     }
 
     /// KU §2.3 step 13: Stop before the resolve builds no set and asks nothing.
