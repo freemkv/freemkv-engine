@@ -334,11 +334,17 @@ pub fn mux_title(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let input = libfreemkv::MuxSource::Url {
-        url: source_url,
-        opts: input_opts,
+    let opts = libfreemkv::MuxOptions {
+        title_index: input_opts.title_index.unwrap_or(0),
+        raw: input_opts.raw,
+        selection: input_opts.selection,
+        ..mux_opts.clone()
     };
-    mux_with_input(input, source_url, dest, mux_opts, total_bytes_hint, sink)
+    let keys = input_opts.keys;
+    with_mux_watcher(sink, dest, |ctx| {
+        log_mux_start(sink, source_url, dest, total_bytes_hint);
+        libfreemkv::mux_url(source_url, keys.as_ref(), dest, &opts, ctx)
+    })
 }
 
 /// Mux a single title live off an opened, scanned, key-resolved
@@ -356,11 +362,12 @@ pub fn mux_title_session(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let source_label = format!("disc title {}", title_index + 1);
-    let input = libfreemkv::MuxSource::Session {
-        session,
+    let opts = libfreemkv::MuxOptions {
         title_index,
+        ..mux_opts.clone()
     };
-    mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
+    let input = libfreemkv::Source::from_session(session);
+    mux_with_input(input, &source_label, dest, &opts, total_bytes_hint, sink)
 }
 
 /// Mux `title` (already scanned: the drive's, or the image's own) out of the ISO at `path`
@@ -368,25 +375,20 @@ pub fn mux_title_session(
 /// area of a staged ISO does not matter. `mux_opts.selection` picks the streams.
 pub(crate) fn mux_iso_title(
     path: &std::path::Path,
-    title: libfreemkv::DiscTitle,
-    format: libfreemkv::ContentFormat,
+    title: libfreemkv::ScannedTitle,
     keys: &libfreemkv::keys::KeyRing,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let hint = title.size_bytes;
+    let hint = title.title.size_bytes;
     with_mux_watcher(sink, dest, |ctx| {
-        let line = iso_mux_line(path, &title.playlist);
+        let line = iso_mux_line(path, &title.title.playlist);
         sink.log(
             Level::Info,
             &format!("{line} -> {dest} (~{})", human_bytes(hint)),
         );
-        let source = libfreemkv::MuxSource::Iso {
-            path,
-            title,
-            format,
-        };
+        let source = libfreemkv::Source::from_image(path, title);
         libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, ctx)
     })
 }
@@ -400,7 +402,7 @@ fn iso_mux_line(path: &std::path::Path, playlist: &str) -> String {
 // `mux_with_keys` for an already-built `MuxSource`, bridging progress and cancel
 // onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
 fn mux_with_input(
-    input: libfreemkv::MuxSource<'_>,
+    input: libfreemkv::Source<'_>,
     source_label: &str,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
@@ -408,16 +410,21 @@ fn mux_with_input(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     with_mux_watcher(sink, dest, |ctx| {
-        sink.log(
-            Level::Info,
-            &format!(
-                "mux: {source_label} -> {dest} (~{})",
-                human_bytes(total_bytes_hint)
-            ),
-        );
-        // No set: a Url carries its own `InputOptions.keys`; a Session needs none (CSS, clear).
+        log_mux_start(sink, source_label, dest, total_bytes_hint);
+        // A Session needs no set (CSS, clear); an AACS title rip passes its set by URL.
         libfreemkv::mux_with_keys(input, None, dest, mux_opts, ctx)
     })
+}
+
+// The "mux: <source> -> <dest> (~size)" line every mux opens with.
+fn log_mux_start(sink: &dyn Sink, source_label: &str, dest: &str, total_bytes_hint: u64) {
+    sink.log(
+        Level::Info,
+        &format!(
+            "mux: {source_label} -> {dest} (~{})",
+            human_bytes(total_bytes_hint)
+        ),
+    );
 }
 
 // The Sink↔libfreemkv bridge every mux runs inside, lifted out of `mux_with_input` so it's

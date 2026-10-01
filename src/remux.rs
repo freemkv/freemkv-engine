@@ -33,6 +33,7 @@ pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
         raw,
         // Per title from `MuxPlan::streams` (an `iso://` title) or `InputOptions` (`dir://`).
         selection: libfreemkv::StreamSelection::default(),
+        title_index: 0,
     }
 }
 
@@ -184,13 +185,16 @@ fn mux_opened_title(
     match &opened.source {
         ImageSource::Iso(path) => {
             let opts = libfreemkv::MuxOptions {
-                skip_errors: mux.skip_errors,
-                batch_sectors: mux.batch_sectors,
-                raw: mux.raw,
                 selection,
+                ..mux.clone()
             };
-            let format = opened.disc.content_format;
-            mux_iso_title(path, title.clone(), format, keys, dest, &opts, sink)
+            let scanned = libfreemkv::ScannedTitle::of(&opened.disc, idx).ok_or(
+                libfreemkv::Error::DiscTitleRange {
+                    index: idx,
+                    count: opened.disc.titles.len(),
+                },
+            )?;
+            mux_iso_title(path, scanned, keys, dest, &opts, sink)
         }
         ImageSource::Dir(_) => {
             utf8_source(&opened.source)?;
