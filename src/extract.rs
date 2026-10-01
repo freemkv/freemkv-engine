@@ -35,19 +35,15 @@ pub fn extract_tree_with(
     reader: &mut dyn libfreemkv::SectorSource,
     dest: &Path,
     force: bool,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
     sink: &dyn Sink,
 ) -> crate::Result<libfreemkv::ExtractResult> {
     // One should_cancel → halt bridge for the whole engine (see `with_cancel_watcher`), so
     // cancelling even a small extraction is deterministic. Both shells poll the result.
     crate::run::with_cancel_watcher(sink, |halt| {
-        let opts = libfreemkv::ExtractOptions {
-            force,
-            progress: None,
-            halt: Some(libfreemkv::Halt::from_arc(halt.clone())),
-            keys,
-        };
-        disc.extract_tree(reader, dest, &opts)
+        let opts = libfreemkv::ExtractOptions { force, keys };
+        let ctx = crate::run::ctx(&libfreemkv::Halt::from_arc(halt.clone()));
+        disc.extract_tree(reader, dest, &opts, &ctx)
     })
 }
 

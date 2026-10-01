@@ -1,0 +1,9 @@
+multi-decrypt-job result = unreadable=0 pending=0 good=8546304 lost_ms=0.0 severity=Clean passes=1 aborted=false halted=false wedged=false complete=true
+multi-decrypt-job iso = 8546304 bytes sha256:2dabcc8e1d6c460a8e11adbce81bc74b
+multi-raw-mkv result = unreadable=0 pending=0 good=8546304 lost_ms=0.0 severity=Clean passes=1 aborted=false halted=false wedged=false complete=true
+multi-raw-mkv iso = 8546304 bytes sha256:298df513a14ddc658df9c00f07c48f05
+multi-raw-iso result = unreadable=0 pending=0 good=8546304 lost_ms=0.0 severity=Clean passes=1 aborted=false halted=false wedged=false complete=true
+multi-raw-iso iso = 8546304 bytes sha256:298df513a14ddc658df9c00f07c48f05
+single-decrypt result = unreadable=0 pending=0 good=8546304 lost_ms=0.0 severity=Clean passes=1 aborted=false halted=false wedged=false complete=true
+single-decrypt iso = 8546304 bytes sha256:2dabcc8e1d6c460a8e11adbce81bc74b
+single-dead-range refused = E6000

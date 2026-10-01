@@ -19,11 +19,9 @@ pub mod keys;
 mod multipass;
 mod mux;
 mod outcome;
+mod plan;
 mod preflight;
-// Relocated recovery strategy (sweep/patch/mapfile/read_error/section_recover).
-// Some faithfully-relocated internals have no in-crate caller yet — allow
-// dead_code here rather than diverge from the byte-faithful move.
-#[allow(dead_code)]
+// The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 
 // Recovery primitives (relocated from libfreemkv). `multipass_rip` drives
@@ -37,6 +35,8 @@ pub use recovery::{
 };
 #[cfg(test)]
 mod ku_image_tests;
+#[cfg(test)]
+mod parity_tests;
 mod remux;
 mod resolve;
 mod run;
@@ -55,7 +55,7 @@ pub use image::{
     open_image_with_traced, parse_error_code, scan_image,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
-pub use keys::{KeyParams, key_source_factory, key_sources, won_source};
+pub use keys::{KeyParams, key_source_factory, key_sources, resolve_loose_clip, won_source};
 pub use multipass::{
     MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
     abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
@@ -68,6 +68,7 @@ pub use mux::{
     mux_title_session, open_scan, open_scan_with, resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
+pub use plan::{KeyParamsData, Output, Plan, Report, run, run_with};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
     MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,

@@ -18,7 +18,7 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     reader: &'r mut dyn SectorSource,
     decrypt: bool,
     halt: Option<&libfreemkv::halt::Halt>,
-    keys: Option<&libfreemkv::keys::ResolvedKeySet>,
+    keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> Result<WholeDiscReader<'r>> {
     if !decrypt {
         return Ok(libfreemkv::whole_disc::raw_whole_disc_reader(reader));
@@ -27,6 +27,6 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
         Some(set) => set.whole_disc_reader(disc, reader, halt),
         // No halt: like the pre-KU-X2 reader, a stop is the pass's to observe (it ends halted,
         // not Err(Halted) at construction); the empty set's non-AACS arm reads it nowhere else.
-        None => libfreemkv::keys::ResolvedKeySet::none().whole_disc_reader(disc, reader, None),
+        None => libfreemkv::keys::KeyRing::none().whole_disc_reader(disc, reader, None),
     }
 }

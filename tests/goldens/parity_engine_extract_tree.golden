@@ -1,0 +1,25 @@
+one-key whole-disc resolve = KeySetStatus { proven: 1, declared: Some(2), keyed: 1, clear: 0, lazy: 1, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
+keyed result = good=129024 unreadable=24576 complete=false halted=false files=7
+keyed BDMV/CLIPINF/00000.clpi = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+keyed BDMV/CLIPINF/00001.clpi = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+keyed BDMV/PLAYLIST/00000.mpls = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+keyed BDMV/PLAYLIST/00001.mpls = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+keyed BDMV/STREAM/00000.m2ts = 61440 bytes sha256:95d8f566f5f40e03ccf69fd863b4bd88
+keyed BDMV/STREAM/00001.m2ts = 61440 bytes sha256:95d8f566f5f40e03ccf69fd863b4bd88
+keyed BDMV/index.bdmv = 6144 bytes sha256:3a25ec8e4276a359fbd2da7b70b74436
+no-set result = good=153600 unreadable=0 complete=true halted=false files=7
+no-set BDMV/CLIPINF/00000.clpi = 6144 bytes sha256:67d55e7fa83aad726c96b991fba41f30
+no-set BDMV/CLIPINF/00001.clpi = 6144 bytes sha256:9ce174343681ae36185784ec9eedc3c6
+no-set BDMV/PLAYLIST/00000.mpls = 6144 bytes sha256:21a56ecb575ed790c727defea6a87b84
+no-set BDMV/PLAYLIST/00001.mpls = 6144 bytes sha256:ab62a5575f003227b859984a4826de7b
+no-set BDMV/STREAM/00000.m2ts = 61440 bytes sha256:3b6ee1ecb9e3cebe582147703404af84
+no-set BDMV/STREAM/00001.m2ts = 61440 bytes sha256:2e4b12075a0b1331bab9a50d6225487f
+no-set BDMV/index.bdmv = 6144 bytes sha256:3a25ec8e4276a359fbd2da7b70b74436
+one-key result = good=67584 unreadable=86016 complete=false halted=false files=7
+one-key BDMV/CLIPINF/00000.clpi = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+one-key BDMV/CLIPINF/00001.clpi = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+one-key BDMV/PLAYLIST/00000.mpls = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+one-key BDMV/PLAYLIST/00001.mpls = 6144 bytes sha256:fd9243e1ba57263ed469c3bdbd7ade6e
+one-key BDMV/STREAM/00000.m2ts = 61440 bytes sha256:95d8f566f5f40e03ccf69fd863b4bd88
+one-key BDMV/STREAM/00001.m2ts = 61440 bytes sha256:0693f6bfa2117a9b14f9ceca13d3a561
+one-key BDMV/index.bdmv = 6144 bytes sha256:3a25ec8e4276a359fbd2da7b70b74436

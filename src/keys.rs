@@ -3,13 +3,13 @@
 //! Both the CLI and the desktop UI build the SAME local-first ordered
 //! [`freemkv_keysources::KeySource`] list ([`key_source_factory`]) and resolve a rip's keys
 //! through ONE call, [`resolve_for_rip`], before any output (keys-upfront design, KU §2.1):
-//! the resulting [`ResolvedKeySet`] lives in memory only and is handed to every pass and
+//! the resulting [`KeyRing`] lives in memory only and is handed to every pass and
 //! mux of the rip, which never ask a source again.
 //!
 //! [`KeyParams`] is a thin, already-resolved shape, never re-interpreted here.
 
 use libfreemkv::aacs::trace::ResolutionTrace;
-use libfreemkv::keys::{DecryptStatus, KeyScope, ResolveKeysOptions, ResolvedKeySet};
+use libfreemkv::keys::{AcquireOptions, DecryptStatus, KeyRing, KeyScope};
 
 /// Already-resolved key configuration, boundary-normalized by the calling
 /// shell. Each field's doc says what it means and does NOT mean.
@@ -129,9 +129,9 @@ pub fn resolve_for_rip(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-) -> crate::Result<ResolvedKeySet> {
+) -> crate::Result<KeyRing> {
     resolve_for_rip_traced(disc, reader, scope, sources, seed, halt).0
 }
 
@@ -143,10 +143,10 @@ pub fn resolve_for_rip_observed(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-    progress: &libfreemkv::halt::Progress,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+    progress: &libfreemkv::halt::Liveness,
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     resolve_traced(disc, reader, scope, sources, seed, halt, Some(progress))
 }
 
@@ -158,10 +158,53 @@ pub fn resolve_for_rip_traced(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     resolve_traced(disc, reader, scope, sources, seed, halt, None)
+}
+
+/// The keys for a loose Blu-ray clip (`m2ts://`), looked up the only way a loose file allows:
+/// walk up to its disc folder ([`libfreemkv::disc_root_of`]), scan it, and resolve once over
+/// the titles that play the clip (every title when none names it, so an unrelated keyless
+/// title can then refuse it). `Ok(None)`: no readable disc
+/// structure or no AACS, so the clip reads keyless and an encrypted one refuses (E7022).
+pub fn resolve_loose_clip(
+    clip: &std::path::Path,
+    sources: &libfreemkv::KeySourceFactory,
+    halt: Option<&libfreemkv::Halt>,
+) -> (crate::Result<Option<KeyRing>>, ResolutionTrace) {
+    let Some(root) = libfreemkv::disc_root_of(clip) else {
+        return (Ok(None), ResolutionTrace::new());
+    };
+    // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
+    // refuses E7022 in `input()`.
+    let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
+        Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
+        r => r,
+    };
+    let (disc, mut reader) = match scanned {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
+            return (Ok(None), ResolutionTrace::new());
+        }
+    };
+    let stem = clip
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let plays =
+        |t: &libfreemkv::DiscTitle| t.clips.iter().any(|c| c.clip_id.eq_ignore_ascii_case(stem));
+    let mut titles: Vec<usize> = (0..disc.titles.len())
+        .filter(|&i| plays(&disc.titles[i]))
+        .collect();
+    if titles.is_empty() {
+        titles = (0..disc.titles.len()).collect();
+    }
+    let scope = KeyScope::Titles(titles);
+    let (set, trace) = resolve_traced(&disc, reader.as_mut(), scope, sources, None, halt, None);
+    (set.map(Some), trace)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -170,24 +213,21 @@ fn resolve_traced(
     reader: &mut dyn libfreemkv::SectorSource,
     scope: KeyScope,
     sources: &libfreemkv::KeySourceFactory,
-    seed: Option<&ResolvedKeySet>,
+    seed: Option<&KeyRing>,
     halt: Option<&libfreemkv::Halt>,
-    progress: Option<&libfreemkv::halt::Progress>,
-) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
+    progress: Option<&libfreemkv::halt::Liveness>,
+) -> (crate::Result<KeyRing>, ResolutionTrace) {
     let scope_log = format!("{scope:?}");
     let walk = std::sync::Mutex::new(ResolutionTrace::new());
-    let opts = ResolveKeysOptions {
-        halt,
+    let req = Acquire {
         seed,
         vid: None,
-        vid_would_help: None,
-        trace: Some(&walk),
+        halt,
+        progress,
     };
-    let r = match progress {
-        Some(p) => ResolvedKeySet::resolve_with_progress(disc, reader, scope, sources, opts, p),
-        None => ResolvedKeySet::resolve(disc, reader, scope, sources, opts),
-    }
-    .map(|r| r.keys);
+    let r = acquire(disc, reader, &scope, sources, req, &walk)
+        .map(|r| r.keys)
+        .map_err(|(e, _)| e);
     let walk = walk.into_inner().unwrap_or_else(|e| e.into_inner());
     match &r {
         Ok(keys) => log_status(keys, &scope_log),
@@ -202,8 +242,41 @@ fn resolve_traced(
     (r, walk)
 }
 
+// What one acquisition is asked with, beyond the disc and its scope.
+#[derive(Default)]
+pub(crate) struct Acquire<'a> {
+    pub(crate) seed: Option<&'a KeyRing>,
+    pub(crate) vid: Option<[u8; 16]>,
+    pub(crate) halt: Option<&'a libfreemkv::Halt>,
+    pub(crate) progress: Option<&'a libfreemkv::halt::Liveness>,
+}
+
+// The engine's one key acquisition (drive and image rips alike): evidence from the scanned
+// disc over its raw reader, then `KeyRing::acquire`. `Err` carries whether a VID would
+// have helped (KU J23).
+pub(crate) fn acquire(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    scope: &KeyScope,
+    sources: &libfreemkv::KeySourceFactory,
+    req: Acquire<'_>,
+    walk: &std::sync::Mutex<ResolutionTrace>,
+) -> Result<libfreemkv::keys::KeyResolution, (libfreemkv::Error, bool)> {
+    let help = std::sync::atomic::AtomicBool::new(false);
+    let opts = AcquireOptions {
+        seed: req.seed,
+        vid: req.vid,
+        vid_would_help: Some(&help),
+        trace: Some(walk),
+        liveness: req.progress,
+    };
+    let ctx = libfreemkv::Ctx::new(req.halt.cloned().unwrap_or_default());
+    KeyRing::acquire_for_disc(disc, reader, scope.clone(), sources, opts, &ctx)
+        .map_err(|e| (e, help.load(std::sync::atomic::Ordering::SeqCst)))
+}
+
 // The qa key log line (KU §7.6): counts only, never a key or the VID.
-pub(crate) fn log_status(keys: &ResolvedKeySet, scope: &str) {
+pub(crate) fn log_status(keys: &KeyRing, scope: &str) {
     let st = keys.status();
     tracing::info!(
         target: "freemkv::keys",
@@ -220,7 +293,7 @@ pub(crate) fn log_status(keys: &ResolvedKeySet, scope: &str) {
 
 /// Whether `disc` can be decrypted from the rip's `set` (KU §12.2: `Ready`, Missing as
 /// `AacsKeysMissing`, `ForensicPending`); CSS and clear discs as the library reads them.
-pub fn key_status(disc: &libfreemkv::Disc, set: &ResolvedKeySet) -> DecryptStatus {
+pub fn key_status(disc: &libfreemkv::Disc, set: &KeyRing) -> DecryptStatus {
     libfreemkv::keys::decrypt_status(disc, Some(set))
 }
 
@@ -295,11 +368,11 @@ mod tests {
 
     #[test]
     fn ssrf_rejected_url_is_dropped() {
-        // Metadata / loopback endpoints fail `validate_keyserver_url` and must
+        // Unspecified/class-E endpoints fail `validate_keyserver_url` and must
         // not be added as a source; the keydb (if any) still applies.
         let p = KeyParams {
             keydb_path: Some("keydb.cfg".into()),
-            key_url: Some("http://169.254.169.254/latest/meta-data".into()),
+            key_url: Some("http://0.0.0.0/latest/meta-data".into()),
             key_auth: None,
             online_only: false,
         };
@@ -309,13 +382,13 @@ mod tests {
 
         let p_url_only = KeyParams {
             keydb_path: None,
-            key_url: Some("https://127.0.0.1:8443/keys".into()),
+            key_url: Some("https://240.0.0.1:8443/keys".into()),
             key_auth: None,
             online_only: false,
         };
         assert!(
             key_sources(&p_url_only).is_empty(),
-            "loopback url-only must yield zero sources"
+            "invalid-address url-only must yield zero sources"
         );
     }
 
@@ -365,7 +438,7 @@ mod tests {
     // ── KU-E1: the front door (KU §3.2) ─────────────────────────────────────
 
     use crate::test_fixtures::{Answer, Calls, K1, K2, bd_image, factory};
-    use libfreemkv::keys::{DecryptStatus, KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{DecryptStatus, KeyRing, KeyScope};
 
     /// EK5 (KU §2.5): MKV/M2TS/MP4/… → `Titles(selected)`, a plain rip `Titles([main])`;
     /// decrypted ISO or folder → `WholeDisc`; raw copy → `None` (no key call).
@@ -407,11 +480,11 @@ mod tests {
         assert!(key_url_rejection(&p).is_none(), "passes without a lookup");
         let labels: Vec<&str> = key_source_factory(&p)().iter().map(|s| s.label()).collect();
         assert_eq!(labels, ["keydb", "online"], "the online source is kept");
-        let loopback = KeyParams {
-            key_url: Some("https://127.0.0.1:8443/keys".into()),
+        let invalid = KeyParams {
+            key_url: Some("https://240.0.0.1:8443/keys".into()),
             ..p
         };
-        let labels: Vec<&str> = key_source_factory(&loopback)()
+        let labels: Vec<&str> = key_source_factory(&invalid)()
             .iter()
             .map(|s| s.label())
             .collect();
@@ -426,7 +499,7 @@ mod tests {
             key_url: Some(u.into()),
             ..Default::default()
         };
-        for bad in ["http://keys.example.test/k", "https://169.254.169.254/k"] {
+        for bad in ["http://keys.example.test/k", "https://240.0.0.1/k"] {
             let rejected = key_url_rejection(&url(bad)).expect(bad);
             assert!(!rejected.is_temporary(), "{bad}");
             assert!(key_sources(&url(bad)).is_empty(), "{bad}");
@@ -442,8 +515,7 @@ mod tests {
     /// without one; the host lookup runs at the first query.
     #[test]
     fn a_factory_build_does_no_dns_lookup() {
-        // `localhost` resolves to loopback, which the DNS-backed check refuses: only a build
-        // that does no lookup keeps it (the address guard refuses it at the first query).
+        // A host name is kept without resolving it; the lookup happens at the first query.
         let resolves_to_loopback = KeyParams {
             key_url: Some("https://localhost/keys".into()),
             ..Default::default()
@@ -454,7 +526,7 @@ mod tests {
             .collect();
         assert_eq!(labels, ["online"], "no lookup at build time");
         let blocked = KeyParams {
-            key_url: Some("https://169.254.169.254/keys".into()),
+            key_url: Some("https://240.0.0.1/keys".into()),
             ..Default::default()
         };
         assert!(
@@ -498,6 +570,41 @@ mod tests {
         assert!(set.status().proven == 0);
     }
 
+    /// 1.8.0: a loose clip outside any disc folder has nowhere to look keys up: no set, no
+    /// source asked (an encrypted clip then refuses E7022 in `input()`).
+    #[test]
+    fn a_loose_clip_with_no_disc_folder_asks_nothing() {
+        let dir = std::env::temp_dir().join(format!("fe-loose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("00001.m2ts");
+        std::fs::write(&clip, b"").unwrap();
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+        let (set, _) = resolve_loose_clip(&clip, &f, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(set.unwrap().is_none());
+        assert_eq!(calls.len(), 0);
+    }
+
+    /// 1.8.0: a clip in an encrypted disc folder (which `dir://` refuses, E9063) gets the
+    /// folder's keys; a decrypted folder that kept `AACS/` asks nothing.
+    #[test]
+    fn a_loose_clip_gets_its_encrypted_disc_folder_keys() {
+        let dir = std::env::temp_dir().join(format!("fe-loose-enc-{}", std::process::id()));
+        let enc = bd_image(&[Some(K1)], 1).write_folder(&dir.join("enc"));
+        let clear = bd_image(&[None], 1).write_folder(&dir.join("clear"));
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+        let (clear_set, _) = resolve_loose_clip(&clear, &f, None);
+        let asked_for_clear = calls.len();
+        let (set, _) = resolve_loose_clip(&enc, &f, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(clear_set.unwrap().is_none());
+        assert_eq!(asked_for_clear, 0);
+        assert!(set.unwrap().is_some_and(|s| s.is_aacs()));
+        assert!(calls.len() > 0);
+    }
+
     /// KU §2.3 step 13: Stop before the resolve builds no set and asks nothing.
     #[test]
     fn resolve_for_rip_honours_halt() {
@@ -539,7 +646,7 @@ mod tests {
         let fx = bd_image(&[Some(K1)], 1);
         let f: libfreemkv::KeySourceFactory =
             std::sync::Arc::new(|| vec![Box::new(Trickle) as Box<dyn libfreemkv::KeySource>]);
-        let progress = libfreemkv::halt::Progress::new();
+        let progress = libfreemkv::halt::Liveness::new();
         let (_, _) = resolve_for_rip_observed(
             &fx.disc,
             &mut fx.source(),
@@ -575,14 +682,14 @@ mod tests {
     fn key_status_reads_the_set() {
         let fx = bd_image(&[Some(K1)], 1);
         assert!(matches!(
-            key_status(&fx.disc, &ResolvedKeySet::none()),
+            key_status(&fx.disc, &KeyRing::none()),
             DecryptStatus::AacsKeysMissing(_)
         ));
         let mut clear = bd_image(&[None], 1).disc;
         clear.aacs = None;
         clear.encrypted = false;
         assert!(matches!(
-            key_status(&clear, &ResolvedKeySet::none()),
+            key_status(&clear, &KeyRing::none()),
             DecryptStatus::NotEncrypted
         ));
     }

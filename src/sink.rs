@@ -83,6 +83,21 @@ pub enum Event<'a> {
         dest: &'a str,
         title: &'a libfreemkv::DiscTitle,
     },
+    /// [`crate::run()`] opened and scanned its source: the drive's device path (`None` for
+    /// an image or folder) and the disc.
+    SourceOpened {
+        device: Option<&'a str>,
+        disc: &'a libfreemkv::Disc,
+    },
+    /// [`crate::run()`]'s key acquisition ended: the per-source walk, and the ring (`None`
+    /// when it refused; the refusal is the run's error).
+    Keys {
+        trace: &'a libfreemkv::aacs::trace::ResolutionTrace,
+        ring: Option<&'a libfreemkv::keys::KeyRing>,
+    },
+    /// A recovery pass's raw progress (damage, retries), beside the derived
+    /// [`Progress`] the engine computes from it.
+    Pass(&'a libfreemkv::progress::PassProgress),
 }
 
 /// The engine→front-end seam. One trait, implemented once per front-end.

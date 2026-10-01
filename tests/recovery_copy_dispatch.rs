@@ -1326,11 +1326,13 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         }
     }
 
-    // A reporter that cancels on the very first tick.
-    struct CancelNow;
-    impl libfreemkv::progress::Progress for CancelNow {
-        fn report(&self, _p: &libfreemkv::progress::PassProgress) -> bool {
-            false // false == halt
+    // A front end that stops on the very first tick, through the pass's halt flag.
+    struct CancelNow(Arc<std::sync::atomic::AtomicBool>);
+    impl libfreemkv::Events for CancelNow {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let libfreemkv::Event::Pass(_) = e {
+                self.0.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1363,8 +1365,9 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         reads: Arc::clone(&reads),
         served: Arc::clone(&served),
     };
-    let reporter = CancelNow;
-    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reporter = CancelNow(stop.clone());
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), Some(stop));
     let out = freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let n = reads.load(Ordering::Relaxed);
@@ -1961,7 +1964,7 @@ fn a_resume_whose_image_was_deleted_starts_over_instead_of_erroring() {
 #[test]
 fn the_mapfile_header_never_carries_the_unit_keys() {
     use libfreemkv::aacs::types::UnitKey;
-    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{KeyRing, KeyScope};
     use libfreemkv::test_util::{BdFile, encrypted_bd_image, unit_key_ro};
 
     struct Pool([u8; 16]);
@@ -1996,12 +1999,13 @@ fn the_mapfile_header_never_carries_the_unit_keys() {
     let mut reader = fx.source();
     let factory: libfreemkv::KeySourceFactory =
         std::sync::Arc::new(|| vec![Box::new(Pool(KEY)) as Box<dyn libfreemkv::KeySource>]);
-    let keys = ResolvedKeySet::resolve(
+    let keys = KeyRing::acquire_for_disc(
         &disc,
         &mut reader,
         KeyScope::WholeDisc,
         &factory,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .expect("the pool's key opens the fixture's keyed file")
     .keys;
@@ -2362,16 +2366,13 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
                 .wrapping_mul(7)
                 .wrapping_add((i as u8).wrapping_mul(31));
         }
-        // Scrambled DVD sectors are MPEG-2 PS packs; descramble policy requires
-        // the pack start code plus the flag bits — byte 0x14 alone isn't
-        // sufficient to authorise descrambling in an IFO or UDF sector.
+        // A DVD-Video pack: pack header (no stuffing), a video PES at 0x0E whose MPEG-2
+        // flags byte (0x14) carries the CSS scramble bits 4-5; 0x14 alone is no evidence.
         s[0x00..0x04].copy_from_slice(&[0x00, 0x00, 0x01, 0xBA]);
         s[4] = 0x44; // '01': a 13818-1 pack (an 11172-1 pack cannot be CSS)
-        // Bits 4-5 of the sub-header byte are the CSS scramble flag.
-        s[0x14] &= !0x30;
-        if scrambled {
-            s[0x14] |= 0x30;
-        }
+        s[0x0D] = 0xF8;
+        s[0x0E..0x12].copy_from_slice(&[0x00, 0x00, 0x01, 0xE0]);
+        s[0x14] = if scrambled { 0xB0 } else { 0x80 };
         s
     }
 

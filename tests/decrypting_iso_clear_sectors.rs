@@ -10,7 +10,7 @@ use freemkv_engine::{Mapfile, SectorStatus, SweepOptions};
 use libfreemkv::aacs::types::UnitKey;
 use libfreemkv::disc::DiscRegion;
 use libfreemkv::error::Error;
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::{ContentFormat, Disc, DiscFormat, DiscTitle, Extent};
 
@@ -311,15 +311,11 @@ impl libfreemkv::KeySource for Pool {
 /// The rip's up-front key set for `d` from its pool, resolved over `reader` (the same
 /// drive the pass reads) with scope `WholeDisc` through the engine's one front door, as a
 /// decrypted-image rip does.
-fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<ResolvedKeySet> {
+fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<KeyRing> {
     keyed_over(d, reader, KeyScope::WholeDisc)
 }
 
-fn keyed_over(
-    d: &Disc,
-    reader: &mut MemDisc,
-    scope: KeyScope,
-) -> libfreemkv::Result<ResolvedKeySet> {
+fn keyed_over(d: &Disc, reader: &mut MemDisc, scope: KeyScope) -> libfreemkv::Result<KeyRing> {
     let two = d.aacs.as_ref().is_some_and(|a| a.uk_ro == unit_key_ro(2));
     let pool = if two {
         vec![(1, UNIT_KEY), (2, SECOND_KEY)]
@@ -332,7 +328,7 @@ fn keyed_over(
     freemkv_engine::keys::resolve_for_rip(d, reader, scope, &f, None, None)
 }
 
-fn sweep_opts<'a>(keys: impl Into<Option<ResolvedKeySet>>) -> SweepOptions<'a> {
+fn sweep_opts<'a>(keys: impl Into<Option<KeyRing>>) -> SweepOptions<'a> {
     SweepOptions {
         decrypt: true,
         resume: false,
@@ -469,7 +465,7 @@ fn run_passes(
     tmp: &tempfile::TempDir,
     d: &Disc,
     source: &[u8],
-    keys: Option<ResolvedKeySet>,
+    keys: Option<KeyRing>,
 ) -> Vec<(
     std::path::PathBuf,
     libfreemkv::error::Result<freemkv_engine::CopyResult>,
@@ -496,7 +492,7 @@ fn run_passes(
     out
 }
 
-/// A set with no AACS keys (`ResolvedKeySet::none()`) on an AACS disc: the engine's gate
+/// A set with no AACS keys (`KeyRing::none()`) on an AACS disc: the engine's gate
 /// refuses E7022 before any output. The library's whole-disc reader takes such a set's
 /// non-AACS branch and would write ciphertext at exit 0.
 #[test]
@@ -504,7 +500,7 @@ fn a_non_aacs_set_on_an_aacs_disc_refuses_up_front() {
     let fx = bd(None);
     let d = disc(&fx);
     let tmp = tempfile::tempdir().unwrap();
-    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(ResolvedKeySet::none())) {
+    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(KeyRing::none())) {
         assert_refused_before_output(&iso, r, libfreemkv::error::E_NO_DISC_KEY);
     }
     let iso = tmp.path().join("patch.iso");
@@ -518,7 +514,7 @@ fn a_non_aacs_set_on_an_aacs_disc_refuses_up_front() {
         &d,
         &mut MemDisc::new(&fx.source),
         &iso,
-        &patch_opts(ResolvedKeySet::none()),
+        &patch_opts(KeyRing::none()),
     );
     assert_eq!(
         r.map(|_| ()).unwrap_err().code(),
@@ -558,9 +554,9 @@ fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
     assert_eq!(std::fs::read(&map_path).unwrap(), map_before, "scope kept");
 }
 
-/// A non-title file no held key opens is unprovable: the rip's up-front resolve refuses
-/// it (E7032) on a multi-CPS, single-CPS, no-`Unit_Key_RO.inf` and FMTS disc. The passes
-/// themselves never run without a set covering the whole disc: handed none (E7022) or one
+/// A non-title file no held key opens no longer refuses the whole-disc resolve (10d85b2):
+/// it stays Lazy and is blanked on read, on a multi-CPS, single-CPS, no-`Unit_Key_RO.inf`
+/// and FMTS disc. The passes themselves never run without a set covering the whole disc: handed none (E7022) or one
 /// resolved for the title only (E7013, a caller bug), each refuses before any output.
 #[test]
 fn an_unprovable_non_title_stream_file_refuses_up_front() {
@@ -570,11 +566,9 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     let mut fmts = disc(&fx);
     fmts.format = DiscFormat::Fmts;
     for d in [multi_cps_disc(&fx), disc(&fx), no_ukro, fmts] {
-        let refused = keyed(&d, &mut MemDisc::new(&fx.source)).map(|_| ());
-        assert_eq!(
-            refused.unwrap_err().code(),
-            Error::WholeDiscKeyMissing.code()
-        );
+        // 10d85b2: a whole-disc set keeps the unopenable file Lazy while the title's file keys.
+        let whole = keyed(&d, &mut MemDisc::new(&fx.source)).expect("damage, not E7032");
+        assert_eq!(whole.lazy().len(), 1, "the unopenable file stays Lazy");
         let title = keyed_over(&d, &mut MemDisc::new(&fx.source), KeyScope::Titles(vec![0]))
             .expect("the title alone keys");
         for (keys, code) in [
@@ -625,35 +619,44 @@ fn one_opened_probe_leaves_a_file_lazy_and_the_sweep_proves_it_on_arrival() {
 }
 
 /// The same file under a key no held key matches: the set resolves (the file Lazy), and
-/// every pass shape refuses it BEFORE the copy starts, not hours in when the walk reaches it.
+/// the sweep blanks the unit and goes on, never E7032 (10d85b2, E7013 option A).
 #[test]
-fn a_multi_cps_sweep_refuses_a_first_unit_no_key_opens_before_output() {
+fn a_multi_cps_sweep_blanks_a_first_unit_no_key_opens() {
     let mut fx = bd(None);
     fx.encrypt_units(ORPHAN, &FOREIGN_KEY, false, 0..1);
     let d = multi_cps_disc(&fx);
     let set = keyed(&d, &mut MemDisc::new(&fx.source)).expect("the set resolves");
     let tmp = tempfile::tempdir().unwrap();
-    for (iso, r) in run_passes(&tmp, &d, &fx.source, Some(set)) {
-        assert_refused_before_output(&iso, r, Error::WholeDiscKeyMissing.code());
-    }
+    let iso = tmp.path().join("out.iso");
+    freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &sweep_opts(set))
+        .expect("an unopenable unit is blanked, never a stop");
+    let at = fx.files[ORPHAN].0 as usize * SECTOR;
+    let out = std::fs::read(&iso).unwrap();
+    assert!(
+        out[at..at + UNIT_SECTORS as usize * SECTOR]
+            .iter()
+            .all(|&b| b == 0)
+    );
 }
 
 /// Last resort: every probe of the unplayed file is unreadable (damage), so its key
-/// cannot be proven up front. The pass stops at its first encrypted unit with the
-/// same E7032, never writing ciphertext and never as a generic decrypt failure.
+/// cannot be proven up front. The pass blanks the unopenable unit and goes on (10d85b2),
+/// never writing ciphertext.
 #[test]
-fn an_unreadable_probe_stops_the_pass_with_the_mkv_or_raw_error() {
+fn an_unreadable_probe_blanks_the_unit_and_the_pass_goes_on() {
     let fx = bd(Some((&FOREIGN_KEY, false)));
     let (o, n) = fx.files[ORPHAN];
     let tmp = tempfile::tempdir().unwrap();
     let mut reader = MemDisc::new(&fx.source);
     reader.probe_fail = Some((o, o + n));
     let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut reader);
-    let err = r.expect_err("an encrypted unit with no proven key must stop the pass");
-    assert_eq!(err.code(), Error::WholeDiscKeyMissing.code(), "got {err}");
+    r.expect("an encrypted unit with no proven key is blanked, never a stop");
+    let at = o as usize * SECTOR;
+    let out = std::fs::read(&iso).unwrap();
     assert!(
-        iso.exists(),
-        "the pass started: this is the mid-pass last resort"
+        out[at..at + UNIT_SECTORS as usize * SECTOR]
+            .iter()
+            .all(|&b| b == 0)
     );
 }
 
@@ -822,7 +825,7 @@ fn prep_patch(iso: &std::path::Path, image: &[u8], bad: &[(u32, u32)]) {
     std::fs::write(iso, &seeded).unwrap();
 }
 
-fn patch_opts<'a>(keys: ResolvedKeySet) -> freemkv_engine::PatchOptions<'a> {
+fn patch_opts<'a>(keys: KeyRing) -> freemkv_engine::PatchOptions<'a> {
     freemkv_engine::PatchOptions {
         keys: Some(keys),
         ..freemkv_engine::PatchOptions::for_patch_pass(true, None, None)
@@ -870,19 +873,18 @@ fn a_patch_decrypts_a_non_title_stream_file() {
 }
 
 /// Unprovable non-title file on Pass N: patch refuses before touching the ISO or the
-/// mapfile (the bad range stays NonTrimmed): E7032 with a set that leaves a unit no held
-/// key opens, E7022 with no set, E7013 with a title-only set.
+/// mapfile (the bad range stays NonTrimmed): E7022 with no set, E7013 with a title-only
+/// set. A set that leaves a unit no held key opens no longer refuses (10d85b2): see
+/// `a_patch_blanks_a_unit_no_key_opens`.
 #[test]
 fn an_unprovable_patch_refuses_up_front() {
     let mut fx = bd(None);
     fx.encrypt_units(ORPHAN, &FOREIGN_KEY, false, 0..1);
     let o = fx.files[ORPHAN].0;
     let d = multi_cps_disc(&fx);
-    let lazy = keyed(&d, &mut MemDisc::new(&fx.source)).expect("the set resolves");
     let title = keyed_over(&d, &mut MemDisc::new(&fx.source), KeyScope::Titles(vec![0]))
         .expect("the title alone keys");
     for (keys, code) in [
-        (Some(lazy), Error::WholeDiscKeyMissing.code()),
         (None, libfreemkv::error::E_NO_DISC_KEY),
         (Some(title), libfreemkv::error::E_DECRYPT_FAILED),
     ] {
@@ -912,4 +914,30 @@ fn an_unprovable_patch_refuses_up_front() {
             "the orphan unit stays NonTrimmed"
         );
     }
+}
+
+/// A patch over a unit no held key opens blanks it and finishes (10d85b2, E7013 option A).
+#[test]
+fn a_patch_blanks_a_unit_no_key_opens() {
+    let mut fx = bd(None);
+    fx.encrypt_units(ORPHAN, &FOREIGN_KEY, false, 0..1);
+    let o = fx.files[ORPHAN].0;
+    let d = multi_cps_disc(&fx);
+    let lazy = keyed(&d, &mut MemDisc::new(&fx.source)).expect("the set resolves");
+    let tmp = tempfile::tempdir().unwrap();
+    let iso = tmp.path().join("patch-multi.iso");
+    prep_patch(&iso, &fx.expected, &[(o, UNIT_SECTORS)]);
+    let opts = freemkv_engine::PatchOptions {
+        keys: Some(lazy),
+        ..freemkv_engine::PatchOptions::for_patch_pass(true, None, None)
+    };
+    freemkv_engine::patch(&d, &mut MemDisc::new(&fx.source), &iso, &opts)
+        .expect("an unopenable unit is blanked, never a stop");
+    let at = o as usize * SECTOR;
+    let out = std::fs::read(&iso).unwrap();
+    assert!(
+        out[at..at + UNIT_SECTORS as usize * SECTOR]
+            .iter()
+            .all(|&b| b == 0)
+    );
 }

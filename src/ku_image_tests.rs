@@ -10,7 +10,7 @@ use crate::test_fixtures::{
 };
 use crate::{Mapfile, RipOutcome, mapfile_path_for, mux_image_titles};
 use libfreemkv::error::{E_AACS_VID_NEEDS_DISC, E_NO_DISC_KEY};
-use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::{Error, SectorSource};
 use std::path::Path;
 
@@ -173,8 +173,16 @@ fn known_set_makes_no_key_request_fmts() {
     let calls = Calls::default();
     let f = fmts_factory(&[(Answer::Online, &[K1, K2])], &[F1, F2], &calls);
     let scope = KeyScope::Titles(vec![0, 1, 2]);
-    let whole =
-        |d: &mut Drive| ResolvedKeySet::resolve(&fx.disc, d, scope.clone(), &f, Default::default());
+    let whole = |d: &mut Drive| {
+        KeyRing::acquire_for_disc(
+            &fx.disc,
+            d,
+            scope.clone(),
+            &f,
+            Default::default(),
+            &libfreemkv::Ctx::default(),
+        )
+    };
     let drive = Drive::new(&fx.img.image);
     let set = whole(&mut drive.clone()).unwrap().keys;
     assert!(!set.forensic_pending());
@@ -675,12 +683,13 @@ fn known_set_with_a_verify_phase_decrypts_both_halves() {
     let drive = Drive::new(&fx.img.image);
     drive.set(Damage::Range(clip + 20 * 3, clip + 36 * 3));
     let scope = KeyScope::Titles(vec![1]);
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut drive.clone(),
         scope.clone(),
         &f,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -708,12 +717,13 @@ fn known_set_with_a_verify_phase_decrypts_both_halves() {
 
     // Control: with the phase probes readable, index 2 resolves to Even and unit 21 (odd)
     // is left as ciphertext, so the decrypt above is Verify's.
-    let set = ResolvedKeySet::resolve(
+    let set = KeyRing::acquire_for_disc(
         &fx.disc,
         &mut fx.source(),
         KeyScope::Titles(vec![1]),
         &f,
         Default::default(),
+        &libfreemkv::Ctx::default(),
     )
     .unwrap()
     .keys;
@@ -837,7 +847,7 @@ fn vid_needs_disc_only_when_a_vid_would_help() {
     );
 }
 
-/// `ResolvedKeySet::none()` holds no AACS key, so it never covers an AACS disc's titles
+/// `KeyRing::none()` holds no AACS key, so it never covers an AACS disc's titles
 /// (`covers(scope)` alone has no disc): `Seeded(f, none)` resolves, asking once; `Known(none)`
 /// refuses E7022 up front. On a clear disc `none()` still covers.
 #[test]
@@ -847,11 +857,11 @@ fn a_none_set_never_covers_an_aacs_title() {
     let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
     let calls = Calls::default();
     let f = factory(&[(Answer::Online, &[K1])], &calls);
-    let opened = open_image_with(&src, OpenImageOptions::seeded(f, ResolvedKeySet::none()))
+    let opened = open_image_with(&src, OpenImageOptions::seeded(f, KeyRing::none()))
         .expect("Seeded(none) resolves");
     assert_eq!(calls.len(), 1, "the factory was asked once");
     assert!(opened.keys.is_aacs());
-    let err = open_image_with(&src, OpenImageOptions::known(ResolvedKeySet::none()))
+    let err = open_image_with(&src, OpenImageOptions::known(KeyRing::none()))
         .map(|_| ())
         .unwrap_err();
     assert_eq!(err.code(), E_NO_DISC_KEY, "{err}");
@@ -859,7 +869,7 @@ fn a_none_set_never_covers_an_aacs_title() {
     crate::test_fixtures::clear_folder(&folder);
     open_image_with(
         &ImageSource::Dir(folder),
-        OpenImageOptions::known(ResolvedKeySet::none()),
+        OpenImageOptions::known(KeyRing::none()),
     )
     .expect("none() covers a clear disc");
 }
@@ -1017,10 +1027,16 @@ fn a_pending_only_gap_is_not_re_resolved() {
     let calls = Calls::default();
     let f = fmts_factory(&[(Answer::Keydb, &[K1, K2])], &[F1, F2], &calls);
     let scope = KeyScope::Titles(vec![0, 1]);
-    let pending =
-        ResolvedKeySet::resolve(&fx.disc, &mut drive.clone(), scope, &f, Default::default())
-            .unwrap()
-            .keys;
+    let pending = KeyRing::acquire_for_disc(
+        &fx.disc,
+        &mut drive.clone(),
+        scope,
+        &f,
+        Default::default(),
+        &libfreemkv::Ctx::default(),
+    )
+    .unwrap()
+    .keys;
     assert!(pending.forensic_pending());
     let dir = tempfile::tempdir().unwrap();
     let iso = fx.write(dir.path(), "uhd.iso");
@@ -1039,7 +1055,7 @@ fn staged_with(fx: &Fx, dir: &Path, name: &str) -> std::path::PathBuf {
     iso
 }
 
-fn open_prescanned(iso: &Path, disc_vid: [u8; 16], set: &ResolvedKeySet) -> crate::Result<()> {
+fn open_prescanned(iso: &Path, disc_vid: [u8; 16], set: &KeyRing) -> crate::Result<()> {
     let mut disc = bd_image(&[Some(K1)], 1).disc;
     disc.aacs.as_mut().unwrap().volume_id = disc_vid;
     let opts = OpenImageOptions {

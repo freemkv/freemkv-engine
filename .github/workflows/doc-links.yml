@@ -18,4 +18,4 @@ jobs:
     with:
       self: freemkv-engine
       checkout: libfreemkv freemkv-keysources freemkv-unlock
-      patch: libfreemkv freemkv-keysources
+      patch: libfreemkv freemkv-keysources freemkv-unlock

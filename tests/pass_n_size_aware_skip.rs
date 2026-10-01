@@ -280,10 +280,11 @@ fn patch_block_sectors_zero_does_not_busy_spin() {
     struct KindReporter {
         kinds: Mutex<Vec<libfreemkv::progress::PassKind>>,
     }
-    impl libfreemkv::progress::Progress for KindReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-            self.kinds.lock().unwrap().push(p.kind);
-            true
+    impl libfreemkv::Events for KindReporter {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let libfreemkv::Event::Pass(p) = e {
+                self.kinds.lock().unwrap().push(p.kind);
+            }
         }
     }
     let reporter = KindReporter::default();

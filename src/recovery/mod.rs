@@ -1413,7 +1413,9 @@ fn sweep_linked(
                         bytes_done,
                         bytes_good_done,
                     );
-                    if !reporter.report(&pp) {
+                    // The report point is a stop check: a front end stops from its events.
+                    reporter.event(&libfreemkv::Event::Pass(&pp));
+                    if halt.is_cancelled() {
                         halt_requested = true;
                         break 'outer;
                     }
@@ -1435,7 +1437,7 @@ fn sweep_linked(
             bytes_done,
             bytes_good_done,
         );
-        let _ = reporter.report(&pp);
+        reporter.event(&libfreemkv::Event::Pass(&pp));
     }
 
     // Producer is done; let the consumer drain and run close() (writeback, fsync,
@@ -1509,12 +1511,12 @@ fn sweep_linked(
 pub struct CopyOptions<'a> {
     pub decrypt: bool,
     pub multipass: bool,
-    pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
+    pub progress: Option<&'a dyn libfreemkv::Events>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1566,12 +1568,12 @@ pub struct SweepOptions<'a> {
     pub resume: bool,
     pub batch_sectors: Option<u16>,
     pub skip_on_error: bool,
-    pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
+    pub progress: Option<&'a dyn libfreemkv::Events>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 
 /// Options for [`patch()`] (Pass N retry pass over bad ranges).
@@ -1595,12 +1597,12 @@ pub struct PatchOptions<'a> {
     /// to render. Nothing counts wedged reads against it — `wedged_exit` is set
     /// from a handler's transport fault.
     pub wedged_threshold: u64,
-    pub progress: Option<&'a dyn libfreemkv::progress::Progress>,
+    pub progress: Option<&'a dyn libfreemkv::Events>,
     pub halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The rip's up-front key set (KU §3.2): a decrypting pass reads through its whole-disc
     /// reader and gates on it, with no lookup. `None` holds no key: a decrypting pass over an
     /// AACS disc refuses (E7022) whatever keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 impl<'a> PatchOptions<'a> {
     /// THE tuning preset for a Pass-N patch pass, shared by both entry points
@@ -1613,7 +1615,7 @@ impl<'a> PatchOptions<'a> {
     /// is reported, not enforced.
     pub fn for_patch_pass(
         decrypt: bool,
-        progress: Option<&'a dyn libfreemkv::progress::Progress>,
+        progress: Option<&'a dyn libfreemkv::Events>,
         halt: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Self {
         PatchOptions {
@@ -2348,7 +2350,7 @@ mod finish_bounded_tests {
     // the write, BEFORE the `record`), and records once the write returns.
     struct MapSink {
         map: mapfile::Mapfile,
-        done: SignalOnDrop,
+        _done: SignalOnDrop,
         gate: Gate,
         entered: Arc<AtomicUsize>,
     }
@@ -2396,7 +2398,7 @@ mod finish_bounded_tests {
             WRITE_THROUGH_DEPTH,
             MapSink {
                 map,
-                done: SignalOnDrop(Arc::clone(&dropped)),
+                _done: SignalOnDrop(Arc::clone(&dropped)),
                 gate: gate.clone(),
                 entered: Arc::clone(&entered),
             },
@@ -2999,10 +3001,11 @@ mod sweep_contract_tests {
     #[derive(Default)]
     struct Ticks(std::sync::Mutex<Vec<libfreemkv::progress::PassProgress>>);
 
-    impl libfreemkv::progress::Progress for Ticks {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-            self.0.lock().unwrap().push(p.clone());
-            true
+    impl libfreemkv::Events for Ticks {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let libfreemkv::Event::Pass(p) = e {
+                self.0.lock().unwrap().push((*p).clone());
+            }
         }
     }
 

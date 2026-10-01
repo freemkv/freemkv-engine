@@ -61,7 +61,7 @@ pub struct Job {
     /// The rip's up-front key set ([`crate::keys::resolve_for_rip`], KU §2.1), in memory
     /// only. `None` holds no key: a decrypting rip of an AACS disc refuses (E7022) whatever
     /// keys the disc banked (KU-X1).
-    pub keys: Option<libfreemkv::keys::ResolvedKeySet>,
+    pub keys: Option<libfreemkv::keys::KeyRing>,
 }
 
 /// The audio + subtitle stream choice for a rip — the two selections that
@@ -125,7 +125,7 @@ impl Job {
     }
 
     /// Builder: the rip's up-front key set, read by every decrypting pass and gate.
-    pub fn with_keys(mut self, keys: libfreemkv::keys::ResolvedKeySet) -> Self {
+    pub fn with_keys(mut self, keys: libfreemkv::keys::KeyRing) -> Self {
         self.keys = Some(keys);
         self
     }

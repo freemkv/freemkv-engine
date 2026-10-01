@@ -4,7 +4,7 @@
 decrypt, mux, raw reads) and the front-ends. **The UI needs no direct
 libfreemkv dependency for the disc model and cancellation**: the engine
 re-exports them. A few types are not re-exported (`DeviceTarget`,
-`DriveCredentials`, `SectorSource`, `keys::ResolvedKeySet`, `DecryptStatus`), so
+`DriveCredentials`, `SectorSource`, `keys::KeyRing`, `DecryptStatus`), so
 add `libfreemkv = "1.7"` (with the same `[patch.crates-io]` block) to name them.
 
 ```
@@ -161,19 +161,15 @@ match preflight(&disc, &job) {
     Preflight::Blocked(reasons) => {
         for r in &reasons {
             // r.key is a STABLE identifier you localize (never English).
-            // The COMPLETE set the engine emits — map all seven, or a
+            // The COMPLETE set the engine emits — map all six, or a
             // blocked Start renders with no explanation:
             //   "no-titles" | "empty-selection" | "title-out-of-range"
-            //   | "multipass-requires-raw" | "language-unmatched"
-            //   | "unknown-language" | "encrypted-no-key"
+            //   | "language-unmatched" | "unknown-language" | "encrypted-no-key"
             // "unknown-language": a requested tag names no language;
             // r.detail is the tag as given.
             // "language-unmatched": a language-filtered stream class the job
             // asked for is carried by no selected title; r.detail is the class
             // key ("audio", "subtitle", "subtitle_forced").
-            // "multipass-requires-raw": RipMode::Multi without job.raw. A
-            // multipass rip is whole-disc image recovery; decryption happens
-            // later, in the mux from that image.
             // r.detail is an optional machine value (e.g. the bad index).
         }
     }

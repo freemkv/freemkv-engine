@@ -111,19 +111,19 @@ fn sweep_and_patch_options_are_default() {
 /// both shells call it.
 #[test]
 fn key_front_door_is_nameable() {
-    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{KeyRing, KeyScope};
     type ResolveForRip = fn(
         &libfreemkv::Disc,
         &mut dyn libfreemkv::SectorSource,
         KeyScope,
         &libfreemkv::KeySourceFactory,
-        Option<&ResolvedKeySet>,
+        Option<&KeyRing>,
         Option<&libfreemkv::Halt>,
-    ) -> Result<ResolvedKeySet, libfreemkv::Error>;
+    ) -> Result<KeyRing, libfreemkv::Error>;
     let _: ResolveForRip = freemkv_engine::keys::resolve_for_rip;
     let _: fn(&libfreemkv::Disc, &[usize], freemkv_engine::keys::RipOutput) -> KeyScope =
         freemkv_engine::keys::rip_scope;
-    let _: fn(&libfreemkv::Disc, &ResolvedKeySet) -> libfreemkv::keys::DecryptStatus =
+    let _: fn(&libfreemkv::Disc, &KeyRing) -> libfreemkv::keys::DecryptStatus =
         freemkv_engine::keys::key_status;
     let _: fn(&freemkv_engine::KeyParams) -> libfreemkv::KeySourceFactory =
         freemkv_engine::key_source_factory;
@@ -138,13 +138,13 @@ fn key_front_door_is_nameable() {
 #[test]
 fn image_front_door_is_nameable() {
     use freemkv_engine::{ImageSource, KeyInput, OpenImageOptions, OpenedImage};
-    use libfreemkv::keys::{KeyScope, ResolvedKeySet};
+    use libfreemkv::keys::{KeyRing, KeyScope};
     let _: fn(&ImageSource, OpenImageOptions) -> Result<OpenedImage, libfreemkv::Error> =
         freemkv_engine::open_image_with;
     let _: fn(&ImageSource, &freemkv_engine::KeyParams) -> Result<OpenedImage, libfreemkv::Error> =
         freemkv_engine::open_image;
     let f: libfreemkv::KeySourceFactory = std::sync::Arc::new(Vec::new);
-    let set = ResolvedKeySet::none();
+    let set = KeyRing::none();
     for keys in [
         KeyInput::Resolve(f.clone()),
         KeyInput::Known(set.clone()),
@@ -159,7 +159,7 @@ fn image_front_door_is_nameable() {
         };
         drop(opts);
     }
-    fn _fields(o: &OpenedImage) -> (&ResolvedKeySet, Option<&libfreemkv::KeySourceFactory>, bool) {
+    fn _fields(o: &OpenedImage) -> (&KeyRing, Option<&libfreemkv::KeySourceFactory>, bool) {
         (&o.keys, o.sources.as_ref(), o.prescanned)
     }
 }

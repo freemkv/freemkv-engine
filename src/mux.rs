@@ -321,12 +321,11 @@ where
 /// Mux a single title from a source URL to `dest`, driving
 /// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`].
 ///
-/// Bridges the two libfreemkv seams onto the Sink:
-/// - `MuxEvents` write-progress → `Sink::progress` (via a channel + a scoped
-///   watcher thread, because `mux_with_keys` takes an `Arc<dyn MuxEvents + 'static>`
-///   that cannot borrow the `&dyn Sink` directly).
-/// - `Sink::should_cancel()` → the `Halt` token the mux polls (the watcher sets
-///   it), so a UI Cancel / Ctrl-C stops the pump exactly as today.
+/// Bridges the run's [`libfreemkv::Ctx`] onto the Sink:
+/// - its events' write progress → `Sink::progress` (via a channel + a scoped watcher
+///   thread, because the `Ctx` holds an `Arc<dyn Events>` that cannot borrow the Sink).
+/// - `Sink::should_cancel()` → the `Ctx`'s halt (the watcher cancels it), so a UI
+///   Cancel / Ctrl-C stops the pump exactly as today.
 pub fn mux_title(
     source_url: &str,
     dest: &str,
@@ -335,11 +334,17 @@ pub fn mux_title(
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let input = libfreemkv::MuxSource::Url {
-        url: source_url,
-        opts: input_opts,
+    let opts = libfreemkv::MuxOptions {
+        title_index: input_opts.title_index.unwrap_or(0),
+        raw: input_opts.raw,
+        selection: input_opts.selection,
+        ..mux_opts.clone()
     };
-    mux_with_input(input, source_url, dest, mux_opts, total_bytes_hint, sink)
+    let keys = input_opts.keys;
+    with_mux_watcher(sink, dest, |ctx| {
+        log_mux_start(sink, source_url, dest, total_bytes_hint);
+        libfreemkv::mux_url(source_url, keys.as_ref(), dest, &opts, ctx)
+    })
 }
 
 /// Mux a single title live off an opened, scanned, key-resolved
@@ -357,11 +362,12 @@ pub fn mux_title_session(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let source_label = format!("disc title {}", title_index + 1);
-    let input = libfreemkv::MuxSource::Session {
-        session,
+    let opts = libfreemkv::MuxOptions {
         title_index,
+        ..mux_opts.clone()
     };
-    mux_with_input(input, &source_label, dest, mux_opts, total_bytes_hint, sink)
+    let input = libfreemkv::Source::from_session(session);
+    mux_with_input(input, &source_label, dest, &opts, total_bytes_hint, sink)
 }
 
 /// Mux `title` (already scanned: the drive's, or the image's own) out of the ISO at `path`
@@ -369,26 +375,21 @@ pub fn mux_title_session(
 /// area of a staged ISO does not matter. `mux_opts.selection` picks the streams.
 pub(crate) fn mux_iso_title(
     path: &std::path::Path,
-    title: libfreemkv::DiscTitle,
-    format: libfreemkv::ContentFormat,
-    keys: &libfreemkv::keys::ResolvedKeySet,
+    title: libfreemkv::ScannedTitle,
+    keys: &libfreemkv::keys::KeyRing,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let hint = title.size_bytes;
-    with_mux_watcher(sink, dest, |halt, events| {
-        let line = iso_mux_line(path, &title.playlist);
+    let hint = title.title.size_bytes;
+    with_mux_watcher(sink, dest, |ctx| {
+        let line = iso_mux_line(path, &title.title.playlist);
         sink.log(
             Level::Info,
             &format!("{line} -> {dest} (~{})", human_bytes(hint)),
         );
-        let source = libfreemkv::MuxSource::Iso {
-            path,
-            title,
-            format,
-        };
-        libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, halt, events)
+        let source = libfreemkv::Source::from_image(path, title);
+        libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, ctx)
     })
 }
 
@@ -401,33 +402,34 @@ fn iso_mux_line(path: &std::path::Path, playlist: &str) -> String {
 // `mux_with_keys` for an already-built `MuxSource`, bridging progress and cancel
 // onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
 fn mux_with_input(
-    input: libfreemkv::MuxSource<'_>,
+    input: libfreemkv::Source<'_>,
     source_label: &str,
     dest: &str,
     mux_opts: &libfreemkv::MuxOptions,
     total_bytes_hint: u64,
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
-    with_mux_watcher(sink, dest, |halt, events| {
-        sink.log(
-            Level::Info,
-            &format!(
-                "mux: {source_label} -> {dest} (~{})",
-                human_bytes(total_bytes_hint)
-            ),
-        );
-        // No set: a Url carries its own `InputOptions.keys`; a Session needs none (CSS, clear).
-        libfreemkv::mux_with_keys(input, None, dest, mux_opts, halt, events)
+    with_mux_watcher(sink, dest, |ctx| {
+        log_mux_start(sink, source_label, dest, total_bytes_hint);
+        // A Session needs no set (CSS, clear); an AACS title rip passes its set by URL.
+        libfreemkv::mux_with_keys(input, None, dest, mux_opts, ctx)
     })
+}
+
+// The "mux: <source> -> <dest> (~size)" line every mux opens with.
+fn log_mux_start(sink: &dyn Sink, source_label: &str, dest: &str, total_bytes_hint: u64) {
+    sink.log(
+        Level::Info,
+        &format!(
+            "mux: {source_label} -> {dest} (~{})",
+            human_bytes(total_bytes_hint)
+        ),
+    );
 }
 
 // The Sink↔libfreemkv bridge every mux runs inside, lifted out of `mux_with_input` so it's
 // testable against a closure without real media.
-fn with_mux_watcher<T>(
-    sink: &dyn Sink,
-    dest: &str,
-    f: impl FnOnce(&libfreemkv::Halt, Arc<dyn libfreemkv::MuxEvents>) -> T,
-) -> T {
+fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::Ctx) -> T) -> T {
     use std::sync::mpsc;
 
     let halt = libfreemkv::Halt::new();
@@ -441,24 +443,29 @@ fn with_mux_watcher<T>(
     let (opened_tx, opened_rx) = mpsc::channel::<libfreemkv::DiscTitle>();
     let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
-    // MuxEvents impl that forwards write-progress and the output opening over channels.
-    // Owned + 'static (holds only Senders), so it satisfies mux_with_keys's Arc bound.
+    // Forwards write progress, the output opening and flush progress over channels.
+    // Owned + 'static (holds only Senders), so it fits the `Ctx`'s `Arc<dyn Events>`.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
         flush: mpsc::Sender<(u64, u64)>,
     }
-    impl libfreemkv::MuxEvents for ChannelEvents {
-        fn on_write_progress(&self, bytes_written: u64, bytes_total: u64) {
-            let _ = self.tx.send((bytes_written, bytes_total));
-        }
-        fn on_output_opened(&self, title: &libfreemkv::DiscTitle) {
-            let _ = self.opened.send(title.clone());
-        }
-        // Stop design v5 §4.5: "`MuxEvents::on_flush_progress` … The engine's mux bridge
-        // turns that into `Sink::progress(pass: "sync")`" (one call per libfreemkv call).
-        fn on_flush_progress(&self, bytes_durable: u64, bytes_total: u64) {
-            let _ = self.flush.send((bytes_durable, bytes_total));
+    impl libfreemkv::Events for ChannelEvents {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            match *e {
+                libfreemkv::Event::BytesWritten { bytes, total } => {
+                    let _ = self.tx.send((bytes, total));
+                }
+                libfreemkv::Event::OutputOpened { title } => {
+                    let _ = self.opened.send(title.clone());
+                }
+                // Stop design v5 §4.5: flush progress becomes `Sink::progress(pass: "sync")`,
+                // one call per event.
+                libfreemkv::Event::BytesDurable { bytes, total } => {
+                    let _ = self.flush.send((bytes, total));
+                }
+                _ => {}
+            }
         }
     }
     let opened = |title: &libfreemkv::DiscTitle| {
@@ -522,16 +529,16 @@ fn with_mux_watcher<T>(
             }
         });
 
-        let events: Arc<dyn libfreemkv::MuxEvents> = Arc::new(ChannelEvents {
+        let ctx = crate::run::ctx(&halt).with_events(Arc::new(ChannelEvents {
             tx,
             opened: opened_tx,
             flush: flush_tx,
-        });
+        }));
         // Same guard the recovery paths use: `mux_with_keys` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
         // it, leaving thread::scope joining a watcher that loops forever.
         let _signal_done = crate::run::SignalDone(&done);
-        f(&halt, events)
+        f(&ctx)
     })
 }
 
@@ -564,7 +571,7 @@ pub fn open_scan(
     credentials: Option<libfreemkv::DriveCredentials>,
     raw_copy: bool,
 ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
-    let (halt, progress) = (libfreemkv::Halt::new(), libfreemkv::halt::Progress::new());
+    let (halt, progress) = (libfreemkv::Halt::new(), libfreemkv::halt::Liveness::new());
     open_scan_with(target, credentials, raw_copy, &halt, &progress)
 }
 
@@ -576,7 +583,7 @@ pub fn open_scan_with(
     credentials: Option<libfreemkv::DriveCredentials>,
     raw_copy: bool,
     halt: &libfreemkv::Halt,
-    progress: &libfreemkv::halt::Progress,
+    progress: &libfreemkv::halt::Liveness,
 ) -> Result<libfreemkv::DiscSession, libfreemkv::Error> {
     let mut session = libfreemkv::DiscSession::open_with(target, build_keyspec(credentials), halt)?;
     session.attach_progress(progress);
@@ -841,7 +848,7 @@ mod tests {
             Option<libfreemkv::DriveCredentials>,
             bool,
             &libfreemkv::Halt,
-            &libfreemkv::halt::Progress,
+            &libfreemkv::halt::Liveness,
         ) -> Result<libfreemkv::DiscSession, libfreemkv::Error>;
         let _: OpenScanWith = open_scan_with;
     }
@@ -952,7 +959,7 @@ mod tests {
             asked: AtomicUsize::new(0),
         };
         let halted_on_entry =
-            with_mux_watcher(&sink, "mkv:///o.mkv", |halt, _events| halt.is_cancelled());
+            with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| ctx.halt.is_cancelled());
         assert!(
             halted_on_entry,
             "a rip that was cancelled before it began must reach the muxer \
@@ -975,9 +982,9 @@ mod tests {
         let sink = CancelOnceStarted {
             started: AtomicBool::new(false),
         };
-        let saw_halt = with_mux_watcher(&sink, "mkv:///o.mkv", |halt, _events| {
+        let saw_halt = with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| {
             sink.started.store(true, Ordering::SeqCst);
-            wait_for(5, || halt.is_cancelled())
+            wait_for(5, || ctx.halt.is_cancelled())
         });
         assert!(
             saw_halt,
@@ -991,8 +998,11 @@ mod tests {
     #[test]
     fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
         let sink = RecordingSink::default();
-        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
-            events.on_write_progress(4096, 8192);
+        with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| {
+            ctx.events.event(&libfreemkv::Event::BytesWritten {
+                bytes: 4096,
+                total: 8192,
+            });
             assert!(
                 wait_for(5, || !sink.ticks.lock().unwrap().is_empty()),
                 "no progress tick reached the sink"
@@ -1022,8 +1032,10 @@ mod tests {
             }
         }
         let sink = Opened::default();
-        with_mux_watcher(&sink, "mpg:///o.mpg", |_halt, events| {
-            events.on_output_opened(&libfreemkv::DiscTitle::empty());
+        with_mux_watcher(&sink, "mpg:///o.mpg", |ctx| {
+            ctx.events.event(&libfreemkv::Event::OutputOpened {
+                title: &libfreemkv::DiscTitle::empty(),
+            });
         });
         assert_eq!(
             *sink.0.lock().unwrap(),
@@ -1031,20 +1043,25 @@ mod tests {
         );
     }
 
-    // ET23 `mux_close_flush_progress_reaches_sink` — stop design v5 §4.5: "The driver … forwards
-    // increases through a new **defaulted** `MuxEvents::on_flush_progress` … The engine's mux
-    // bridge turns that into `Sink::progress(pass: "sync")`"; no call when nothing moves.
+    // ET23 `mux_close_flush_progress_reaches_sink` — stop design v5 §4.5: each `BytesDurable`
+    // event becomes `Sink::progress(pass: "sync")`; no call when nothing moves.
     #[test]
     fn mux_close_flush_progress_reaches_sink() {
         let sink = RecordingSink::default();
-        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
+        with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| {
             std::thread::sleep(std::time::Duration::from_millis(250));
             assert!(
                 sink.ticks.lock().unwrap().is_empty(),
                 "a call with no flush progress"
             );
-            events.on_flush_progress(1 << 20, 4 << 20);
-            events.on_flush_progress(2 << 20, 4 << 20);
+            ctx.events.event(&libfreemkv::Event::BytesDurable {
+                bytes: 1 << 20,
+                total: 4 << 20,
+            });
+            ctx.events.event(&libfreemkv::Event::BytesDurable {
+                bytes: 2 << 20,
+                total: 4 << 20,
+            });
             assert!(
                 wait_for(5, || sink.ticks.lock().unwrap().len() == 2),
                 "the flush progress did not reach the sink"
@@ -1095,10 +1112,16 @@ mod tests {
             in_poll: std::sync::Mutex::new(Some(in_poll)),
             sent: std::sync::Mutex::new(Some(got)),
         };
-        with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, events| {
+        with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| {
             let _ = polled.recv_timeout(std::time::Duration::from_secs(5));
-            events.on_write_progress(4 << 20, 4 << 20);
-            events.on_flush_progress(4 << 20, 4 << 20);
+            ctx.events.event(&libfreemkv::Event::BytesWritten {
+                bytes: 4 << 20,
+                total: 4 << 20,
+            });
+            ctx.events.event(&libfreemkv::Event::BytesDurable {
+                bytes: 4 << 20,
+                total: 4 << 20,
+            });
             let _ = sent.send(());
         });
         let ticks = sink.ticks.lock().unwrap();
@@ -1118,9 +1141,7 @@ mod tests {
         std::thread::spawn(move || {
             let sink = NoopSink;
             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                with_mux_watcher(&sink, "mkv:///o.mkv", |_halt, _events| {
-                    panic!("mux blew up")
-                })
+                with_mux_watcher(&sink, "mkv:///o.mkv", |_ctx| panic!("mux blew up"))
             }));
             assert!(r.is_err(), "the panic must still propagate to the caller");
             let _ = tx.send(());

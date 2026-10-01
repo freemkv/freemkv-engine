@@ -137,11 +137,12 @@ fn test_disc_copy_progress_callback_fires() {
         calls: Arc<AtomicU64>,
         last_bytes: Arc<AtomicU64>,
     }
-    impl libfreemkv::progress::Progress for CountingReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            self.last_bytes.store(p.bytes_good_total, Ordering::Relaxed);
-            true
+    impl libfreemkv::Events for CountingReporter {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let libfreemkv::Event::Pass(p) = e {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                self.last_bytes.store(p.bytes_good_total, Ordering::Relaxed);
+            }
         }
     }
     let reporter = CountingReporter {
@@ -577,8 +578,11 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
         good: Arc<AtomicU64>,
         dur: Arc<AtomicU64>,
     }
-    impl libfreemkv::progress::Progress for SnapshotReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+    impl libfreemkv::Events for SnapshotReporter {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            let libfreemkv::Event::Pass(p) = e else {
+                return;
+            };
             self.unreadable
                 .store(p.bytes_unreadable_total, Ordering::Relaxed);
             self.pending.store(p.bytes_pending_total, Ordering::Relaxed);
@@ -586,7 +590,6 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
             if let Some(d) = p.disc_duration_secs {
                 self.dur.store((d * 1000.0) as u64, Ordering::Relaxed);
             }
-            true
         }
     }
     let reporter = SnapshotReporter {
@@ -675,15 +678,17 @@ fn test_patch_progress_locates_damage_against_the_main_title() {
         num_ranges: Arc<AtomicU64>,
         at_risk_ms: Arc<AtomicU64>,
     }
-    impl libfreemkv::progress::Progress for LocatedReporter {
-        fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
+    impl libfreemkv::Events for LocatedReporter {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            let libfreemkv::Event::Pass(p) = e else {
+                return;
+            };
             self.bad_in_title
                 .store(p.bytes_bad_in_main_title, Ordering::Relaxed);
             self.num_ranges
                 .store(p.located.num_ranges as u64, Ordering::Relaxed);
             self.at_risk_ms
                 .store(p.located.main_at_risk_ms as u64, Ordering::Relaxed);
-            true
         }
     }
     let bad_in_title = Arc::new(AtomicU64::new(0));
@@ -784,12 +789,13 @@ struct MaxGoodReporter {
     worst: Arc<WorstTick>,
 }
 
-impl libfreemkv::progress::Progress for MaxGoodReporter {
-    fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-        self.max_good
-            .fetch_max(p.bytes_good_total, Ordering::Relaxed);
-        self.worst.note(p);
-        true
+impl libfreemkv::Events for MaxGoodReporter {
+    fn event(&self, e: &libfreemkv::Event<'_>) {
+        if let libfreemkv::Event::Pass(p) = e {
+            self.max_good
+                .fetch_max(p.bytes_good_total, Ordering::Relaxed);
+            self.worst.note(p);
+        }
     }
 }
 

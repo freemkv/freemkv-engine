@@ -48,6 +48,7 @@ codegen-units = 1
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.7.7" }
 freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.7.7" }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.7.7" }
 
 [lints.clippy]
 uninlined_format_args = "allow"

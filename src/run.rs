@@ -5,23 +5,16 @@
 //! [`libfreemkv::SectorSource`] and reports progress through the engine [`Sink`].
 //! The mux stage lives beside it ([`crate::mux_title`], [`crate::run_titles`],
 //! [`crate::mux_image_titles`], [`crate::remux_iso`]); [`ProgressBridge`] adapts
-//! libfreemkv pass progress to the [`Sink`].
+//! libfreemkv `Event::Pass` progress to the [`Sink`].
 
 use crate::job::{Job, RipMode};
 use crate::recovery::{self, CopyOptions, CopyResult};
 use crate::sink::{Level, Progress, Sink};
 
-// The error both recovery entry points return for a decrypting multipass job.
-// One constructor so the two call sites can't describe the same refusal two
-// different ways.
-pub(crate) fn multipass_requires_raw() -> libfreemkv::Error {
-    libfreemkv::Error::IoError {
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "multipass implies raw: a multipass rip recovers a whole-disc \
-             image and cannot decrypt",
-        ),
-    }
+/// The run context the engine hands every libfreemkv stage: the op's `halt`, no events yet,
+/// and the developer diagnostics read once from the environment.
+pub(crate) fn ctx(halt: &libfreemkv::Halt) -> libfreemkv::Ctx {
+    libfreemkv::Ctx::new(halt.clone()).with_diag(libfreemkv::Diag::from_env())
 }
 
 // Sets `done` on every exit path, including a panic unwind, since a plain `store(true)` placed
@@ -82,13 +75,13 @@ pub(crate) fn with_cancel_watcher<T>(
     })
 }
 
-// Bridges libfreemkv's `Progress::report` callback onto the engine `Sink`,
-// translating each tick and honouring `should_cancel()`. `pub(crate)` so
-// `crate::multipass::multipass_rip` reuses the same speed/ETA derivation.
+// Bridges libfreemkv's `Event::Pass` progress onto the engine `Sink`, translating each
+// tick (a Stop comes through the run's halt, which polls `should_cancel()`). `pub(crate)`
+// so `crate::multipass::multipass_rip` reuses the same speed/ETA derivation.
 pub(crate) struct ProgressBridge<'a> {
     sink: &'a dyn Sink,
-    // The engine's ONE speed/ETA derivation. `report` takes `&self`, and the
-    // library may hold the `&dyn Progress` across threads, so guard the
+    // The engine's ONE speed/ETA derivation. `event` takes `&self`, and the
+    // library may hold the `&dyn Events` across threads, so guard the
     // estimator with a Mutex.
     speed: std::sync::Mutex<crate::speed::SpeedEstimator>,
 }
@@ -104,15 +97,18 @@ impl<'a> ProgressBridge<'a> {
     }
 }
 
-impl libfreemkv::progress::Progress for ProgressBridge<'_> {
-    fn report(&self, p: &libfreemkv::progress::PassProgress) -> bool {
-        self.report_at(std::time::Instant::now(), p)
+impl libfreemkv::Events for ProgressBridge<'_> {
+    fn event(&self, e: &libfreemkv::Event<'_>) {
+        if let libfreemkv::Event::Pass(p) = e {
+            self.sink.event(&crate::sink::Event::Pass(p));
+            self.report_at(std::time::Instant::now(), p);
+        }
     }
 }
 
 impl ProgressBridge<'_> {
-    // `report` at an injected `now`, so the speed derivation is testable.
-    fn report_at(&self, now: std::time::Instant, p: &libfreemkv::progress::PassProgress) -> bool {
+    // One pass tick at an injected `now`, so the speed derivation is testable.
+    fn report_at(&self, now: std::time::Instant, p: &libfreemkv::progress::PassProgress) {
         // Borrowed, not allocated: this runs once per batch.
         let pass: std::borrow::Cow<'static, str> = std::borrow::Cow::Borrowed(match p.kind {
             libfreemkv::progress::PassKind::Sweep => "sweep",
@@ -120,6 +116,7 @@ impl ProgressBridge<'_> {
             libfreemkv::progress::PassKind::Trim { .. } => "patch-trim",
             libfreemkv::progress::PassKind::Mux => "mux",
             libfreemkv::progress::PassKind::Verify => "verify",
+            libfreemkv::progress::PassKind::Extract => "extract",
         });
         // Derive speed/ETA ONCE, here — the front-end just formats it. Sweep's
         // work_done/work_total are the authoritative progress denominator.
@@ -148,9 +145,6 @@ impl ProgressBridge<'_> {
             eta_secs,
         };
         self.sink.progress(&progress);
-        // `false` from report() tells the library to halt; the engine halts
-        // when the front-end asks to cancel.
-        !self.sink.should_cancel()
     }
 }
 
@@ -171,13 +165,6 @@ pub fn recover_to_iso(
     job: &Job,
     sink: &dyn Sink,
 ) -> crate::Result<CopyResult> {
-    // Multipass implies raw — refuse before touching the drive. `preflight`
-    // reports this as data, but a front-end may skip that optional check; this
-    // enforcement can't be bypassed and avoids handing back an undecrypted ISO.
-    if matches!(job.mode, RipMode::Multi) && !job.raw {
-        return Err(multipass_requires_raw());
-    }
-
     let bridge = ProgressBridge::new(sink);
 
     sink.log(
@@ -198,8 +185,9 @@ pub fn recover_to_iso(
             halt: Some(halt.clone()),
             keys: job.keys.clone(),
         };
-
-        recovery::copy(disc, reader, iso_path, &opts)
+        // The Sink probe makes every progress report a `should_cancel()` check.
+        let halt = crate::EngineHalt::legacy(opts.halt.clone()).with_sink(sink);
+        recovery::copy_in(disc, reader, iso_path, &opts, &halt)
     })
 }
 
@@ -375,8 +363,6 @@ mod tests {
     // `bytes_pending_total` made a flawless disc report ~12M bad sectors on the first tick.
     #[test]
     fn a_clean_disc_reports_no_bad_sectors_while_the_sweep_is_still_running() {
-        use libfreemkv::progress::Progress as _;
-
         #[derive(Default)]
         struct Captured(std::sync::Mutex<Vec<u64>>);
         impl Sink for Captured {
@@ -392,21 +378,24 @@ mod tests {
         // yet is NOT damage. `bytes_retryable_total` and
         // `bytes_unreadable_total` are both zero because nothing has failed.
         let disc = 25u64 * 1024 * 1024 * 1024;
-        bridge.report(&libfreemkv::progress::PassProgress {
-            kind: libfreemkv::progress::PassKind::Sweep,
-            work_done: 4096,
-            work_total: disc,
-            bytes_good_total: 4096,
-            bytes_unreadable_total: 0,
-            bytes_pending_total: disc - 4096, // the un-swept remainder
-            bytes_retryable_total: 0,
-            bytes_total_disc: disc,
-            disc_duration_secs: None,
-            bytes_bad_in_main_title: 0,
-            main_title_duration_secs: None,
-            main_title_size_bytes: None,
-            located: libfreemkv::progress::LocatedProgress::default(),
-        });
+        bridge.report_at(
+            std::time::Instant::now(),
+            &libfreemkv::progress::PassProgress {
+                kind: libfreemkv::progress::PassKind::Sweep,
+                work_done: 4096,
+                work_total: disc,
+                bytes_good_total: 4096,
+                bytes_unreadable_total: 0,
+                bytes_pending_total: disc - 4096, // the un-swept remainder
+                bytes_retryable_total: 0,
+                bytes_total_disc: disc,
+                disc_duration_secs: None,
+                bytes_bad_in_main_title: 0,
+                main_title_duration_secs: None,
+                main_title_size_bytes: None,
+                located: libfreemkv::progress::LocatedProgress::default(),
+            },
+        );
 
         assert_eq!(
             sink.0.lock().unwrap().as_slice(),
@@ -420,8 +409,6 @@ mod tests {
     // `PassProgress`, where `/`, `%` and `*` by 2048 all agree on `0`.
     #[test]
     fn sectors_bad_converts_bad_bytes_into_a_sector_count() {
-        use libfreemkv::progress::Progress as _;
-
         #[derive(Default)]
         struct Captured(std::sync::Mutex<Vec<u64>>);
         impl Sink for Captured {
@@ -436,21 +423,24 @@ mod tests {
         // 4096 unreadable + 2952 retryable = 7048 bytes, deliberately NOT a
         // multiple of 2048, so `/`, `%` and `*` all give different answers
         // (3 vs 904 vs an overflow-saturated absurdity).
-        bridge.report(&libfreemkv::progress::PassProgress {
-            kind: libfreemkv::progress::PassKind::Sweep,
-            work_done: 1_000_000,
-            work_total: 25 * 1024 * 1024 * 1024,
-            bytes_good_total: 1_000_000,
-            bytes_unreadable_total: 4096,
-            bytes_pending_total: 8192,
-            bytes_retryable_total: 2952,
-            bytes_total_disc: 25 * 1024 * 1024 * 1024,
-            disc_duration_secs: None,
-            bytes_bad_in_main_title: 0,
-            main_title_duration_secs: None,
-            main_title_size_bytes: None,
-            located: libfreemkv::progress::LocatedProgress::default(),
-        });
+        bridge.report_at(
+            std::time::Instant::now(),
+            &libfreemkv::progress::PassProgress {
+                kind: libfreemkv::progress::PassKind::Sweep,
+                work_done: 1_000_000,
+                work_total: 25 * 1024 * 1024 * 1024,
+                bytes_good_total: 1_000_000,
+                bytes_unreadable_total: 4096,
+                bytes_pending_total: 8192,
+                bytes_retryable_total: 2952,
+                bytes_total_disc: 25 * 1024 * 1024 * 1024,
+                disc_duration_secs: None,
+                bytes_bad_in_main_title: 0,
+                main_title_duration_secs: None,
+                main_title_size_bytes: None,
+                located: libfreemkv::progress::LocatedProgress::default(),
+            },
+        );
 
         assert_eq!(
             sink.0.lock().unwrap().as_slice(),
@@ -530,23 +520,37 @@ mod tests {
     }
 
     // `report`'s return is the library's keep-going flag: false exactly when the sink cancels.
+    // A Stop the Sink raises at a progress tick halts the recovery before another tick (the
+    // run's halt polls `should_cancel()`), not a watcher poll later.
     #[test]
-    fn report_returns_false_once_the_sink_cancels() {
-        use libfreemkv::progress::{PassKind, Progress as _};
-        struct Flag(std::sync::atomic::AtomicBool);
-        impl Sink for Flag {
+    fn a_cancel_raised_at_a_progress_tick_halts_before_the_next_tick() {
+        #[derive(Default)]
+        struct StopAtFirstTick {
+            ticks: AtomicUsize,
+        }
+        impl Sink for StopAtFirstTick {
+            fn progress(&self, _p: &Progress) {
+                self.ticks.fetch_add(1, Ordering::SeqCst);
+            }
             fn should_cancel(&self) -> bool {
-                self.0.load(Ordering::SeqCst)
+                self.ticks.load(Ordering::SeqCst) > 0
             }
         }
-        let sink = Flag(std::sync::atomic::AtomicBool::new(false));
-        let bridge = ProgressBridge::new(&sink);
-        assert!(
-            bridge.report(&tick(PassKind::Sweep, 0)),
-            "no cancel: keep going"
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("t.iso");
+        let sectors = 1 << 16;
+        let disc = clean_disc(sectors);
+        let mut reader = ZeroReader { capacity: sectors };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.raw = true;
+        let sink = StopAtFirstTick::default();
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &sink).unwrap();
+        assert!(r.halted, "the tick's Stop halts the rip");
+        assert_eq!(
+            sink.ticks.load(Ordering::SeqCst),
+            1,
+            "no tick after the Stop"
         );
-        sink.0.store(true, Ordering::SeqCst);
-        assert!(!bridge.report(&tick(PassKind::Sweep, 0)), "cancel: halt");
     }
 
     // A panic inside the watched call must PROPAGATE, not hang the join. The failure mode is a
@@ -651,5 +655,20 @@ mod tests {
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
              token is polled every 100 ms and must break the pause"
         );
+    }
+
+    // Decryption is orthogonal to the read policy (EO6): a decrypting multipass job runs.
+    #[test]
+    fn a_decrypting_multipass_job_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("decrypted.iso");
+        let disc = clean_disc(64);
+        let mut reader = ZeroReader { capacity: 64 };
+        let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
+        job.mode = RipMode::Multi;
+        let r = recover_to_iso(&disc, &mut reader, &iso, &job, &CountingSink::default())
+            .expect("a decrypting multipass recovery is allowed");
+        assert!(r.complete, "{r:?}");
+        assert_eq!(std::fs::metadata(&iso).unwrap().len(), 64 * 2048);
     }
 }

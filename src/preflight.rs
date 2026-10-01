@@ -47,7 +47,6 @@ pub struct Reason {
     /// "no-titles"              the scan found no titles at all
     /// "empty-selection"        the selection resolves to no title
     /// "title-out-of-range"     an index past the last title (detail = index)
-    /// "multipass-requires-raw" RipMode::Multi without job.raw
     /// "language-unmatched"     a language-filtered class no selected title
     ///                          carries (detail = audio|subtitle|subtitle_forced)
     /// "unknown-language"       a requested tag names no language (detail = tag)
@@ -78,8 +77,7 @@ impl Reason {
 ///
 /// Checks, cheapest first: the disc has titles; the selection resolves to a non-empty set of
 /// in-range indices; every requested language tag names a language; every language-filtered
-/// stream class the job asks for is carried by a selected title; a multipass job is `raw`;
-/// and, if the disc is encrypted and the job is not `raw`, a usable key exists.
+/// stream class the job asks for is carried by a selected title; and, if the disc is encrypted and the job is not `raw`, a usable key exists.
 pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     let mut reasons = Vec::new();
 
@@ -135,13 +133,6 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         }
     }
 
-    // Multipass implies raw: it's whole-disc image recovery where decryption
-    // has no place, yet `raw`/`multipass` were independent booleans nothing
-    // refused combining. Refused rather than forced, avoiding an undecrypted ISO.
-    if matches!(job.mode, crate::job::RipMode::Multi) && !job.raw {
-        reasons.push(Reason::new("multipass-requires-raw"));
-    }
-
     // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key set (KU §3.5)
     // covering the selected titles; with none, the executors' gate (KU-X1: never the
     // disc-banked keys), so preflight can't pass a rip the passes refuse.
@@ -172,43 +163,16 @@ mod tests {
     use crate::job::RipMode;
 
     // Multipass implies raw, and the engine must be the place that knows it.
+    // Decryption is orthogonal to the read policy (EO6): a decrypting multipass job is not
+    // blocked for being multipass.
     #[test]
-    fn a_decrypting_multipass_job_is_blocked() {
+    fn a_decrypting_multipass_job_is_not_blocked_for_being_multipass() {
         let disc = disc_with(2, false, false);
-
         let mut job = Job::new("disc:///dev/sg0", "iso:///tmp/out.iso");
         job.mode = RipMode::Multi;
         job.raw = false;
         let pf = preflight(&disc, &job);
-        assert!(
-            pf.reasons()
-                .iter()
-                .any(|r| r.key == "multipass-requires-raw"),
-            "a decrypting multipass job must be refused before a sector is \
-             read; got {:?}",
-            pf
-        );
-
-        // The supported combination still passes this gate.
-        job.raw = true;
-        let pf = preflight(&disc, &job);
-        assert!(
-            !pf.reasons()
-                .iter()
-                .any(|r| r.key == "multipass-requires-raw"),
-            "a raw multipass job is the supported shape and must not be blocked"
-        );
-
-        // And single-pass decrypting rips are untouched.
-        job.mode = RipMode::Single;
-        job.raw = false;
-        let pf = preflight(&disc, &job);
-        assert!(
-            !pf.reasons()
-                .iter()
-                .any(|r| r.key == "multipass-requires-raw"),
-            "single-pass decrypt is the ordinary case and must not be blocked"
-        );
+        assert!(pf.reasons().is_empty(), "{pf:?}");
     }
 
     // Every reason key this module can emit must be documented where a front-end will look for
@@ -242,10 +206,6 @@ mod tests {
         assert!(
             keys.len() >= 5,
             "fixture check: expected at least the five known keys, found {keys:?}"
-        );
-        assert!(
-            keys.contains(&"multipass-requires-raw"),
-            "fixture check: the key this test was written for is gone: {keys:?}"
         );
 
         for key in keys {
