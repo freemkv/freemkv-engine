@@ -1317,6 +1317,8 @@ mod tests {
                 Event::Keys { .. } => "keys".into(),
                 Event::Pass(_) => "pass".into(),
                 Event::Recovery(_) => "recovery".into(),
+                Event::TitleSkipped { idx, .. } => format!("skipped:{idx}"),
+                Event::TitleFailed { idx, .. } => format!("failed:{idx}"),
             };
             self.0.lock().unwrap().push(s);
         }

@@ -229,6 +229,40 @@ pub fn run_titles<F>(
 where
     F: FnMut(usize) -> std::io::Result<()>,
 {
+    run_titles_with(indices, explicit_selection, sink, |idx| {
+        mux_one(idx).map_err(TitleError::from)
+    })
+}
+
+/// A title's failure as [`run_titles_with`] decides on it: the policy class and the error.
+#[derive(Debug)]
+pub struct TitleError {
+    /// How the loop's policy ([`decide_title`]) classifies the failure.
+    pub result: TitleResult,
+    /// The error the title failed with, as a front end renders it.
+    pub error: std::io::Error,
+}
+
+impl From<std::io::Error> for TitleError {
+    fn from(error: std::io::Error) -> Self {
+        TitleError {
+            result: classify_title_error(&error),
+            error,
+        }
+    }
+}
+
+/// [`run_titles`] for a front end that classifies its own per-title failures (a setup error
+/// that is always fatal, a Stop): `mux_one` returns the [`TitleError`] it decided.
+pub fn run_titles_with<F>(
+    indices: &[usize],
+    explicit_selection: bool,
+    sink: &dyn Sink,
+    mut mux_one: F,
+) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
     let multi_title = indices.len() > 1;
     let mut titles_written = 0usize;
 
@@ -249,14 +283,22 @@ where
         let mut fail_code = None;
         let mut fail_kind = std::io::ErrorKind::Other;
         let mut fail_data = String::new();
+        let mut failure: Option<std::io::Error> = None;
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
-            Err(e) => {
+            Err(TitleError { result, error: e }) => {
                 fail_detail = e.to_string();
-                fail_code = crate::error_code(&e);
+                fail_code = crate::error_code(&e)
+                    .or_else(|| crate::parse_error_code(&fail_detail).map(|(c, _)| c));
                 fail_data = error_data(&e);
                 fail_kind = e.kind();
-                classify_title_error(&e)
+                failure = Some(e);
+                result
+            }
+        };
+        let failed = |sink: &dyn Sink| {
+            if let Some(e) = &failure {
+                sink.event(&crate::Event::TitleFailed { idx, error: e });
             }
         };
 
@@ -267,12 +309,18 @@ where
                     Level::Info,
                     &format!("title {} skipped (empty/uncrackable stub)", idx + 1),
                 );
+                sink.event(&crate::Event::TitleSkipped {
+                    idx,
+                    empty: fail_code == Some(6008),
+                });
             }
             TitleAction::StopHalt => {
+                failed(sink);
                 sink.log(Level::Info, "cancelled — stopping the whole rip");
                 return RipOutcome::Halted;
             }
             TitleAction::StopNoKey => {
+                failed(sink);
                 sink.log(
                     Level::Error,
                     "disc has no decryption key — every title would fail; stopping",
@@ -280,6 +328,7 @@ where
                 return RipOutcome::NoKey;
             }
             TitleAction::StopFatal => {
+                failed(sink);
                 // Unlike every other arm here, this one used to return silently,
                 // so a hard failure (disk full, permission denied) reached the
                 // front-end as a bare title index with no diagnostic anywhere.

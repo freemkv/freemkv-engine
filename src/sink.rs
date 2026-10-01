@@ -67,6 +67,14 @@ pub enum Event<'a> {
         dest: &'a str,
         result: Result<&'a libfreemkv::MuxOutcome, &'a std::io::Error>,
     },
+    /// [`crate::run_titles`] skipped title `idx`: an incidental stub in a multi-title rip
+    /// (`empty` when it held no streams, else it could not be decrypted).
+    TitleSkipped { idx: usize, empty: bool },
+    /// [`crate::run_titles`] stopped on title `idx`: the error, as the title failed with it.
+    TitleFailed {
+        idx: usize,
+        error: &'a std::io::Error,
+    },
     /// A written MKV was checked against its title. `runtime_secs` is what the
     /// file showed, `expected_secs` the title's duration.
     Verify {
