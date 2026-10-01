@@ -221,6 +221,77 @@ mod tests {
         assert_eq!(written, contents);
     }
 
+    // `force` reaches the extraction: a non-empty destination is refused without it only.
+    #[test]
+    fn force_extracts_into_a_non_empty_destination() {
+        let contents = b"forced".to_vec();
+        let tmp = tempfile::tempdir().unwrap();
+        let out_dir = tmp.path().join("out");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        std::fs::write(out_dir.join("OTHER"), b"x").unwrap();
+        let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
+        let err = extract_tree_with(&disc, &mut reader, &out_dir, false, None, &NoopSink)
+            .expect_err("a non-empty destination without force");
+        assert!(
+            matches!(err, libfreemkv::Error::DirNotEmpty { .. }),
+            "{err:?}"
+        );
+        let (disc, mut reader) = synthetic_disc_with_one_file(&contents);
+        extract_tree_with(&disc, &mut reader, &out_dir, true, None, &NoopSink).expect("forced");
+        assert_eq!(std::fs::read(out_dir.join("HELLO.TXT")).unwrap(), contents);
+    }
+
+    // The caller's key ring reaches the extraction: an AACS stream file comes out decrypted
+    // with it, and is refused without one.
+    #[test]
+    fn the_key_ring_decrypts_the_extracted_files() {
+        use crate::test_fixtures::*;
+        let fx = bd_image(&[Some(K1)], 1);
+        let set = resolve(
+            &fx,
+            libfreemkv::keys::KeyScope::WholeDisc,
+            &[(Answer::Keydb, &[K1])],
+            &Calls::default(),
+        )
+        .unwrap();
+        let (at, len) = {
+            let (s, n) = fx.clip(0);
+            (s as usize * 2048, n as usize * 2048)
+        };
+        let plain = &fx.img.plain[at..at + len];
+        let tmp = tempfile::tempdir().unwrap();
+        // The copy-permission bits of each TS packet's header differ once decrypted.
+        let masked = |b: &[u8]| -> Vec<u8> {
+            let mut v = b.to_vec();
+            v.chunks_mut(192).for_each(|p| p[0] &= 0x3F);
+            v
+        };
+        let plain = masked(plain);
+        let clip = |dir: &std::path::Path| {
+            std::fs::read(dir.join("BDMV/STREAM/00000.m2ts")).map(|b| masked(&b))
+        };
+        let keyed = tmp.path().join("keyed");
+        extract_tree_with(
+            &fx.disc,
+            &mut fx.source(),
+            &keyed,
+            false,
+            Some(&set),
+            &NoopSink,
+        )
+        .expect("extracts with the set");
+        assert!(
+            clip(&keyed).unwrap() == plain,
+            "decrypted with the caller's set"
+        );
+        let bare = tmp.path().join("bare");
+        let r = extract_tree_with(&fx.disc, &mut fx.source(), &bare, false, None, &NoopSink);
+        assert!(
+            r.is_err() || clip(&bare).map_or(true, |b| b != plain),
+            "no key ring: the AACS file is not extracted decrypted"
+        );
+    }
+
     #[test]
     fn cancel_via_sink_halts_extraction() {
         struct CancelSink;

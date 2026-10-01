@@ -3989,5 +3989,9 @@ mod tests {
         .expect("a decrypting multipass rip is allowed");
         assert!(!reads.lock().unwrap().is_empty(), "the rip read the disc");
         assert!(iso.exists(), "the rip wrote its image");
+        // The passes ran decrypting: the map says so (an AACS image's plaintext is pinned by
+        // the KU gate tests).
+        let map = Mapfile::load(&disc.mapfile_for(&iso)).unwrap();
+        assert_eq!(map.raw(), Some(false), "a decrypting run's image");
     }
 }

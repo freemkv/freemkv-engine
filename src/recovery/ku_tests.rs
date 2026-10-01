@@ -81,6 +81,20 @@ fn side_read_failures_never_reach_the_damage_classifier() {
     );
     assert_eq!(CLASSIFIED.with(|c| c.get()), 0, "no damage classification");
     assert_image_is_plain(&fx, &iso, 1);
+
+    // Control: the same sweep failing its own reads does reach the classifier on this thread.
+    drive.set(Damage::Range(s, s + n));
+    CLASSIFIED.with(|c| c.set(0));
+    let _ = super::sweep(
+        &fx.disc,
+        &mut drive.clone(),
+        &dir.path().join("dead.iso"),
+        &opts,
+    );
+    assert!(
+        CLASSIFIED.with(|c| c.get()) > 0,
+        "a pass's own failed read is classified"
+    );
 }
 
 /// EK10 (KU §2.4, KS-1 "encryption is applied to every Aligned Unit in the file", KS-7):
@@ -224,7 +238,9 @@ fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<KeyRing>) {
     };
     crate::multipass_rip(disc, &mut fx.source(), &iso("mp.iso"), &job, &single, &sink)
         .expect("single-pass multipass_rip");
-    assert_image_is_plain(fx, &iso("run.iso"), 0);
+    for out in ["copy.iso", "sweep.iso", "run.iso", "mp.iso"] {
+        assert_image_is_plain(fx, &iso(out), 0);
+    }
 }
 
 /// EK8 (KU §3.5, N-KU8): a keyed rip passes every engine gate with the set alone (no

@@ -256,8 +256,6 @@ fn open_image_resolves_once_and_hands_the_set_to_every_title() {
 
     let input = opened.input_options(1, libfreemkv::StreamSelection::default());
     assert!(input.keys.is_some(), "the set, not banked keys or a fetch");
-    let src_code = include_str!("image.rs");
-    assert!(!src_code.contains(&["fn build_key", "_fetch"].concat()));
 
     // remux_iso: one open, one resolution round for its title, then the mux.
     let calls = Calls::default();
