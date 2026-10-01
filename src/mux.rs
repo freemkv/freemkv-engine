@@ -258,6 +258,29 @@ pub fn run_titles_with<F>(
     indices: &[usize],
     explicit_selection: bool,
     sink: &dyn Sink,
+    mux_one: F,
+) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
+    title_loop(indices, explicit_selection, false, sink, mux_one)
+}
+
+/// The loop for a disc's episodes beside its main title (a TV disc's fan-out): an episode
+/// that fails is reported ([`crate::Event::TitleFailed`]) and dropped, and the rest still
+/// run. A Stop and a disc with no key still end the loop.
+pub fn run_episodes<F>(indices: &[usize], sink: &dyn Sink, mux_one: F) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
+    title_loop(indices, false, true, sink, mux_one)
+}
+
+fn title_loop<F>(
+    indices: &[usize],
+    explicit_selection: bool,
+    keep_going: bool,
+    sink: &dyn Sink,
     mut mux_one: F,
 ) -> RipOutcome
 where
@@ -327,6 +350,7 @@ where
                 );
                 return RipOutcome::NoKey;
             }
+            TitleAction::StopFatal if keep_going => failed(sink),
             TitleAction::StopFatal => {
                 failed(sink);
                 // Unlike every other arm here, this one used to return silently,
