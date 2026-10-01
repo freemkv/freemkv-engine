@@ -19,6 +19,120 @@ const MILLIS_PER_SEC: f64 = 1000.0;
 /// Bytes in one optical sector — the unit damage is scored in.
 pub(crate) const SECTOR_BYTES: u64 = 2048;
 
+// Typical average playback bitrates (bytes/sec) by video class, the estimate a title gets when
+// it reports neither a usable size nor a usable duration. Averages, not peaks: a lower rate
+// converts the same lost bytes into MORE lost time, so the estimate errs towards reporting loss.
+const SD_BYTES_PER_SEC: f64 = 6_000_000.0 / 8.0;
+const HD_BYTES_PER_SEC: f64 = 30_000_000.0 / 8.0;
+const UHD_BYTES_PER_SEC: f64 = 60_000_000.0 / 8.0;
+
+/// The title's playback rate in bytes/sec, the one conversion between lost bytes and lost time.
+///
+/// Its own size over its own duration when it has both. A missing size is taken from its
+/// extents and a missing duration from its clips; when either is still missing, a typical
+/// rate for the title's video (UHD, HD or SD, else its container: a program stream is DVD-class,
+/// a transport stream Blu-ray-class). Always finite and positive, so missing metadata never
+/// leaves a loss unmeasured.
+pub fn title_bytes_per_sec(title: &libfreemkv::DiscTitle) -> f64 {
+    let size = if title.size_bytes > 0 {
+        title.size_bytes
+    } else {
+        title
+            .extents
+            .iter()
+            .map(|e| u64::from(e.sector_count) * SECTOR_BYTES)
+            .sum()
+    };
+    let usable = |d: f64| d.is_finite() && d > 0.0;
+    let duration = if usable(title.duration_secs) {
+        title.duration_secs
+    } else {
+        title
+            .clips
+            .iter()
+            .map(|c| c.duration_secs)
+            .filter(|d| usable(*d))
+            .sum()
+    };
+    if size > 0 && usable(duration) {
+        let bps = size as f64 / duration;
+        if usable(bps) {
+            return bps;
+        }
+    }
+    format_bytes_per_sec(title)
+}
+
+// The typical rate for a title's video class, for a title whose size or duration is missing.
+fn format_bytes_per_sec(title: &libfreemkv::DiscTitle) -> f64 {
+    use libfreemkv::Resolution as R;
+    let video = title.streams.iter().find_map(|s| match s {
+        libfreemkv::Stream::Video(v) if !v.secondary => Some(v.resolution),
+        _ => None,
+    });
+    match video {
+        Some(R::R2160p | R::R4320p) => UHD_BYTES_PER_SEC,
+        Some(R::R720p | R::R1080i | R::R1080p) => HD_BYTES_PER_SEC,
+        Some(R::R480i | R::R480p | R::R576i | R::R576p) => SD_BYTES_PER_SEC,
+        Some(R::Unknown) | None => match title.content_format {
+            libfreemkv::ContentFormat::MpegPs => SD_BYTES_PER_SEC,
+            libfreemkv::ContentFormat::BdTs => HD_BYTES_PER_SEC,
+        },
+    }
+}
+
+/// Milliseconds of `title`'s playback that `bad_bytes` of it hold, at [`title_bytes_per_sec`].
+pub fn lost_ms_in_title(title: &libfreemkv::DiscTitle, bad_bytes: u64) -> f64 {
+    if bad_bytes == 0 {
+        return 0.0;
+    }
+    bad_bytes as f64 / title_bytes_per_sec(title) * MILLIS_PER_SEC
+}
+
+/// The engine's one loss verdict over the ripped titles: what was lost and whether it aborts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LossVerdict {
+    /// Unreadable bytes under the deliverable's scope: the whole disc for an ISO, inside the
+    /// titles for a mux, and the whole disc's when a title has no extents to scope by.
+    pub lost_bytes: u64,
+    /// Playback milliseconds lost in the titles. NaN when a damaged title has no extents, so
+    /// its share of the damage cannot be timed: the loss is then reported in bytes only.
+    pub lost_ms: f64,
+    /// The loss exceeds the tolerance: `abort_on_lost_secs == 0` aborts on any lost byte, a
+    /// positive tolerance on more lost time than that. A loss reported in bytes only never
+    /// exceeds a positive tolerance (a rip is never stopped for missing metadata).
+    pub aborts: bool,
+}
+
+/// The loss verdict for `titles` over the confirmed-unreadable `bad_ranges`, against
+/// `abort_on_lost_secs` (already [`effective_abort_secs`] for an ISO).
+pub fn loss_verdict(
+    is_iso_output: bool,
+    titles: &[&libfreemkv::DiscTitle],
+    bad_ranges: &[(u64, u64)],
+    abort_on_lost_secs: u64,
+) -> LossVerdict {
+    let unscopable = titles
+        .iter()
+        .any(|t| loss_is_unscopable(is_iso_output, t, bad_ranges));
+    let lost_bytes = if unscopable {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum()
+    } else {
+        titles_abort_lost_bytes(is_iso_output, titles, bad_ranges)
+    };
+    let (lost_ms, _) = titles_lost_ms(true, titles, bad_ranges);
+    let aborts = if abort_on_lost_secs == 0 {
+        lost_bytes > 0
+    } else {
+        lost_ms.is_finite() && lost_ms > (abort_on_lost_secs as f64) * MILLIS_PER_SEC
+    };
+    LossVerdict {
+        lost_bytes,
+        lost_ms,
+        aborts,
+    }
+}
+
 /// Does the residual loss exceed the tolerance and therefore abort the rip?
 ///
 /// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
@@ -382,20 +496,10 @@ fn recovery_is_complete(aborted_for_loss: bool, unreadable_bytes: u64, pending_b
     !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0
 }
 
-// Milliseconds of main-title playback lost, scaling `main_bad_bytes` by `title`'s own
-// size/runtime — NaN when unquantifiable. `title` must be the title `main_bad_bytes` was scoped
-// to.
+// Milliseconds of main-title playback lost, at `title`'s [`title_bytes_per_sec`]. `title` must
+// be the title `main_bad_bytes` was scoped to.
 fn main_title_lost_ms(title: &libfreemkv::DiscTitle, main_bad_bytes: u64) -> f64 {
-    if main_bad_bytes == 0 {
-        return 0.0;
-    }
-    if title.size_bytes > 0 && title.duration_secs > 0.0 && title.duration_secs.is_finite() {
-        main_bad_bytes as f64 / title.size_bytes as f64 * title.duration_secs * MILLIS_PER_SEC
-    } else {
-        // Loss exists but we can't quantify it (no bitrate) → NaN, which the
-        // gate treats as fail-safe abort.
-        f64::NAN
-    }
+    lost_ms_in_title(title, main_bad_bytes)
 }
 
 /// The end-of-recovery loss figure, plus the reason it is unquantifiable when
@@ -518,14 +622,20 @@ pub struct MultipassResult {
     pub pending_bytes: u64,
     /// Good bytes recovered across all passes.
     pub good_bytes: u64,
-    /// Playback milliseconds lost in the ripped titles (NaN if unquantifiable): those
+    /// Playback milliseconds lost in the ripped titles: those
     /// [`Job::selection`] resolves to, summed per title (title 0 for the default `MainMovie`).
     ///
     /// ALWAYS scoped to those titles' own extents, even on an ISO rip whose
     /// abort gate counts bytes across the whole disc — an unreadable menu or
     /// trailer is not lost feature playback, and reporting it as such once
-    /// stamped `Serious` on a movie the drive had read perfectly.
+    /// stamped `Serious` on a movie the drive had read perfectly. A title missing its size or
+    /// duration is timed at an estimated rate ([`title_bytes_per_sec`]). NaN when the loss
+    /// cannot be timed: a damaged title with no extents (the loss is in [`Self::lost_bytes`]),
+    /// a damage record that could not be read, or a run that stopped before the verdict.
     pub main_lost_ms: f64,
+    /// Unreadable bytes the loss verdict counted ([`LossVerdict::lost_bytes`]): the whole
+    /// disc for an ISO, the ripped titles' otherwise. The loss when `main_lost_ms` is NaN.
+    pub lost_bytes: u64,
     /// Damage classification from the residual loss.
     pub severity: crate::DamageSeverity,
     /// Number of passes executed (1 sweep + N patch in multipass mode; 1 in
@@ -955,6 +1065,7 @@ pub(crate) fn recover(
                     pending_bytes: last_pending,
                     good_bytes: last_good,
                     main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
+                    lost_bytes: last_unreadable,
                     severity: interrupted_severity(last_unreadable, last_pending),
                     passes,
                     aborted_for_loss: false,
@@ -996,6 +1107,7 @@ pub(crate) fn recover(
             pending_bytes: last_pending,
             good_bytes: last_good,
             main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
+            lost_bytes: last_unreadable,
             severity: interrupted_severity(last_unreadable, last_pending),
             passes,
             aborted_for_loss: false,
@@ -1008,83 +1120,107 @@ pub(crate) fn recover(
     // ── End-of-recovery promotion + abort-on-loss gate. ──
     // `bad_sectors` is carried out of the match, not derived after: the Ok
     // branch has the mapfile split; the Err branch has only unsplittable counters.
-    let (main_lost_ms, main_lost_bytes, good_bytes, unreadable_bytes, pending_bytes, bad_sectors) =
-        match Mapfile::load(&mapfile_path) {
-            Ok(mut map) => {
-                // Promotion MAKES the loss visible: the abort gate reads only
-                // Unreadable ranges, so a range that fails to promote out of
-                // NonTrimmed silently drops out — a write error ships as a good rip.
-                let mut promotion_intact = true;
-                let (promote_from, promote_to) = end_of_recovery_promotion();
-                if let Err(e) = map.promote(promote_from, promote_to) {
-                    promotion_intact = false;
-                    sink.log(
-                        Level::Warn,
-                        &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
-                    );
-                }
-                if let Err(e) = map.flush() {
-                    promotion_intact = false;
-                    sink.log(
-                        Level::Warn,
-                        &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
-                    );
-                }
-                milestone(
-                    sink,
-                    RecoveryEvent::Promoted {
-                        map: &map,
-                        intact: promotion_intact,
-                    },
+    let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
+    // `verdict` is the engine's one loss verdict; `bad_sectors` is carried out of the match,
+    // not derived after: the Ok branch has the mapfile split; the Err branch has only
+    // unsplittable counters.
+    let (verdict, good_bytes, unreadable_bytes, pending_bytes, bad_sectors) = match Mapfile::load(
+        &mapfile_path,
+    ) {
+        Ok(mut map) => {
+            // Promotion MAKES the loss visible: the abort gate reads only
+            // Unreadable ranges, so a range that fails to promote out of
+            // NonTrimmed silently drops out — a write error ships as a good rip.
+            let mut promotion_intact = true;
+            let (promote_from, promote_to) = end_of_recovery_promotion();
+            if let Err(e) = map.promote(promote_from, promote_to) {
+                promotion_intact = false;
+                sink.log(
+                    Level::Warn,
+                    &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
                 );
-                let stats = map.stats();
-                let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-                let lost_bytes = titles_abort_lost_bytes(opts.is_iso_output, &titles, &bad_ranges);
-                // Fail-safe: an incomplete damage record makes loss NaN, so
-                // `loss_aborts` fires regardless of threshold. Deliberately
-                // asymmetric: `lost_bytes` is whole-disc; the ms below stays title-scoped.
-                let (lost_ms, unquantifiable) =
-                    titles_lost_ms(promotion_intact, &titles, &bad_ranges);
-                if let Some(why) = unquantifiable {
+            }
+            if let Err(e) = map.flush() {
+                promotion_intact = false;
+                sink.log(
+                    Level::Warn,
+                    &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
+                );
+            }
+            milestone(
+                sink,
+                RecoveryEvent::Promoted {
+                    map: &map,
+                    intact: promotion_intact,
+                },
+            );
+            let stats = map.stats();
+            let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+            let mut verdict =
+                loss_verdict(opts.is_iso_output, &titles, &bad_ranges, effective_abort);
+            if !promotion_intact {
+                // Fail-safe: an incomplete damage record cannot vouch for any figure
+                // derived from it, so the rip is not shipped as within tolerance.
+                let (ms, why) = titles_lost_ms(false, &titles, &bad_ranges);
+                if let Some(why) = why {
                     sink.log(Level::Error, why);
                 }
-                (
-                    lost_ms,
-                    lost_bytes,
-                    stats.bytes_good,
-                    stats.bytes_unreadable,
-                    stats.bytes_pending,
-                    end_of_recovery_bad_sectors(&stats),
-                )
-            }
-            Err(e) => {
-                // Fail-safe: the mapfile — the rip's only damage record — couldn't be read at
-                // the abort-decision point. NaN makes `loss_aborts` fire instead of shipping
-                // this as a perfect rip.
-                milestone(sink, RecoveryEvent::LossUnmeasured { error: &e });
+                verdict.lost_ms = ms;
+                verdict.aborts = true;
+            } else if verdict.lost_ms.is_nan() {
                 sink.log(
+                    Level::Warn,
+                    &format!(
+                        "multipass_rip: a ripped title reports no extents, so its loss \
+                             cannot be timed — {} bytes unreadable, reported in bytes",
+                        verdict.lost_bytes
+                    ),
+                );
+            }
+            (
+                verdict,
+                stats.bytes_good,
+                stats.bytes_unreadable,
+                stats.bytes_pending,
+                end_of_recovery_bad_sectors(&stats),
+            )
+        }
+        Err(e) => {
+            // Fail-safe: the mapfile — the rip's only damage record — couldn't be read at
+            // the abort-decision point, so the rip is not shipped as perfect.
+            milestone(sink, RecoveryEvent::LossUnmeasured { error: &e });
+            sink.log(
                     Level::Error,
                     &format!(
                         "multipass_rip: mapfile could not be loaded to verify loss — forcing abort ({e})"
                     ),
                 );
-                // No `MapStats` to split, so the score keeps the whole in-flight
-                // aggregate deliberately — this fail-safe path must over-report,
-                // not under-report (NaN can't escalate a zero-sector Clean verdict).
-                (
-                    f64::NAN,
-                    0,
-                    last_good,
-                    last_unreadable,
-                    last_pending,
-                    bad_sector_count(last_unreadable, last_pending),
-                )
-            }
-        };
+            // No `MapStats` to split, so the score keeps the whole in-flight
+            // aggregate deliberately — this fail-safe path must over-report,
+            // not under-report (NaN can't escalate a zero-sector Clean verdict).
+            (
+                LossVerdict {
+                    lost_bytes: last_unreadable,
+                    lost_ms: f64::NAN,
+                    aborts: true,
+                },
+                last_good,
+                last_unreadable,
+                last_pending,
+                bad_sector_count(last_unreadable, last_pending),
+            )
+        }
+    };
 
-    let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
-    let aborted_for_loss = loss_aborts(main_lost_bytes, main_lost_ms, effective_abort);
-    let severity = classify_damage(bad_sectors, main_lost_ms);
+    let aborted_for_loss = verdict.aborts;
+    // A loss reported in bytes only is scored by its sectors; an untrustworthy record (an
+    // aborting NaN) stays Serious.
+    let severity = if verdict.lost_ms.is_nan() && !verdict.aborts {
+        classify_damage(bad_sectors, 0.0)
+    } else {
+        classify_damage(bad_sectors, verdict.lost_ms)
+    };
+    let main_lost_ms = verdict.lost_ms;
     let complete = recovery_is_complete(aborted_for_loss, unreadable_bytes, pending_bytes);
 
     Ok(MultipassResult {
@@ -1092,6 +1228,7 @@ pub(crate) fn recover(
         pending_bytes,
         good_bytes,
         main_lost_ms,
+        lost_bytes: verdict.lost_bytes,
         severity,
         passes,
         aborted_for_loss,
@@ -1173,6 +1310,7 @@ fn single_pass(
         // 0.0 would falsely claim "no playback lost" beside real damage.
         // NaN marks it unquantified — except zero bad sectors, genuinely 0.0.
         main_lost_ms: if bad_sectors == 0 { 0.0 } else { f64::NAN },
+        lost_bytes: cr.bytes_unreadable,
         // Severity comes from the SECTOR count, which single-pass knows.
         // NaN would wrongly escalate to Serious via `classify_damage`'s
         // fail-safe (right for the abort gate; single-pass has none).
@@ -1437,52 +1575,39 @@ mod tests {
         assert!(!loss_is_unscopable(false, &t, &[(0, 4096)]));
     }
 
-    // `main_title_lost_ms`'s bitrate guard, pinned in every direction: the mutation run flipped
-    // the `&&`/`>` operators here and the suite stayed green. Getting it wrong divides by zero
-    // by accident.
+    // The title's own size/duration wins; missing metadata falls back to an estimated rate
+    // (never NaN), so a rip is never stopped just because a title lacks a size or duration.
     #[test]
-    fn lost_ms_needs_both_a_size_and_a_duration() {
+    fn lost_ms_uses_the_title_rate_else_an_estimate() {
         let damage = 4096u64;
 
-        // Both present -> a real number.
         let mut ok = libfreemkv::DiscTitle::empty();
         ok.size_bytes = 1_000_000;
         ok.duration_secs = 100.0;
+        // 4096 bytes at 10_000 B/s = 409.6 ms.
         let ms = main_title_lost_ms(&ok, damage);
-        assert!(
-            ms.is_finite() && ms > 0.0,
-            "expected a real figure, got {ms}"
-        );
+        assert!((ms - 409.6).abs() < 1e-6, "expected 409.6 ms, got {ms}");
 
-        // Size alone, duration alone, and neither: all unquantifiable. `||`
-        // would let the first two through; `true` would let all three.
         let mut size_only = libfreemkv::DiscTitle::empty();
         size_only.size_bytes = 1_000_000;
         let mut dur_only = libfreemkv::DiscTitle::empty();
         dur_only.duration_secs = 100.0;
+        let mut zero_dur = libfreemkv::DiscTitle::empty();
+        zero_dur.size_bytes = 1_000_000;
         for (name, t) in [
             ("size only", size_only),
             ("duration only", dur_only),
+            ("zero duration", zero_dur),
             ("neither", libfreemkv::DiscTitle::empty()),
         ] {
             let ms = main_title_lost_ms(&t, damage);
-            assert!(ms.is_nan(), "{name}: expected NaN, got {ms}");
+            assert!(
+                ms.is_finite() && ms > 0.0,
+                "{name}: expected an estimate, got {ms}"
+            );
         }
 
-        // Exactly zero is NOT usable — `>=` would admit it and divide by zero.
-        let mut zero_size = libfreemkv::DiscTitle::empty();
-        zero_size.size_bytes = 0;
-        zero_size.duration_secs = 100.0;
-        assert!(main_title_lost_ms(&zero_size, damage).is_nan());
-
-        let mut zero_dur = libfreemkv::DiscTitle::empty();
-        zero_dur.size_bytes = 1_000_000;
-        zero_dur.duration_secs = 0.0;
-        assert!(main_title_lost_ms(&zero_dur, damage).is_nan());
-
-        // An extent-less / bitrate-less title (the shape a failed scan leaves).
-        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), damage).is_nan());
-        // And no damage is genuinely zero regardless of the title.
+        // No damage is genuinely zero regardless of the title.
         assert_eq!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 0), 0.0);
     }
 
@@ -1893,10 +2018,11 @@ mod tests {
     }
 
     #[test]
-    fn main_title_lost_ms_is_nan_when_unquantifiable() {
-        // A title with loss but no measurable bitrate (size 0, dur 0) → NaN
-        // (fail-safe abort).
-        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096).is_nan());
+    fn a_title_without_metadata_gets_an_estimated_loss_not_an_abort() {
+        // No size, no duration: timed at the format's typical rate, so the loss is measured
+        // and a positive tolerance decides, rather than a NaN forcing an abort.
+        let ms = main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096);
+        assert!(ms.is_finite() && ms > 0.0, "expected an estimate, got {ms}");
     }
 
     // ── multipass_rip strategy LOOP, exercised headlessly (hard rule #2) ── Every double must

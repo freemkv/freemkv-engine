@@ -58,11 +58,12 @@ pub use image::{
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_loose_clip, won_source};
 pub use multipass::{
-    MultipassOpts, MultipassResult, PassExit, PassHost, PassPlan, PatchDecision, ReaderHost,
-    abort_lost_bytes, abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
-    end_of_recovery_promotion, loss_aborts, measured_scope_bad, mkv_staging_scope, multipass_rip,
-    multipass_rip_staged, multipass_rip_with, pass_exit, patch_made_progress, patch_pass_decision,
-    plan_passes, pre_pass_converged, scope_bad_bytes, scope_converged, should_abort_for_loss,
+    LossVerdict, MultipassOpts, MultipassResult, PassExit, PassHost, PassPlan, PatchDecision,
+    ReaderHost, abort_lost_bytes, abort_lost_ms, bad_sector_statuses, classify_damage,
+    effective_abort_secs, end_of_recovery_promotion, loss_aborts, loss_verdict, lost_ms_in_title,
+    measured_scope_bad, mkv_staging_scope, multipass_rip, multipass_rip_staged, multipass_rip_with,
+    pass_exit, patch_made_progress, patch_pass_decision, plan_passes, pre_pass_converged,
+    scope_bad_bytes, scope_converged, should_abort_for_loss, title_bytes_per_sec,
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
