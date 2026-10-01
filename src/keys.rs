@@ -164,6 +164,48 @@ pub fn resolve_for_rip_traced(
     resolve_traced(disc, reader, scope, sources, seed, halt, None)
 }
 
+/// The keys for a loose Blu-ray clip (`m2ts://`), looked up the only way a loose file allows:
+/// walk up to its disc folder ([`libfreemkv::disc_root_of`]), scan it, and resolve once over
+/// the titles that play the clip (every title when none names it, so an unrelated keyless
+/// title can then refuse it). `Ok(None)`: no readable disc
+/// structure or no AACS, so the clip reads keyless and an encrypted one refuses (E7022).
+pub fn resolve_loose_clip(
+    clip: &std::path::Path,
+    sources: &libfreemkv::KeySourceFactory,
+    halt: Option<&libfreemkv::Halt>,
+) -> (crate::Result<Option<ResolvedKeySet>>, ResolutionTrace) {
+    let Some(root) = libfreemkv::disc_root_of(clip) else {
+        return (Ok(None), ResolutionTrace::new());
+    };
+    // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
+    // refuses E7022 in `input()`.
+    let (disc, mut reader) = match crate::image::scan_image(&crate::ImageSource::Dir(root)) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
+            return (Ok(None), ResolutionTrace::new());
+        }
+    };
+    if disc.aacs.is_none() {
+        return (Ok(None), ResolutionTrace::new());
+    }
+    let stem = clip
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let plays =
+        |t: &libfreemkv::DiscTitle| t.clips.iter().any(|c| c.clip_id.eq_ignore_ascii_case(stem));
+    let mut titles: Vec<usize> = (0..disc.titles.len())
+        .filter(|&i| plays(&disc.titles[i]))
+        .collect();
+    if titles.is_empty() {
+        titles = (0..disc.titles.len()).collect();
+    }
+    let scope = KeyScope::Titles(titles);
+    let (set, trace) = resolve_traced(&disc, reader.as_mut(), scope, sources, None, halt, None);
+    (set.map(Some), trace)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_traced(
     disc: &libfreemkv::Disc,
@@ -496,6 +538,22 @@ mod tests {
             resolve_for_rip(&fx.disc, &mut fx.source(), KeyScope::None, &f, None, None).unwrap();
         assert_eq!(calls.len(), 0);
         assert!(set.status().proven == 0);
+    }
+
+    /// 1.8.0: a loose clip outside any disc folder has nowhere to look keys up: no set, no
+    /// source asked (an encrypted clip then refuses E7022 in `input()`).
+    #[test]
+    fn a_loose_clip_with_no_disc_folder_asks_nothing() {
+        let dir = std::env::temp_dir().join(format!("fe-loose-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clip = dir.join("00001.m2ts");
+        std::fs::write(&clip, b"").unwrap();
+        let calls = Calls::default();
+        let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+        let (set, _) = resolve_loose_clip(&clip, &f, None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(set.unwrap().is_none());
+        assert_eq!(calls.len(), 0);
     }
 
     /// KU §2.3 step 13: Stop before the resolve builds no set and asks nothing.
