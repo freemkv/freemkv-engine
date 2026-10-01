@@ -7,7 +7,7 @@
 
 use super::tests::{Events, job, mkv, outcome, title, writes};
 use super::*;
-use libfreemkv::halt::Progress as Counter;
+use libfreemkv::halt::Liveness as Counter;
 use libfreemkv::io::artifact_lock::lock_path as sidecar_for;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;

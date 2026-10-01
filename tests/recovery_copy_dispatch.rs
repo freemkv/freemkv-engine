@@ -1326,11 +1326,13 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         }
     }
 
-    // A reporter that cancels on the very first tick.
-    struct CancelNow;
-    impl libfreemkv::progress::Progress for CancelNow {
-        fn report(&self, _p: &libfreemkv::progress::PassProgress) -> bool {
-            false // false == halt
+    // A front end that stops on the very first tick, through the pass's halt flag.
+    struct CancelNow(Arc<std::sync::atomic::AtomicBool>);
+    impl libfreemkv::Events for CancelNow {
+        fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let libfreemkv::Event::Pass(_) = e {
+                self.0.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1363,8 +1365,9 @@ fn cancelling_reporter_stops_the_patch_chain_promptly() {
         reads: Arc::clone(&reads),
         served: Arc::clone(&served),
     };
-    let reporter = CancelNow;
-    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), None);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reporter = CancelNow(stop.clone());
+    let popts = freemkv_engine::PatchOptions::for_patch_pass(false, Some(&reporter), Some(stop));
     let out = freemkv_engine::patch(&disc, &mut reader, &iso_path, &popts).unwrap();
 
     let n = reads.load(Ordering::Relaxed);

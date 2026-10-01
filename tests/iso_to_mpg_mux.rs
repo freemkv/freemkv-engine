@@ -269,7 +269,12 @@ fn iso_dvd_source_muxes_to_mpg_through_the_engine() {
 
     // Read the muxed output back and confirm its stream shape matches the
     // source title (one video, one audio, same codecs).
-    let mut readback = libfreemkv::input(&dest_url, &InputOptions::default()).unwrap_or_else(|e| {
+    let mut readback = libfreemkv::input(
+        &dest_url,
+        &InputOptions::default(),
+        &libfreemkv::Ctx::default(),
+    )
+    .unwrap_or_else(|e| {
         panic!("the muxed mpg:// output must itself be a readable source, got {e}")
     });
     let streams = readback.info().streams.clone();

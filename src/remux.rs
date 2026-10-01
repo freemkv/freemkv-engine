@@ -604,7 +604,7 @@ fn land_verified(
     });
     let outcome = result?;
     if !outcome.completed {
-        return Err(if halt.is_cancelled() {
+        return Err(if outcome.halted || halt.is_cancelled() {
             libfreemkv::Error::Halted.into()
         } else {
             libfreemkv::Error::MuxIncomplete { title: idx + 1 }.into()
@@ -953,7 +953,7 @@ fn watch_worker<T>(
     mut beat: LockBeat,
     report: &dyn Fn(u64) -> crate::sink::Progress,
 ) -> io::Result<T> {
-    let progress = libfreemkv::halt::Progress::new();
+    let progress = libfreemkv::halt::Liveness::new();
     let mut timer = StallTimer::new(stall, &progress);
     let (mut every, mut seen) = (Activity::new(timing.activity_every), 0);
     loop {
@@ -1284,6 +1284,7 @@ mod tests {
     pub(super) fn outcome(completed: bool) -> libfreemkv::MuxOutcome {
         libfreemkv::MuxOutcome {
             completed,
+            halted: false,
             output_opened: true,
             bytes_written: 1,
             errors: 0,

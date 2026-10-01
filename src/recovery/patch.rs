@@ -576,7 +576,7 @@ impl PatchLoopState {
 pub(super) enum RegionOutcome {
     /// Section drained: recovered what was readable, left the rest NonTrimmed.
     Completed,
-    /// Halt requested — the halt token or the progress reporter.
+    /// Halt requested (the halt token, also checked at each progress report).
     /// `state.halted` is set.
     Halted,
     /// USB-bridge transport fault: a dead bus, not a bad sector.
@@ -983,7 +983,7 @@ impl PatchCtx<'_, '_> {
                 };
                 if due {
                     last_tick.set(Some(t));
-                    if report_patch_progress(disc, state, opts, total_bytes, shared) {
+                    if report_patch_progress(disc, state, opts, total_bytes, shared, ext_halt) {
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -1064,6 +1064,7 @@ impl PatchCtx<'_, '_> {
             self.opts,
             self.total_bytes,
             self.shared,
+            self.halt,
         ) {
             self.state.halted = true;
             return Ok(RegionOutcome::Halted);
@@ -1092,15 +1093,16 @@ impl PatchCtx<'_, '_> {
     }
 }
 
-// Build + dispatch a `PassProgress` to the caller's reporter, using the
-// current pipeline-shared mapfile snapshot. Returns `true` if the reporter
-// asked to halt (outer loop should set `state.halted` and break).
+// Build + dispatch a `PassProgress` to the caller's reporter, using the current
+// pipeline-shared mapfile snapshot. `true` once `halt` is cancelled at this report
+// (outer loop should set `state.halted` and break).
 pub(super) fn report_patch_progress(
     disc: &libfreemkv::Disc,
     state: &PatchLoopState,
     opts: &PatchOptions,
     total_bytes: u64,
     shared: &Mutex<SharedPatchState>,
+    halt: &EngineHalt<'_>,
 ) -> bool {
     let Some(reporter) = opts.progress else {
         return false;
@@ -1140,7 +1142,8 @@ pub(super) fn report_patch_progress(
         // client renders it verbatim and never reads the mapfile.
         located,
     };
-    !reporter.report(&pp)
+    reporter.event(&libfreemkv::Event::Pass(&pp));
+    halt.is_cancelled()
 }
 
 /// Bytes of bad/unreadable data in a title's extents, from a mapfile.
@@ -2033,10 +2036,11 @@ mod tests {
         assert!(shared.is_poisoned());
 
         sink.publish_now();
-        let calls = std::cell::Cell::new(0u32);
-        let reporter = |_: &libfreemkv::progress::PassProgress| {
-            calls.set(calls.get() + 1);
-            true
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let reporter = |e: &libfreemkv::Event<'_>| {
+            if let libfreemkv::Event::Pass(_) = e {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
         };
         let opts = PatchOptions::for_patch_pass(true, Some(&reporter), None);
         let state = PatchLoopState::new(0, 1, 0);
@@ -2045,9 +2049,14 @@ mod tests {
             &state,
             &opts,
             8192,
-            &shared
+            &shared,
+            &EngineHalt::legacy(None),
         ));
-        assert_eq!(calls.get(), 1, "the reporter still hears the snapshot");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the reporter still hears the snapshot"
+        );
     }
 
     /// Fails every read with one fixed error, counting the reads.

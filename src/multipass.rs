@@ -597,7 +597,7 @@ pub fn multipass_rip(
     // progress ticks, so `should_cancel` can't be polled while waiting. Run the
     // whole multipass under one halt token so Stop works mid-cooldown too.
     crate::run::with_cancel_watcher(sink, |halt| {
-        let halt = crate::EngineHalt::legacy(Some(halt.clone()));
+        let halt = crate::EngineHalt::legacy(Some(halt.clone())).with_sink(sink);
         multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, &halt)
     })
 }
@@ -651,7 +651,7 @@ pub fn multipass_rip_staged(
     sink: &dyn Sink,
 ) -> crate::Result<MultipassResult> {
     crate::run::with_cancel_watcher(sink, |halt| {
-        let halt = crate::EngineHalt::legacy(Some(halt.clone()));
+        let halt = crate::EngineHalt::legacy(Some(halt.clone())).with_sink(sink);
         multipass_rip_inner(disc, reader, iso_path, job, opts, scope, sink, &halt)
     })
 }

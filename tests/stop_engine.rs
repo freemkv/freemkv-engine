@@ -534,16 +534,23 @@ fn patch_stop_during_the_error_pause() {
     mapfile_is_sane(&iso, 256, 192..=192);
 }
 
-// ET5 "(+ the latch is exempt)" — §4.2: "The patch latch is exempt": a Stop that reaches the
-// pass only through its progress reporter (no token cancelled) still ends it as halted.
+// ET5 "(+ the latch is exempt)" — §4.2: "The patch latch is exempt": a Stop raised from the
+// pass's progress events through the options' flag (no op token cancelled) still ends it
+// as halted.
 #[test]
 fn patch_latch_is_exempt() {
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     swept_with_damage(&iso);
     let mut reader = Script::new(256, 0..256);
-    let stop = |_: &libfreemkv::progress::PassProgress| false;
-    let opts = PatchOptions::for_patch_pass(false, Some(&stop), None);
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raise = flag.clone();
+    let stop = move |e: &libfreemkv::Event<'_>| {
+        if let libfreemkv::Event::Pass(_) = e {
+            raise.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    };
+    let opts = PatchOptions::for_patch_pass(false, Some(&stop), Some(flag));
     let op = Halt::new();
     let t0 = Instant::now();
     let out = freemkv_engine::patch_with(&op, &disc(256), &mut reader, &iso, &opts);

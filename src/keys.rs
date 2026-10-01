@@ -145,7 +145,7 @@ pub fn resolve_for_rip_observed(
     sources: &libfreemkv::KeySourceFactory,
     seed: Option<&ResolvedKeySet>,
     halt: Option<&libfreemkv::Halt>,
-    progress: &libfreemkv::halt::Progress,
+    progress: &libfreemkv::halt::Liveness,
 ) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
     resolve_traced(disc, reader, scope, sources, seed, halt, Some(progress))
 }
@@ -227,7 +227,7 @@ fn resolve_traced(
     sources: &libfreemkv::KeySourceFactory,
     seed: Option<&ResolvedKeySet>,
     halt: Option<&libfreemkv::Halt>,
-    progress: Option<&libfreemkv::halt::Progress>,
+    progress: Option<&libfreemkv::halt::Liveness>,
 ) -> (crate::Result<ResolvedKeySet>, ResolutionTrace) {
     let scope_log = format!("{scope:?}");
     let walk = std::sync::Mutex::new(ResolutionTrace::new());
@@ -629,7 +629,7 @@ mod tests {
         let fx = bd_image(&[Some(K1)], 1);
         let f: libfreemkv::KeySourceFactory =
             std::sync::Arc::new(|| vec![Box::new(Trickle) as Box<dyn libfreemkv::KeySource>]);
-        let progress = libfreemkv::halt::Progress::new();
+        let progress = libfreemkv::halt::Liveness::new();
         let (_, _) = resolve_for_rip_observed(
             &fx.disc,
             &mut fx.source(),
