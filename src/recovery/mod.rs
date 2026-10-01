@@ -2350,7 +2350,7 @@ mod finish_bounded_tests {
     // the write, BEFORE the `record`), and records once the write returns.
     struct MapSink {
         map: mapfile::Mapfile,
-        done: SignalOnDrop,
+        _done: SignalOnDrop,
         gate: Gate,
         entered: Arc<AtomicUsize>,
     }
@@ -2398,7 +2398,7 @@ mod finish_bounded_tests {
             WRITE_THROUGH_DEPTH,
             MapSink {
                 map,
-                done: SignalOnDrop(Arc::clone(&dropped)),
+                _done: SignalOnDrop(Arc::clone(&dropped)),
                 gate: gate.clone(),
                 entered: Arc::clone(&entered),
             },

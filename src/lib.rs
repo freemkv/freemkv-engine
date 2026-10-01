@@ -21,10 +21,7 @@ mod mux;
 mod outcome;
 mod plan;
 mod preflight;
-// Relocated recovery strategy (sweep/patch/mapfile/read_error/section_recover).
-// Some faithfully-relocated internals have no in-crate caller yet — allow
-// dead_code here rather than diverge from the byte-faithful move.
-#[allow(dead_code)]
+// The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 
 // Recovery primitives (relocated from libfreemkv). `multipass_rip` drives
