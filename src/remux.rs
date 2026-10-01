@@ -1316,6 +1316,7 @@ mod tests {
                 Event::SourceOpened { .. } => "source".into(),
                 Event::Keys { .. } => "keys".into(),
                 Event::Pass(_) => "pass".into(),
+                Event::Recovery(_) => "recovery".into(),
             };
             self.0.lock().unwrap().push(s);
         }

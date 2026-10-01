@@ -238,6 +238,16 @@ pub struct Mapfile {
     disowned: Arc<AtomicBool>,
 }
 
+impl std::fmt::Debug for Mapfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mapfile")
+            .field("path", &self.path)
+            .field("total_size", &self.total_size)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Mapfile {
     /// Create a new mapfile with one `NonTried` region covering the whole disc.
     /// Writes to disk immediately so a resume can pick up even if the caller

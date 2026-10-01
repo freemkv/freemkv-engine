@@ -417,7 +417,12 @@ fn mux_with_input(
 }
 
 // The "mux: <source> -> <dest> (~size)" line every mux opens with.
-fn log_mux_start(sink: &dyn Sink, source_label: &str, dest: &str, total_bytes_hint: u64) {
+pub(crate) fn log_mux_start(
+    sink: &dyn Sink,
+    source_label: &str,
+    dest: &str,
+    total_bytes_hint: u64,
+) {
     sink.log(
         Level::Info,
         &format!(
@@ -430,9 +435,21 @@ fn log_mux_start(sink: &dyn Sink, source_label: &str, dest: &str, total_bytes_hi
 // The Sink↔libfreemkv bridge every mux runs inside, lifted out of `mux_with_input` so it's
 // testable against a closure without real media.
 fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::Ctx) -> T) -> T {
+    with_mux_watcher_for(sink, dest, None, None, f)
+}
+
+// [`with_mux_watcher`] under a front end's own stop token `halt` (else a fresh one) and with
+// its own listener `extra` hearing every library event beside the bridge.
+pub(crate) fn with_mux_watcher_for<T>(
+    sink: &dyn Sink,
+    dest: &str,
+    halt: Option<libfreemkv::Halt>,
+    extra: Option<Arc<dyn libfreemkv::Events>>,
+    f: impl FnOnce(&libfreemkv::Ctx) -> T,
+) -> T {
     use std::sync::mpsc;
 
-    let halt = libfreemkv::Halt::new();
+    let halt = halt.unwrap_or_default();
     // Ask ONCE before starting (same rule as `with_cancel_watcher` in run.rs):
     // a watcher alone makes cancellation a race the work can win on a short
     // title, and only asking before the work begins closes that window.
@@ -449,9 +466,13 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
         flush: mpsc::Sender<(u64, u64)>,
+        extra: Option<Arc<dyn libfreemkv::Events>>,
     }
     impl libfreemkv::Events for ChannelEvents {
         fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let Some(extra) = &self.extra {
+                extra.event(e);
+            }
             match *e {
                 libfreemkv::Event::BytesWritten { bytes, total } => {
                     let _ = self.tx.send((bytes, total));
@@ -533,6 +554,7 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
             tx,
             opened: opened_tx,
             flush: flush_tx,
+            extra,
         }));
         // Same guard the recovery paths use: `mux_with_keys` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip

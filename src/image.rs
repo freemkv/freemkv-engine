@@ -156,6 +156,23 @@ impl OpenedImage {
     }
 }
 
+/// The one title of a container or stream source (`m2ts://`, `mkv://`, `mp4://`, …) as the
+/// library reads it, for `info` and an app's open: its tracks and duration. `keys` opens a
+/// loose clip; `halt` stops the open.
+pub fn stream_info(
+    url: &str,
+    keys: Option<libfreemkv::keys::KeyRing>,
+    halt: &libfreemkv::Halt,
+) -> crate::Result<libfreemkv::DiscTitle> {
+    let opts = libfreemkv::InputOptions {
+        keys,
+        ..Default::default()
+    };
+    let ctx = libfreemkv::Ctx::new(halt.clone());
+    let stream = libfreemkv::input(url, &opts, &ctx)?;
+    Ok(stream.info().clone())
+}
+
 /// Keyless scan of an image. Every front-end scans with the default
 /// [`libfreemkv::ScanOptions`]: an image has no drive to hand credentials to.
 pub fn scan_image(
