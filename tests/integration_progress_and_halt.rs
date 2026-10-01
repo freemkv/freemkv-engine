@@ -1,7 +1,7 @@
 //! Integration tests for progress reporting, halt behavior,
 //! and the file-backed sector reader round trip.
 
-use freemkv_engine::CopyOptions;
+use freemkv_engine::{CopyOptions, Mapfile, SectorStatus};
 use libfreemkv::disc::DiscRegion;
 use libfreemkv::error::Result;
 use libfreemkv::{
@@ -15,6 +15,22 @@ use std::time::{Duration, Instant};
 const SECTOR_SIZE: usize = 2048;
 
 // ── helpers ────────────────────────────────────────────────────────────────
+
+/// The whole image must be one NonTrimmed run: pending bytes alone also count
+/// never-attempted (NonTried) bytes, so a sweep that stopped early would hide.
+fn assert_all_nontrimmed(iso: &std::path::Path, total: u64) {
+    let map = Mapfile::load(&freemkv_engine::mapfile_path_for(iso)).unwrap();
+    let nt: u64 = map
+        .ranges_with(&[SectorStatus::NonTrimmed])
+        .iter()
+        .map(|&(_, len)| len)
+        .sum();
+    assert_eq!(nt, total, "every byte must be NonTrimmed");
+    assert!(
+        map.ranges_with(&[SectorStatus::NonTried]).is_empty(),
+        "no sector may stay NonTried after Pass 1"
+    );
+}
 
 /// Returns zeroed sectors. Always succeeds. Counts each call.
 struct ZeroSectorReader {
@@ -362,18 +378,12 @@ fn test_disc_copy_completes_full_disc_with_failing_reader() {
         ..Default::default()
     };
 
-    let t0 = Instant::now();
     let result =
         freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts).expect("copy returns Ok");
-    let elapsed = t0.elapsed();
 
-    // Hard bound — Pass 1 must NOT infinite-loop on a fully-failing reader.
-    // Accommodates the wedge-avoidance pause (5 s/failed batch); well-bounded
-    // total (~20-30 s typical), not "completes in milliseconds."
-    assert!(
-        elapsed < Duration::from_secs(60),
-        "Pass 1 took {elapsed:?} on a 2 MB synthetic disc — expected < 60 s (not infinite)"
-    );
+    // No wall-clock bound: the whole-disc NonTrimmed map proves the sweep
+    // finished rather than looping or stopping early.
+    assert_all_nontrimmed(&iso_path, total_bytes);
 
     // Pass 1 must reach end of disc regardless of read outcomes.
     assert_eq!(
@@ -535,6 +545,7 @@ fn test_disc_copy_marks_failed_ecc_blocks_as_nontrimmed() {
         !result.complete,
         "complete=false because NonTrimmed regions remain (Pass N's work)"
     );
+    assert_all_nontrimmed(&iso_path, total_bytes);
 }
 
 // ── PassProgress carries separate unreadable vs pending byte counts ─────
@@ -566,6 +577,7 @@ fn test_pass2_leaves_failed_reads_as_pending_not_unreadable() {
         pass1.bytes_pending, total_bytes,
         "pass1: all sectors NonTrimmed"
     );
+    assert_all_nontrimmed(&iso_path, total_bytes);
 
     let last_unreadable = Arc::new(AtomicU64::new(0));
     let last_pending = Arc::new(AtomicU64::new(0));

@@ -143,13 +143,14 @@ fn default_copy_options_sleep_is_cancellable() {
 }
 
 // ET3 `no_raw_halt_loads_in_production` — §4.2: "Every raw halt load becomes
-// `EngineHalt::is_cancelled()`". The patch latch and `EngineHalt` itself are exempt.
+// `EngineHalt::is_cancelled()`". `EngineHalt` itself and the one patch latch load are exempt.
 #[test]
 fn no_raw_halt_loads_in_production() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let files = common::rs_files(&src);
     let test_only = test_only_modules(&files);
     let (mut hits, mut used) = (Vec::new(), [false; NOT_A_HALT.len()]);
+    let mut latch_used = false;
     for path in &files {
         let rel = path
             .strip_prefix(&src)
@@ -162,6 +163,10 @@ fn no_raw_halt_loads_in_production() {
         let text = std::fs::read_to_string(path).unwrap();
         for (line, receiver) in atomic_loads(&text) {
             let entry = (rel.as_str(), receiver.as_str());
+            if entry == HALT_LATCH {
+                latch_used = true;
+                continue;
+            }
             match NOT_A_HALT.iter().position(|e| *e == entry) {
                 Some(i) => used[i] = true,
                 None => hits.push(format!("{rel}:{line}: {receiver}.load(")),
@@ -174,6 +179,7 @@ fn no_raw_halt_loads_in_production() {
          NOT_A_HALT:\n{}",
         hits.join("\n")
     );
+    assert!(latch_used, "HALT_LATCH {HALT_LATCH:?} matches no load");
     let stale: Vec<_> = NOT_A_HALT.iter().zip(used).filter(|(_, u)| !u).collect();
     assert!(
         stale.is_empty(),
@@ -181,8 +187,11 @@ fn no_raw_halt_loads_in_production() {
     );
 }
 
-// `EngineHalt` itself and the patch latch (§4.2) read the raw flag by design.
-const HALT_EXEMPT: [&str; 2] = ["engine_halt.rs", "recovery/section_recover.rs"];
+// `EngineHalt` itself (§4.2) reads the raw flag by design.
+const HALT_EXEMPT: [&str; 1] = ["engine_halt.rs"];
+
+// The patch latch (`HandlerCtx::halted`), the one other raw halt load, as (file, receiver).
+const HALT_LATCH: (&str, &str) = ("recovery/section_recover.rs", "h");
 
 // Production atomic loads that are not a halt, as (file, receiver); list a new one here.
 // remux.rs `quit` is the copy worker's give-up flag, set by its halt-aware watcher.
