@@ -100,6 +100,7 @@ impl<'a> ProgressBridge<'a> {
 impl libfreemkv::Events for ProgressBridge<'_> {
     fn event(&self, e: &libfreemkv::Event<'_>) {
         if let libfreemkv::Event::Pass(p) = e {
+            self.sink.event(&crate::sink::Event::Pass(p));
             self.report_at(std::time::Instant::now(), p);
         }
     }

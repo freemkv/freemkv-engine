@@ -1313,6 +1313,9 @@ mod tests {
                 Event::Verify { ok, .. } => format!("verify:{ok}"),
                 Event::Replaced { .. } => "replaced".into(),
                 Event::OutputOpened { .. } => "opened".into(),
+                Event::SourceOpened { .. } => "source".into(),
+                Event::Keys { .. } => "keys".into(),
+                Event::Pass(_) => "pass".into(),
             };
             self.0.lock().unwrap().push(s);
         }

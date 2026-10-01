@@ -6,6 +6,10 @@ project follows semantic versioning.
 
 ## [Unreleased]
 
+### Added
+
+- **`run(Plan)` / `run_with(Plan, sources, sink)`**: the engine's one request type (`Plan`: source and destination URLs, titles, streams, `raw`, `multipass`, key-source parameters as `KeyParamsData`, `force`) and its entry. A whole-disc plan (`iso://`, `null://` from a drive, `dir://`) opens the source, acquires the keys it needs (none when raw), takes the image's artifact lock, copies (resumable against the image's mapfile; recovered over passes when `multipass`) or extracts, and returns a `Report`. `Plan::output()` names the chain the destination selects. `Event::SourceOpened`, `Event::Keys` and `Event::Pass` let a front end render the run.
+
 ### Changed
 
 - **A multipass recovery decrypts unless raw** (CLI, GUI, server): decryption is no longer tied to the read policy, so `recover_to_iso` and `multipass_rip` run a decrypting multipass job (sweep and patch passes decrypt in place) instead of refusing it with E9082, and `preflight` no longer reports `multipass-requires-raw`.

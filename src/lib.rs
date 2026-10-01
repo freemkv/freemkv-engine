@@ -19,6 +19,7 @@ pub mod keys;
 mod multipass;
 mod mux;
 mod outcome;
+mod plan;
 mod preflight;
 // Relocated recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 // Some faithfully-relocated internals have no in-crate caller yet — allow
@@ -70,6 +71,7 @@ pub use mux::{
     mux_title_session, open_scan, open_scan_with, resolve_selection, run_titles,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
+pub use plan::{KeyParamsData, Output, Plan, Report, run, run_with};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
     MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
