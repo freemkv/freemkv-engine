@@ -3,15 +3,15 @@
 //! [`crate::recovery::copy`] performs ONE dispatch step (sweep, one patch
 //! pass, or a terminal result) chosen from mapfile state; this module's loop
 //! calls it repeatedly until the disc is clean or progress stalls, then
-//! applies the abort-on-loss gate mirroring autorip's `loss_aborts` (hard
-//! rule #6): `abort_on_lost_secs == 0` requires a perfect rip, a positive
-//! value tolerates that many seconds of loss, and NaN always fails safe.
+//! applies the abort-on-loss gate ([`loss_aborts`], hard rule #6):
+//! `abort_on_lost_secs == 0` requires a perfect rip, and a positive value
+//! tolerates that many seconds of loss; an untimeable loss never exceeds it.
 
 use crate::job::Job;
 use crate::recovery::mapfile::{MapStats, Mapfile, SectorStatus};
 use crate::recovery::{CopyOptions, PatchOptions, SweepOptions};
 use crate::run::ProgressBridge;
-use crate::sink::{Level, Sink};
+use crate::sink::{Level, RecoveryEvent, Sink};
 
 /// Milliseconds per second — the byte-loss→time conversion base.
 const MILLIS_PER_SEC: f64 = 1000.0;
@@ -19,11 +19,121 @@ const MILLIS_PER_SEC: f64 = 1000.0;
 /// Bytes in one optical sector — the unit damage is scored in.
 pub(crate) const SECTOR_BYTES: u64 = 2048;
 
-/// Does the residual loss exceed the tolerance and therefore abort the rip?
+// Typical average playback bitrates (bytes/sec) by video class, the estimate a title gets when
+// it reports neither a usable size nor a usable duration. Averages, not peaks: a lower rate
+// converts the same lost bytes into MORE lost time, so the estimate errs towards reporting loss.
+const SD_BYTES_PER_SEC: f64 = 6_000_000.0 / 8.0;
+const HD_BYTES_PER_SEC: f64 = 30_000_000.0 / 8.0;
+const UHD_BYTES_PER_SEC: f64 = 60_000_000.0 / 8.0;
+
+/// The title's playback rate in bytes/sec, the one conversion between lost bytes and lost time.
 ///
-/// Ported verbatim from autorip. `abort_on_lost_secs == 0` is byte-exact:
-/// any lost byte (or an unquantifiable NaN loss) aborts; exactly zero proceeds.
-/// A positive threshold switches to the seconds gate (bytes not consulted).
+/// Its own size over its own duration when it has both. A missing size is taken from its
+/// extents and a missing duration from its clips; when either is still missing, a typical
+/// rate for the title's video (UHD, HD or SD, else its container: a program stream is DVD-class,
+/// a transport stream Blu-ray-class). Always finite and positive, so missing metadata never
+/// leaves a loss unmeasured.
+pub fn title_bytes_per_sec(title: &libfreemkv::DiscTitle) -> f64 {
+    let size = if title.size_bytes > 0 {
+        title.size_bytes
+    } else {
+        title
+            .extents
+            .iter()
+            .map(|e| u64::from(e.sector_count) * SECTOR_BYTES)
+            .sum()
+    };
+    let usable = |d: f64| d.is_finite() && d > 0.0;
+    let duration = if usable(title.duration_secs) {
+        title.duration_secs
+    } else {
+        title
+            .clips
+            .iter()
+            .map(|c| c.duration_secs)
+            .filter(|d| usable(*d))
+            .sum()
+    };
+    if size > 0 && usable(duration) {
+        let bps = size as f64 / duration;
+        if usable(bps) {
+            return bps;
+        }
+    }
+    format_bytes_per_sec(title)
+}
+
+// The typical rate for a title's video class, for a title whose size or duration is missing.
+fn format_bytes_per_sec(title: &libfreemkv::DiscTitle) -> f64 {
+    use libfreemkv::Resolution as R;
+    let video = title.streams.iter().find_map(|s| match s {
+        libfreemkv::Stream::Video(v) if !v.secondary => Some(v.resolution),
+        _ => None,
+    });
+    match video {
+        Some(R::R2160p | R::R4320p) => UHD_BYTES_PER_SEC,
+        Some(R::R720p | R::R1080i | R::R1080p) => HD_BYTES_PER_SEC,
+        Some(R::R480i | R::R480p | R::R576i | R::R576p) => SD_BYTES_PER_SEC,
+        Some(R::Unknown) | None => match title.content_format {
+            libfreemkv::ContentFormat::MpegPs => SD_BYTES_PER_SEC,
+            libfreemkv::ContentFormat::BdTs => HD_BYTES_PER_SEC,
+        },
+    }
+}
+
+/// Milliseconds of `title`'s playback that `bad_bytes` of it hold, at [`title_bytes_per_sec`].
+pub fn lost_ms_in_title(title: &libfreemkv::DiscTitle, bad_bytes: u64) -> f64 {
+    if bad_bytes == 0 {
+        return 0.0;
+    }
+    bad_bytes as f64 / title_bytes_per_sec(title) * MILLIS_PER_SEC
+}
+
+/// The engine's one loss verdict over the ripped titles: what was lost and whether it aborts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LossVerdict {
+    /// Unreadable bytes under the deliverable's scope: the whole disc for an ISO, inside the
+    /// titles for a mux, and the whole disc's when a title has no extents to scope by.
+    pub lost_bytes: u64,
+    /// Playback milliseconds lost in the titles. NaN when a damaged title has no extents, so
+    /// its share of the damage cannot be timed: the loss is then reported in bytes only.
+    pub lost_ms: f64,
+    /// The loss exceeds the tolerance: `abort_on_lost_secs == 0` aborts on any lost byte, a
+    /// positive tolerance on more lost time than that. A loss reported in bytes only never
+    /// exceeds a positive tolerance (a rip is never stopped for missing metadata).
+    pub aborts: bool,
+}
+
+/// The loss verdict for `titles` over the confirmed-unreadable `bad_ranges`, against
+/// `abort_on_lost_secs` (already [`effective_abort_secs`] for an ISO).
+pub fn loss_verdict(
+    is_iso_output: bool,
+    titles: &[&libfreemkv::DiscTitle],
+    bad_ranges: &[(u64, u64)],
+    abort_on_lost_secs: u64,
+) -> LossVerdict {
+    let unscopable = titles
+        .iter()
+        .any(|t| loss_is_unscopable(is_iso_output, t, bad_ranges));
+    let lost_bytes = if is_iso_output || unscopable {
+        bad_ranges.iter().map(|(_, sz)| *sz).sum()
+    } else {
+        titles_abort_lost_bytes(is_iso_output, titles, bad_ranges)
+    };
+    let (lost_ms, _) = titles_lost_ms(true, titles, bad_ranges);
+    LossVerdict {
+        lost_bytes,
+        lost_ms,
+        aborts: loss_aborts(lost_bytes, lost_ms, abort_on_lost_secs),
+    }
+}
+
+/// Does the residual loss exceed the tolerance and therefore abort the rip? The gate
+/// [`loss_verdict`] applies.
+///
+/// `abort_on_lost_secs == 0` is byte-exact: any lost byte (or an unquantifiable NaN loss)
+/// aborts; exactly zero proceeds. A positive threshold switches to the seconds gate (bytes
+/// not consulted), where a NaN loss never aborts (a rip is never stopped for missing metadata).
 pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bool {
     if abort_on_lost_secs == 0 {
         lost_bytes > 0 || lost_ms.is_nan()
@@ -32,10 +142,10 @@ pub fn loss_aborts(lost_bytes: u64, lost_ms: f64, abort_on_lost_secs: u64) -> bo
     }
 }
 
-/// The seconds-threshold half of the gate: strictly-greater-than aborts, and a
-/// NaN (unquantifiable) loss fails safe to abort.
+/// The seconds-threshold half of the gate: strictly-greater-than aborts; a NaN
+/// (unquantifiable) loss does not.
 pub fn should_abort_for_loss(lost_ms: f64, abort_threshold_ms: f64) -> bool {
-    lost_ms.is_nan() || lost_ms > abort_threshold_ms
+    lost_ms.is_finite() && lost_ms > abort_threshold_ms
 }
 
 /// An ISO-image output is a whole-disc backup and always requires 100% (the
@@ -84,9 +194,8 @@ pub(crate) fn loss_is_unscopable(
 /// Milliseconds of playback lost, scoped by [`abort_lost_bytes`] and converted
 /// via the title's own bytes/sec bitrate.
 ///
-/// Fails safe to NaN when the loss exists but cannot be measured — see [`loss_is_unscopable`].
-/// NaN aborts under EVERY threshold, including `u64::MAX`, which is a deliberate behaviour
-/// change from autorip's `.accept-loss` escape hatch.
+/// NaN when the loss exists but cannot be measured — see [`loss_is_unscopable`]. A NaN
+/// aborts only the perfect (`0`) gate, through its byte count ([`loss_aborts`]).
 pub fn abort_lost_ms(
     output_is_iso: bool,
     title: &libfreemkv::DiscTitle,
@@ -137,6 +246,8 @@ pub struct PassPlan {
 }
 
 pub fn plan_passes(max_retries: u8) -> PassPlan {
+    // Capped so `total_passes` (retries + 2) still fits a u8 and counts every pass.
+    let max_retries = max_retries.min(u8::MAX - 2);
     if max_retries > 0 {
         PassPlan {
             multipass: true,
@@ -288,20 +399,25 @@ pub fn classify_damage(bad_sectors: u64, lost_ms: f64) -> crate::DamageSeverity 
     if bad_sectors == 0 {
         return Clean;
     }
-    // An unquantifiable loss fails SAFE, matching `should_abort_for_loss`: every
-    // NaN comparison is false, so without this it fell through both tiers to
-    // Cosmetic — badging "Cosmetic" on the rip the abort gate is refusing.
+    // An unquantifiable loss badges Serious: every NaN comparison is false, so
+    // without this it fell through both tiers to Cosmetic.
     if lost_ms.is_nan() {
         return Serious;
     }
-    if bad_sectors >= 500 || lost_ms >= 30_000.0 {
+    if bad_sectors >= SERIOUS_SECTORS || lost_ms >= SERIOUS_LOST_MS {
         return Serious;
     }
-    if bad_sectors >= 51 || lost_ms >= 1_000.0 {
+    if bad_sectors >= MODERATE_SECTORS || lost_ms >= MODERATE_LOST_MS {
         return Moderate;
     }
     Cosmetic
 }
+
+// The damage tiers' thresholds (documented on `DamageSeverity`).
+const SERIOUS_SECTORS: u64 = 500;
+const SERIOUS_LOST_MS: f64 = 30_000.0;
+const MODERATE_SECTORS: u64 = 51;
+const MODERATE_LOST_MS: f64 = 1_000.0;
 
 // Whether a recovery pass decrypts in place, given the job's `raw` flag. Named so the
 // `!job.raw` policy shared by four call sites reads as a decision, not a stray `!`.
@@ -382,25 +498,15 @@ fn recovery_is_complete(aborted_for_loss: bool, unreadable_bytes: u64, pending_b
     !aborted_for_loss && unreadable_bytes == 0 && pending_bytes == 0
 }
 
-// Milliseconds of main-title playback lost, scaling `main_bad_bytes` by `title`'s own
-// size/runtime — NaN when unquantifiable. `title` must be the title `main_bad_bytes` was scoped
-// to.
+// Milliseconds of main-title playback lost, at `title`'s [`title_bytes_per_sec`]. `title` must
+// be the title `main_bad_bytes` was scoped to.
 fn main_title_lost_ms(title: &libfreemkv::DiscTitle, main_bad_bytes: u64) -> f64 {
-    if main_bad_bytes == 0 {
-        return 0.0;
-    }
-    if title.size_bytes > 0 && title.duration_secs > 0.0 && title.duration_secs.is_finite() {
-        main_bad_bytes as f64 / title.size_bytes as f64 * title.duration_secs * MILLIS_PER_SEC
-    } else {
-        // Loss exists but we can't quantify it (no bitrate) → NaN, which the
-        // gate treats as fail-safe abort.
-        f64::NAN
-    }
+    lost_ms_in_title(title, main_bad_bytes)
 }
 
 /// The end-of-recovery loss figure, plus the reason it is unquantifiable when
 /// it is. `None` means the number is trustworthy. Pure and separate from
-/// [`multipass_rip_inner`] deliberately, so it can be tested without a drive.
+/// [`recover`] deliberately, so it can be tested without a drive.
 ///
 /// SCOPE — ALWAYS main-title-scoped, whatever the deliverable is: it derives its own byte count
 /// from `title` + `bad_ranges` rather than accepting the ABORT GATE's count
@@ -518,14 +624,19 @@ pub struct MultipassResult {
     pub pending_bytes: u64,
     /// Good bytes recovered across all passes.
     pub good_bytes: u64,
-    /// Playback milliseconds lost in the ripped titles (NaN if unquantifiable): those
+    /// Playback milliseconds lost in the ripped titles: those
     /// [`Job::selection`] resolves to, summed per title (title 0 for the default `MainMovie`).
     ///
-    /// ALWAYS scoped to those titles' own extents, even on an ISO rip whose
-    /// abort gate counts bytes across the whole disc — an unreadable menu or
-    /// trailer is not lost feature playback, and reporting it as such once
-    /// stamped `Serious` on a movie the drive had read perfectly.
+    /// Always scoped to those titles' own extents, even on an ISO rip (an unreadable menu is
+    /// not lost feature playback). A title missing its size or duration is timed at an
+    /// estimated rate ([`title_bytes_per_sec`]). NaN when the loss cannot be timed: a damaged
+    /// title with no extents (see [`Self::lost_bytes`]), an unreadable damage record, or a
+    /// run that stopped before the verdict.
     pub main_lost_ms: f64,
+    /// Unreadable bytes the loss verdict counted ([`LossVerdict::lost_bytes`]): the whole
+    /// disc for an ISO, the ripped titles' otherwise. The loss when `main_lost_ms` is NaN.
+    /// A run with no verdict (halted, wedged, single pass) counts the whole image's.
+    pub lost_bytes: u64,
     /// Damage classification from the residual loss.
     pub severity: crate::DamageSeverity,
     /// Number of passes executed (1 sweep + N patch in multipass mode; 1 in
@@ -598,7 +709,16 @@ pub fn multipass_rip(
     // whole multipass under one halt token so Stop works mid-cooldown too.
     crate::run::with_cancel_watcher(sink, |halt| {
         let halt = crate::EngineHalt::legacy(Some(halt.clone())).with_sink(sink);
-        multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, &halt)
+        recover(
+            disc,
+            &mut ReaderHost(reader),
+            iso_path,
+            job,
+            opts,
+            None,
+            sink,
+            &halt,
+        )
     })
 }
 
@@ -616,7 +736,16 @@ pub fn multipass_rip_with(
     // §4.2: "ST-E1 stops depending on [the watchers], because the op token is observed
     // directly"; the Sink's `should_cancel` stays a cancel input.
     let halt = crate::EngineHalt::new(op, None).with_sink(sink);
-    let r = multipass_rip_inner(disc, reader, iso_path, job, opts, None, sink, &halt);
+    let r = recover(
+        disc,
+        &mut ReaderHost(reader),
+        iso_path,
+        job,
+        opts,
+        None,
+        sink,
+        &halt,
+    );
     crate::EngineOutcome::from_result(r, &halt, |r| r.halted)
 }
 
@@ -652,14 +781,88 @@ pub fn multipass_rip_staged(
 ) -> crate::Result<MultipassResult> {
     crate::run::with_cancel_watcher(sink, |halt| {
         let halt = crate::EngineHalt::legacy(Some(halt.clone())).with_sink(sink);
-        multipass_rip_inner(disc, reader, iso_path, job, opts, scope, sink, &halt)
+        recover(
+            disc,
+            &mut ReaderHost(reader),
+            iso_path,
+            job,
+            opts,
+            scope,
+            sink,
+            &halt,
+        )
     })
 }
 
+/// What a front end does around the passes of a recovery: it owns the reader the passes
+/// read, and may bring a lost transport back, un-wedge the drive before a patch pass, or
+/// end the passes on a failed one and keep what was read (the server's autorip 1.7.7
+/// policy). Every method but [`reader`](Self::reader) defaults to what an engine-only run
+/// does; [`ReaderHost`] is that host over a plain reader.
+pub trait PassHost {
+    /// The sector source every pass reads. A host that recovers a lost transport may
+    /// return a different (re-opened) drive afterwards.
+    fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource;
+
+    /// Whether to resume the image's mapfile in the sweep: `Some` decides (the server's
+    /// Resume), `None` (default) resumes a mapfile written in the run's raw/decrypt mode.
+    fn resume_sweep(&self) -> Option<bool> {
+        None
+    }
+
+    /// Whether sweep attempt `attempt` (1-based) may start. Default: the first only.
+    fn sweep_attempt(&mut self, attempt: u32) -> bool {
+        attempt == 1
+    }
+
+    /// Sweep attempt `attempt` failed on a transport fault `e` (a bridge crash): bring the
+    /// drive back and return `true` to sweep again, resuming the mapfile. Default: `false`,
+    /// the run fails with `e`.
+    fn recover_transport(&mut self, _attempt: u32, _e: &libfreemkv::Error) -> bool {
+        false
+    }
+
+    /// Patch pass `pass` (2 = the first patch pass) is about to read: the moment to
+    /// un-wedge the drive. Default: nothing.
+    fn before_patch(&mut self, _pass: u32) {}
+
+    /// Patch pass `pass` failed with `e`: `true` ends the passes and finishes the recovery
+    /// with what was read (promotion, loss gate); `false` (default) fails the run with `e`.
+    fn patch_failed(&mut self, _pass: u32, _e: &libfreemkv::Error) -> bool {
+        false
+    }
+
+    /// A patch pass ended on a transport fault: `true` treats it as any other pass (the
+    /// no-progress rule decides); `false` (default) ends the recovery there, its damage
+    /// left retryable and unpromoted.
+    fn continue_after_wedge(&mut self) -> bool {
+        false
+    }
+}
+
+/// A [`PassHost`] over a plain reader: one sweep attempt, nothing between passes.
+pub struct ReaderHost<'a>(pub &'a mut dyn libfreemkv::SectorSource);
+
+impl PassHost for ReaderHost<'_> {
+    fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource {
+        &mut *self.0
+    }
+}
+
+// The recovery milestone `e`, to the sink.
+fn milestone(sink: &dyn Sink, e: RecoveryEvent<'_>) {
+    sink.event(&crate::sink::Event::Recovery(&e));
+}
+
+/// The one recovery implementation behind every `iso://` deliverable (CLI, app, server):
+/// a single pass (`max_passes == 0`), or a sweep then up to `max_passes` patch passes, the
+/// end-of-recovery promotion and the abort-on-loss gate, with `host`'s hooks between the
+/// passes. Damage is measured over the titles `job.selection` picks; `scope` limits the
+/// passes to a staged image's sectors.
 #[allow(clippy::too_many_arguments)]
-fn multipass_rip_inner(
+pub(crate) fn recover(
     disc: &libfreemkv::Disc,
-    reader: &mut dyn libfreemkv::SectorSource,
+    host: &mut dyn PassHost,
     iso_path: &std::path::Path,
     job: &Job,
     opts: &MultipassOpts,
@@ -670,9 +873,21 @@ fn multipass_rip_inner(
     let plan = plan_passes(opts.max_passes.min(u8::MAX as u32) as u8);
 
     // The recovery sweeps an image of the other raw/decrypt mode fresh; say so where users see it.
-    if Mapfile::load(&disc.mapfile_for(iso_path))
-        .is_ok_and(|m| m.raw().is_some_and(|r| r != job.raw))
-    {
+    // A missing or corrupt map starts fresh; an unreadable one (EIO, EACCES) fails the run.
+    let prior = match Mapfile::load(&disc.mapfile_for(iso_path)) {
+        Ok(m) => Some(m),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+            ) =>
+        {
+            None
+        }
+        Err(e) => return Err(libfreemkv::Error::from(e)),
+    };
+    let map_mode = prior.as_ref().and_then(|m| m.raw());
+    if map_mode.is_some_and(|r| r != job.raw) {
         sink.log(
             Level::Warn,
             "multipass_rip: the existing image is in the other raw/decrypt mode; overwriting it",
@@ -681,96 +896,100 @@ fn multipass_rip_inner(
     let empty_title = libfreemkv::DiscTitle::empty();
     let titles = measured_titles(disc, job, &empty_title);
     if !plan.multipass {
-        // Single-pass: one `copy` dispatch (sweep-or-resume via mapfile
-        // state), no retry loop, no ISO-multipass semantics, no abort gate —
-        // mirrors `RipMode::Single`.
-        let bridge = ProgressBridge::new(sink);
-        let copy_opts = CopyOptions {
-            decrypt: pass_should_decrypt(job.raw),
-            multipass: false,
-            progress: Some(&bridge),
-            halt: None,
-            keys: job.keys.clone(),
-        };
-        let cr = match scope {
-            // A scoped single pass resumes its own staging; `copy` is the iso:// path.
-            Some(scope) => {
-                let sweep_opts = SweepOptions {
-                    decrypt: copy_opts.decrypt,
-                    resume: disc.mapfile_for(iso_path).exists(),
-                    batch_sectors: None,
-                    skip_on_error: false,
-                    progress: copy_opts.progress,
-                    halt: copy_opts.halt.clone(),
-                    keys: copy_opts.keys.clone(),
-                };
-                let scope = crate::recovery::sector_scope_to_bytes(scope);
-                crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, Some(scope), halt)?
-            }
-            None => crate::recovery::copy_in(disc, reader, iso_path, &copy_opts, halt)?,
-        };
-        // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
-        // here (unlike the aggregate `bad_sector_count` forbids) because every
-        // un-halted route here has `nontried == 0`, so pending is retryable damage.
-        let bad_sectors = bad_sector_count(cr.bytes_unreadable, cr.bytes_pending);
-        return Ok(MultipassResult {
-            unreadable_bytes: cr.bytes_unreadable,
-            pending_bytes: cr.bytes_pending,
-            good_bytes: cr.bytes_good,
-            // Single-pass never runs the end-of-recovery loss gate, so a flat
-            // 0.0 would falsely claim "no playback lost" beside real damage.
-            // NaN marks it unquantified — except zero bad sectors, genuinely 0.0.
-            main_lost_ms: if bad_sectors == 0 { 0.0 } else { f64::NAN },
-            // Severity comes from the SECTOR count, which single-pass knows.
-            // NaN would wrongly escalate to Serious via `classify_damage`'s
-            // fail-safe (right for the abort gate; single-pass has none).
-            severity: if cr.halted {
-                interrupted_severity(cr.bytes_unreadable, cr.bytes_pending)
-            } else {
-                classify_damage(bad_sectors, 0.0)
-            },
-            passes: 1,
-            aborted_for_loss: false,
-            halted: cr.halted,
-            // Single-pass has no patch stage, so no transport-fault exit to
-            // report: `recovery::copy` aborts the pass on a bridge crash
-            // rather than continuing past it.
-            wedged: false,
-            complete: cr.complete,
-        });
+        return single_pass(disc, host.reader(), iso_path, job, scope, sink, halt);
     }
 
-    // ── Pass 1: the forward sweep, resuming a mapfile stamped raw (a re-run after Stop, a wedge
-    // or an abort). The sweep re-reads only NonTried and refuses a map whose known identity
-    // differs; an identity-less disc (DVD, pre-stamp map) is matched on capacity alone. ──
+    // ── Pass 1: the sweep over a mapfile this version wrote (or as the host decides): it
+    // refuses another disc's map, sweeps the other raw/decrypt mode fresh, else re-reads
+    // NonTried. A transport fault the host recovers from sweeps again, resuming. ──
+    let resume = host.resume_sweep().unwrap_or(map_mode.is_some());
+    let resumed = match (&prior, resume && map_mode == Some(job.raw)) {
+        (Some(m), true) => m.stats(),
+        _ => MapStats::default(),
+    };
     let mut passes = 0u32;
     let (mut last_good, mut last_unreadable, mut last_pending, mut halted);
     {
-        let bridge = ProgressBridge::new(sink);
-        let sweep_opts = SweepOptions {
-            decrypt: pass_should_decrypt(job.raw),
-            // Multipass is always raw, so only a map proven raw may be resumed.
-            resume: Mapfile::load(&disc.mapfile_for(iso_path)).is_ok_and(|m| m.raw() == Some(true)),
-            batch_sectors: None,
-            skip_on_error: true,
-            progress: Some(&bridge),
-            halt: None,
-            keys: job.keys.clone(),
-        };
+        milestone(
+            sink,
+            RecoveryEvent::PassStart {
+                pass: 1,
+                good: resumed.bytes_good,
+                pending: resumed.bytes_pending,
+                unreadable: resumed.bytes_unreadable,
+            },
+        );
         let scope = scope.map(crate::recovery::sector_scope_to_bytes);
-        let sr = crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, scope, halt)?;
+        let mut attempt = 0u32;
+        let mut last_err = None;
+        let sr = loop {
+            attempt += 1;
+            if !host.sweep_attempt(attempt) {
+                return Err(last_err.unwrap_or(libfreemkv::Error::SourceTerminated));
+            }
+            let bridge = ProgressBridge::new(sink);
+            let sweep_opts = SweepOptions {
+                decrypt: pass_should_decrypt(job.raw),
+                resume: resume || attempt > 1,
+                batch_sectors: None,
+                skip_on_error: true,
+                progress: Some(&bridge),
+                halt: None,
+                keys: job.keys.clone(),
+            };
+            match crate::recovery::sweep_in(
+                disc,
+                host.reader(),
+                iso_path,
+                &sweep_opts,
+                scope.clone(),
+                halt,
+            ) {
+                Ok(sr) => break sr,
+                Err(e) if e.is_scsi_transport_failure() && !halt.is_cancelled() => {
+                    if !host.recover_transport(attempt, &e) {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        };
         passes += 1;
         last_good = sr.bytes_good;
         last_unreadable = sr.bytes_unreadable;
         last_pending = sr.bytes_pending;
         halted = sr.halted;
+        milestone(
+            sink,
+            RecoveryEvent::PassDone {
+                pass: 1,
+                good: last_good,
+                unreadable: last_unreadable,
+                pending: last_pending,
+                recovered: 0,
+                wedged: false,
+                halted,
+            },
+        );
     }
 
     // ── Pass 2..N: patch passes over the mapfile's bad ranges. ──
     let mapfile_path = disc.mapfile_for(iso_path);
-    if !halted {
-        for _ in 1..=plan.patch_passes {
+    milestone(
+        sink,
+        RecoveryEvent::PatchesStart {
+            max: plan.patch_passes as u32,
+            pending: last_pending,
+        },
+    );
+    if halted {
+        milestone(sink, RecoveryEvent::Stopped { pass: 2 });
+    } else {
+        for n in 1..=plan.patch_passes as u32 {
+            let pass = n + 1;
             if sink.should_cancel() || halt.is_cancelled() {
+                milestone(sink, RecoveryEvent::Stopped { pass });
                 halted = true;
                 break;
             }
@@ -784,6 +1003,7 @@ fn multipass_rip_inner(
                     titles_scope_bad(opts.is_iso_output, &bad, &titles)
                 }
                 Err(e) => {
+                    milestone(sink, RecoveryEvent::MapUnreadable { pass, error: &e });
                     sink.log(
                         Level::Warn,
                         &format!(
@@ -794,6 +1014,7 @@ fn multipass_rip_inner(
                 }
             };
             if pre_pass_converged(mux_scope_bad, last_good) {
+                milestone(sink, RecoveryEvent::Converged { pass });
                 sink.log(
                     Level::Info,
                     "multipass_rip: muxable scope 100% recovered — skipping remaining patch passes",
@@ -801,25 +1022,54 @@ fn multipass_rip_inner(
                 break;
             }
 
+            milestone(
+                sink,
+                RecoveryEvent::PassStart {
+                    pass,
+                    good: last_good,
+                    pending: last_pending,
+                    unreadable: last_unreadable,
+                },
+            );
+            host.before_patch(pass);
             let bridge = ProgressBridge::new(sink);
-            let patch_opts =
-                PatchOptions::for_patch_pass(pass_should_decrypt(job.raw), Some(&bridge), None);
-            let pr = crate::recovery::patch_in(disc, reader, iso_path, &patch_opts, halt)?;
+            let patch_opts = PatchOptions {
+                keys: job.keys.clone(),
+                ..PatchOptions::for_patch_pass(pass_should_decrypt(job.raw), Some(&bridge), None)
+            };
+            let pr =
+                match crate::recovery::patch_in(disc, host.reader(), iso_path, &patch_opts, halt) {
+                    Ok(pr) => pr,
+                    Err(e) if host.patch_failed(pass, &e) => break,
+                    Err(e) => return Err(e),
+                };
             passes += 1;
             last_good = pr.bytes_good;
             last_unreadable = pr.bytes_unreadable;
             last_pending = pr.bytes_pending;
             let recovered = pr.bytes_recovered_this_pass;
+            milestone(
+                sink,
+                RecoveryEvent::PassDone {
+                    pass,
+                    good: last_good,
+                    unreadable: last_unreadable,
+                    pending: last_pending,
+                    recovered,
+                    wedged: pr.wedged_exit,
+                    halted: pr.halted,
+                },
+            );
 
             let exit = pass_exit(pr.halted, pr.wedged_exit);
-            if exit == PassExit::Cancelled {
+            if exit == PassExit::Cancelled || sink.should_cancel() || halt.is_cancelled() {
                 halted = true;
                 break;
             }
             // A transport fault is NOT an exhausted pass: unreached ranges are
             // still retryable, and falling through would promote them to
             // permanently Unreadable, so a re-run would skip them forever.
-            if exit == PassExit::Wedged {
+            if exit == PassExit::Wedged && !host.continue_after_wedge() {
                 sink.log(
                     Level::Warn,
                     "multipass_rip: patch pass ended on a transport fault — \
@@ -831,6 +1081,7 @@ fn multipass_rip_inner(
                     pending_bytes: last_pending,
                     good_bytes: last_good,
                     main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
+                    lost_bytes: last_unreadable,
                     severity: interrupted_severity(last_unreadable, last_pending),
                     passes,
                     aborted_for_loss: false,
@@ -852,6 +1103,7 @@ fn multipass_rip_inner(
             if patch_pass_decision_measured(mux_scope_bad, Some(recovered))
                 == PatchDecision::NoProgress
             {
+                milestone(sink, RecoveryEvent::NoProgress { pass, recovered });
                 sink.log(
                     Level::Info,
                     "multipass_rip: patch pass made no progress — exhausted, muxing on what we have",
@@ -860,6 +1112,8 @@ fn multipass_rip_inner(
             }
         }
     }
+    // A Stop that landed as the last pass ended still keeps the image resumable.
+    halted |= sink.should_cancel() || halt.is_cancelled();
 
     if halted {
         // Severity comes from damage actually recorded — hard-coding Clean here
@@ -869,6 +1123,7 @@ fn multipass_rip_inner(
             pending_bytes: last_pending,
             good_bytes: last_good,
             main_lost_ms: interrupted_lost_ms(last_unreadable, last_pending),
+            lost_bytes: last_unreadable,
             severity: interrupted_severity(last_unreadable, last_pending),
             passes,
             aborted_for_loss: false,
@@ -881,75 +1136,107 @@ fn multipass_rip_inner(
     // ── End-of-recovery promotion + abort-on-loss gate. ──
     // `bad_sectors` is carried out of the match, not derived after: the Ok
     // branch has the mapfile split; the Err branch has only unsplittable counters.
-    let (main_lost_ms, main_lost_bytes, good_bytes, unreadable_bytes, pending_bytes, bad_sectors) =
-        match Mapfile::load(&mapfile_path) {
-            Ok(mut map) => {
-                // Promotion MAKES the loss visible: the abort gate reads only
-                // Unreadable ranges, so a range that fails to promote out of
-                // NonTrimmed silently drops out — a write error ships as a good rip.
-                let mut promotion_intact = true;
-                let (promote_from, promote_to) = end_of_recovery_promotion();
-                if let Err(e) = map.promote(promote_from, promote_to) {
-                    promotion_intact = false;
-                    sink.log(
-                        Level::Warn,
-                        &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
-                    );
-                }
-                if let Err(e) = map.flush() {
-                    promotion_intact = false;
-                    sink.log(
-                        Level::Warn,
-                        &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
-                    );
-                }
-                let stats = map.stats();
-                let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
-                let lost_bytes = titles_abort_lost_bytes(opts.is_iso_output, &titles, &bad_ranges);
-                // Fail-safe: an incomplete damage record makes loss NaN, so
-                // `loss_aborts` fires regardless of threshold. Deliberately
-                // asymmetric: `lost_bytes` is whole-disc; the ms below stays title-scoped.
-                let (lost_ms, unquantifiable) =
-                    titles_lost_ms(promotion_intact, &titles, &bad_ranges);
-                if let Some(why) = unquantifiable {
+    let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
+    // `verdict` is the engine's one loss verdict; `bad_sectors` is carried out of the match,
+    // not derived after: the Ok branch has the mapfile split; the Err branch has only
+    // unsplittable counters.
+    let (verdict, good_bytes, unreadable_bytes, pending_bytes, bad_sectors) = match Mapfile::load(
+        &mapfile_path,
+    ) {
+        Ok(mut map) => {
+            // Promotion MAKES the loss visible: the abort gate reads only
+            // Unreadable ranges, so a range that fails to promote out of
+            // NonTrimmed silently drops out — a write error ships as a good rip.
+            let mut promotion_intact = true;
+            let (promote_from, promote_to) = end_of_recovery_promotion();
+            if let Err(e) = map.promote(promote_from, promote_to) {
+                promotion_intact = false;
+                sink.log(
+                    Level::Warn,
+                    &format!("multipass_rip: end-of-recovery promotion failed: {e}"),
+                );
+            }
+            if let Err(e) = map.flush() {
+                promotion_intact = false;
+                sink.log(
+                    Level::Warn,
+                    &format!("multipass_rip: failed to flush promoted mapfile: {e}"),
+                );
+            }
+            milestone(
+                sink,
+                RecoveryEvent::Promoted {
+                    map: &map,
+                    intact: promotion_intact,
+                },
+            );
+            let stats = map.stats();
+            let bad_ranges = map.ranges_with(&[SectorStatus::Unreadable]);
+            let mut verdict =
+                loss_verdict(opts.is_iso_output, &titles, &bad_ranges, effective_abort);
+            if !promotion_intact {
+                // Fail-safe: an incomplete damage record cannot vouch for any figure
+                // derived from it, so the rip is not shipped as within tolerance.
+                let (ms, why) = titles_lost_ms(false, &titles, &bad_ranges);
+                if let Some(why) = why {
                     sink.log(Level::Error, why);
                 }
-                (
-                    lost_ms,
-                    lost_bytes,
-                    stats.bytes_good,
-                    stats.bytes_unreadable,
-                    stats.bytes_pending,
-                    end_of_recovery_bad_sectors(&stats),
-                )
-            }
-            Err(e) => {
-                // Fail-safe: the mapfile — the rip's only damage record — couldn't be read at
-                // the abort-decision point. NaN makes `loss_aborts` fire instead of shipping
-                // this as a perfect rip.
+                verdict.lost_ms = ms;
+                verdict.aborts = true;
+            } else if verdict.lost_ms.is_nan() {
                 sink.log(
+                    Level::Warn,
+                    &format!(
+                        "multipass_rip: a ripped title reports no extents, so its loss \
+                             cannot be timed — {} bytes unreadable, reported in bytes",
+                        verdict.lost_bytes
+                    ),
+                );
+            }
+            (
+                verdict,
+                stats.bytes_good,
+                stats.bytes_unreadable,
+                stats.bytes_pending,
+                end_of_recovery_bad_sectors(&stats),
+            )
+        }
+        Err(e) => {
+            // Fail-safe: the mapfile — the rip's only damage record — couldn't be read at
+            // the abort-decision point, so the rip is not shipped as perfect.
+            milestone(sink, RecoveryEvent::LossUnmeasured { error: &e });
+            sink.log(
                     Level::Error,
                     &format!(
                         "multipass_rip: mapfile could not be loaded to verify loss — forcing abort ({e})"
                     ),
                 );
-                // No `MapStats` to split, so the score keeps the whole in-flight
-                // aggregate deliberately — this fail-safe path must over-report,
-                // not under-report (NaN can't escalate a zero-sector Clean verdict).
-                (
-                    f64::NAN,
-                    0,
-                    last_good,
-                    last_unreadable,
-                    last_pending,
-                    bad_sector_count(last_unreadable, last_pending),
-                )
-            }
-        };
+            // No `MapStats` to split, so the score keeps the whole in-flight
+            // aggregate deliberately — this fail-safe path must over-report,
+            // not under-report (NaN can't escalate a zero-sector Clean verdict).
+            (
+                LossVerdict {
+                    lost_bytes: last_unreadable,
+                    lost_ms: f64::NAN,
+                    aborts: true,
+                },
+                last_good,
+                last_unreadable,
+                last_pending,
+                bad_sector_count(last_unreadable, last_pending),
+            )
+        }
+    };
 
-    let effective_abort = effective_abort_secs(opts.is_iso_output, opts.abort_on_lost_secs);
-    let aborted_for_loss = loss_aborts(main_lost_bytes, main_lost_ms, effective_abort);
-    let severity = classify_damage(bad_sectors, main_lost_ms);
+    let aborted_for_loss = verdict.aborts;
+    // A loss reported in bytes only is scored by its sectors; an untrustworthy record (an
+    // aborting NaN) stays Serious.
+    let severity = if verdict.lost_ms.is_nan() && !verdict.aborts {
+        classify_damage(bad_sectors, 0.0)
+    } else {
+        classify_damage(bad_sectors, verdict.lost_ms)
+    };
+    let main_lost_ms = verdict.lost_ms;
     let complete = recovery_is_complete(aborted_for_loss, unreadable_bytes, pending_bytes);
 
     Ok(MultipassResult {
@@ -957,12 +1244,105 @@ fn multipass_rip_inner(
         pending_bytes,
         good_bytes,
         main_lost_ms,
+        lost_bytes: verdict.lost_bytes,
         severity,
         passes,
         aborted_for_loss,
         halted: false,
         wedged: false,
         complete,
+    })
+}
+
+/// One pass of the recovery, for a front end that runs one per invocation (the CLI): a plain
+/// copy, or with `multipass` the next step of a resumable recovery — the sweep (skipping past
+/// bad sectors), or once it is done a patch pass over what it left — chosen from the image's
+/// mapfile. No promotion, no loss gate: the next run carries on.
+pub(crate) fn one_pass(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    multipass: bool,
+    sink: &dyn Sink,
+    (halt, op): (&crate::EngineHalt<'_>, &libfreemkv::Halt),
+) -> crate::Result<crate::CopyResult> {
+    let bridge = ProgressBridge::new(sink);
+    let opts = CopyOptions {
+        decrypt: pass_should_decrypt(job.raw),
+        multipass,
+        progress: Some(&bridge),
+        halt: Some(op.as_arc().clone()),
+        keys: job.keys.clone(),
+    };
+    crate::recovery::copy_in(disc, reader, iso_path, &opts, halt)
+}
+
+// The single-pass recovery (`max_passes == 0`): one `copy` dispatch (sweep-or-resume via
+// mapfile state), no retry loop, no ISO-multipass semantics, no abort gate.
+fn single_pass(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn libfreemkv::SectorSource,
+    iso_path: &std::path::Path,
+    job: &Job,
+    scope: Option<&[(u32, u32)]>,
+    sink: &dyn Sink,
+    halt: &crate::EngineHalt<'_>,
+) -> crate::Result<MultipassResult> {
+    let bridge = ProgressBridge::new(sink);
+    let copy_opts = CopyOptions {
+        decrypt: pass_should_decrypt(job.raw),
+        multipass: false,
+        progress: Some(&bridge),
+        halt: None,
+        keys: job.keys.clone(),
+    };
+    let cr = match scope {
+        // A scoped single pass resumes its own staging; `copy` is the iso:// path.
+        Some(scope) => {
+            let sweep_opts = SweepOptions {
+                decrypt: copy_opts.decrypt,
+                resume: disc.mapfile_for(iso_path).exists(),
+                batch_sectors: None,
+                skip_on_error: false,
+                progress: copy_opts.progress,
+                halt: copy_opts.halt.clone(),
+                keys: copy_opts.keys.clone(),
+            };
+            let scope = crate::recovery::sector_scope_to_bytes(scope);
+            crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, Some(scope), halt)?
+        }
+        None => crate::recovery::copy_in(disc, reader, iso_path, &copy_opts, halt)?,
+    };
+    // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
+    // here (unlike the aggregate `bad_sector_count` forbids) because every
+    // un-halted route here has `nontried == 0`, so pending is retryable damage.
+    let bad_sectors = bad_sector_count(cr.bytes_unreadable, cr.bytes_pending);
+    Ok(MultipassResult {
+        unreadable_bytes: cr.bytes_unreadable,
+        pending_bytes: cr.bytes_pending,
+        good_bytes: cr.bytes_good,
+        // Single-pass never runs the end-of-recovery loss gate, so a flat
+        // 0.0 would falsely claim "no playback lost" beside real damage.
+        // NaN marks it unquantified — except zero bad sectors, genuinely 0.0.
+        main_lost_ms: if bad_sectors == 0 { 0.0 } else { f64::NAN },
+        lost_bytes: cr.bytes_unreadable,
+        // Severity comes from the SECTOR count, which single-pass knows.
+        // NaN would wrongly escalate to Serious via `classify_damage`'s
+        // fail-safe (right for the abort gate; single-pass has none).
+        severity: if cr.halted {
+            interrupted_severity(cr.bytes_unreadable, cr.bytes_pending)
+        } else {
+            classify_damage(bad_sectors, 0.0)
+        },
+        passes: 1,
+        aborted_for_loss: false,
+        halted: cr.halted,
+        // Single-pass has no patch stage, so no transport-fault exit to
+        // report: `recovery::copy` aborts the pass on a bridge crash
+        // rather than continuing past it.
+        wedged: false,
+        complete: cr.complete,
     })
 }
 
@@ -1051,8 +1431,12 @@ mod tests {
             "exactly 1000ms at a 1s threshold proceeds (strictly greater-than aborts)"
         );
         assert!(
-            loss_aborts(0, f64::NAN, 30),
-            "NaN loss fails safe to abort on the seconds path too"
+            !loss_aborts(0, f64::NAN, 30),
+            "an untimeable loss never exceeds a seconds tolerance"
+        );
+        assert!(
+            loss_aborts(4096, f64::NAN, 0),
+            "the perfect gate aborts on its bytes"
         );
     }
 
@@ -1085,8 +1469,8 @@ mod tests {
         let ms = abort_lost_ms(false, &t, &damage, 0.0);
         assert!(ms.is_nan(), "zero-bitrate loss must be NaN, got {ms}");
         assert!(
-            loss_aborts(abort_lost_bytes(false, &t, &damage), ms, 30),
-            "an unquantifiable loss must abort even under a 30s tolerance"
+            loss_aborts(abort_lost_bytes(false, &t, &damage), ms, 0),
+            "an unquantifiable loss aborts the perfect gate"
         );
 
         // The scope hole: a title with NO EXTENTS can't be scoped, so
@@ -1152,15 +1536,10 @@ mod tests {
             end_of_recovery_lost_ms(/* promotion_intact */ true, &empty, &damage);
         assert!(lost_ms.is_nan(), "gate answered {lost_ms}, not NaN");
         assert!(why.is_some(), "an unquantifiable verdict must say why");
-        assert!(
-            loss_aborts(0, lost_ms, 30),
-            "unmeasurable loss must abort even under a 30s tolerance"
-        );
-        // What the gate used to answer, pinned so the regression is legible:
-        assert!(
-            !loss_aborts(0, 0.0, 30),
-            "0.0 passes a 30s tolerance — that was the bug"
-        );
+        // The verdict reports it in bytes: the whole disc's, since it cannot be scoped.
+        let v = loss_verdict(false, &[&empty], &damage, 0);
+        assert_eq!(v.lost_bytes, 8192);
+        assert!(v.aborts, "the perfect gate aborts on the unscoped bytes");
     }
 
     /// The gate must still produce a real number when the loss IS measurable —
@@ -1211,52 +1590,39 @@ mod tests {
         assert!(!loss_is_unscopable(false, &t, &[(0, 4096)]));
     }
 
-    // `main_title_lost_ms`'s bitrate guard, pinned in every direction: the mutation run flipped
-    // the `&&`/`>` operators here and the suite stayed green. Getting it wrong divides by zero
-    // by accident.
+    // The title's own size/duration wins; missing metadata falls back to an estimated rate
+    // (never NaN), so a rip is never stopped just because a title lacks a size or duration.
     #[test]
-    fn lost_ms_needs_both_a_size_and_a_duration() {
+    fn lost_ms_uses_the_title_rate_else_an_estimate() {
         let damage = 4096u64;
 
-        // Both present -> a real number.
         let mut ok = libfreemkv::DiscTitle::empty();
         ok.size_bytes = 1_000_000;
         ok.duration_secs = 100.0;
+        // 4096 bytes at 10_000 B/s = 409.6 ms.
         let ms = main_title_lost_ms(&ok, damage);
-        assert!(
-            ms.is_finite() && ms > 0.0,
-            "expected a real figure, got {ms}"
-        );
+        assert!((ms - 409.6).abs() < 1e-6, "expected 409.6 ms, got {ms}");
 
-        // Size alone, duration alone, and neither: all unquantifiable. `||`
-        // would let the first two through; `true` would let all three.
         let mut size_only = libfreemkv::DiscTitle::empty();
         size_only.size_bytes = 1_000_000;
         let mut dur_only = libfreemkv::DiscTitle::empty();
         dur_only.duration_secs = 100.0;
+        let mut zero_dur = libfreemkv::DiscTitle::empty();
+        zero_dur.size_bytes = 1_000_000;
         for (name, t) in [
             ("size only", size_only),
             ("duration only", dur_only),
+            ("zero duration", zero_dur),
             ("neither", libfreemkv::DiscTitle::empty()),
         ] {
             let ms = main_title_lost_ms(&t, damage);
-            assert!(ms.is_nan(), "{name}: expected NaN, got {ms}");
+            assert!(
+                ms.is_finite() && ms > 0.0,
+                "{name}: expected an estimate, got {ms}"
+            );
         }
 
-        // Exactly zero is NOT usable — `>=` would admit it and divide by zero.
-        let mut zero_size = libfreemkv::DiscTitle::empty();
-        zero_size.size_bytes = 0;
-        zero_size.duration_secs = 100.0;
-        assert!(main_title_lost_ms(&zero_size, damage).is_nan());
-
-        let mut zero_dur = libfreemkv::DiscTitle::empty();
-        zero_dur.size_bytes = 1_000_000;
-        zero_dur.duration_secs = 0.0;
-        assert!(main_title_lost_ms(&zero_dur, damage).is_nan());
-
-        // An extent-less / bitrate-less title (the shape a failed scan leaves).
-        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), damage).is_nan());
-        // And no damage is genuinely zero regardless of the title.
+        // No damage is genuinely zero regardless of the title.
         assert_eq!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 0), 0.0);
     }
 
@@ -1430,7 +1796,7 @@ mod tests {
         assert_eq!(
             classify_damage(10, f64::NAN),
             crate::DamageSeverity::Serious,
-            "NaN must fail safe here exactly as it does in should_abort_for_loss"
+            "an untimeable loss badges Serious"
         );
         // And a quantified small loss still classifies normally.
         assert_eq!(classify_damage(10, 0.0), crate::DamageSeverity::Cosmetic);
@@ -1442,7 +1808,11 @@ mod tests {
     #[test]
     fn the_pass_count_saturates_instead_of_wrapping() {
         let plan = plan_passes(u8::MAX);
-        assert_eq!(plan.patch_passes, u8::MAX);
+        assert_eq!(
+            plan.patch_passes,
+            u8::MAX - 2,
+            "capped so every pass is counted"
+        );
         assert_eq!(
             plan.total_passes,
             u8::MAX,
@@ -1667,10 +2037,11 @@ mod tests {
     }
 
     #[test]
-    fn main_title_lost_ms_is_nan_when_unquantifiable() {
-        // A title with loss but no measurable bitrate (size 0, dur 0) → NaN
-        // (fail-safe abort).
-        assert!(main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096).is_nan());
+    fn a_title_without_metadata_gets_an_estimated_loss_not_an_abort() {
+        // No size, no duration: timed at the format's typical rate, so the loss is measured
+        // and a positive tolerance decides, rather than a NaN forcing an abort.
+        let ms = main_title_lost_ms(&libfreemkv::DiscTitle::empty(), 4096);
+        assert!(ms.is_finite() && ms > 0.0, "expected an estimate, got {ms}");
     }
 
     // ── multipass_rip strategy LOOP, exercised headlessly (hard rule #2) ── Every double must
@@ -2723,8 +3094,7 @@ mod tests {
             sink.logs.lock().unwrap()
         );
         let cause = Mapfile::load(&mapfile)
-            .err()
-            .expect("still unreadable")
+            .expect_err("still unreadable")
             .to_string();
         assert!(
             sink.logged(Level::Error, &cause),
@@ -3619,5 +3989,9 @@ mod tests {
         .expect("a decrypting multipass rip is allowed");
         assert!(!reads.lock().unwrap().is_empty(), "the rip read the disc");
         assert!(iso.exists(), "the rip wrote its image");
+        // The passes ran decrypting: the map says so (an AACS image's plaintext is pinned by
+        // the KU gate tests).
+        let map = Mapfile::load(&disc.mapfile_for(&iso)).unwrap();
+        assert_eq!(map.raw(), Some(false), "a decrypting run's image");
     }
 }

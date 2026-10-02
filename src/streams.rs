@@ -201,7 +201,7 @@ fn check_class(
     let wanted: Vec<Language> = tags.iter().filter_map(|t| normalize_lang(t)).collect();
     let any_match = present
         .iter()
-        .any(|l| normalize_lang(l).is_some_and(|pl| wanted.contains(&pl)));
+        .any(|l| stream_lang(l).is_some_and(|pl| wanted.contains(&pl)));
     if !any_match {
         // Report an untagged track as "und" (ISO 639-2 undetermined), not a
         // blank, so the message reads "available audio: und" instead of
@@ -338,14 +338,13 @@ impl Wanted {
         })
     }
 
-    /// Does this side keep a stream tagged `lang`? An untagged (or unresolvable)
-    /// language can only be kept by `All` — a language filter has nothing to
-    /// match it against.
+    /// Does this side keep a stream tagged `lang`? An untagged stream is `und`; an
+    /// unresolvable tag can only be kept by `All`.
     fn keeps(&self, lang: &str) -> bool {
         match self {
             Wanted::All => true,
             Wanted::None => false,
-            Wanted::Langs(langs) => normalize_lang(lang).is_some_and(|l| langs.contains(&l)),
+            Wanted::Langs(langs) => stream_lang(lang).is_some_and(|l| langs.contains(&l)),
         }
     }
 }
@@ -403,6 +402,14 @@ fn resolve_subtitles(
 
 /// Normalize a language tag (a name, 639-1, 639-2/T, 639-2/B, or 639-3 code) to
 /// a language identity, case-insensitively. `None` if unrecognized.
+// A stream's language: an untagged one is `und` (undetermined), as the refusal reports it.
+fn stream_lang(tag: &str) -> Option<Language> {
+    match tag.trim().is_empty() {
+        true => Some(Language::Und),
+        false => normalize_lang(tag),
+    }
+}
+
 fn normalize_lang(tag: &str) -> Option<Language> {
     let t = tag.trim();
     if t.is_empty() {
@@ -646,6 +653,17 @@ mod tests {
             sub(0x1201, "fra"),
         ];
         t
+    }
+
+    // The refusal reports an untagged track as "und"; asking for "und" keeps it.
+    #[test]
+    fn an_untagged_track_is_kept_by_a_request_for_und() {
+        let mut t = title();
+        t.streams.push(audio(0x1104, ""));
+        let und = StreamFilter::Langs(vec!["und".into()]);
+        let sel = resolve_stream_selection(&t, &und, &StreamFilter::None).unwrap();
+        assert_eq!(sel.audio, PidFilter::Only(vec![0x1104]));
+        assert!(choice(und, StreamFilter::None).unmatched(&t).is_empty());
     }
 
     #[test]

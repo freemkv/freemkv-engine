@@ -71,8 +71,8 @@ impl MuxPlan {
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`,
 /// under the [`run_titles`] loop policy. Each title is bracketed by
 /// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails into a
-/// file sink has its partial file removed (a directory sink, ending in `/`,
-/// is left alone).
+/// file sink has its partial file removed, unless the title never touched the file (a
+/// directory sink, ending in `/`, is left alone).
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
 /// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
@@ -108,9 +108,11 @@ pub fn mux_image_titles_with(
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
         let selection = plan.selection_for(idx);
+        let out_path = libfreemkv::parse_url(&dest).path_str().to_string();
+        let before = output_stamp(&out_path);
         let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink);
         if result.is_err() && !dest.ends_with('/') {
-            let _ = std::fs::remove_file(libfreemkv::parse_url(&dest).path_str());
+            remove_failed_output(&out_path, before);
         }
         sink.event(&Event::TitleDone {
             idx,
@@ -119,6 +121,20 @@ pub fn mux_image_titles_with(
         });
         result.map(|_| ())
     })
+}
+
+// Length and mtime of the file at `path`; `None` when absent.
+fn output_stamp(path: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()))
+}
+
+// Remove the file a failed mux left at `path`, unless it is the one `before` saw: an error
+// before the output opened must not delete an earlier rip.
+fn remove_failed_output(path: &str, before: Option<(u64, Option<std::time::SystemTime>)>) {
+    if output_stamp(path) != before {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // A key refusal before any title started (E7022/E7026/E7034, or a halt), as the loop would
@@ -425,6 +441,25 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     Ok(())
 }
 
+// Move `landing` onto the target. Without `replace`, a hard link lands it only if the target
+// is still absent (a plain rename would overwrite one that appeared after the re-check); a
+// filesystem with no hard links falls back to the rename.
+fn land(landing: &Path, job: &RemuxJob) -> io::Result<()> {
+    if job.replace {
+        return std::fs::rename(landing, &job.target);
+    }
+    match std::fs::hard_link(landing, &job.target) {
+        Ok(()) => {
+            if let Err(e) = std::fs::remove_file(landing) {
+                tracing::warn!(target: "freemkv::engine", "could not remove {}: {e}", landing.display());
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(target_exists(&job.target)),
+        Err(_) => std::fs::rename(landing, &job.target),
+    }
+}
+
 fn target_exists(target: &Path) -> io::Error {
     let path = target.display().to_string();
     libfreemkv::Error::RemuxTargetExists { path }.into()
@@ -616,18 +651,21 @@ fn land_verified(
     }
     durable_sync(rio, partial, halt, sink, timing)?;
 
-    sink.event(&Event::Phase { name: "verify" });
-    let verified = verify_watched(partial, title, halt, sink, rio, timing);
-    let stopped = verified.as_ref().is_err_and(libfreemkv::is_halt);
-    if !stopped {
-        sink.event(&Event::Verify {
-            path: partial,
-            ok: verified.is_ok(),
-            runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
-            expected_secs: title.duration_secs,
-        });
-    }
-    let verified = verified?;
+    // Each verify (the local file, then a staged NAS copy) is its own phase and verdict.
+    let verify = |path: &Path| {
+        sink.event(&Event::Phase { name: "verify" });
+        let verified = verify_watched(path, title, halt, sink, rio, timing);
+        if !verified.as_ref().is_err_and(libfreemkv::is_halt) {
+            sink.event(&Event::Verify {
+                path,
+                ok: verified.is_ok(),
+                runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
+                expected_secs: title.duration_secs,
+            });
+        }
+        verified
+    };
+    let verified = verify(partial)?;
 
     let mut remote_guard = None;
     if staged_partial.is_some() {
@@ -637,7 +675,7 @@ fn land_verified(
         copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
         durable_sync(rio, &target_partial, halt, sink, timing)?;
         // Check the NAS copy itself before replacing an existing library file.
-        verify_watched(&target_partial, title, halt, sink, rio, timing)?;
+        verify(&target_partial)?;
     }
 
     sink.event(&Event::Phase { name: "replace" });
@@ -654,7 +692,7 @@ fn land_verified(
     if halt.is_cancelled() {
         return Err(libfreemkv::Error::Halted.into());
     }
-    std::fs::rename(landing, &job.target)?;
+    land(landing, job)?;
     remote_guard.as_mut().unwrap_or(&mut guard).disarm();
     // The rename committed: a Stop or a failure during the folder sync cuts only the sync
     // short (§2.6, §4.4), and the caller is still told the target was replaced.
@@ -992,6 +1030,28 @@ mod stop_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_title_removes_only_an_output_it_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.mkv");
+        let path = p.to_str().unwrap();
+        // Absent before, written by the failed title: removed.
+        let before = output_stamp(path);
+        std::fs::write(&p, b"partial").unwrap();
+        remove_failed_output(path, before);
+        assert!(!p.exists());
+        // Present before and untouched: kept.
+        std::fs::write(&p, b"earlier rip").unwrap();
+        let before = output_stamp(path);
+        remove_failed_output(path, before);
+        assert_eq!(std::fs::read(&p).unwrap(), b"earlier rip");
+        // Present before and rewritten by the failed title: removed.
+        let before = output_stamp(path);
+        std::fs::write(&p, b"partial rewrite").unwrap();
+        remove_failed_output(path, before);
+        assert!(!p.exists());
+    }
+
     use super::*;
     use std::sync::Mutex;
 
@@ -1316,6 +1376,9 @@ mod tests {
                 Event::SourceOpened { .. } => "source".into(),
                 Event::Keys { .. } => "keys".into(),
                 Event::Pass(_) => "pass".into(),
+                Event::Recovery(_) => "recovery".into(),
+                Event::TitleSkipped { idx, .. } => format!("skipped:{idx}"),
+                Event::TitleFailed { idx, .. } => format!("failed:{idx}"),
             };
             self.0.lock().unwrap().push(s);
         }

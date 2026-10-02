@@ -45,7 +45,7 @@ const WEDGE_FASTFAIL_MS: u64 = 500;
 /// Max read speed sentinel for `SET CD SPEED` (0xFFFF = "as fast as the drive
 /// will go"). The default for every read; a handler that wants to slow the
 /// spindle passes [`SpeedPref::Min`] and [`read_span`] restores this on exit.
-const SPEED_MAX_KBS: u16 = 0xFFFF;
+pub(super) const SPEED_MAX_KBS: u16 = 0xFFFF;
 
 /// Min read speed (~DVD 1x). Slower rotation gives the servo more dwell and
 /// the ECC engine more integration time per sector (min-speed [`Linear`] and
@@ -217,8 +217,8 @@ impl HandlerCtx<'_> {
         self.stalled() || (self.now)() >= deadline
     }
 
-    /// True once the handler has read `UNPRODUCTIVE_YIELD` sectors in a row with
-    /// no recovery — its cue to hand the baton to the next handler instead of
+    /// True once the handler has made `UNPRODUCTIVE_YIELD` reads (of any span) in a
+    /// row with no recovery — its cue to hand the baton to the next handler instead of
     /// grinding a dead zone for its whole budget.
     fn stalled(&self) -> bool {
         self.unproductive >= UNPRODUCTIVE_YIELD
@@ -263,6 +263,32 @@ fn read_span(
     count: u16,
     params: ReadParams,
 ) -> ReadHit {
+    read_span_as(ctx, buf, pos, count, params, true)
+}
+
+// A prime read of the sector at `pos`: a still-bad one is a real read (recovered and counted);
+// any other (already good, or outside this section) only warms the drive: nothing is written
+// and it neither recovers nor breaks the dead streak.
+fn prime_read(
+    ctx: &mut HandlerCtx,
+    buf: &mut [u8],
+    pos: u64,
+    params: ReadParams,
+    bad: &SubRanges,
+) -> ReadHit {
+    read_span_as(ctx, buf, pos, 1, params, bad.contains(pos))
+}
+
+// [`read_span`]; `commit: false` reads without handing the bytes to the sink or resetting
+// the dead streak.
+fn read_span_as(
+    ctx: &mut HandlerCtx,
+    buf: &mut [u8],
+    pos: u64,
+    count: u16,
+    params: ReadParams,
+    commit: bool,
+) -> ReadHit {
     let lba = (pos / SECTOR) as u32;
     let bytes = count as usize * SECTOR as usize;
     // Enforce sector-alignment at runtime, every build (not debug_assert!, which
@@ -287,6 +313,7 @@ fn read_span(
     let recovery = params.timeout.recovery();
     let read_started = (ctx.now)();
     let hit = match recovery_read(ctx.reader, lba, count, buf, recovery, params.fua) {
+        Ok(n) if n == bytes && !commit => ReadHit::Good,
         Ok(n) if n == bytes => match ctx.sink.recovered(pos, &buf[..bytes]) {
             Ok(()) => ReadHit::Good,
             // The span was read but cannot be written: stop reading into a dead sink.
@@ -362,7 +389,9 @@ fn read_span(
     // resets it, a fruitless one advances it toward UNPRODUCTIVE_YIELD.
     match hit {
         ReadHit::Good => {
-            ctx.unproductive = 0;
+            if commit {
+                ctx.unproductive = 0;
+            }
             ctx.wedge_streak = 0;
         }
         // A Bad read is unproductive grinding — advance the yield streak.
@@ -731,9 +760,9 @@ impl SectionHandler for SpeedSweep {
                             bad.remove(pos, SECTOR);
                             break;
                         }
-                        // Try the next speed, but check for a stop between them (each
-                        // is a read at up to 60s). Uses `timed_out` not `past`: a run
-                        // of failing reads here is the technique itself, not a stall.
+                        // Next speed, checking for a stop between (each read is up to 60s).
+                        // `timed_out`, not `past`: a failed fast read is the technique.
+                        // Between sectors the dead streak still yields (`past` above).
                         ReadHit::Bad => {
                             if ctx.halted() {
                                 return HandlerOutcome::Halted;
@@ -790,7 +819,7 @@ impl SectionHandler for CachePrime {
             // the servo/PLL, so the boundary sector is read warm, not cold-seeked.
             if rp >= SECTOR {
                 // A bad/absent preceding sector just means no prime — read cold.
-                match read_span(ctx, &mut prime, rp - SECTOR, 1, self.params) {
+                match prime_read(ctx, &mut prime, rp - SECTOR, self.params, bad) {
                     ReadHit::Transport => return HandlerOutcome::TransportFault,
                     ReadHit::Fatal => return HandlerOutcome::Fatal,
                     ReadHit::Good | ReadHit::Bad => {}
@@ -869,7 +898,7 @@ impl SectionHandler for Oscillate {
                 // successful prime must be claimed via bad.remove — read_span already
                 // handed the bytes to the sink; left in `bad` it reports false loss.
                 if pos >= SECTOR {
-                    match read_span(ctx, &mut probe, pos - SECTOR, 1, self.params) {
+                    match prime_read(ctx, &mut probe, pos - SECTOR, self.params, bad) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
                         ReadHit::Fatal => return HandlerOutcome::Fatal,
                         ReadHit::Good => bad.remove(pos - SECTOR, SECTOR),
@@ -908,7 +937,7 @@ impl SectionHandler for Oscillate {
                     // Claim a successful prime — see the prime-below comment. Above
                     // `pos`, `pos + SECTOR` is the next still-bad sector for ranges
                     // two+ sectors long, so a landed prime is a real recovery.
-                    match read_span(ctx, &mut probe, pos + SECTOR, 1, self.params) {
+                    match prime_read(ctx, &mut probe, pos + SECTOR, self.params, bad) {
                         ReadHit::Transport => return HandlerOutcome::TransportFault,
                         ReadHit::Fatal => return HandlerOutcome::Fatal,
                         ReadHit::Good => bad.remove(pos + SECTOR, SECTOR),
@@ -2423,6 +2452,41 @@ mod tests {
         assert!(
             matches!(ctx.fatal, Some(Error::WholeDiscKeyMissing)),
             "the error that ended the chain is kept for the caller: {:?}",
+            ctx.fatal
+        );
+        assert_eq!(bad.total_len(), 64 * SECTOR, "nothing claimed recovered");
+    }
+
+    // A Stop landing mid-read comes back as `Error::Halted`: the read stays bad and the
+    // halt check ends the chain Halted, never Fatal (which would fail a stopped pass).
+    #[test]
+    fn a_read_the_stop_interrupts_ends_the_chain_halted() {
+        struct HaltingSource(Arc<AtomicBool>);
+        impl SectorSource for HaltingSource {
+            fn read_sectors(&mut self, _: u32, _: u16, _: &mut [u8], _: bool) -> Result<usize> {
+                self.0.store(true, Ordering::Relaxed);
+                Err(Error::Halted)
+            }
+        }
+        let (h, _) = Harness::build(&[], None, Duration::from_millis(1));
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut src = HaltingSource(flag.clone());
+        let mut sink = RecordSink::default();
+        let now = h.now_fn();
+        let mut ctx = ctx!(src, sink, now);
+        ctx.halt = Some(flag.as_ref());
+        let mut bad = SubRanges::from_section(0, 64 * SECTOR);
+        let mut handlers: Vec<Box<dyn SectionHandler>> = vec![Box::new(Linear {
+            direction: Direction::Forward,
+            params: ReadParams::fast(),
+        })];
+        let deadline = (ctx.now)() + Duration::from_secs(30);
+        let mut sb = HandlerScoreboard::default();
+        let out = run_handlers(&mut ctx, &mut handlers, &mut bad, &mut sb, |_| deadline);
+        assert_eq!(out, HandlerOutcome::Halted);
+        assert!(
+            ctx.fatal.is_none(),
+            "a stop is not a fatal error: {:?}",
             ctx.fatal
         );
         assert_eq!(bad.total_len(), 64 * SECTOR, "nothing claimed recovered");

@@ -164,6 +164,11 @@ pub fn resolve_for_rip_traced(
     resolve_traced(disc, reader, scope, sources, seed, halt, None)
 }
 
+// An OS "not found": a folder that is not a disc, never a read failure.
+fn is_not_found(e: &libfreemkv::Error) -> bool {
+    matches!(*e, libfreemkv::Error::IoError { source: ref s } if s.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// The keys for a loose Blu-ray clip (`m2ts://`), looked up the only way a loose file allows:
 /// walk up to its disc folder ([`libfreemkv::disc_root_of`]), scan it, and resolve once over
 /// the titles that play the clip (every title when none names it, so an unrelated keyless
@@ -177,14 +182,17 @@ pub fn resolve_loose_clip(
     let Some(root) = libfreemkv::disc_root_of(clip) else {
         return (Ok(None), ResolutionTrace::new());
     };
-    // An unreadable folder looks up nothing: a clear clip still opens, an encrypted one
-    // refuses E7022 in `input()`.
+    // A folder that is not a readable disc looks up nothing: a clear clip still opens, an
+    // encrypted one refuses E7022 in `input()`. An OS read error (EIO, EACCES) surfaces.
     let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
         Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
         r => r,
     };
     let (disc, mut reader) = match scanned {
         Ok(d) => d,
+        Err(e @ libfreemkv::Error::IoError { .. }) if !is_not_found(&e) => {
+            return (Err(e), ResolutionTrace::new());
+        }
         Err(e) => {
             tracing::warn!(target: "freemkv::keys", error = %e, "loose clip: disc folder unreadable");
             return (Ok(None), ResolutionTrace::new());

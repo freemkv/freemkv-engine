@@ -133,16 +133,20 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
         }
     }
 
-    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key set (KU §3.5)
-    // covering the selected titles; with none, the executors' gate (KU-X1: never the
-    // disc-banked keys), so preflight can't pass a rip the passes refuse.
+    // Decrypt gate: an encrypted disc muxed WITHOUT raw needs a usable key set (KU §3.5) over
+    // what the rip decrypts (its titles; the multipass image's whole disc), else the
+    // executors' gate (KU-X1), so preflight can't pass a rip the passes refuse.
+    let scope = match job.mode {
+        crate::RipMode::Multi => libfreemkv::keys::KeyScope::WholeDisc,
+        crate::RipMode::Single => libfreemkv::keys::KeyScope::Titles(resolved),
+    };
     let keyed = match &job.keys {
         Some(set) => {
             matches!(
                 crate::keys::key_status(disc, set),
                 libfreemkv::keys::DecryptStatus::Ready
                     | libfreemkv::keys::DecryptStatus::NotEncrypted
-            ) && set.covers(&libfreemkv::keys::KeyScope::Titles(resolved))
+            ) && set.covers(&scope)
         }
         None => crate::resolve::ensure_decryptable_with(disc, false, None).is_ok(),
     };

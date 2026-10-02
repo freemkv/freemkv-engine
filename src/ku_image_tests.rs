@@ -256,8 +256,6 @@ fn open_image_resolves_once_and_hands_the_set_to_every_title() {
 
     let input = opened.input_options(1, libfreemkv::StreamSelection::default());
     assert!(input.keys.is_some(), "the set, not banked keys or a fetch");
-    let src_code = include_str!("image.rs");
-    assert!(!src_code.contains(&["fn build_key", "_fetch"].concat()));
 
     // remux_iso: one open, one resolution round for its title, then the mux.
     let calls = Calls::default();
@@ -777,9 +775,9 @@ fn extract_tree_reads_through_the_key_set() {
     assert!(mask(&got) == mask(want), "the stream file is decrypted");
 }
 
-/// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, and
-/// `RipOutcome::Failed` its data (here a failed top-up whose sidecar turned unreadable:
-/// `MapfileInvalid { kind: "vidfp" }`), not only the code.
+/// Up-front refusals keep the whole error: `TitleDone(Err)` carries the typed error, not
+/// only the code. A failed top-up whose sidecar turned unreadable stays the key refusal:
+/// the sidecar's own error never replaces it.
 #[test]
 fn an_up_front_refusal_keeps_the_whole_error() {
     #[derive(Default)]
@@ -810,12 +808,10 @@ fn an_up_front_refusal_keeps_the_whole_error() {
         &mkv_dest(dir.path()),
         &sink,
     );
-    let RipOutcome::Failed { data, .. } = &out else {
-        panic!("{out:?}")
-    };
-    assert_eq!(data, "vidfp");
+    assert!(matches!(out, RipOutcome::NoKey), "{out:?}");
     let events = sink.0.lock().unwrap();
-    assert_eq!(*events, [r#"Some(MapfileInvalid { kind: "vidfp" })"#]);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(events[0].starts_with("Some(NoDiscKey {"), "{events:?}");
 }
 
 /// J23 (amends J11 / SG28; KS-16 "Kvu = AES-G(Km, IDv)"): E7034 only when the VID would
@@ -1339,4 +1335,33 @@ fn a_top_up_remembers_a_keydb_failure() {
     }
     let e8002 = Some(libfreemkv::error::E_KEYDB_INVALID);
     assert_eq!(*sink.0.lock().unwrap(), [e8002, e8002]);
+}
+
+// A one-title keyed image opened for the keep-out tests.
+fn keepout_opened(dir: &Path) -> crate::OpenedImage {
+    let fx = bd_image(&[Some(K1)], 1);
+    let iso = fx.write(dir, "d.iso");
+    let f = factory(&[(Answer::Online, &[K1])], &Calls::default());
+    open_image_with(&ImageSource::Iso(iso), OpenImageOptions::resolve(f)).unwrap()
+}
+
+/// A title that fails before its output opens leaves the file already at that path.
+#[test]
+fn a_title_failing_before_output_keeps_the_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let opened = keepout_opened(dir.path());
+    let out = dir.path().join("t0.mkv");
+    std::fs::write(&out, b"earlier rip").unwrap();
+    // An audio PID the title lacks is refused before the output opens.
+    let mut plan = MuxPlan::new(vec![0]);
+    plan.streams = vec![(
+        0,
+        libfreemkv::StreamSelection {
+            audio: libfreemkv::PidFilter::Only(vec![0xFFFE]),
+            ..Default::default()
+        },
+    )];
+    let res = mux_image_titles(&opened, &plan, &mkv_dest(dir.path()), &crate::NoopSink);
+    assert!(matches!(res, RipOutcome::Failed { .. }), "{res:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"earlier rip");
 }

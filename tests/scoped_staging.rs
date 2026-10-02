@@ -324,19 +324,26 @@ fn an_unscoped_multipass_rip_still_refuses_an_unmapped_stream_file() {
 // was located; otherwise (and whenever it is not kept) the staging is scoped.
 #[test]
 fn mkv_staging_scope_is_whole_only_for_a_kept_image_of_a_fully_mapped_disc() {
-    let scoped = |lost: bool, keep: bool| {
+    let scope = |lost: bool, keep: bool| {
         let (mut r, _) = reader(lost);
-        !matches!(
-            freemkv_engine::mkv_staging_scope(&disc(), &mut r, &[], keep),
-            Ok(None)
-        )
+        freemkv_engine::mkv_staging_scope(&disc(), &mut r, &[], keep)
     };
-    assert!(!scoped(false, true), "kept + fully mapped: whole disc");
     assert!(
-        scoped(true, true),
-        "{SPEC_BD_3_7_NOTE}: kept but unmapped: scoped"
+        matches!(scope(false, true), Ok(None)),
+        "kept + fully mapped: whole disc"
     );
-    assert!(scoped(false, false), "not kept: scoped");
+    // The stand-in holds no UDF image, so a scoped result must reach the UDF read and
+    // fail exactly there; any other outcome (Ok(None), another Err) took the wrong branch.
+    for (lost, keep, why) in [
+        (true, true, SPEC_BD_3_7_NOTE),
+        (false, false, "not kept: scoped"),
+    ] {
+        let got = scope(lost, keep);
+        assert!(
+            matches!(got, Err(Error::UdfNotFilesystem)),
+            "{why}: expected the scoped (UDF) path, got {got:?}"
+        );
+    }
 }
 
 fn title(extents: &[(u32, u32)]) -> libfreemkv::DiscTitle {
@@ -368,6 +375,15 @@ fn a_staged_image_muxes_only_titles_its_scope_holds() {
         let err = freemkv_engine::ensure_titles_staged(&iso, &d, sel).unwrap_err();
         assert_eq!(err.code(), E_IMAGE_SCOPED, "{sel:?}");
     }
+    // A title the disc does not have is refused, not passed unchecked.
+    let err = freemkv_engine::ensure_titles_staged(&iso, &d, &[7]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            libfreemkv::Error::DiscTitleRange { index: 7, count: 3 }
+        ),
+        "{err:?}"
+    );
     let plain = tmp.path().join("plain.iso");
     freemkv_engine::ensure_titles_staged(&plain, &d, &[1]).expect("not a staged image");
 }

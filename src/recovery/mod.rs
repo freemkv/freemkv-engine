@@ -1,9 +1,10 @@
 //! freemkv's recovery strategy — relocated here from libfreemkv per the
 //! engine-split design (see this crate's top-level docs).
 //!
-//! Mirrors the original `disc/` module topology 1:1: `mapfile.rs`,
-//! `read_error.rs`, `section_recover.rs`, `patch.rs`, and the private
-//! `sweep.rs` producer/consumer plumbing are unchanged in logic.
+//! `mapfile.rs` (the ddrescue-format damage record), `read_error.rs` (the read-error
+//! policy), `section_recover.rs` and `patch.rs` (the patch passes), `whole_disc.rs` (the
+//! decrypting whole-disc reader) and the private `sweep.rs` consumer; the sweep producer,
+//! the copy dispatch and the resume/identity/raw-mode/scope rules live here.
 
 use crate::engine_halt::{EngineHalt, EngineOutcome};
 use libfreemkv::disc::{bytes_bad_in_title, locate_ranges};
@@ -176,7 +177,15 @@ pub(crate) fn copy_in(
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
     if mf_path.exists() {
-        let mut map = mapfile::Mapfile::load(&mf_path).map_err(Error::from)?;
+        // A corrupt map restarts clean, as the sweep's own resume does; an unreadable one fails.
+        let mut map = match mapfile::Mapfile::load(&mf_path) {
+            Ok(map) => map,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::info!("copy dispatch: → sweep (mapfile is corrupt/unparseable)");
+                return sweep_internal(disc, reader, path, opts, false, halt);
+            }
+            Err(e) => return Err(Error::from(e)),
+        };
         // Another disc's map with no image beside it guards no data (a consumer deleted the
         // ISO after muxing it): start fresh instead of refusing every later rip.
         if mapfile::check_mapfile_identity(&map, disc, opts.keys.as_ref()).is_err()
@@ -467,8 +476,13 @@ impl ImageState {
 
 // Measure `path` against the length a mapfile expects of it. A stat failure other than "not
 // found" is an error, never silently 0.
+// A device has no length to measure (it stats as 0): it holds what was written to it.
 pub(crate) fn image_state(path: &std::path::Path, want: u64) -> Result<ImageState> {
-    let len = match iso_len_from_metadata(std::fs::metadata(path))? {
+    let meta = std::fs::metadata(path);
+    if meta.as_ref().is_ok_and(|m| !m.is_file()) {
+        return Ok(ImageState { len: want, want });
+    }
+    let len = match iso_len_from_metadata(meta)? {
         IsoLen::Missing => 0,
         IsoLen::Len(n) => n,
     };
@@ -811,10 +825,11 @@ pub fn ensure_titles_staged(
     };
     // In scope is not enough: a staging sweep stopped part-way leaves NonTried there too.
     let unread = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
-    let extents = titles
-        .iter()
-        .filter_map(|&i| disc.titles.get(i))
-        .flat_map(|t| &t.extents);
+    let count = disc.titles.len();
+    if let Some(&index) = titles.iter().find(|&&i| i >= count) {
+        return Err(Error::DiscTitleRange { index, count });
+    }
+    let extents = titles.iter().flat_map(|&i| &disc.titles[i].extents);
     for e in extents {
         let want = (e.start_lba as u64 * 2048, e.sector_count as u64 * 2048);
         let have: u64 = mapfile::intersect(&[want], scope).iter().map(|r| r.1).sum();
@@ -1056,23 +1071,31 @@ fn sweep_linked(
     let batch: u16 = sweep_batch_sectors(opts.batch_sectors, opts.skip_on_error, disc.format);
 
     // A scoped sweep reads only its scope (plus any earlier staging's); a whole-disc
-    // sweep over a scoped mapfile fills the rest (the gate above passed).
-    match scope {
+    // sweep over a scoped mapfile fills the rest (the gate above passed). A scoped pass
+    // resuming a whole-disc map with progress reads its scope but leaves the map whole.
+    let resumes_whole =
+        resume && map.scope().is_none() && map.stats().bytes_pending != map.total_size();
+    let pass_scope = match scope {
+        Some(mut s) if resumes_whole => Some(mapfile::merge_byte_ranges(&mut s)),
         Some(mut s) => {
             s.extend_from_slice(map.scope().unwrap_or(&[]));
             map.set_scope(s);
+            map.scope().map(<[_]>::to_vec)
         }
-        None => map.clear_scope(),
-    }
+        None => {
+            map.clear_scope();
+            None
+        }
+    };
 
     // Pre-compute NonTried regions before handing the mapfile to the consumer
     // thread. Producer processes them in order; consumer mutates the mapfile
     // per work-item. Regions left NonTrimmed/Unreadable are the patch pass's job.
     let mut regions: Vec<(u64, u64)> = map.ranges_with(&[mapfile::SectorStatus::NonTried]);
-    if let Some(scope) = map.scope() {
+    if let Some(scope) = &pass_scope {
         regions = mapfile::intersect(&regions, scope);
     }
-    let domain = match map.scope() {
+    let domain = match &pass_scope {
         Some(scope) => mapfile::intersect(&[(0, total_bytes)], scope)
             .iter()
             .map(|r| r.1)
@@ -2918,12 +2941,11 @@ mod sweep_contract_tests {
     }
 
     // R10: only a corrupt mapfile (InvalidData) downgrades a resume to a fresh sweep. An
-    // unreadable one (EACCES here; EIO on a flaky mount) must fail the pass, not be deleted
-    // along with a truncated ISO.
+    // unreadable one (a directory in its place here, read as EISDIR even by root; EACCES or
+    // EIO on a flaky mount) must fail the pass, not be deleted along with a truncated ISO.
     #[cfg(unix)]
     #[test]
     fn a_resume_whose_mapfile_cannot_be_read_fails_instead_of_starting_over() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("ioerr.iso");
         let sectors = 500u32;
@@ -2931,14 +2953,10 @@ mod sweep_contract_tests {
         let d = disc(sectors);
         let mf = d.mapfile_for(&iso);
         std::fs::write(&iso, vec![0x5Au8; total as usize]).unwrap();
-        std::fs::write(&mf, b"# Rescue Logfile\n").unwrap();
-        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read(&mf).is_ok() {
-            return; // root: permissions are not enforced
-        }
+        std::fs::create_dir(&mf).unwrap();
+        std::fs::write(mf.join("keep"), b"x").unwrap();
 
         let r = sweep(&d, &mut reader(sectors, |_| None), &iso, &opts(true, true));
-        std::fs::set_permissions(&mf, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(
             r.is_err(),
             "an unreadable mapfile must fail the resume: {r:?}"

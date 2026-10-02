@@ -72,9 +72,8 @@ pub enum SectorStatus {
 impl SectorStatus {
     /// THE definition of "these bytes are confirmed good".
     ///
-    /// Exhaustive on purpose: adding a sixth variant is a compile error here,
-    /// not a silently-omitted entry in one of the hand-written arrays that
-    /// used to be scattered across this crate.
+    /// Exhaustive on purpose: adding a sixth variant is a compile error here. The status
+    /// sets below are checked against it over every status character by a unit test.
     pub fn is_finished(self) -> bool {
         match self {
             SectorStatus::Finished => true,
@@ -238,6 +237,16 @@ pub struct Mapfile {
     disowned: Arc<AtomicBool>,
 }
 
+impl std::fmt::Debug for Mapfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mapfile")
+            .field("path", &self.path)
+            .field("total_size", &self.total_size)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Mapfile {
     /// Create a new mapfile with one `NonTried` region covering the whole disc.
     /// Writes to disk immediately so a resume can pick up even if the caller
@@ -245,7 +254,7 @@ impl Mapfile {
     pub fn create(path: &Path, total_size: u64, version: &str) -> io::Result<Self> {
         let mut mf = Self {
             path: path.to_path_buf(),
-            // No entry for an empty image: load() refuses a zero-size one.
+            // No entry for an empty image: load() refuses a zero-size entry.
             entries: (total_size > 0)
                 .then_some(MapEntry {
                     pos: 0,
@@ -486,6 +495,12 @@ impl Mapfile {
         }
         self.stats = Self::compute_stats(&self.entries, self.total_size);
         self.changed()
+    }
+
+    /// Whether the next [`Mapfile::record`] persists the map: a consumer makes the image's
+    /// data durable first, so the saved map never marks unsynced sectors Finished.
+    pub(crate) fn persist_due(&self) -> bool {
+        self.last_flushed.elapsed() >= FLUSH_INTERVAL
     }
 
     // Marks in-memory state dirty and persists it once `FLUSH_INTERVAL` has elapsed.
@@ -1051,23 +1066,33 @@ pub(crate) fn merge_byte_ranges(ranges: &mut [(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     for &(p, n) in ranges.iter().filter(|r| r.1 > 0) {
         match out.last_mut() {
-            Some((lp, ln)) if p <= *lp + *ln => *ln = (*ln).max(p + n - *lp),
+            Some((lp, ln)) if p <= lp.saturating_add(*ln) => {
+                *ln = (*ln).max(p.saturating_add(n) - *lp)
+            }
             _ => out.push((p, n)),
         }
     }
     out
 }
 
-/// The parts of `ranges` that lie inside `scope` (both sorted, merged byte ranges).
+/// The parts of `ranges` that lie inside `scope` (both sorted, merged byte ranges): one
+/// walk over the two lists together.
 pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64, u64)> {
     let mut out = Vec::new();
-    for &(p, n) in ranges {
-        let end = p + n;
-        for &(sp, sn) in scope {
-            let (a, b) = (p.max(sp), end.min(sp + sn));
-            if a < b {
-                out.push((a, b - a));
-            }
+    let (mut i, mut j) = (0, 0);
+    while i < ranges.len() && j < scope.len() {
+        let (p, n) = ranges[i];
+        let (sp, sn) = scope[j];
+        let (end, send) = (p.saturating_add(n), sp.saturating_add(sn));
+        let (a, b) = (p.max(sp), end.min(send));
+        if a < b {
+            out.push((a, b - a));
+        }
+        // Advance whichever ends first; the other may still overlap the next one.
+        if end <= send {
+            i += 1;
+        } else {
+            j += 1;
         }
     }
     out
@@ -2011,7 +2036,8 @@ mod tests {
         let took = t.elapsed();
         assert_eq!(st.bytes_nontried, N * 1024 + 1024);
         assert_eq!(st.bytes_pending, st.bytes_nontried);
-        assert!(took < Duration::from_millis(100), "stats() took {took:?}");
+        // Loose enough for a loaded debug runner; a quadratic walk takes seconds.
+        assert!(took < Duration::from_secs(1), "stats() took {took:?}");
         mf.dirty = false;
     }
 
@@ -2039,6 +2065,59 @@ mod tests {
         );
         assert!(intersect(&[(0, 10)], &[(10, 5)]).is_empty());
         assert_eq!(merge_byte_ranges(&mut [(5, 5), (0, 5), (20, 0)]), [(0, 10)]);
+    }
+
+    // Many ranges against many scope runs, both directions of overlap, against a brute force.
+    #[test]
+    fn intersect_matches_every_pair_overlap() {
+        let ranges: Vec<(u64, u64)> = (0..50).map(|i| (i * 100, 60)).collect();
+        let scope: Vec<(u64, u64)> = (0..20).map(|i| (i * 250 + 30, 170)).collect();
+        let mut brute = Vec::new();
+        for &(p, n) in &ranges {
+            for &(sp, sn) in &scope {
+                let (a, b) = (p.max(sp), (p + n).min(sp + sn));
+                if a < b {
+                    brute.push((a, b - a));
+                }
+            }
+        }
+        assert_eq!(intersect(&ranges, &scope), brute);
+    }
+
+    // `is_finished` is the one definition; every status a mapfile can hold sits in exactly
+    // the sets it implies.
+    #[test]
+    fn status_sets_agree_with_is_finished() {
+        for s in (0u8..=127).filter_map(|c| SectorStatus::from_char(c as char)) {
+            assert_eq!(
+                bad_sector_statuses().contains(&s),
+                !s.is_finished(),
+                "{s:?}"
+            );
+            let damage = !s.is_finished() && s != SectorStatus::NonTried;
+            assert_eq!(damage_sector_statuses().contains(&s), damage, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_zero_size_entry_is_refused() {
+        let e = load_text("zero_size_entry", "0x0 0x800 +\n0x800 0x0 -\n")
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(invalid_kind(&e), Some("zero_size"), "{e}");
+    }
+
+    // `record` persists on its own once the flush interval has passed, with no flush call.
+    #[test]
+    fn record_persists_once_the_interval_elapses() {
+        let p = tmpfile("record_interval");
+        let mut mf = Mapfile::create(&p, 0x10000, "test").unwrap();
+        std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(50));
+        mf.record(0, 0x800, SectorStatus::Finished).unwrap();
+        let on_disk = Mapfile::load(&p).unwrap();
+        assert_eq!(on_disk.stats().bytes_good, 0x800);
+        mf.dirty = false;
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
@@ -2593,8 +2672,7 @@ mod tests {
              0x000000080  0x00000100    -\n";
         std::fs::write(&p, corrupt).unwrap();
         let err = Mapfile::open_or_create(&p, 0x100, "test")
-            .err()
-            .expect("a corrupt mapfile is an error, not a reason to start over");
+            .expect_err("a corrupt mapfile is an error, not a reason to start over");
         assert_ne!(
             err.kind(),
             io::ErrorKind::NotFound,

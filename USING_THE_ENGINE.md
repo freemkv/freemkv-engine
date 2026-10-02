@@ -210,10 +210,12 @@ let mp: MultipassResult = multipass_rip(
     &sink,
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
-// mp.main_lost_ms (NaN = unquantifiable; playback lost in the titles
-//                  job.selection picks, title 0 for the default MainMovie,
-//                  summed per title, even when is_iso_output widens the abort
-//                  gate to the whole disc), mp.severity (DamageSeverity),
+// mp.main_lost_ms (playback lost in the titles job.selection picks, title 0
+//                  for the default MainMovie, summed per title, even when
+//                  is_iso_output widens the abort gate to the whole disc; a title
+//                  missing its size/duration is timed at an estimated rate;
+//                  NaN = cannot be timed, the loss is then mp.lost_bytes),
+// mp.lost_bytes (the bytes the loss verdict counted), mp.severity (DamageSeverity),
 // mp.passes, mp.aborted_for_loss, mp.halted,
 // mp.wedged, mp.complete
 ```

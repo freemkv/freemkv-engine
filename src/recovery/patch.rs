@@ -2,8 +2,7 @@
 //!
 //! A consumer thread owns the [`libfreemkv::io::WritebackFile`] and the
 //! [`super::mapfile::Mapfile`]. The producer thread (`Disc::patch`) keeps
-//! the [`libfreemkv::sector::SectorSource`], wedge / damage-window state,
-//! and decrypt, so the channel carries clean cleartext bytes. It runs over
+//! the [`libfreemkv::sector::SectorSource`], the wedge streak and decrypt, so the channel carries clean cleartext bytes. It runs over
 //! a depth-1 channel ([`libfreemkv::io::pipeline::WRITE_THROUGH_DEPTH`]) so
 //! back-pressure kicks in immediately.
 
@@ -16,8 +15,8 @@ use libfreemkv::io::pipeline::{Flow, Sink};
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
     Bisect, CachePrime, Direction, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear,
-    Oscillate, ReadParams, RecoverySink, SectionHandler, SpeedPref, SpeedSweep, TimeoutPref,
-    run_handlers,
+    Oscillate, ReadParams, RecoverySink, SECTOR, SPEED_MAX_KBS, SectionHandler, SpeedPref,
+    SpeedSweep, TimeoutPref, run_handlers,
 };
 
 // Wall-clock budget one handler gets before the chain tries the next idea
@@ -69,10 +68,9 @@ pub(super) enum PatchItem {
     /// `pos`, writes `buf`, records the range as `Finished`.
     Recovered { pos: u64, buf: Vec<u8> },
 
-    /// Producer marks `[pos, pos+len)` as `NonTrimmed`. Used for BOTH the per-range skip-limit
-    /// case (remaining bytes never tried) AND individual sector failures (tried-but-failed
-    /// within a pass). Both stay "hopeful" — a later pass retries them; promotion to true
-    /// `Unreadable` is the orchestrator's job, applied once after all retry passes complete.
+    /// Producer marks `[pos, pos+len)` as `NonTrimmed`: a range's residue after its final
+    /// tier (tried, still failing). It stays "hopeful" — a later pass retries it; promotion
+    /// to true `Unreadable` is the orchestrator's job, applied once after all retry passes.
     NonTrimmed { pos: u64, len: u64 },
 }
 
@@ -86,6 +84,9 @@ pub(super) struct SharedPatchState {
     /// The rendered drilldown — located ranges, section count, "+N more" tail,
     /// at-risk movie time — computed over the COMPLETE damage set.
     pub located: libfreemkv::progress::LocatedProgress,
+    /// Damage bytes inside the map's scope (all of it for an unscoped map): what is still
+    /// bad of the pass's `work_total`.
+    pub damage_in_scope: u64,
 }
 
 impl SharedPatchState {
@@ -100,10 +101,18 @@ impl SharedPatchState {
             ),
             None => (0, libfreemkv::progress::LocatedProgress::default()),
         };
+        let damage_in_scope = match map.scope() {
+            Some(scope) => mapfile::intersect(&bad_ranges, scope),
+            None => bad_ranges,
+        }
+        .iter()
+        .map(|r| r.1)
+        .sum();
         Self {
             stats: map.stats(),
             bad_bytes_in_title,
             located,
+            damage_in_scope,
         }
     }
 }
@@ -232,6 +241,9 @@ impl Sink<PatchItem> for PatchSink {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
+                if self.map.persist_due() && self.is_regular {
+                    self.file.sync_all().map_err(lost)?;
+                }
                 self.map
                     .record(pos, len, SectorStatus::Finished)
                     .map_err(Error::from)?;
@@ -389,6 +401,10 @@ impl SubRanges {
     /// Remove the recovered byte-range `[pos, pos+len)` from the bad set,
     /// splitting any sub-range it bisects and trimming any it overlaps. A
     /// range fully covered is dropped; a removal landing in a gap is a no-op.
+    pub(super) fn contains(&self, pos: u64) -> bool {
+        self.ranges.iter().any(|&(p, n)| pos >= p && pos - p < n)
+    }
+
     pub(super) fn remove(&mut self, pos: u64, len: u64) {
         if len == 0 {
             return;
@@ -476,7 +492,6 @@ pub(super) fn log_patch_start_snapshot(
 // Bundles final mapfile stats + accumulated loop counters into the public
 // `PatchOutcome` the caller consumes, also emitting the post-loop tracing
 // (`patch_iso_size_end`, `patch_done`).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn build_outcome(
     state: &PatchLoopState,
     summary: &PatchSummary,
@@ -522,11 +537,9 @@ pub(super) fn build_outcome(
     }
 }
 
-// Per-pass loop state, accumulated across every range and read inside
-// `Disc::patch`. Lives on the producer thread; helpers take
-// `&mut PatchLoopState` to avoid an explosion of parameters at call sites.
+// Per-pass loop state inside `Disc::patch`, on the producer thread.
 pub(super) struct PatchLoopState {
-    // Counters
+    // How the pass ended.
     pub halted: bool,
     pub wedged_exit: bool,
     // Clock seam: the handler chain reads wall time through this rather than
@@ -605,6 +618,8 @@ struct PatchCtx<'a, 'o> {
     /// per-section `HandlerCtx` and read back after, so a drive fast-fail wedge is
     /// detected even when every bad sub-range is smaller than the abort streak.
     wedge_streak: u32,
+    /// The read speed the drive was last set to, carried across ranges; `None` until set.
+    drive_speed: Option<u16>,
 }
 
 // Build the handler chain for one breadth-first tier (0 fast scouts, 1 slow-deep, 2 marginal
@@ -909,16 +924,18 @@ impl PatchCtx<'_, '_> {
             flat,
             range_index = range_idx,
             num_total_ranges = num_ranges,
-            range_lba = range_pos / 2048,
+            range_lba = range_pos / SECTOR,
             range_size_mb = range_size as f64 / 1_048_576.0,
             bad_bytes = bad.total_len(),
             "entering patch range"
         );
 
-        // Enter at max read speed. A handler picks its own speed / FUA / timeout
-        // via its `ReadParams`; `read_span` restores max after each handler, so
-        // every tier starts from the streaming default.
-        self.reader.set_speed(0xFFFF);
+        // Enter at max read speed (handlers pick their own via `ReadParams`, and `read_span`
+        // restores max after each). Programmed only when the drive's speed is unknown or
+        // was left lower, not on every range.
+        if self.drive_speed != Some(SPEED_MAX_KBS) {
+            self.reader.set_speed(SPEED_MAX_KBS);
+        }
 
         // Handler roster. FLAT mode: the whole pool in one chain, best-first by
         // the rip scorecard. TIER mode: just this tier's roster, likewise
@@ -953,7 +970,7 @@ impl PatchCtx<'_, '_> {
         };
 
         let bad_before = bad.total_len();
-        let (outcome, wedge_after, fatal) = {
+        let (outcome, wedge_after, fatal, speed_after) = {
             // Progress heartbeat: a throttled closure pushing a fresh snapshot to the
             // reporter on every read, so the bar/speed move during a handler, not just
             // at section end. Scoped here so its `self.state` borrow ends before below.
@@ -1002,8 +1019,8 @@ impl PatchCtx<'_, '_> {
                 // Carry the pass-level wedge streak in so a fast-fail wedge is
                 // caught across many small sections, not reset each one.
                 wedge_streak: self.wedge_streak,
-                // Drive was just reset to max above; read_span tracks changes.
-                cur_speed: 0xFFFF,
+                // The drive is at max (above); read_span tracks changes.
+                cur_speed: SPEED_MAX_KBS,
             };
             // Per-handler time budget. FLAT is EXPLORE-first: a short slice per handler
             // so all 16 get a quick turn and the scorecard learns which land bytes.
@@ -1016,9 +1033,10 @@ impl PatchCtx<'_, '_> {
             let o = run_handlers(&mut ctx, &mut handlers, bad, &mut self.scoreboard, |_bad| {
                 handler_deadline(now_ptr(), budget_secs)
             });
-            (o, ctx.wedge_streak, ctx.fatal.take())
+            (o, ctx.wedge_streak, ctx.fatal.take(), ctx.cur_speed)
         };
         self.wedge_streak = wedge_after;
+        self.drive_speed = Some(speed_after);
         // A non-read error (or a sink that can no longer write) ended the chain: fail
         // the pass with it, before any residue is recorded NonTrimmed as damage.
         if let Some(e) = fatal {
@@ -1030,7 +1048,7 @@ impl PatchCtx<'_, '_> {
             phase = "patch.region.exit",
             tier,
             range_index = range_idx,
-            range_lba = range_pos / 2048,
+            range_lba = range_pos / SECTOR,
             outcome = ?outcome,
             bad_bytes_before = bad_before,
             bad_bytes_after = bad.total_len(),
@@ -1110,19 +1128,20 @@ pub(super) fn report_patch_progress(
     // Both figures come from the snapshot, derived over the COMPLETE damage set.
     // They used to be computed from a range list capped at 8192 entries, which
     // silently under-reported at-risk bytes on a disc fragmented past that cap.
-    let (s, main_title_bad, located) = {
+    let (s, main_title_bad, located, still_bad_work) = {
         let g = lock_snapshot(shared);
-        (g.stats, g.bad_bytes_in_title, g.located.clone())
+        (
+            g.stats,
+            g.bad_bytes_in_title,
+            g.located.clone(),
+            g.damage_in_scope,
+        )
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
     let main_title = disc.titles.first();
     // Progress = bytes RECOVERED, not a per-range counter, since breadth-first
-    // tiers bring back readable bulk before any range "finishes". `still_bad_work`
-    // matches `work_total`: `bytes_pending` alone over/undershoots it otherwise.
-    let still_bad_work = s
-        .bytes_pending
-        .saturating_sub(s.bytes_nontried)
-        .saturating_add(s.bytes_unreadable);
+    // tiers bring back readable bulk before any range "finishes". `still_bad_work` is the
+    // damage inside the scope, as `work_total` is.
     let recovered = state.work_total.saturating_sub(still_bad_work);
     let pp = libfreemkv::progress::PassProgress {
         kind,
@@ -1379,6 +1398,7 @@ fn patch_linked(
         state: PatchLoopState::new(bytes_good_before, initial_batch, work_total),
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
+        drive_speed: None,
     };
     // Hold the pass result rather than `?`-ing it: the teardown below runs
     // `PatchSink::close` (sync_all + mapfile.flush), and returning early here
@@ -2160,6 +2180,11 @@ mod tests {
     // dropped sink must not flush those spans' Finished records.
     #[test]
     fn a_failed_write_does_not_persist_earlier_finished_records() {
+        retry_inside_flush_window(a_failed_write_does_not_persist_earlier_finished_records_case);
+    }
+
+    // One attempt; `false` when the periodic persist ran first (inconclusive).
+    fn a_failed_write_does_not_persist_earlier_finished_records_case() -> bool {
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("out.iso");
         std::fs::write(&iso, vec![0u8; 8192]).unwrap();
@@ -2179,7 +2204,7 @@ mod tests {
             buf: vec![7u8; 2048],
         });
         if fresh.elapsed() >= std::time::Duration::from_millis(900) {
-            return; // inconclusive
+            return false; // inconclusive
         }
         assert!(r.is_err(), "a write to a read-only handle must fail");
         drop(sink);
@@ -2188,12 +2213,26 @@ mod tests {
             reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
             "a failed write left earlier, possibly lost, spans persisted Finished"
         );
+        true
+    }
+
+    // A timing-guarded case retries rather than passing silently on a slow runner.
+    fn retry_inside_flush_window(case: fn() -> bool) {
+        assert!(
+            (0..5).any(|_| case()),
+            "no attempt stayed inside the mapfile's flush window"
+        );
     }
 
     // R3: a failed `sync_all` means the recovered data is not durable, so the dropped
     // sink must not flush a Finished record for it.
     #[test]
     fn sync_failure_on_close_does_not_persist_finished() {
+        retry_inside_flush_window(sync_failure_on_close_does_not_persist_finished_case);
+    }
+
+    // One attempt; `false` when the periodic persist ran first (inconclusive).
+    fn sync_failure_on_close_does_not_persist_finished_case() -> bool {
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("out.iso");
         std::fs::write(&iso, vec![0u8; 4096]).unwrap();
@@ -2212,7 +2251,7 @@ mod tests {
         })
         .unwrap();
         if fresh.elapsed() >= std::time::Duration::from_millis(900) {
-            return; // the 1 s periodic persist already ran: inconclusive
+            return false; // the 1 s periodic persist already ran: inconclusive
         }
         let halt = libfreemkv::halt::Halt::new();
         halt.cancel();
@@ -2224,6 +2263,7 @@ mod tests {
             reloaded.ranges_with(&[SectorStatus::Finished]).is_empty(),
             "a non-durable sector must not be recorded Finished"
         );
+        true
     }
 }
 

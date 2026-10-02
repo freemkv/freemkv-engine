@@ -236,6 +236,7 @@ fn run_profile(
     let pr = freemkv_engine::copy(&disc, &mut reader, &iso_path, &opts)
         .unwrap_or_else(|e| panic!("[{profile_name}] disc.copy returned Err: {e:?}"));
 
+    assert_recovered_bytes(profile_name, &iso_path, finished);
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let map = Mapfile::load(&map_path).unwrap();
     let trace_len = trace.lock().unwrap().len();
@@ -270,6 +271,27 @@ fn assert_bad_lbas_not_finished(
             !finished.iter().any(|&(p, sz)| pos >= p && pos < p + sz),
             "[{profile}] scripted-bad LBA {lba} was recorded Finished"
         );
+    }
+}
+
+/// Every sector the patch pass newly marked `Finished` (i.e. outside the seeded
+/// baseline) must hold the reader's per-LBA pattern in the ISO, not zeros or a
+/// shifted write.
+fn assert_recovered_bytes(profile: &str, iso_path: &std::path::Path, seeded: &[(u64, u64)]) {
+    let map = Mapfile::load(&freemkv_engine::mapfile_path_for(iso_path)).unwrap();
+    let iso = std::fs::read(iso_path).unwrap();
+    for (pos, size) in map.ranges_with(&[SectorStatus::Finished]) {
+        for off in (pos..pos + size).step_by(SECTOR_SIZE) {
+            if seeded.iter().any(|&(p, sz)| off >= p && off < p + sz) {
+                continue;
+            }
+            let lba = off / SECTOR_SIZE as u64;
+            let sector = &iso[off as usize..off as usize + SECTOR_SIZE];
+            assert!(
+                sector.iter().all(|&b| b == (lba & 0xff) as u8),
+                "[{profile}] recovered LBA {lba} does not hold its own data in the ISO"
+            );
+        }
     }
 }
 
@@ -793,6 +815,7 @@ fn single_dead_sector_patch_stats(step: ScriptStep) -> freemkv_engine::MapStats 
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("patch must not error on a per-sector failure sense");
 
+    assert_recovered_bytes("single_dead", &iso_path, &finished);
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     Mapfile::load(&map_path).unwrap().stats()
 }
@@ -812,9 +835,10 @@ fn assert_persistent_sense_contract(step: ScriptStep, label: &str) {
         total,
         "{label}: conservation — no byte may be silently dropped"
     );
-    assert!(
-        stats.bytes_pending >= 2048,
-        "{label}: the always-dead sector must remain pending (NonTrimmed)"
+    // Only the dead sector may stay pending; the other 63 must be recovered.
+    assert_eq!(
+        stats.bytes_pending, 2048,
+        "{label}: exactly the always-dead sector must remain pending (NonTrimmed)"
     );
 }
 
@@ -894,6 +918,7 @@ fn patch_not_ready_then_recovers_fully() {
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("patch must not error on a transient NOT_READY");
 
+    assert_recovered_bytes("not_ready", &iso_path, &finished);
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let stats = Mapfile::load(&map_path).unwrap().stats();
     assert_eq!(
@@ -944,6 +969,7 @@ fn handler_chain_recovers_readable_sectors_leaving_only_dead_pending() {
     freemkv_engine::patch(&disc, &mut reader, &iso_path, &opts)
         .expect("handler-chain patch must not error");
 
+    assert_recovered_bytes("handler_chain", &iso_path, &finished);
     let map_path = freemkv_engine::mapfile_path_for(&iso_path);
     let stats = Mapfile::load(&map_path).unwrap().stats();
 

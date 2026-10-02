@@ -229,8 +229,67 @@ pub fn run_titles<F>(
 where
     F: FnMut(usize) -> std::io::Result<()>,
 {
+    run_titles_with(indices, explicit_selection, sink, |idx| {
+        mux_one(idx).map_err(TitleError::from)
+    })
+}
+
+/// A title's failure as [`run_titles_with`] decides on it: the policy class and the error.
+#[derive(Debug)]
+pub struct TitleError {
+    /// How the loop's policy ([`decide_title`]) classifies the failure.
+    pub result: TitleResult,
+    /// The error the title failed with, as a front end renders it.
+    pub error: std::io::Error,
+}
+
+impl From<std::io::Error> for TitleError {
+    fn from(error: std::io::Error) -> Self {
+        TitleError {
+            result: classify_title_error(&error),
+            error,
+        }
+    }
+}
+
+/// [`run_titles`] for a front end that classifies its own per-title failures (a setup error
+/// that is always fatal, a Stop): `mux_one` returns the [`TitleError`] it decided.
+pub fn run_titles_with<F>(
+    indices: &[usize],
+    explicit_selection: bool,
+    sink: &dyn Sink,
+    mux_one: F,
+) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
+    title_loop(indices, explicit_selection, false, sink, mux_one)
+}
+
+/// The loop for a disc's episodes beside its main title (a TV disc's fan-out): an episode
+/// that fails is reported ([`crate::Event::TitleFailed`]) and dropped, and the rest still
+/// run. A Stop and a disc with no key still end the loop.
+pub fn run_episodes<F>(indices: &[usize], sink: &dyn Sink, mux_one: F) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
+    title_loop(indices, false, true, sink, mux_one)
+}
+
+fn title_loop<F>(
+    indices: &[usize],
+    explicit_selection: bool,
+    keep_going: bool,
+    sink: &dyn Sink,
+    mut mux_one: F,
+) -> RipOutcome
+where
+    F: FnMut(usize) -> Result<(), TitleError>,
+{
     let multi_title = indices.len() > 1;
     let mut titles_written = 0usize;
+    // A hard failure `keep_going` passed over: the rip's outcome when no title was written.
+    let mut last_failure = None;
 
     for &idx in indices {
         // (2) Poll for a full-stop between titles.
@@ -249,14 +308,22 @@ where
         let mut fail_code = None;
         let mut fail_kind = std::io::ErrorKind::Other;
         let mut fail_data = String::new();
+        let mut failure: Option<std::io::Error> = None;
         let result = match mux_one(idx) {
             Ok(()) => TitleResult::Ok,
-            Err(e) => {
+            Err(TitleError { result, error: e }) => {
                 fail_detail = e.to_string();
-                fail_code = crate::error_code(&e);
+                fail_code = crate::error_code(&e)
+                    .or_else(|| crate::parse_error_code(&fail_detail).map(|(c, _)| c));
                 fail_data = error_data(&e);
                 fail_kind = e.kind();
-                classify_title_error(&e)
+                failure = Some(e);
+                result
+            }
+        };
+        let failed = |sink: &dyn Sink| {
+            if let Some(e) = &failure {
+                sink.event(&crate::Event::TitleFailed { idx, error: e });
             }
         };
 
@@ -267,19 +334,43 @@ where
                     Level::Info,
                     &format!("title {} skipped (empty/uncrackable stub)", idx + 1),
                 );
+                sink.event(&crate::Event::TitleSkipped {
+                    idx,
+                    empty: fail_code == Some(libfreemkv::error::E_MKV_INVALID),
+                });
             }
             TitleAction::StopHalt => {
+                failed(sink);
                 sink.log(Level::Info, "cancelled — stopping the whole rip");
                 return RipOutcome::Halted;
             }
             TitleAction::StopNoKey => {
+                failed(sink);
                 sink.log(
                     Level::Error,
                     "disc has no decryption key — every title would fail; stopping",
                 );
                 return RipOutcome::NoKey;
             }
+            TitleAction::StopFatal if keep_going => {
+                failed(sink);
+                sink.log(
+                    Level::Error,
+                    &format!(
+                        "title {} failed — continuing with the rest: {}",
+                        idx + 1,
+                        log_safe(&fail_detail)
+                    ),
+                );
+                last_failure = Some(RipOutcome::Failed {
+                    title_index: idx,
+                    code: fail_code,
+                    kind: fail_kind,
+                    data: fail_data,
+                });
+            }
             TitleAction::StopFatal => {
+                failed(sink);
                 // Unlike every other arm here, this one used to return silently,
                 // so a hard failure (disk full, permission denied) reached the
                 // front-end as a bare title index with no diagnostic anywhere.
@@ -305,6 +396,9 @@ where
     // an all-skippable-stub selection used to surface as exit-0 success with no
     // explanation. `Ok` stays the variant (matched exhaustively elsewhere).
     if titles_written == 0 {
+        if let Some(failure) = last_failure {
+            return failure;
+        }
         sink.log(
             Level::Error,
             if indices.is_empty() {
@@ -319,7 +413,7 @@ where
 }
 
 /// Mux a single title from a source URL to `dest`, driving
-/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`].
+/// `libfreemkv::mux_url` and reporting through the engine [`Sink`].
 ///
 /// Bridges the run's [`libfreemkv::Ctx`] onto the Sink:
 /// - its events' write progress → `Sink::progress` (via a channel + a scoped watcher
@@ -335,8 +429,8 @@ pub fn mux_title(
     sink: &dyn Sink,
 ) -> std::io::Result<libfreemkv::MuxOutcome> {
     let opts = libfreemkv::MuxOptions {
-        title_index: input_opts.title_index.unwrap_or(0),
-        raw: input_opts.raw,
+        title_index: input_opts.title_index.unwrap_or(mux_opts.title_index),
+        raw: input_opts.raw || mux_opts.raw,
         selection: input_opts.selection,
         ..mux_opts.clone()
     };
@@ -345,29 +439,6 @@ pub fn mux_title(
         log_mux_start(sink, source_url, dest, total_bytes_hint);
         libfreemkv::mux_url(source_url, keys.as_ref(), dest, &opts, ctx)
     })
-}
-
-/// Mux a single title live off an opened, scanned, key-resolved
-/// [`libfreemkv::DiscSession`] (the drive's staged reader), driving
-/// `libfreemkv::mux_with_keys` and reporting through the engine [`Sink`] —
-/// the disc:// analogue of [`mux_title`]. Shares the exact same
-/// watcher/speed/halt/done scaffolding via [`mux_with_input`], so a live-drive
-/// rip gets the same speed/ETA reporting a file/ISO rip does.
-pub fn mux_title_session(
-    session: &mut libfreemkv::DiscSession,
-    title_index: usize,
-    dest: &str,
-    mux_opts: &libfreemkv::MuxOptions,
-    total_bytes_hint: u64,
-    sink: &dyn Sink,
-) -> std::io::Result<libfreemkv::MuxOutcome> {
-    let source_label = format!("disc title {}", title_index + 1);
-    let opts = libfreemkv::MuxOptions {
-        title_index,
-        ..mux_opts.clone()
-    };
-    let input = libfreemkv::Source::from_session(session);
-    mux_with_input(input, &source_label, dest, &opts, total_bytes_hint, sink)
 }
 
 /// Mux `title` (already scanned: the drive's, or the image's own) out of the ISO at `path`
@@ -386,7 +457,7 @@ pub(crate) fn mux_iso_title(
         let line = iso_mux_line(path, &title.title.playlist);
         sink.log(
             Level::Info,
-            &format!("{line} -> {dest} (~{})", human_bytes(hint)),
+            &format!("{line} -> {} (~{})", log_safe(dest), human_bytes(hint)),
         );
         let source = libfreemkv::Source::from_image(path, title);
         libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, ctx)
@@ -398,41 +469,40 @@ fn iso_mux_line(path: &std::path::Path, playlist: &str) -> String {
     log_safe(&format!("mux: iso://{} {playlist}", path.display()))
 }
 
-// Shared scaffolding behind `mux_title` and `mux_title_session`: drives
-// `mux_with_keys` for an already-built `MuxSource`, bridging progress and cancel
-// onto the Sink via `with_mux_watcher` (see its doc for the mechanism).
-fn mux_with_input(
-    input: libfreemkv::Source<'_>,
+// The "mux: <source> -> <dest> (~size)" line every mux opens with.
+pub(crate) fn log_mux_start(
+    sink: &dyn Sink,
     source_label: &str,
     dest: &str,
-    mux_opts: &libfreemkv::MuxOptions,
     total_bytes_hint: u64,
-    sink: &dyn Sink,
-) -> std::io::Result<libfreemkv::MuxOutcome> {
-    with_mux_watcher(sink, dest, |ctx| {
-        log_mux_start(sink, source_label, dest, total_bytes_hint);
-        // A Session needs no set (CSS, clear); an AACS title rip passes its set by URL.
-        libfreemkv::mux_with_keys(input, None, dest, mux_opts, ctx)
-    })
-}
-
-// The "mux: <source> -> <dest> (~size)" line every mux opens with.
-fn log_mux_start(sink: &dyn Sink, source_label: &str, dest: &str, total_bytes_hint: u64) {
+) {
     sink.log(
         Level::Info,
-        &format!(
+        &log_safe(&format!(
             "mux: {source_label} -> {dest} (~{})",
             human_bytes(total_bytes_hint)
-        ),
+        )),
     );
 }
 
-// The Sink↔libfreemkv bridge every mux runs inside, lifted out of `mux_with_input` so it's
+// The Sink↔libfreemkv bridge every mux runs inside, lifted out of the mux paths so it's
 // testable against a closure without real media.
 fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::Ctx) -> T) -> T {
+    with_mux_watcher_for(sink, dest, None, None, f)
+}
+
+// [`with_mux_watcher`] under a front end's own stop token `halt` (else a fresh one) and with
+// its own listener `extra` hearing every library event beside the bridge.
+pub(crate) fn with_mux_watcher_for<T>(
+    sink: &dyn Sink,
+    dest: &str,
+    halt: Option<libfreemkv::Halt>,
+    extra: Option<Arc<dyn libfreemkv::Events>>,
+    f: impl FnOnce(&libfreemkv::Ctx) -> T,
+) -> T {
     use std::sync::mpsc;
 
-    let halt = libfreemkv::Halt::new();
+    let halt = halt.unwrap_or_default();
     // Ask ONCE before starting (same rule as `with_cancel_watcher` in run.rs):
     // a watcher alone makes cancellation a race the work can win on a short
     // title, and only asking before the work begins closes that window.
@@ -449,9 +519,13 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
         tx: mpsc::Sender<(u64, u64)>,
         opened: mpsc::Sender<libfreemkv::DiscTitle>,
         flush: mpsc::Sender<(u64, u64)>,
+        extra: Option<Arc<dyn libfreemkv::Events>>,
     }
     impl libfreemkv::Events for ChannelEvents {
         fn event(&self, e: &libfreemkv::Event<'_>) {
+            if let Some(extra) = &self.extra {
+                extra.event(e);
+            }
             match *e {
                 libfreemkv::Event::BytesWritten { bytes, total } => {
                     let _ = self.tx.send((bytes, total));
@@ -480,7 +554,7 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
         // scope; `done` is a shared Arc the main thread sets when mux returns.
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
-        s.spawn(move || {
+        let watcher = s.spawn(move || {
             // The engine's ONE speed/ETA derivation for the mux stage. Owned by
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
@@ -525,14 +599,17 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
                 if sink.should_cancel() {
                     watcher_halt.cancel();
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::park_timeout(std::time::Duration::from_millis(100));
             }
         });
+        // Woken when the mux returns, so a title's end is not held up by a 100 ms nap.
+        let _wake = crate::run::WakeOnDrop(watcher.thread().clone());
 
         let ctx = crate::run::ctx(&halt).with_events(Arc::new(ChannelEvents {
             tx,
             opened: opened_tx,
             flush: flush_tx,
+            extra,
         }));
         // Same guard the recovery paths use: `mux_with_keys` runs on damaged media
         // and can panic; storing `done` after the call would let an unwind skip
@@ -762,6 +839,28 @@ mod tests {
             vec![2],
             "the last valid index still survives the same filter"
         );
+    }
+
+    // Episodes: a failed one is dropped and the rest delivered; when every one fails the
+    // rip failed (never an `Ok` that wrote nothing), with the last failure's detail.
+    #[test]
+    fn episodes_that_all_fail_are_a_failed_rip() {
+        let hard = |_: usize| {
+            Err(TitleError {
+                result: TitleResult::Failed,
+                error: std::io::Error::other("disk full"),
+            })
+        };
+        let out = run_episodes(&[1, 2], &NoopSink, hard);
+        assert!(
+            matches!(out, RipOutcome::Failed { title_index: 2, .. }),
+            "{out:?}"
+        );
+        let some = run_episodes(&[1, 2], &NoopSink, |i| match i {
+            1 => hard(i),
+            _ => Ok(()),
+        });
+        assert_eq!(some, RipOutcome::Ok { titles_written: 1 });
     }
 
     // A lone selected title is NOT a multi-title rip: `multi_title = indices.len() > 1` guards

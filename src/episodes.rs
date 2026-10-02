@@ -86,18 +86,21 @@ fn plays_all(titles: &[DiscTitle], long: &[usize], short: &[usize]) -> bool {
     })
 }
 
-// Drop titles whose content duplicates an already-kept one: DVD angles or redundant
-// playlists of the same programme (same first-extent start LBA and duration). A title with
-// no extents has no content identity, so it is always kept.
+// Drop titles whose content duplicates a kept one (the same whole extent list and duration:
+// episodes often share an opening clip). A title with no extents has no content identity,
+// so it is always kept.
 fn dedup_by_content(titles: &[DiscTitle], indices: Vec<usize>) -> Vec<usize> {
     let mut seen = HashSet::new();
     indices
         .into_iter()
         .filter(|&i| {
             let t = &titles[i];
-            t.extents
-                .first()
-                .is_none_or(|e| seen.insert((e.start_lba, t.duration_secs.round() as i64)))
+            let extents: Vec<(u32, u32)> = t
+                .extents
+                .iter()
+                .map(|e| (e.start_lba, e.sector_count))
+                .collect();
+            extents.is_empty() || seen.insert((extents, t.duration_secs.round() as i64))
         })
         .collect()
 }
@@ -135,6 +138,29 @@ mod tests {
         let ep = 44.0 * 60.0;
         let titles = vec![title(ep, 1000), title(ep, 1000), title(ep, 2000)];
         assert_eq!(episode_titles(&titles), vec![0, 2]);
+    }
+
+    // Episodes that open on the same intro clip are different content: only a matching
+    // extent list and duration is a duplicate.
+    #[test]
+    fn episodes_sharing_an_opening_clip_are_all_kept() {
+        let ep = 24.0 * 60.0;
+        let episode = |body: u32, dur: f64| {
+            let mut t = title(dur, 500);
+            t.extents.push(Extent {
+                start_lba: body,
+                sector_count: 1000,
+            });
+            t
+        };
+        let titles = vec![
+            episode(1000, ep),
+            episode(2000, ep),
+            episode(3000, ep + 30.0),
+        ];
+        assert_eq!(episode_titles(&titles), vec![0, 1, 2]);
+        let same_start = vec![title(ep, 1000), title(ep + 60.0, 1000)];
+        assert_eq!(episode_titles(&same_start), vec![0, 1]);
     }
 
     #[test]

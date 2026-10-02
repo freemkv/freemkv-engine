@@ -9,6 +9,7 @@
 // message + code carried on events.
 #![forbid(unsafe_code)]
 
+pub mod drive;
 pub mod drive_info;
 mod engine_halt;
 mod episodes;
@@ -52,30 +53,32 @@ pub use episodes::episode_titles;
 pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
     ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
-    open_image_with_traced, parse_error_code, scan_image,
+    open_image_with_traced, parse_error_code, scan_image, stream_info,
 };
 pub use job::{Job, RipMode, Selection, StreamChoice, StreamFilter};
 pub use keys::{KeyParams, key_source_factory, key_sources, resolve_loose_clip, won_source};
 pub use multipass::{
-    MultipassOpts, MultipassResult, PassExit, PassPlan, PatchDecision, abort_lost_bytes,
-    abort_lost_ms, bad_sector_statuses, classify_damage, effective_abort_secs,
-    end_of_recovery_promotion, loss_aborts, measured_scope_bad, mkv_staging_scope, multipass_rip,
-    multipass_rip_staged, multipass_rip_with, pass_exit, patch_made_progress, patch_pass_decision,
-    plan_passes, pre_pass_converged, scope_bad_bytes, scope_converged, should_abort_for_loss,
+    LossVerdict, MultipassOpts, MultipassResult, PassExit, PassHost, PassPlan, PatchDecision,
+    ReaderHost, abort_lost_bytes, abort_lost_ms, bad_sector_statuses, classify_damage,
+    effective_abort_secs, end_of_recovery_promotion, loss_aborts, loss_verdict, lost_ms_in_title,
+    measured_scope_bad, mkv_staging_scope, multipass_rip, multipass_rip_staged, multipass_rip_with,
+    pass_exit, patch_made_progress, patch_pass_decision, plan_passes, pre_pass_converged,
+    scope_bad_bytes, scope_converged, should_abort_for_loss, title_bytes_per_sec,
 };
 pub use mux::{
-    RipOutcome, TitleAction, TitleResult, classify_title_error, decide_title, mux_title,
-    mux_title_session, open_scan, open_scan_with, resolve_selection, run_titles,
+    RipOutcome, TitleAction, TitleError, TitleResult, classify_title_error, decide_title,
+    mux_title, open_scan, open_scan_with, resolve_selection, run_episodes, run_titles,
+    run_titles_with,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
-pub use plan::{KeyParamsData, Output, Plan, Report, run, run_with};
+pub use plan::{Held, KeyParamsData, Output, Plan, Report, RunWith, TitleOptions, run, run_with};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
     MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
     remux_iso, remux_iso_staged, remux_iso_with, verify_mkv,
 };
 pub use run::recover_to_iso;
-pub use sink::{Event, Level, NoopSink, Progress, Sink};
+pub use sink::{Event, Level, NoopSink, Progress, RecoveryEvent, Sink};
 pub use speed::SpeedEstimator;
 pub use streams::{
     StreamSelError, SubtitleFilter, UnmatchedClass, resolve_stream_selection,

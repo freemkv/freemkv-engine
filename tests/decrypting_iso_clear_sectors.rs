@@ -355,6 +355,26 @@ fn sweep_to(
     (iso, r)
 }
 
+/// A blanked unit is resolved, not skipped: the mapfile holds it (and the whole disc)
+/// Finished, with nothing NonTried/NonTrimmed left over. An untouched unit would stay
+/// NonTried after a sweep and NonTrimmed after a patch.
+fn assert_blanked_unit_is_resolved(iso: &std::path::Path, lba: u32, pending: u64) {
+    let map = Mapfile::load(&freemkv_engine::mapfile_path_for(iso)).unwrap();
+    let st = map.stats();
+    assert_eq!(st.bytes_good, st.bytes_total, "{st:?}");
+    assert_eq!(pending, 0, "no bytes left pending");
+    let unit = (
+        lba as u64 * SECTOR as u64,
+        UNIT_SECTORS as u64 * SECTOR as u64,
+    );
+    assert!(
+        map.ranges_with(&[SectorStatus::Finished])
+            .iter()
+            .any(|&(p, l)| p <= unit.0 && unit.0 + unit.1 <= p + l),
+        "the blanked unit is recorded Finished"
+    );
+}
+
 /// Sweep `d` over `fx` and require EXACTLY the decrypted image.
 fn assert_sweeps_to_expected(fx: &Fixture, d: &Disc) {
     let tmp = tempfile::tempdir().unwrap();
@@ -540,6 +560,7 @@ fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
     mf.flush().unwrap();
     std::fs::write(&iso, &fx.expected[..total as usize / 2]).unwrap();
     let map_before = std::fs::read(&map_path).unwrap();
+    let iso_before = std::fs::read(&iso).unwrap();
     let opts = freemkv_engine::CopyOptions {
         decrypt: true,
         multipass: true,
@@ -552,6 +573,7 @@ fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
         libfreemkv::error::E_NO_DISC_KEY
     );
     assert_eq!(std::fs::read(&map_path).unwrap(), map_before, "scope kept");
+    assert!(std::fs::read(&iso).unwrap() == iso_before, "ISO untouched");
 }
 
 /// A non-title file no held key opens no longer refuses the whole-disc resolve (10d85b2):
@@ -628,7 +650,7 @@ fn a_multi_cps_sweep_blanks_a_first_unit_no_key_opens() {
     let set = keyed(&d, &mut MemDisc::new(&fx.source)).expect("the set resolves");
     let tmp = tempfile::tempdir().unwrap();
     let iso = tmp.path().join("out.iso");
-    freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &sweep_opts(set))
+    let r = freemkv_engine::sweep(&d, &mut MemDisc::new(&fx.source), &iso, &sweep_opts(set))
         .expect("an unopenable unit is blanked, never a stop");
     let at = fx.files[ORPHAN].0 as usize * SECTOR;
     let out = std::fs::read(&iso).unwrap();
@@ -637,6 +659,7 @@ fn a_multi_cps_sweep_blanks_a_first_unit_no_key_opens() {
             .iter()
             .all(|&b| b == 0)
     );
+    assert_blanked_unit_is_resolved(&iso, fx.files[ORPHAN].0, r.bytes_pending);
 }
 
 /// Last resort: every probe of the unplayed file is unreadable (damage), so its key
@@ -650,7 +673,7 @@ fn an_unreadable_probe_blanks_the_unit_and_the_pass_goes_on() {
     let mut reader = MemDisc::new(&fx.source);
     reader.probe_fail = Some((o, o + n));
     let (iso, r) = sweep_to(&tmp, &multi_cps_disc(&fx), &mut reader);
-    r.expect("an encrypted unit with no proven key is blanked, never a stop");
+    let r = r.expect("an encrypted unit with no proven key is blanked, never a stop");
     let at = o as usize * SECTOR;
     let out = std::fs::read(&iso).unwrap();
     assert!(
@@ -658,6 +681,7 @@ fn an_unreadable_probe_blanks_the_unit_and_the_pass_goes_on() {
             .iter()
             .all(|&b| b == 0)
     );
+    assert_blanked_unit_is_resolved(&iso, o, r.bytes_pending);
 }
 
 /// A skipping sweep's batches tile each file's unit grid: a bad sector in the unit
@@ -695,7 +719,18 @@ fn a_skipping_sweep_fails_only_the_batch_holding_the_bad_unit() {
         Some(o as u64),
         "the batch BEFORE the bad unit must read clean: {bad_ranges:?}"
     );
-    assert!(r.bytes_pending + r.bytes_unreadable > 0);
+    // One 32-sector batch lost: [o, o+2) is in the batch before the edge, the rest after.
+    assert_eq!(
+        bad_ranges.len(),
+        1,
+        "exactly one range fails: {bad_ranges:?}"
+    );
+    let (start, len) = bad_ranges[0];
+    assert!(
+        len <= 32 * SECTOR as u64 && start + len >= (o + UNIT_SECTORS) as u64 * SECTOR as u64,
+        "one batch holds the whole bad unit and no more: {bad_ranges:?}"
+    );
+    assert_eq!(r.bytes_pending + r.bytes_unreadable, len);
 }
 
 /// HD DVD: an `.EVO` no kept title plays is AACS content like a BD stream file —
@@ -931,7 +966,7 @@ fn a_patch_blanks_a_unit_no_key_opens() {
         keys: Some(lazy),
         ..freemkv_engine::PatchOptions::for_patch_pass(true, None, None)
     };
-    freemkv_engine::patch(&d, &mut MemDisc::new(&fx.source), &iso, &opts)
+    let r = freemkv_engine::patch(&d, &mut MemDisc::new(&fx.source), &iso, &opts)
         .expect("an unopenable unit is blanked, never a stop");
     let at = o as usize * SECTOR;
     let out = std::fs::read(&iso).unwrap();
@@ -940,4 +975,5 @@ fn a_patch_blanks_a_unit_no_key_opens() {
             .iter()
             .all(|&b| b == 0)
     );
+    assert_blanked_unit_is_resolved(&iso, o, r.bytes_pending);
 }

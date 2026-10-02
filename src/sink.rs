@@ -67,6 +67,14 @@ pub enum Event<'a> {
         dest: &'a str,
         result: Result<&'a libfreemkv::MuxOutcome, &'a std::io::Error>,
     },
+    /// [`crate::run_titles`] skipped title `idx`: an incidental stub in a multi-title rip
+    /// (`empty` when it held no streams, else it could not be decrypted).
+    TitleSkipped { idx: usize, empty: bool },
+    /// [`crate::run_titles`] stopped on title `idx`: the error, as the title failed with it.
+    TitleFailed {
+        idx: usize,
+        error: &'a std::io::Error,
+    },
     /// A written MKV was checked against its title. `runtime_secs` is what the
     /// file showed, `expected_secs` the title's duration.
     Verify {
@@ -98,6 +106,54 @@ pub enum Event<'a> {
     /// A recovery pass's raw progress (damage, retries), beside the derived
     /// [`Progress`] the engine computes from it.
     Pass(&'a libfreemkv::progress::PassProgress),
+    /// A recovery loop milestone: a pass starting or ending, and why the passes ended.
+    Recovery(&'a RecoveryEvent<'a>),
+}
+
+/// A milestone of the recovery passes ([`Event::Recovery`]), for a front end that narrates
+/// them (the server's device log and pass tiles). Pass 1 is the sweep; 2.. are patch passes.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum RecoveryEvent<'a> {
+    /// Pass `pass` starts, with the bytes the earlier passes left.
+    PassStart {
+        pass: u32,
+        good: u64,
+        pending: u64,
+        unreadable: u64,
+    },
+    /// Pass `pass` ended: the image's bytes after it, what it recovered (a patch pass), and
+    /// whether a transport fault (`wedged`) or a Stop (`halted`) ended it early.
+    PassDone {
+        pass: u32,
+        good: u64,
+        unreadable: u64,
+        pending: u64,
+        recovered: u64,
+        wedged: bool,
+        halted: bool,
+    },
+    /// The patch passes start: at most `max`, over `pending` bytes still to retry.
+    PatchesStart { max: u32, pending: u64 },
+    /// A Stop before pass `pass`: the passes end, the image stays resumable.
+    Stopped { pass: u32 },
+    /// Before pass `pass` the mapfile could not be read to check convergence; it runs.
+    MapUnreadable {
+        pass: u32,
+        error: &'a std::io::Error,
+    },
+    /// Before pass `pass` the deliverable's scope was already fully recovered: the passes end.
+    Converged { pass: u32 },
+    /// Pass `pass` recovered nothing (`recovered == 0`): the passes end.
+    NoProgress { pass: u32, recovered: u64 },
+    /// The end-of-recovery promotion was applied to `map` (`intact` is false when part of
+    /// it failed to record): its Unreadable ranges are the confirmed loss.
+    Promoted {
+        map: &'a crate::Mapfile,
+        intact: bool,
+    },
+    /// The mapfile could not be read to measure the loss: it is unquantifiable (NaN).
+    LossUnmeasured { error: &'a std::io::Error },
 }
 
 /// The engine→front-end seam. One trait, implemented once per front-end.
