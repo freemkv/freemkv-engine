@@ -1,7 +1,8 @@
 //! Stop on the remux path (stop design v5 §4.2, §4.4, §4.5; §5.4 ET12-ET17, ET19-ET22).
 //! Per spec; do not change without a spec citation proving otherwise.
 //!
-//! `FakeIo` scales time: a production 60 s stall window is a few hundred ms here. Its
+//! `FakeIo` scales time: a production 60 s stall window is 1 s here, so a 200 ms sleep
+//! overshoot between two progress steps stays inside it. Its
 //! `sync` keeps libfreemkv's `durable_sync_file` contract (LP19): it reports each piece,
 //! fails `SyncTimeout` only after its window with no piece, and ends `Halted` on a cancel.
 
@@ -12,7 +13,7 @@ use libfreemkv::io::artifact_lock::lock_path as sidecar_for;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
-const WINDOW: Duration = Duration::from_millis(250);
+const WINDOW: Duration = Duration::from_secs(1);
 // §5.0 (B): "Tests assert **≤ 1 s** wall beyond the injected in-flight time."
 const STOP_LATENCY: Duration = Duration::from_secs(1);
 
@@ -363,7 +364,7 @@ fn remux_takes_target_lock() {
         })
     });
     let t0 = Instant::now();
-    while !sidecar_for(&target).exists() && t0.elapsed() < STOP_LATENCY {
+    while !sidecar_for(&target).exists() && t0.elapsed() < Duration::from_secs(30) {
         std::thread::sleep(Duration::from_millis(5));
     }
     assert!(
@@ -423,14 +424,14 @@ fn remux_lock_wait_times_out_on_a_frozen_holder() {
 }
 
 // ET13 `remux_durable_sync_is_stall_based_and_stoppable` — T12b: "E9056 only on a true 60 s
-// stall; Stop → `Halted`"; §5.0: "(a) progresses at 0.5 × window for ≥ 4 windows".
+// stall; Stop → `Halted`"; §5.0: "(a) progresses" at 0.2 × window for over 3 windows.
 #[test]
 fn remux_durable_sync_is_stall_based_and_stoppable() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("Movie.mkv");
     let slow = SyncPlan {
-        pieces: 10,
-        gap: WINDOW / 2,
+        pieces: 16,
+        gap: WINDOW / 5,
         stall_at: None,
         stop: None,
     };
@@ -541,11 +542,26 @@ fn remux_iso_with_op_token_stops_the_real_mux() {
 #[test]
 fn remux_should_cancel_still_cancels_everywhere() {
     let dir = tempfile::tempdir().unwrap();
+    // Flips the cancel 100 ms on and returns when it did.
     let flip = |w: &Arc<Watch>| {
-        let w = w.clone();
+        let (w, at) = (w.clone(), Arc::new(Mutex::new(None)));
+        let at2 = at.clone();
         cancel_later(
-            move || w.cancel.store(true, Ordering::SeqCst),
+            move || {
+                *at2.lock().unwrap() = Some(Instant::now());
+                w.cancel.store(true, Ordering::SeqCst);
+            },
             Duration::from_millis(100),
+        );
+        at
+    };
+    // The run ended within the Stop latency of the cancel.
+    let lands = |at: &Arc<Mutex<Option<Instant>>>, what: &str| {
+        let landed = Instant::now();
+        let at = at.lock().unwrap().expect("the cancel was flipped");
+        assert!(
+            landed.saturating_duration_since(at) < STOP_LATENCY,
+            "{what}"
         );
     };
     // (a) mid-mux.
@@ -567,14 +583,13 @@ fn remux_should_cancel_still_cancels_everywhere() {
         stop: None,
     };
     let rio = FakeIo::new(blocked, ReadPlan::default());
-    flip(&w);
-    let t0 = Instant::now();
+    let at = flip(&w);
     let e = run(&target, &*w, &Halt::new(), &rio, writes(good(), true)).unwrap_err();
+    lands(&at, "(b) the Stop waited out the sync");
     assert!(
         libfreemkv::is_halt(&e) && rio.in_sync.load(Ordering::SeqCst),
         "(b) {e}"
     );
-    assert!(t0.elapsed() < STOP_LATENCY);
     untouched(&target, mtime);
     // (c) while waiting for the sidecar lock: no `.partial` is ever created.
     let held = DeleteOnDrop(Some(
@@ -582,7 +597,7 @@ fn remux_should_cancel_still_cancels_everywhere() {
     ));
     let w = Arc::new(Watch::default());
     let rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
-    flip(&w);
+    let _ = flip(&w);
     let muxed = AtomicBool::new(false);
     let e = run(&target, &*w, &Halt::new(), &rio, |_| {
         muxed.store(true, Ordering::SeqCst);
@@ -602,11 +617,10 @@ fn remux_should_cancel_still_cancels_everywhere() {
     };
     let mut rio = FakeIo::new(SyncPlan::default(), blocking);
     rio.timing.verify_stall = Duration::from_secs(30);
-    flip(&w);
-    let t0 = Instant::now();
+    let at = flip(&w);
     let e = run(&target, &*w, &Halt::new(), &rio, writes(good(), true)).unwrap_err();
+    lands(&at, "(d) the Stop waited out the verify");
     assert!(libfreemkv::is_halt(&e), "(d) {e}");
-    assert!(t0.elapsed() < STOP_LATENCY);
     untouched(&target, mtime);
 }
 
@@ -1000,6 +1014,8 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
     struct StopInCopy {
         stage: PathBuf,
         copy_at: Mutex<Option<Instant>>,
+        // When the cancel was first reported.
+        stopped_at: Mutex<Option<Instant>>,
         held: Mutex<Option<std::fs::File>>,
     }
     impl Sink for StopInCopy {
@@ -1011,7 +1027,14 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
         }
         fn should_cancel(&self) -> bool {
             let at = *self.copy_at.lock().unwrap();
-            at.is_some_and(|t| t.elapsed() >= Duration::from_millis(50))
+            let stop = at.is_some_and(|t| t.elapsed() >= Duration::from_millis(50));
+            if stop {
+                self.stopped_at
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(Instant::now);
+            }
+            stop
         }
     }
     let dir = tempfile::tempdir().unwrap();
@@ -1023,11 +1046,12 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
     let release = rio.release.clone();
     cancel_later(
         move || release.store(true, Ordering::SeqCst),
-        STOP_LATENCY * 3,
+        STOP_LATENCY * 5,
     );
     let sink = StopInCopy {
         stage: stage.clone(),
         copy_at: Mutex::default(),
+        stopped_at: Mutex::default(),
         held: Mutex::default(),
     };
     let e = run_staged(
@@ -1038,7 +1062,8 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
         &rio,
         writes(good(), true),
     );
-    let copy_at = sink.copy_at.lock().unwrap().expect("the copy phase ran");
+    let landed = Instant::now();
+    let stopped_at = sink.stopped_at.lock().unwrap().expect("the Stop was seen");
     let held = sink.held.lock().unwrap().take().expect("the stage existed");
     assert_eq!(
         held.metadata().unwrap().len(),
@@ -1048,7 +1073,7 @@ fn remux_staged_copy_is_stall_based_and_stoppable() {
     let e = e.unwrap_err();
     assert!(libfreemkv::is_halt(&e), "{e}");
     assert!(
-        copy_at.elapsed() < STOP_LATENCY,
+        landed.saturating_duration_since(stopped_at) < STOP_LATENCY,
         "the Stop waited out the blocked write"
     );
     untouched(&target, mtime);

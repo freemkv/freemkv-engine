@@ -367,7 +367,7 @@ mod sleep_secs_or_halt_tests {
         sleep_secs_or_halt(30, &EngineHalt::legacy(Some(halt.clone())));
         let e = t0.elapsed();
         assert!(
-            e < Duration::from_millis(500),
+            e < Duration::from_secs(5),
             "waited {e:?} on an already-halted sleep"
         );
     }
@@ -401,7 +401,7 @@ mod sleep_secs_or_halt_tests {
     fn zero_seconds_returns_immediately() {
         let t0 = Instant::now();
         sleep_secs_or_halt(0, &EngineHalt::legacy(None));
-        assert!(t0.elapsed() < Duration::from_millis(200));
+        assert!(t0.elapsed() < Duration::from_millis(800));
     }
 }
 

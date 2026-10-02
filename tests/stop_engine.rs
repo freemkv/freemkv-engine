@@ -102,13 +102,21 @@ fn skip_on_error() -> SweepOptions<'static> {
     }
 }
 
-// Cancel `op` from another thread after `after`.
-fn cancel_later(op: &Halt, after: Duration) {
+// Cancel `op` from another thread after `after`; the thread returns when it cancelled.
+fn cancel_later(op: &Halt, after: Duration) -> std::thread::JoinHandle<Instant> {
     let op = op.clone();
     std::thread::spawn(move || {
         std::thread::sleep(after);
+        let at = Instant::now();
         op.cancel();
-    });
+        at
+    })
+}
+
+// How long the run took to end after `stopper` cancelled it, measured from the cancel
+// itself so a late-starting canceller thread cannot fail the bound.
+fn after_cancel(stopper: std::thread::JoinHandle<Instant>, landed: Instant) -> Duration {
+    landed.saturating_duration_since(stopper.join().unwrap())
 }
 
 // §5.0 (B): "Tests assert **≤ 1 s** wall beyond the injected in-flight time."
@@ -131,12 +139,11 @@ fn default_copy_options_sleep_is_cancellable() {
         "the CLI's options wire no narrower flag"
     );
     let delay = Duration::from_millis(300);
-    cancel_later(&op, delay);
-    let t0 = Instant::now();
+    let stopper = cancel_later(&op, delay);
     let out = freemkv_engine::copy_with(&op, &disc(64), &mut reader, &iso, &opts);
-    let took = t0.elapsed();
+    let took = after_cancel(stopper, Instant::now());
     assert!(
-        took < delay + STOP_LATENCY,
+        took < STOP_LATENCY,
         "a Stop during the 30 s wedge pause took {took:?}"
     );
     assert!(out.is_stopped(), "{out:?}");
@@ -398,10 +405,10 @@ fn sweep_stop_during_the_error_pause() {
     let mut reader = Script::new(256, 0..256);
     let op = Halt::new();
     let delay = Duration::from_millis(300);
-    cancel_later(&op, delay);
-    let t0 = Instant::now();
+    let stopper = cancel_later(&op, delay);
     let out = freemkv_engine::sweep_with(&op, &disc(256), &mut reader, &iso, &skip_on_error());
-    assert!(t0.elapsed() < delay + STOP_LATENCY, "{:?}", t0.elapsed());
+    let took = after_cancel(stopper, Instant::now());
+    assert!(took < STOP_LATENCY, "{took:?}");
     assert!(out.is_stopped(), "{out:?}");
     mapfile_is_sane(&iso, 256, 0..=0);
 }
@@ -536,10 +543,10 @@ fn patch_stop_during_the_error_pause() {
     reader.hook = Box::new(|_, _| std::thread::sleep(Duration::from_millis(20)));
     let op = Halt::new();
     let delay = Duration::from_millis(300);
-    cancel_later(&op, delay);
-    let t0 = Instant::now();
+    let stopper = cancel_later(&op, delay);
     let out = freemkv_engine::patch_with(&op, &disc(256), &mut reader, &iso, &patch_opts());
-    assert!(t0.elapsed() < delay + STOP_LATENCY, "{:?}", t0.elapsed());
+    let took = after_cancel(stopper, Instant::now());
+    assert!(took < STOP_LATENCY, "{took:?}");
     assert!(out.is_stopped(), "{out:?}");
     mapfile_is_sane(&iso, 256, 192..=192);
 }

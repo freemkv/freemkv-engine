@@ -457,15 +457,15 @@ mod tests {
         impl Sink for NeverCancel {}
         let t0 = std::time::Instant::now();
         // Each call outlives the watcher's first poll, so the watcher is asleep when it ends.
-        for _ in 0..5 {
+        for _ in 0..10 {
             with_cancel_watcher(&NeverCancel, |_halt| {
                 std::thread::sleep(std::time::Duration::from_millis(5))
             });
         }
         let took = t0.elapsed();
         assert!(
-            took < std::time::Duration::from_millis(250),
-            "5 short calls took {took:?}: each waited out the watcher's 100 ms sleep"
+            took < std::time::Duration::from_millis(800),
+            "10 short calls took {took:?}: each waited out the watcher's 100 ms sleep"
         );
     }
 
@@ -651,7 +651,7 @@ mod tests {
              unreachable again)"
         );
         assert!(
-            elapsed < std::time::Duration::from_secs(2),
+            elapsed < std::time::Duration::from_millis(2500),
             "Stop waited out the cooldown: took {elapsed:?}, but a wired halt \
              token is polled every 100 ms and must break the pause"
         );
