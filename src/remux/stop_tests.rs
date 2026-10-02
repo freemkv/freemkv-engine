@@ -33,8 +33,10 @@ struct ReadPlan {
     block_after: Option<u64>,
 }
 
-// What the folder sync after the rename does.
+// What the folder sync after the rename does. Only Unix syncs the folder (`sync_parent`),
+// so only Unix tests set `Stop` or `Fail`.
 #[derive(Default)]
+#[cfg_attr(not(unix), allow(dead_code))]
 enum DirSync {
     #[default]
     Ok,
