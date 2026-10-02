@@ -22,6 +22,9 @@ struct SyncPlan {
     gap: Duration,
     // Pieces completed before the flush stops making progress (`None`: never stalls).
     stall_at: Option<u64>,
+    // Cancelled when the sync starts. The sync's stall window is then `STOP_LATENCY`, the
+    // whole budget for the Stop to reach it, so only a Stop that never arrives times out.
+    stop: Option<Halt>,
 }
 
 #[derive(Default)]
@@ -131,8 +134,15 @@ impl RemuxIo for FakeIo {
             return Ok(());
         }
         self.in_sync.store(true, Ordering::SeqCst);
+        let window = match &self.sync.stop {
+            Some(op) => {
+                op.cancel();
+                STOP_LATENCY
+            }
+            None => WINDOW,
+        };
         let (len, p) = (m.len(), Counter::new());
-        let mut timer = StallTimer::new(WINDOW, &p);
+        let mut timer = StallTimer::new(window, &p);
         let piece = len.div_ceil(self.sync.pieces).max(1);
         let mut done = 0;
         for i in 0..self.sync.pieces {
@@ -422,6 +432,7 @@ fn remux_durable_sync_is_stall_based_and_stoppable() {
         pieces: 10,
         gap: WINDOW / 2,
         stall_at: None,
+        stop: None,
     };
     let rio = FakeIo::new(slow, ReadPlan::default());
     let t0 = Instant::now();
@@ -440,6 +451,7 @@ fn remux_durable_sync_is_stall_based_and_stoppable() {
         pieces: 4,
         gap: Duration::ZERO,
         stall_at: Some(1),
+        stop: None,
     };
     let rio = FakeIo::new(stall, ReadPlan::default());
     let t0 = Instant::now();
@@ -463,10 +475,9 @@ fn remux_durable_sync_is_stall_based_and_stoppable() {
         pieces: 4,
         gap: Duration::from_secs(30),
         stall_at: None,
+        stop: Some(op.clone()),
     };
     let rio = FakeIo::new(stall, ReadPlan::default());
-    let o = op.clone();
-    cancel_later(move || o.cancel(), Duration::from_millis(100));
     let t0 = Instant::now();
     let e = run(&target, &Events::default(), &op, &rio, writes(good(), true)).unwrap_err();
     assert!(libfreemkv::is_halt(&e), "{e}");
@@ -553,6 +564,7 @@ fn remux_should_cancel_still_cancels_everywhere() {
         pieces: 2,
         gap: WINDOW * 3,
         stall_at: None,
+        stop: None,
     };
     let rio = FakeIo::new(blocked, ReadPlan::default());
     flip(&w);
@@ -657,6 +669,7 @@ fn remux_sync_emits_activity_while_healthy() {
         pieces: 40,
         gap: Duration::from_millis(20),
         stall_at: None,
+        stop: None,
     };
     let rio = FakeIo::new(healthy, ReadPlan::default());
     let w = Watch::default();
@@ -691,6 +704,7 @@ fn remux_sync_stall_goes_silent_then_fails() {
         pieces: 20,
         gap: Duration::from_millis(10),
         stall_at: Some(5),
+        stop: None,
     };
     let rio = FakeIo::new(stall, ReadPlan::default());
     let w = Watch::default();
@@ -940,6 +954,7 @@ fn remux_holder_stays_observable_during_sync_and_verify() {
         pieces: 10,
         gap: Duration::from_millis(20),
         stall_at: None,
+        stop: None,
     };
     let slow_read = ReadPlan {
         chunk: 8,
