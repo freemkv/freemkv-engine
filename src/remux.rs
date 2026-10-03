@@ -340,7 +340,10 @@ pub fn remux_iso_with(
 
 /// Remux to a local partial file, then copy a verified result to a partial
 /// beside the target before the atomic replacement. The caller owns the
-/// staging location; the engine removes both partial files on every exit.
+/// staging location. Both partial files are removed on every exit but one: when
+/// the local file verified and a later step failed for a storage reason (not a
+/// Stop), it is kept in the staging folder with a sidecar, and the error carries
+/// a [`StagedKept`] (see [`staged_kept`], [`finish_staged`]).
 pub fn remux_iso_staged(
     job: &RemuxJob,
     keys: &KeyParams,
@@ -631,6 +634,8 @@ fn land_verified(
     let _lock = DeleteOnDrop(Some(lock));
     remove_stale_partial(partial)?;
     let mut guard = PartialFile(Some(partial));
+    // What sat at the target before this remux; a later resume refuses a target that changed.
+    let target_before = staged_partial.map(|_| staged::TargetStamp::of(&job.target));
 
     sink.event(&Event::Phase { name: "mux" });
     let dest = format!("mkv://{partial_str}");
@@ -651,62 +656,33 @@ fn land_verified(
     }
     durable_sync(rio, partial, halt, sink, timing)?;
 
-    // Each verify (the local file, then a staged NAS copy) is its own phase and verdict.
-    let verify = |path: &Path| {
-        sink.event(&Event::Phase { name: "verify" });
-        let verified = verify_watched(path, title, halt, sink, rio, timing);
-        if !verified.as_ref().is_err_and(libfreemkv::is_halt) {
-            sink.event(&Event::Verify {
-                path,
-                ok: verified.is_ok(),
-                runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
-                expected_secs: title.duration_secs,
-            });
-        }
-        verified
-    };
+    let verify = |path: &Path| verify_phase(path, title, halt, sink, rio, timing);
     let verified = verify(partial)?;
 
-    let mut remote_guard = None;
-    if staged_partial.is_some() {
-        sink.event(&Event::Phase { name: "copy" });
-        remove_stale_partial(&target_partial)?;
-        remote_guard = Some(PartialFile(Some(&target_partial)));
-        copy_staged(partial, &target_partial, halt, sink, rio, timing)?;
-        durable_sync(rio, &target_partial, halt, sink, timing)?;
-        // Check the NAS copy itself before replacing an existing library file.
-        verify(&target_partial)?;
-    }
-
-    sink.event(&Event::Phase { name: "replace" });
-    // Re-checked: the target may have appeared while the title muxed.
-    refuse_existing(job)?;
-    let replaced = target_present(&job.target)?;
-    let landing = if staged_partial.is_some() {
-        &target_partial
-    } else {
-        partial
+    let remote = staged_partial.map(|_| target_partial.as_path());
+    let step = Step {
+        halt,
+        sink,
+        rio,
+        timing,
     };
-    // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`"; the rename
-    // is the commit, so a Stop that arrived before it leaves the target untouched.
-    if halt.is_cancelled() {
-        return Err(libfreemkv::Error::Halted.into());
-    }
-    land(landing, job)?;
-    remote_guard.as_mut().unwrap_or(&mut guard).disarm();
-    // The rename committed: a Stop or a failure during the folder sync cuts only the sync
-    // short (§2.6, §4.4), and the caller is still told the target was replaced.
-    match sync_parent(rio, &job.target, halt) {
-        Err(e) if libfreemkv::is_halt(&e) => sink.log(
-            Level::Warn,
-            "stopped during the folder sync after the target was replaced; the rename may not be durable yet",
-        ),
-        Err(e) => sink.log(
-            Level::Warn,
-            &format!("the target was replaced but its folder sync failed: {e}"),
-        ),
-        Ok(()) => {}
-    }
+    let replaced = match deliver(job, partial, remote, &verify, &step, true, &mut guard) {
+        Ok(replaced) => replaced,
+        Err((phase, e)) => {
+            let Some(before) = target_before.filter(|_| staged::keeps(&e, halt)) else {
+                return Err(e);
+            };
+            let kept = staged::Kept {
+                job,
+                idx,
+                title,
+                outcome: &outcome,
+                verified: &verified,
+                target_before: before,
+            };
+            return Err(staged::keep(partial, &mut guard, &kept, phase, e, sink));
+        }
+    };
     if replaced {
         sink.event(&Event::Replaced { path: &job.target });
     }
@@ -718,6 +694,128 @@ fn land_verified(
     })
 }
 
+// One verify of the remux path, its own phase and verdict: the local file, then a staged copy.
+fn verify_phase(
+    path: &Path,
+    title: &libfreemkv::DiscTitle,
+    halt: &EngineHalt<'_>,
+    sink: &dyn Sink,
+    rio: &dyn RemuxIo,
+    timing: RemuxTiming,
+) -> io::Result<libfreemkv::MkvProbe> {
+    sink.event(&Event::Phase { name: "verify" });
+    let verified = verify_watched(path, title, halt, sink, rio, timing);
+    if !verified.as_ref().is_err_and(libfreemkv::is_halt) {
+        sink.event(&Event::Verify {
+            path,
+            ok: verified.is_ok(),
+            runtime_secs: verified.as_ref().ok().and_then(muxed_runtime),
+            expected_secs: title.duration_secs,
+        });
+    }
+    verified
+}
+
+// What every step after the local verify runs under.
+struct Step<'a, 'h> {
+    halt: &'a EngineHalt<'h>,
+    sink: &'a dyn Sink,
+    rio: &'a dyn RemuxIo,
+    timing: RemuxTiming,
+}
+
+type Verify<'a> = dyn Fn(&Path) -> io::Result<libfreemkv::MkvProbe> + 'a;
+
+// Everything after the local verify: with `remote`, copy `local` there, sync it and verify it;
+// then land on the target and sync its folder. `Ok(replaced)`, or the failed phase and error.
+// `remote` is always removed on failure (best effort); `local_guard` is disarmed once it landed.
+fn deliver(
+    job: &RemuxJob,
+    local: &Path,
+    remote: Option<&Path>,
+    verify: &Verify<'_>,
+    step: &Step<'_, '_>,
+    free_on_stop: bool,
+    local_guard: &mut PartialFile<'_>,
+) -> Result<bool, (&'static str, io::Error)> {
+    let mut remote_guard = remote.map(|p| PartialFile(Some(p)));
+    let landed = deliver_steps(job, local, remote, verify, step, free_on_stop);
+    match (&landed, remote_guard.as_mut()) {
+        (Ok(_), Some(g)) => g.disarm(),
+        (Ok(_), None) => local_guard.disarm(),
+        (Err(_), Some(g)) => remove_remote(g, step.sink),
+        (Err(_), None) => {}
+    }
+    let replaced = landed?;
+    // The rename committed: a Stop or a failure during the folder sync cuts only the sync
+    // short (§2.6, §4.4), and the caller is still told the target was replaced.
+    match sync_parent(step.rio, &job.target, step.halt) {
+        Err(e) if libfreemkv::is_halt(&e) => step.sink.log(
+            Level::Warn,
+            "stopped during the folder sync after the target was replaced; the rename may not be durable yet",
+        ),
+        Err(e) => step.sink.log(
+            Level::Warn,
+            &format!("the target was replaced but its folder sync failed: {e}"),
+        ),
+        Ok(()) => {}
+    }
+    Ok(replaced)
+}
+
+fn deliver_steps(
+    job: &RemuxJob,
+    local: &Path,
+    remote: Option<&Path>,
+    verify: &Verify<'_>,
+    step: &Step<'_, '_>,
+    free_on_stop: bool,
+) -> Result<bool, (&'static str, io::Error)> {
+    let Step {
+        halt,
+        sink,
+        rio,
+        timing,
+    } = *step;
+    if let Some(remote) = remote {
+        sink.event(&Event::Phase { name: "copy" });
+        let copy = remove_stale_partial(remote)
+            .and_then(|()| copy_staged(local, remote, halt, sink, rio, timing, free_on_stop));
+        copy.map_err(|e| ("copy", e))?;
+        durable_sync(rio, remote, halt, sink, timing).map_err(|e| ("sync", e))?;
+        // Check the NAS copy itself before replacing an existing library file.
+        verify(remote).map_err(|e| ("verify", e))?;
+    }
+
+    sink.event(&Event::Phase { name: "replace" });
+    let replace = || -> io::Result<bool> {
+        // Re-checked: the target may have appeared while the title muxed.
+        refuse_existing(job)?;
+        let replaced = target_present(&job.target)?;
+        // §2.6: "**Done after Stop** only if the commit … happened before `t_cancel`"; the
+        // rename is the commit, so a Stop that arrived before it leaves the target untouched.
+        if halt.is_cancelled() {
+            return Err(libfreemkv::Error::Halted.into());
+        }
+        land(remote.unwrap_or(local), job)?;
+        Ok(replaced)
+    };
+    replace().map_err(|e| ("replace", e))
+}
+
+// A failed delivery's copy beside the target goes; one on a dead mount may refuse, which is
+// logged and left (the library's partial sweep removes it once the share is back).
+fn remove_remote(guard: &mut PartialFile<'_>, sink: &dyn Sink) {
+    let Some(path) = guard.0.take() else { return };
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => sink.log(
+            Level::Warn,
+            &format!("could not remove {}: {e}", path.display()),
+        ),
+        _ => {}
+    }
+}
+
 // The staged copy on a worker, waited on as verify is: Stop within a slice, and
 // `TimedOut { op: "copy" }` after `copy_stall` with no bytes written (§3.1 HR1).
 fn copy_staged(
@@ -727,6 +825,7 @@ fn copy_staged(
     sink: &dyn Sink,
     rio: &dyn RemuxIo,
     timing: RemuxTiming,
+    free_on_stop: bool,
 ) -> io::Result<()> {
     let mut src = std::fs::File::open(source)?;
     let total = src.metadata()?.len();
@@ -763,11 +862,15 @@ fn copy_staged(
         beat,
         &report,
     );
-    // A leaked worker holds both files until its write returns: empty the local stage so its
-    // blocks free now (never the NAS side, which may be the hung mount).
-    if watched.is_err() {
+    // A leaked worker holds both files until its write returns. On a Stop the local stage is
+    // emptied so its blocks free now (never the NAS side, which may be the hung mount); a stall
+    // keeps it, as the verified file the caller may resume from.
+    if let Err(e) = &watched {
         quit.store(true, Ordering::Relaxed);
-        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(source) {
+        if free_on_stop
+            && libfreemkv::is_halt(e)
+            && let Ok(f) = std::fs::OpenOptions::new().write(true).open(source)
+        {
             let _ = f.set_len(0);
         }
     }
@@ -1025,6 +1128,12 @@ fn watch_worker<T>(
     }
 }
 
+mod staged;
+pub use staged::{
+    StagedInfo, StagedKept, discard_staged, finish_staged, finish_staged_with, is_kept_staged,
+    read_staged, staged_expired, staged_kept, staged_orphans, staged_over_budget, staged_pending,
+};
+
 #[cfg(test)]
 mod stop_tests;
 
@@ -1196,7 +1305,16 @@ mod tests {
         let sink = Events::default();
         let halt = EngineHalt::new(&token, None).with_sink(&sink);
         let timing = RemuxTiming::default();
-        let err = copy_staged(&source, &destination, &halt, &sink, &OsRemuxIo, timing).unwrap_err();
+        let err = copy_staged(
+            &source,
+            &destination,
+            &halt,
+            &sink,
+            &OsRemuxIo,
+            timing,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
     }
@@ -1228,7 +1346,16 @@ mod tests {
         let sink = Events::default();
         let halt = EngineHalt::new(&token, None).with_sink(&sink);
         let timing = RemuxTiming::default();
-        let e = copy_staged(&source, &destination, &halt, &sink, &DroppingIo, timing).unwrap_err();
+        let e = copy_staged(
+            &source,
+            &destination,
+            &halt,
+            &sink,
+            &DroppingIo,
+            timing,
+            true,
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert_eq!(e.to_string(), "E9080: 0/9");
     }

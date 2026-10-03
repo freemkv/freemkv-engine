@@ -19,6 +19,8 @@ anyhow = "1"
 libfreemkv = "1.7"
 freemkv-keysources = "1.7"
 serde = { version = "1", features = ["derive"] }
+# The kept staged remux's sidecar (`<name>.staged.json`).
+serde_json = "1"
 tracing = "0.1"
 # Language-tag normalization for stream selection (name / 639-1 / 639-2/3 →
 # language identity). `lowercase_names` enables case-insensitive name matching

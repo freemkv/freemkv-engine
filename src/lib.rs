@@ -74,8 +74,10 @@ pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use plan::{Held, KeyParamsData, Output, Plan, Report, RunWith, TitleOptions, run, run_with};
 pub use preflight::{Preflight, Reason, preflight};
 pub use remux::{
-    MuxPlan, RemuxJob, RemuxReport, mux_image_titles, mux_image_titles_with, mux_options,
-    remux_iso, remux_iso_staged, remux_iso_with, verify_mkv,
+    MuxPlan, RemuxJob, RemuxReport, StagedInfo, StagedKept, discard_staged, finish_staged,
+    finish_staged_with, is_kept_staged, mux_image_titles, mux_image_titles_with, mux_options,
+    read_staged, remux_iso, remux_iso_staged, remux_iso_with, staged_expired, staged_kept,
+    staged_orphans, staged_over_budget, staged_pending, verify_mkv,
 };
 pub use run::recover_to_iso;
 pub use sink::{Event, Level, NoopSink, Progress, RecoveryEvent, Sink};
