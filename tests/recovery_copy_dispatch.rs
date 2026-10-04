@@ -2430,7 +2430,7 @@ fn a_decrypting_css_sweep_descrambles_the_scrambled_sectors() {
     let sectors: u32 = 96;
     let mut disc = make_test_disc(sectors, "CSSDISC");
     disc.format = DiscFormat::Dvd;
-    disc.content_format = ContentFormat::MpegPs;
+    disc.content_format = ContentFormat::DvdPs;
     disc.encrypted = true;
     disc.css = Some(libfreemkv::css::CssState {
         title_key: [0x11, 0x22, 0x33, 0x44, 0x55],
