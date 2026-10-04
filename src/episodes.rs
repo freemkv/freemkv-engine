@@ -25,6 +25,60 @@ pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
     dedup_by_content(titles, episode_cluster(titles, EPISODE_MIN_SECS))
 }
 
+/// A title's role, stated only where the disc's own structure proves it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleRole {
+    /// Plays two or more other titles back to back: their sectors lie wholly inside its own.
+    PlayAll,
+    /// One of the titles a play-all plays.
+    Episode,
+}
+
+// Shortest title a play-all's part may be (10 min): a logo or recap inside it is not an episode.
+const PART_MIN_SECS: f64 = 600.0;
+
+/// The proven role of every title, in `titles` order; `None` where the disc proves nothing.
+///
+/// A play-all is read off the sectors, never the runtimes: every cell (extent) of other titles
+/// at least [`PART_MIN_SECS`] long and strictly smaller than it is one of its own cells, the
+/// same sector range exactly, and those titles begin
+/// at two or more different sectors. Every title it holds that way is an episode, including the
+/// same episode authored again with other audio (it begins at the same sector). Identical decoy
+/// playlists hold the same sectors as each other, so none is smaller and none is a play-all.
+pub fn title_roles(titles: &[DiscTitle]) -> Vec<Option<TitleRole>> {
+    let mut roles = vec![None; titles.len()];
+    for (l, long) in titles.iter().enumerate() {
+        let size = sectors(long);
+        let held: Vec<usize> = (0..titles.len())
+            .filter(|&s| {
+                let short = &titles[s];
+                s != l
+                    && short.duration_secs >= PART_MIN_SECS
+                    && sectors(short) < size
+                    && !short.extents.is_empty()
+                    && short.extents.iter().all(|e| long.extents.contains(e))
+            })
+            .collect();
+        let mut starts: Vec<u32> = held
+            .iter()
+            .filter_map(|&s| titles[s].extents.first().map(|e| e.start_lba))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        if starts.len() >= 2 {
+            roles[l] = Some(TitleRole::PlayAll);
+            for s in held {
+                roles[s].get_or_insert(TitleRole::Episode);
+            }
+        }
+    }
+    roles
+}
+
+fn sectors(t: &DiscTitle) -> u64 {
+    t.extents.iter().map(|e| u64::from(e.sector_count)).sum()
+}
+
 fn same_length(center: f64, d: f64) -> bool {
     (d - center).abs() <= (center * EPISODE_TOLERANCE_FRAC).max(EPISODE_TOLERANCE_MIN_SECS)
 }
@@ -131,6 +185,94 @@ mod tests {
         }
         titles.push(title(2.0 * 60.0, 50));
         assert_eq!(episode_titles(&titles), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
+        let mut t = title(dur, 0);
+        t.extents = spans
+            .iter()
+            .map(|&(start_lba, sector_count)| Extent {
+                start_lba,
+                sector_count,
+            })
+            .collect();
+        t
+    }
+
+    #[test]
+    fn a_play_all_is_the_title_holding_its_episodes_sectors() {
+        let ep = 44.0 * 60.0;
+        let titles = vec![
+            spans(ep * 3.0, &[(1000, 1000), (2000, 1000), (3000, 1000)]),
+            spans(ep, &[(1000, 1000)]),
+            spans(ep, &[(2000, 1000)]),
+            spans(ep, &[(3000, 1000)]),
+            spans(120.0, &[(1000, 50)]), // a recap inside it: too short to be a part
+            spans(ep, &[(9000, 1000)]),  // same length, elsewhere: proves nothing
+        ];
+        use TitleRole::*;
+        assert_eq!(
+            title_roles(&titles),
+            vec![
+                Some(PlayAll),
+                Some(Episode),
+                Some(Episode),
+                Some(Episode),
+                None,
+                None
+            ]
+        );
+    }
+
+    // As on a real DVD: every episode ends on one shared end-card cell that the play-all holds
+    // once, and an episode can be authored twice with only the audio differing.
+    #[test]
+    fn episodes_sharing_an_end_card_or_authored_twice_are_all_episodes() {
+        let ep = 48.0 * 60.0;
+        let titles = vec![
+            spans(ep * 2.0, &[(0, 2000), (2000, 2000), (9000, 5)]),
+            spans(ep, &[(0, 2000), (9000, 5)]),
+            spans(ep, &[(0, 2000), (9000, 5)]),
+            spans(ep, &[(2000, 2000), (9000, 5)]),
+        ];
+        use TitleRole::*;
+        assert_eq!(
+            title_roles(&titles),
+            vec![Some(PlayAll), Some(Episode), Some(Episode), Some(Episode)]
+        );
+    }
+
+    // Decoy playlists repeat the feature's sectors exactly: none is smaller than another.
+    #[test]
+    fn identical_playlists_are_not_play_alls() {
+        let f = 110.0 * 60.0;
+        let titles = vec![
+            spans(f, &[(0, 9000)]),
+            spans(f, &[(0, 9000)]),
+            spans(f, &[(0, 9000)]),
+        ];
+        assert!(title_roles(&titles).iter().all(Option::is_none));
+    }
+
+    // Two cuts sharing most sectors overlap, so a title holding both plays no episodes.
+    #[test]
+    fn overlapping_parts_do_not_make_a_play_all() {
+        let t = 50.0 * 60.0;
+        let titles = vec![
+            spans(t * 2.0, &[(0, 4000)]),
+            spans(t, &[(0, 2500)]),
+            spans(t, &[(500, 2500)]),
+        ];
+        assert!(title_roles(&titles).iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn a_film_disc_proves_no_roles() {
+        let titles = vec![
+            spans(120.0 * 60.0, &[(0, 9000)]),
+            spans(12.0 * 60.0, &[(20_000, 500)]),
+        ];
+        assert!(title_roles(&titles).iter().all(Option::is_none));
     }
 
     #[test]

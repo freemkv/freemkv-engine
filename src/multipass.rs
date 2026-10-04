@@ -75,7 +75,9 @@ fn format_bytes_per_sec(title: &libfreemkv::DiscTitle) -> f64 {
         Some(R::R720p | R::R1080i | R::R1080p) => HD_BYTES_PER_SEC,
         Some(R::R480i | R::R480p | R::R576i | R::R576p) => SD_BYTES_PER_SEC,
         Some(R::Unknown) | None => match title.content_format {
-            libfreemkv::ContentFormat::MpegPs => SD_BYTES_PER_SEC,
+            libfreemkv::ContentFormat::MpegPs | libfreemkv::ContentFormat::DvdPs => {
+                SD_BYTES_PER_SEC
+            }
             libfreemkv::ContentFormat::BdTs => HD_BYTES_PER_SEC,
         },
     }
