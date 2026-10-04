@@ -49,7 +49,7 @@ mod test_fixtures;
 
 pub use drive_info::{CapturedFeature, DriveCapture, capture_drive_data, mask_bytes, mask_string};
 pub use engine_halt::{EngineHalt, EngineOutcome};
-pub use episodes::episode_titles;
+pub use episodes::{TitleRole, episode_titles, title_roles};
 pub use extract::{extract_tree, extract_tree_with};
 pub use image::{
     ImageSource, KeyInput, OpenImageOptions, OpenedImage, error_code, open_image, open_image_with,
