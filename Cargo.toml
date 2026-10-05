@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-engine"
-version = "1.7.7"
+version = "1.8.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -16,8 +16,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-libfreemkv = "1.7"
-freemkv-keysources = "1.7"
+libfreemkv = "1.8"
+freemkv-keysources = "1.8"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 # Language-tag normalization for stream selection (name / 639-1 / 639-2/3 →
@@ -34,7 +34,7 @@ sha2 = "0.11"
 tempfile = "3"
 # `test_util` fixtures (`aacs_state`, …) for this crate's tests (keys-upfront
 # KU-P1). CI resolves it through the sibling path patch.
-libfreemkv = { version = "1.7", features = ["test-util"] }
+libfreemkv = { version = "1.8", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"
@@ -46,9 +46,9 @@ codegen-units = 1
 # on bump. Local dev overrides it with a path patch via the gitignored
 # .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.7.7" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.7.7" }
-freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.7.7" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.8.0" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.8.0" }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.0" }
 
 [lints.clippy]
 uninlined_format_args = "allow"
