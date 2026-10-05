@@ -4,9 +4,11 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
-## [Unreleased]
+## [1.8.0] — Unreleased
 
 ### Added
+
+- Multipass treats a DVD title (`ContentFormat::DvdPs`) as standard definition.
 
 - **`run_with(Plan, RunWith, sink)`**: what a front end already holds goes beside the plan in `RunWith` — key sources, the rip's `KeyRing`, a `Held` source (a drive session, a scanned disc and reader, a disc under a `PassHost`, or one scanned title over a held drive), `TitleOptions` (resolved PIDs, skip read errors, read batch), recovery `passes` (`MultipassOpts`) and a staged `scope`, `locked` (the front end holds the image lock), its own `Halt` and its own `libfreemkv::Events` listener. A title plan (`mkv://`, `m2ts://`, …) now runs: one title off the held drive or title, or the source opened here (a drive scanned and keyed over the title; an image's keys acquired over the title, a loose clip's from its disc folder) — `Report::Title { outcome }`. `Report::Image` carries `recovery: Option<MultipassResult>` and `disc: Option<Box<Disc>>` (the run's own open only). `dir://` writes through libfreemkv's `TreeSink`.
 - **One recovery loop for every front end**: `PassHost` (the reader the passes read, plus hooks: resume decision, sweep attempts, transport recovery, before each patch pass, a failed patch pass, a wedged pass) and `ReaderHost`; `Event::Recovery(RecoveryEvent)` reports each pass start and end, the patch loop's start, a Stop, an unreadable mapfile, convergence, no progress, the promotion (with the promoted `Mapfile`) and an unmeasurable loss. The server's pass loop now runs here.
