@@ -213,6 +213,10 @@ const NOT_A_HALT: [(&str, &str); 7] = [
 ];
 
 // Files of the modules declared `#[cfg(test)] mod name;` anywhere under `src/`.
+fn module(line: &str) -> Option<&str> {
+    line.strip_prefix("mod ").and_then(|m| m.strip_suffix(';'))
+}
+
 fn test_only_modules(files: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for path in files {
@@ -224,11 +228,24 @@ fn test_only_modules(files: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
         };
         let text = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
-        for w in lines.windows(2) {
-            let decl = w[1].strip_prefix("mod ").and_then(|m| m.strip_suffix(';'));
-            if let (true, Some(name)) = (w[0] == "#[cfg(test)]", decl) {
-                out.push(base.join(format!("{name}.rs")));
-                out.push(base.join(name).join("mod.rs"));
+        for (i, line) in lines.iter().enumerate() {
+            if *line != "#[cfg(test)]" {
+                continue;
+            }
+            let next = lines.get(i + 1).copied().unwrap_or("");
+            // `#[path = "x_tests.rs"]` side files resolve against this file's directory.
+            let side = next
+                .strip_prefix("#[path = \"")
+                .and_then(|p| p.strip_suffix("\"]"));
+            match (side, module(next)) {
+                (Some(file), _) if lines.get(i + 2).copied().and_then(module).is_some() => {
+                    out.push(dir.join(file));
+                }
+                (None, Some(name)) => {
+                    out.push(base.join(format!("{name}.rs")));
+                    out.push(base.join(name).join("mod.rs"));
+                }
+                _ => {}
             }
         }
     }
