@@ -150,7 +150,7 @@ fn hits(rel: &str, src: &str) -> Vec<(usize, &'static str)> {
         rel == "src/recovery/mapfile.rs" && n == "parse_legacy_key_lines"
     });
     let line_tests = fn_spans(&bare, |n| match rel {
-        "src/recovery/mapfile.rs" => [
+        "src/recovery/mapfile_ku_identity_tests.rs" => [
             "mapfile_never_writes_key_or_raw_vid_lines",
             "legacy_lines_become_fingerprints_on_first_write",
         ]
