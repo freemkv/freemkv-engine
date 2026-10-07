@@ -4,6 +4,12 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [1.8.2] — Unreleased
+
+### Changed
+
+- Key-set tests follow libfreemkv 1.8.2's trusted CPS units: with one declared unit the main title's key keys every file, and on a multi-unit disc a file's one encrypted unit names its key. No behaviour change.
+
 ## [1.8.1] — 2026-10-07
 
 ### Changed
