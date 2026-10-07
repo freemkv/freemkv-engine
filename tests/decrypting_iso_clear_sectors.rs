@@ -576,9 +576,10 @@ fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
     assert!(std::fs::read(&iso).unwrap() == iso_before, "ISO untouched");
 }
 
-/// A non-title file no held key opens no longer refuses the whole-disc resolve (10d85b2):
-/// it stays Lazy and is blanked on read, on a multi-CPS, single-CPS, no-`Unit_Key_RO.inf`
-/// and FMTS disc. The passes themselves never run without a set covering the whole disc: handed none (E7022) or one
+/// A non-title file no held key opens never refuses the whole-disc resolve (10d85b2): with
+/// several or no declared CPS units it stays Lazy and is blanked on read; with one declared
+/// unit (single-CPS, FMTS) the declaration is trusted and the main title's key keys it.
+/// The passes never run without a set covering the whole disc: handed none (E7022) or one
 /// resolved for the title only (E7013, a caller bug), each refuses before any output.
 #[test]
 fn an_unprovable_non_title_stream_file_refuses_up_front() {
@@ -587,10 +588,10 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::new();
     let mut fmts = disc(&fx);
     fmts.format = DiscFormat::Fmts;
-    for d in [multi_cps_disc(&fx), disc(&fx), no_ukro, fmts] {
-        // 10d85b2: a whole-disc set keeps the unopenable file Lazy while the title's file keys.
+    for (d, lazy) in [(multi_cps_disc(&fx), 1), (disc(&fx), 0), (no_ukro, 1), (fmts, 0)] {
         let whole = keyed(&d, &mut MemDisc::new(&fx.source)).expect("damage, not E7032");
-        assert_eq!(whole.lazy().len(), 1, "the unopenable file stays Lazy");
+        assert_eq!(whole.lazy().len(), lazy, "{:?}", whole.status());
+        assert_eq!(whole.status().keyed, 2 - lazy, "{:?}", whole.status());
         let title = keyed_over(&d, &mut MemDisc::new(&fx.source), KeyScope::Titles(vec![0]))
             .expect("the title alone keys");
         for (keys, code) in [
@@ -626,17 +627,17 @@ fn an_fmts_sweep_proves_an_unplayed_file_with_another_base_key() {
     assert_sweeps_to_expected(&fx, &d);
 }
 
-/// J21: one opened probe is not proof. A file whose single encrypted unit opens under a
-/// held key is never keyed from that probe: the set leaves it Lazy, and the sweep proves
-/// the key on arrival and decrypts it.
+/// KS-10: a stream file sits in one CPS unit, so on a multi-CPS disc the one encrypted unit
+/// of a file that opens under a held key names its key: the set keys it, and the sweep
+/// decrypts it.
 #[test]
-fn one_opened_probe_leaves_a_file_lazy_and_the_sweep_proves_it_on_arrival() {
+fn one_opened_unit_keys_its_file_on_a_multi_cps_disc() {
     let mut fx = bd(None);
     fx.encrypt_units(ORPHAN, &SECOND_KEY, true, 0..1);
     let d = multi_cps_disc(&fx);
-    let (o, n) = fx.files[ORPHAN];
     let set = keyed(&d, &mut MemDisc::new(&fx.source)).expect("the set resolves");
-    assert_eq!(set.lazy(), &[(o, o + n)], "never keyed from one probe");
+    assert!(set.lazy().is_empty(), "keyed by its sampled unit");
+    assert_eq!(set.status().keyed, 2);
     assert_sweeps_to_expected(&fx, &d);
 }
 
