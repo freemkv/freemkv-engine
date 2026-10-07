@@ -588,7 +588,12 @@ fn an_unprovable_non_title_stream_file_refuses_up_front() {
     no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::new();
     let mut fmts = disc(&fx);
     fmts.format = DiscFormat::Fmts;
-    for (d, lazy) in [(multi_cps_disc(&fx), 1), (disc(&fx), 0), (no_ukro, 1), (fmts, 0)] {
+    for (d, lazy) in [
+        (multi_cps_disc(&fx), 1),
+        (disc(&fx), 0),
+        (no_ukro, 1),
+        (fmts, 0),
+    ] {
         let whole = keyed(&d, &mut MemDisc::new(&fx.source)).expect("damage, not E7032");
         assert_eq!(whole.lazy().len(), lazy, "{:?}", whole.status());
         assert_eq!(whole.status().keyed, 2 - lazy, "{:?}", whole.status());
