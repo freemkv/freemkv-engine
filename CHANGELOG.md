@@ -4,6 +4,12 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [1.8.1] — Unreleased
+
+### Changed
+
+- Unit tests live in `*_tests.rs` side files; the legacy-key and halt-load guards treat `#[cfg(test)] #[path]` side files as test code, with the same rules. No behaviour change.
+
 ## [1.8.0] — 2026-10-05
 
 ### Added
