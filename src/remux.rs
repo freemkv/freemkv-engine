@@ -747,12 +747,12 @@ fn copy_staged(
             drop((src, dst));
             let _ = tx.send(result);
         })?;
-    let started = Instant::now();
+    let speed = std::cell::RefCell::new(crate::SpeedEstimator::new());
     let report = |done: u64| {
-        let speed = (done as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64;
+        let (speed_bps, eta_secs) = speed.borrow_mut().sample(done, total);
         crate::sink::Progress {
-            speed_bps: speed,
-            eta_secs: (speed > 0).then(|| total.saturating_sub(done) / speed),
+            speed_bps,
+            eta_secs,
             ..activity("copy", done, total)
         }
     };

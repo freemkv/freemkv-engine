@@ -809,3 +809,31 @@ fn a_stop_mid_mux_is_halted_and_an_incomplete_mux_is_e9078() {
     assert_eq!(std::fs::read(&target).unwrap(), b"old");
     assert!(!partial_path(&target).exists());
 }
+
+// The staged copy's speed/ETA come from the one SpeedEstimator: a single sample shows no
+// speed yet, and no tick exceeds its plausibility cap, however fast a local copy runs.
+#[test]
+fn staged_copy_speed_comes_from_the_speed_estimator() {
+    #[derive(Default)]
+    struct Ticks(Mutex<Vec<crate::sink::Progress>>);
+    impl Sink for Ticks {
+        fn progress(&self, p: &crate::sink::Progress) {
+            self.0.lock().unwrap().push(p.clone());
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (source, destination) = (dir.path().join("s.mkv"), dir.path().join("d.partial"));
+    std::fs::write(&source, vec![7u8; 64 << 20]).unwrap();
+    let token = Halt::new();
+    let sink = Ticks::default();
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let timing = RemuxTiming {
+        activity_every: Duration::from_secs(3600),
+        ..RemuxTiming::default()
+    };
+    let _ = copy_staged(&source, &destination, &halt, &sink, &DroppingIo, timing);
+    let ticks = sink.0.lock().unwrap();
+    assert!(!ticks.is_empty(), "the copy reports its progress");
+    assert_eq!(ticks[0].speed_bps, 0, "one sample is no speed yet");
+    assert!(ticks.iter().all(|t| t.speed_bps <= 1024 << 20), "{ticks:?}");
+}
