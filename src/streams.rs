@@ -38,7 +38,7 @@ impl SubtitleFilter {
 
 // One filter applied to BOTH sides: forcedness is ignored, matching what a
 // caller with only a single subtitle list means (`Langs(["de"])` keeps every
-// German subtitle whether or not it is forced).
+// German subtitle whether or not it is forced). Equal sides are missed as one list.
 impl From<StreamFilter> for SubtitleFilter {
     fn from(f: StreamFilter) -> Self {
         SubtitleFilter::split(f.clone(), f)
@@ -65,23 +65,28 @@ impl StreamChoice {
     /// no streams of that class (nothing could match).
     pub fn unmatched(&self, title: &libfreemkv::DiscTitle) -> Vec<UnmatchedClass> {
         let mut out = Vec::new();
-        let _ = check_class(title, &self.audio, StreamClass::Audio, &mut out);
-        // BOTH sides, each against only its own streams: a forced-language miss
-        // used to go unreported, exiting 0 as though honoured. The sides are
-        // chosen independently, so `available` must not mix them together.
-        let _ = check_class(
-            title,
-            &self.subtitles.normal,
-            StreamClass::Subtitle,
-            &mut out,
-        );
-        let _ = check_class(
-            title,
-            &self.subtitles.forced,
-            StreamClass::SubtitleForced,
-            &mut out,
-        );
+        for (class, sel) in self.classes() {
+            let _ = check_class(title, sel, class, &mut out);
+        }
         out
+    }
+
+    // The filtered classes in report order. A split subtitle policy checks BOTH sides, each
+    // against only its own streams (a forced-language miss used to go unreported); one list
+    // (both sides equal) ignores forcedness, so it is one check over every subtitle.
+    fn classes(&self) -> Vec<(StreamClass, &StreamFilter)> {
+        let subs = &self.subtitles;
+        if subs.normal == subs.forced {
+            return vec![
+                (StreamClass::Audio, &self.audio),
+                (StreamClass::SubtitleAny, &subs.normal),
+            ];
+        }
+        vec![
+            (StreamClass::Audio, &self.audio),
+            (StreamClass::Subtitle, &subs.normal),
+            (StreamClass::SubtitleForced, &subs.forced),
+        ]
     }
 
     /// The requested language tags no language resolves from, in request order,
@@ -113,13 +118,9 @@ impl StreamChoice {
         &self,
         titles: impl IntoIterator<Item = &'a libfreemkv::DiscTitle>,
     ) -> Vec<&'static str> {
-        let classes = [
-            (StreamClass::Audio, &self.audio),
-            (StreamClass::Subtitle, &self.subtitles.normal),
-            (StreamClass::SubtitleForced, &self.subtitles.forced),
-        ];
-        let mut missed = [false; 3];
-        let mut matched = [false; 3];
+        let classes = self.classes();
+        let mut missed = vec![false; classes.len()];
+        let mut matched = vec![false; classes.len()];
         let mut scratch = Vec::new();
         for title in titles {
             for (i, (class, sel)) in classes.iter().enumerate() {
@@ -238,6 +239,10 @@ fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<Str
             .filter(|s| s.forced)
             .map(|s| s.language.clone())
             .collect(),
+        StreamClass::SubtitleAny => title
+            .subtitle_streams()
+            .map(|s| s.language.clone())
+            .collect(),
     }
 }
 
@@ -300,6 +305,8 @@ enum StreamClass {
     /// independently ("German subtitles, forced only if English"), so a request
     /// that matches nothing on one side says nothing about the other.
     SubtitleForced,
+    /// Every subtitle, forced or not: one list that ignores forcedness.
+    SubtitleAny,
 }
 
 impl StreamClass {
@@ -307,7 +314,7 @@ impl StreamClass {
     fn key(self) -> &'static str {
         match self {
             StreamClass::Audio => "audio",
-            StreamClass::Subtitle => "subtitle",
+            StreamClass::Subtitle | StreamClass::SubtitleAny => "subtitle",
             StreamClass::SubtitleForced => "subtitle_forced",
         }
     }

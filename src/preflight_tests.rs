@@ -462,7 +462,7 @@ fn a_subtitle_language_no_selected_title_carries_is_refused() {
     );
     let every = Job {
         selection: only_first,
-        ..job(Selection::All, "fra", "fra")
+        ..job(Selection::All, "fra", "deu")
             .with_audio(crate::job::StreamFilter::Langs(vec!["jpn".into()]))
     };
     assert_eq!(

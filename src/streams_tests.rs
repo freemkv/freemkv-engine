@@ -631,3 +631,25 @@ fn an_unknown_language_converts_to_its_code() {
     );
     assert_eq!(io.to_string(), "E9083: Klingonish");
 }
+
+// One subtitle list ignores forcedness for SELECTION, so it must for the miss check too: a
+// German request met by a full German subtitle is not missed because the only forced one is
+// English, and a miss is reported once, over every subtitle the title has.
+#[test]
+fn a_single_subtitle_list_is_checked_once_over_every_subtitle() {
+    let mut t = libfreemkv::DiscTitle::empty();
+    t.streams = vec![sub(0x1200, "deu"), forced_sub(0x1210, "eng")];
+    let one = |lang: &str| StreamChoice {
+        audio: StreamFilter::All,
+        subtitles: StreamFilter::Langs(vec![lang.into()]).into(),
+    };
+    assert_eq!(one("de").unmatched(&t), vec![]);
+    assert!(one("de").unmatched_everywhere([&t]).is_empty());
+    // Met only by the forced English subtitle: still met.
+    assert_eq!(one("en").unmatched(&t), vec![]);
+    let miss = one("fr").unmatched(&t);
+    assert_eq!(miss.len(), 1, "{miss:?}");
+    assert_eq!(miss[0].class, "subtitle");
+    assert_eq!(miss[0].available, vec!["deu", "eng"]);
+    assert_eq!(one("fr").unmatched_everywhere([&t]), vec!["subtitle"]);
+}
