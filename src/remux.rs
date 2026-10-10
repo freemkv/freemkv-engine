@@ -109,7 +109,8 @@ pub fn mux_image_titles_with(
         let selection = plan.selection_for(idx);
         let out_path = libfreemkv::parse_url(&dest).path_str().to_string();
         let before = output_stamp(&out_path);
-        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink);
+        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink)
+            .and_then(|outcome| finished(outcome, idx, &halt));
         if result.is_err() && !dest.ends_with('/') {
             remove_failed_output(&out_path, before);
         }
@@ -119,6 +120,22 @@ pub fn mux_image_titles_with(
             result: result.as_ref(),
         });
         result.map(|_| ())
+    })
+}
+
+// An incomplete mux is never a written title: Halted after a Stop, else E9078 (1-based).
+fn finished(
+    outcome: libfreemkv::MuxOutcome,
+    idx: usize,
+    halt: &EngineHalt<'_>,
+) -> io::Result<libfreemkv::MuxOutcome> {
+    if outcome.completed {
+        return Ok(outcome);
+    }
+    Err(if outcome.halted || halt.is_cancelled() {
+        libfreemkv::Error::Halted.into()
+    } else {
+        libfreemkv::Error::MuxIncomplete { title: idx + 1 }.into()
     })
 }
 
@@ -636,14 +653,7 @@ fn land_verified(
         dest: &dest,
         result: result.as_ref(),
     });
-    let outcome = result?;
-    if !outcome.completed {
-        return Err(if outcome.halted || halt.is_cancelled() {
-            libfreemkv::Error::Halted.into()
-        } else {
-            libfreemkv::Error::MuxIncomplete { title: idx + 1 }.into()
-        });
-    }
+    let outcome = finished(result?, idx, halt)?;
     durable_sync(rio, partial, halt, sink, timing)?;
 
     // Each verify (the local file, then a staged NAS copy) is its own phase and verdict.

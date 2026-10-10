@@ -1365,3 +1365,38 @@ fn a_title_failing_before_output_keeps_the_existing_file() {
     assert!(matches!(res, RipOutcome::Failed { .. }), "{res:?}");
     assert_eq!(std::fs::read(&out).unwrap(), b"earlier rip");
 }
+
+/// A Stop that lands once the last title's mux has begun: the mux returns incomplete
+/// (`completed: false`), which is a halted rip with no file kept, never a written title.
+#[test]
+fn a_stop_during_the_last_title_is_halted_not_written() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct StopOnStart(AtomicBool);
+    impl crate::Sink for StopOnStart {
+        fn event(&self, e: &crate::Event<'_>) {
+            if matches!(e, crate::Event::TitleStart { .. }) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        fn should_cancel(&self) -> bool {
+            self.0.load(Ordering::SeqCst)
+        }
+    }
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    let sink = StopOnStart(AtomicBool::new(false));
+    let out = mux_image_titles(
+        &opened,
+        &MuxPlan::new(vec![0]),
+        &mkv_dest(dir.path()),
+        &sink,
+    );
+    assert_eq!(out, RipOutcome::Halted);
+    assert!(
+        !dir.path().join("t0.mkv").exists(),
+        "no truncated file is kept"
+    );
+}

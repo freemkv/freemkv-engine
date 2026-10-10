@@ -783,3 +783,29 @@ fn a_target_appearing_before_publication_is_its_coded_refusal() {
     assert_eq!(crate::error_code(&e), Some(code), "{e}");
     assert_eq!(std::fs::read(&target).unwrap(), b"raced in");
 }
+
+// A Stop during the remux's own mux (incomplete, halted) is Halted, not a failure; an
+// incomplete mux nobody stopped is E9078 naming the 1-based title. Neither replaces the target.
+#[test]
+fn a_stop_mid_mux_is_halted_and_an_incomplete_mux_is_e9078() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    std::fs::write(&target, b"old").unwrap();
+    let j = job(target.clone(), true);
+    let stopped = |dest: &str| {
+        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half")?;
+        Ok(libfreemkv::MuxOutcome {
+            halted: true,
+            ..outcome(false)
+        })
+    };
+    let e = land(&j, 2, &title(60.0), &Events::default(), stopped).unwrap_err();
+    assert!(libfreemkv::is_halt(&e), "{e}");
+    let incomplete = writes(mkv(60.0, Some(59), 1), false);
+    let e = land(&j, 2, &title(60.0), &Events::default(), incomplete).unwrap_err();
+    let code = libfreemkv::error::E_MUX_INCOMPLETE;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert_eq!(e.to_string(), "E9078: 3");
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
+    assert!(!partial_path(&target).exists());
+}
