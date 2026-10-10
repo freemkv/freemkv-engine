@@ -26,8 +26,8 @@ mod presentation;
 mod selection;
 pub use presentation::PresentationIdentity;
 pub use selection::{
-    SelectionBasis, SelectionModel, SelectionPreferences, SelectionReport, SelectionReviewReason,
-    SelectionTitle,
+    SelectionBasis, SelectionModel, SelectionPreferences, SelectionReport, SelectionReview,
+    SelectionReviewReason, SelectionTitle,
 };
 // The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;

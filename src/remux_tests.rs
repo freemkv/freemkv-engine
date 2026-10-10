@@ -752,3 +752,18 @@ fn plan_selection_defaults_to_every_stream() {
     assert!(plan.selection_for(0).is_all());
     assert_eq!(plan.selection_for(3), only);
 }
+
+// A remux whose main title needs review is refused with the coded reason (E9086), not an
+// uncoded English InvalidInput; an explicit title bypasses the hold.
+#[test]
+fn a_remux_main_title_needing_review_is_its_coded_refusal() {
+    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::launch_titles());
+    let e = pick_title(&disc, None, &StreamFilter::All).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+    let code = libfreemkv::error::E_SELECTION_REVIEW_REQUIRED;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert_eq!(e.to_string(), "E9086: missing-presentation-language");
+    let de = StreamFilter::Langs(vec!["de".into()]);
+    assert_eq!(pick_title(&disc, None, &de).unwrap(), 1);
+    assert_eq!(pick_title(&disc, Some(0), &StreamFilter::All).unwrap(), 0);
+}

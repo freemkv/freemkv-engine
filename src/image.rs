@@ -81,7 +81,8 @@ pub struct OpenImageOptions {
     /// (J14); a raw reader is opened and checked for capacity and disc hash. A `dir://`
     /// folder is always scanned, so a disc given with one is refused (E7013, caller bug).
     pub disc: Option<libfreemkv::Disc>,
-    /// What the rip decrypts; `None` = `Titles([main])`.
+    /// What the rip decrypts; `None` = `Titles([main])`, or the main title's review
+    /// candidates when it needs review (the title is authorized later, not here).
     pub scope: Option<KeyScope>,
     /// An in-memory VID from a drive scan (KU §4.2), checked against the sidecar `vidfp`.
     pub vid: Option<[u8; 16]>,
@@ -256,12 +257,7 @@ fn open_image_inner(
         }
         None => scan_image(src)?,
     };
-    let scope = scope.unwrap_or_else(|| {
-        KeyScope::Titles(crate::resolve_selection(
-            &disc,
-            &crate::Selection::MainMovie,
-        ))
-    });
+    let scope = scope.unwrap_or_else(|| KeyScope::Titles(crate::keys::main_scope(&disc)));
     let vid_in_hand = in_hand_vid_fingerprint(&disc, vid, keys.held());
     if let Some(map) = &sidecar {
         let identity = DiscIdentity {

@@ -461,14 +461,9 @@ fn pick_title(
     audio: &StreamFilter,
 ) -> io::Result<usize> {
     let sel = title.map_or(Selection::MainMovie, |i| Selection::Titles(vec![i]));
-    let report = crate::SelectionModel::from_disc(disc).select(&sel, audio);
-    if let Some(reason) = report.review_reason {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("Title selection needs review: {}", reason.key()),
-        ));
-    }
-    report.indices.first().copied().ok_or_else(|| {
+    let indices = crate::mux::resolve_selection_with_audio(disc, &sel, audio)
+        .map_err(|review| io::Error::from(libfreemkv::Error::from(review)))?;
+    indices.first().copied().ok_or_else(|| {
         libfreemkv::Error::DiscTitleRange {
             index: title.unwrap_or(0),
             count: disc.titles.len(),

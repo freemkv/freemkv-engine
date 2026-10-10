@@ -87,6 +87,34 @@ impl SelectionReport {
     pub fn requires_review(&self) -> bool {
         self.review_reason.is_some()
     }
+
+    /// The executable `indices`, or the review this selection needs (reason and candidates).
+    pub fn into_result(self) -> Result<Vec<usize>, SelectionReview> {
+        match self.review_reason {
+            Some(reason) => Err(SelectionReview {
+                reason,
+                candidates: self.candidates,
+            }),
+            None => Ok(self.indices),
+        }
+    }
+}
+
+/// A selection the evidence does not prove. `candidates` may size a key scope or a damage
+/// measurement; they never authorize a rip. As an error it is E9086
+/// (`SelectionReviewRequired`), carrying [`SelectionReviewReason::key`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionReview {
+    pub reason: SelectionReviewReason,
+    pub candidates: Vec<usize>,
+}
+
+impl From<SelectionReview> for libfreemkv::Error {
+    fn from(review: SelectionReview) -> Self {
+        libfreemkv::Error::SelectionReviewRequired {
+            reason: review.reason.key(),
+        }
+    }
 }
 
 impl SelectionModel {

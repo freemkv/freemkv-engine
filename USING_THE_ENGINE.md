@@ -77,8 +77,10 @@ alternate selection; contradictory or incomplete ordering requires review.
 An authored program partition does **not** establish TV semantics (a movie could
 author chapter titles). Request Episodes only from user intent or TV metadata, not
 merely because a structural roster exists. Explicit choices remain available.
-Explicit title selections bypass this hold. Movie selection remains canonical,
-with requested audio choosing only an exactly equivalent authored presentation.
+Explicit title selections bypass this hold. Movie selection remains canonical
+(title 0 unless authored launch proof chooses), with requested audio choosing only
+an exactly equivalent authored presentation; launch proof without a matching
+presentation language requires review.
 
 ## The one rule: everything goes through the `Sink`
 
@@ -186,7 +188,11 @@ job.raw = true;                     // Multi requires raw (see preflight below)
 ```
 
 `resolve_selection(&disc, &job.selection)` turns the selection into concrete
-0-based title indices.
+0-based title indices, or `Err(SelectionReview { reason, candidates })` when the
+evidence proves no automatic choice. Review is never an empty list (only an
+explicit `Titles([])` is). Converted to an error it is E9086
+(`SelectionReviewRequired`, detail = `reason.key()`); `candidates` may size a key
+scope or a damage measurement, but never authorize a rip.
 
 ### 2. `preflight(&Disc, &Job) -> Preflight` — keep Start honest
 
@@ -249,8 +255,9 @@ let mp: MultipassResult = multipass_rip(
     &sink,
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
-// mp.main_lost_ms (playback lost in the titles job.selection picks, title 0
-//                  for the default MainMovie, summed per title, even when
+// mp.main_lost_ms (playback lost in the titles job.selection picks, the main
+//                  title for the default MainMovie (its review candidates when
+//                  it needs review), summed per title, even when
 //                  is_iso_output widens the abort gate to the whole disc; a title
 //                  missing its size/duration is timed at an estimated rate;
 //                  NaN = cannot be timed, the loss is then mp.lost_bytes),
@@ -393,7 +400,7 @@ the default scheduler.
 fn rip(src: PathBuf, iso_out: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
     let (disc, mut reader) = scan_image(&ImageSource::from_path(&src))?;
     let sources = key_source_factory(&KeyParams::default());
-    let titles = resolve_selection(&disc, &Selection::MainMovie);
+    let titles = resolve_selection(&disc, &Selection::MainMovie)?; // review: E9086
     let scope = rip_scope(&disc, &titles, RipOutput::Streams);
     let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
     update_keydb_strip(key_status(&disc, &set));

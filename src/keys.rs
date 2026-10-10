@@ -104,17 +104,21 @@ pub enum RipOutput {
 }
 
 /// The [`KeyScope`] a rip of `titles` (indices into `disc.titles`) to `output` resolves
-/// (KU §2.5): `Titles(selected)`, or `Titles([main])` for a plain rip with no selection;
+/// (KU §2.5): `Titles(selected)`, or `Titles([main])` for a plain rip with no selection (the
+/// review candidates when the main title needs review: scoping keys authorizes nothing);
 /// `WholeDisc` for a decrypted image; `None` for a raw copy, which makes no key call.
 pub fn rip_scope(disc: &libfreemkv::Disc, titles: &[usize], output: RipOutput) -> KeyScope {
     match output {
         RipOutput::RawImage => KeyScope::None,
         RipOutput::DecryptedImage => KeyScope::WholeDisc,
-        RipOutput::Streams if titles.is_empty() => {
-            KeyScope::Titles(crate::resolve_selection(disc, &crate::Selection::MainMovie))
-        }
+        RipOutput::Streams if titles.is_empty() => KeyScope::Titles(main_scope(disc)),
         RipOutput::Streams => KeyScope::Titles(titles.to_vec()),
     }
+}
+
+// The titles a key scope covers for the main title: the review candidates when it needs review.
+pub(crate) fn main_scope(disc: &libfreemkv::Disc) -> Vec<usize> {
+    crate::resolve_selection(disc, &crate::Selection::MainMovie).unwrap_or_else(|r| r.candidates)
 }
 
 /// Resolve a rip's keys ONCE, before any output (KU §2.1, §2.3): the one engine call every

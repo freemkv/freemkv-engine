@@ -1,35 +1,6 @@
 use super::*;
+use crate::test_fixtures::{clip_title as title, launch_titles};
 use libfreemkv::disc::NavigationSource;
-
-fn launch_titles() -> Vec<DiscTitle> {
-    use libfreemkv::disc::{DvdLaunchEvidence, DvdLaunchRoute, DvdLaunchStep};
-    let mut titles = vec![title(2, "en", 101.0, "eng"), title(1, "de", 100.0, "deu")];
-    for title in &mut titles {
-        let audio_language = title.audio_streams().next().unwrap().language.clone();
-        title.selection_evidence.dvd_launch = DvdLaunchEvidence::VerifiedRoot {
-            vts: 1,
-            pgcn: 1,
-            title_count: 2,
-            routes: vec![DvdLaunchRoute {
-                button: title.playlist_id as u8,
-                display_masks: vec![1, 4],
-                target_vts: 1,
-                target_title: title.playlist_id as u8,
-                target_part: 1,
-                audio_stream: title.playlist_id as u8 - 1,
-                audio_pid: 0x1100,
-                audio_language,
-                traces: vec![vec![DvdLaunchStep {
-                    vts: 1,
-                    menu_vob: true,
-                    byte_offset: 197,
-                    command: [0x30, 5, 0, 1, 0, title.playlist_id as u8, 0, 0],
-                }]],
-            }],
-        };
-    }
-    titles
-}
 
 #[test]
 fn authored_launch_presentation_is_independent_of_audio_retention_and_explicit_titles() {
@@ -135,34 +106,6 @@ fn authored_launch_inconsistent_proof_never_falls_back_to_canonical_movie() {
         assert!(report.requires_review(), "mutation {mutation}");
         assert!(report.indices.is_empty());
     }
-}
-
-fn title(id: u16, program: &str, secs: f64, language: &str) -> DiscTitle {
-    let mut title = DiscTitle::empty();
-    title.playlist_id = id;
-    title.playlist = format!("{id:05}.mpls");
-    title.duration_secs = secs;
-    title.clips = vec![libfreemkv::Clip {
-        clip_id: program.into(),
-        in_time: 90,
-        out_time: 900_090,
-        duration_secs: secs,
-        source_packets: 0,
-        feed_span: None,
-    }];
-    title
-        .streams
-        .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
-            pid: 0x1100,
-            codec: libfreemkv::Codec::TrueHd,
-            channels: libfreemkv::AudioChannels::Stereo,
-            language: language.into(),
-            sample_rate: libfreemkv::SampleRate::S48,
-            secondary: false,
-            purpose: libfreemkv::LabelPurpose::Normal,
-            label: String::new(),
-        }));
-    title
 }
 
 // Synthetic evidence contract fixture, not a claim about a real menu schema.

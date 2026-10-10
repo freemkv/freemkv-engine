@@ -13,8 +13,15 @@ fn unknown_episode_roster_blocks_every_automatic_route_but_not_explicit_choices(
     assert!(report.requires_review());
     assert_eq!(report.candidates, vec![0, 1]);
     assert!(crate::episode_titles(&disc.titles).is_empty());
-    assert!(crate::resolve_selection(&disc, &job.selection).is_empty());
-    assert!(crate::resolve_job_selection(&disc, &job).is_empty());
+    let review = crate::SelectionReview {
+        reason: crate::SelectionReviewReason::MissingEpisodeRoster,
+        candidates: vec![0, 1],
+    };
+    assert_eq!(
+        crate::resolve_selection(&disc, &job.selection),
+        Err(review.clone())
+    );
+    assert_eq!(crate::resolve_job_selection(&disc, &job), Err(review));
     assert_eq!(
         preflight(&disc, &job).reasons(),
         &[Reason::with_detail(
@@ -23,7 +30,10 @@ fn unknown_episode_roster_blocks_every_automatic_route_but_not_explicit_choices(
         )]
     );
     job.selection = Selection::Titles(vec![1, 0]);
-    assert_eq!(crate::resolve_job_selection(&disc, &job), vec![1, 0]);
+    assert_eq!(
+        crate::resolve_job_selection(&disc, &job).unwrap(),
+        vec![1, 0]
+    );
     assert_eq!(preflight(&disc, &job), Preflight::Ready);
 }
 
@@ -249,7 +259,7 @@ fn ready_implies_the_selection_resolves_to_at_least_one_title() {
     // The property, stated against the owner of the policy: preflight may
     // not report Ready for a selection that resolves to nothing.
     let pf = preflight(&d, &j);
-    let resolved = crate::mux::resolve_selection(&d, &j.selection);
+    let resolved = crate::mux::resolve_selection(&d, &j.selection).unwrap();
     assert!(
         resolved.is_empty(),
         "fixture invalid: Longest must resolve to nothing when no duration \

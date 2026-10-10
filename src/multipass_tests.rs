@@ -2610,6 +2610,25 @@ fn measured_titles_follow_the_selection_and_never_come_back_empty() {
     );
 }
 
+// A whole-disc image's MainMovie that needs review still measures its damage, over the
+// review candidates: measuring never authorizes or refuses anything.
+#[test]
+fn measured_titles_of_a_selection_needing_review_are_its_candidates() {
+    let empty = libfreemkv::DiscTitle::empty();
+    let mut titles = crate::test_fixtures::launch_titles();
+    for (i, t) in titles.iter_mut().enumerate() {
+        t.extents = vec![libfreemkv::disc::Extent {
+            start_lba: 100 * i as u32,
+            sector_count: 10,
+        }];
+    }
+    let disc = crate::test_fixtures::disc_of(titles);
+    let job = raw_job(std::path::Path::new("x.iso")).with_selection(crate::Selection::MainMovie);
+    let got = measured_titles(&disc, &job, &empty);
+    let starts: Vec<u32> = got.iter().map(|t| t.extents[0].start_lba).collect();
+    assert_eq!(starts, vec![0, 100]);
+}
+
 // Decryption is orthogonal to the read policy (EO6): a decrypting multipass rip reads
 // and writes its image like a raw one.
 #[test]

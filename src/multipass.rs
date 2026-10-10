@@ -546,14 +546,16 @@ pub(crate) fn end_of_recovery_lost_ms(
     (main_title_lost_ms(title, main_bad_bytes), None)
 }
 
-// The titles this rip delivers (`Job::selection`), whose damage the loop measures. Never empty:
-// with none, the extent-less `empty` title makes any damage unmeasurable, not clean.
+// The titles this rip delivers (`Job::selection`; a selection needing review: its candidates),
+// whose damage the loop measures. Never empty: with none, the extent-less `empty` title makes
+// any damage unmeasurable, not clean.
 fn measured_titles<'a>(
     disc: &'a libfreemkv::Disc,
     job: &Job,
     empty: &'a libfreemkv::DiscTitle,
 ) -> Vec<&'a libfreemkv::DiscTitle> {
     let picked: Vec<_> = crate::mux::resolve_job_selection(disc, job)
+        .unwrap_or_else(|review| review.candidates)
         .into_iter()
         .filter_map(|i| disc.titles.get(i))
         .collect();

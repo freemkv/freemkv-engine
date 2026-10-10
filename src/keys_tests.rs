@@ -378,3 +378,14 @@ fn key_status_reads_the_set() {
         DecryptStatus::NotEncrypted
     ));
 }
+
+// A plain rip whose main title needs review scopes its keys to the review candidates, not
+// to no title: the scope is sized here, the rip is authorized (or refused) elsewhere.
+#[test]
+fn a_plain_rip_needing_review_scopes_keys_to_the_candidates() {
+    let d = crate::test_fixtures::disc_of(crate::test_fixtures::launch_titles());
+    assert_eq!(
+        rip_scope(&d, &[], RipOutput::Streams),
+        KeyScope::Titles(vec![0, 1])
+    );
+}

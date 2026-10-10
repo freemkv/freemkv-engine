@@ -671,3 +671,92 @@ pub(crate) fn authored_episodes(titles: &mut [libfreemkv::DiscTitle], members: &
         };
     }
 }
+
+/// One clip-identified title with one audio stream (PID 0x1100) in `language`.
+pub(crate) fn clip_title(
+    id: u16,
+    program: &str,
+    secs: f64,
+    language: &str,
+) -> libfreemkv::DiscTitle {
+    let mut title = libfreemkv::DiscTitle::empty();
+    title.playlist_id = id;
+    title.playlist = format!("{id:05}.mpls");
+    title.duration_secs = secs;
+    title.clips = vec![libfreemkv::Clip {
+        clip_id: program.into(),
+        in_time: 90,
+        out_time: 900_090,
+        duration_secs: secs,
+        source_packets: 0,
+        feed_span: None,
+    }];
+    title
+        .streams
+        .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
+            pid: 0x1100,
+            codec: libfreemkv::Codec::TrueHd,
+            channels: libfreemkv::AudioChannels::Stereo,
+            language: language.into(),
+            sample_rate: libfreemkv::SampleRate::S48,
+            secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+    title
+}
+
+/// Two DVD titles with complete authored launch proof: MainMovie needs a presentation
+/// language (`MissingPresentationLanguage`, candidates [0, 1] with audio All).
+pub(crate) fn launch_titles() -> Vec<libfreemkv::DiscTitle> {
+    use libfreemkv::disc::{DvdLaunchEvidence, DvdLaunchRoute, DvdLaunchStep};
+    let mut titles = vec![
+        clip_title(2, "en", 101.0, "eng"),
+        clip_title(1, "de", 100.0, "deu"),
+    ];
+    for title in &mut titles {
+        let audio_language = title.audio_streams().next().unwrap().language.clone();
+        title.selection_evidence.dvd_launch = DvdLaunchEvidence::VerifiedRoot {
+            vts: 1,
+            pgcn: 1,
+            title_count: 2,
+            routes: vec![DvdLaunchRoute {
+                button: title.playlist_id as u8,
+                display_masks: vec![1, 4],
+                target_vts: 1,
+                target_title: title.playlist_id as u8,
+                target_part: 1,
+                audio_stream: title.playlist_id as u8 - 1,
+                audio_pid: 0x1100,
+                audio_language,
+                traces: vec![vec![DvdLaunchStep {
+                    vts: 1,
+                    menu_vob: true,
+                    byte_offset: 197,
+                    command: [0x30, 5, 0, 1, 0, title.playlist_id as u8, 0, 0],
+                }]],
+            }],
+        };
+    }
+    titles
+}
+
+/// A clear disc of `titles`.
+pub(crate) fn disc_of(titles: Vec<libfreemkv::DiscTitle>) -> Disc {
+    Disc {
+        volume_id: "T".into(),
+        meta_title: None,
+        format: libfreemkv::DiscFormat::Dvd,
+        capacity_sectors: 1,
+        capacity_bytes: 2048,
+        layers: 1,
+        titles,
+        region: libfreemkv::disc::DiscRegion::Free,
+        aacs: None,
+        css: None,
+        encrypted: false,
+        aacs_error: None,
+        css_error: None,
+        content_format: libfreemkv::ContentFormat::DvdPs,
+    }
+}

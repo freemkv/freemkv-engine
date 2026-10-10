@@ -761,15 +761,15 @@ fn url_source(
     Ok((keys?, title))
 }
 
-// The one title a title run muxes: `Titles([i])` is title `i`; `MainMovie` the disc's main
-// title (index 0 for a source with no scanned disc). Anything else names several titles,
-// which a title run does not mux.
+// The one title a title run muxes: `Titles([i])` is title `i`; another selection is resolved
+// against the scanned disc (review is E9086); `MainMovie` with no scanned disc is title 0.
+// Anything naming several titles is not a title run.
 fn title_index(plan: &Plan, disc: Option<&libfreemkv::Disc>) -> crate::Result<usize> {
     match (&plan.titles, disc) {
         (crate::Selection::Titles(t), _) if t.len() == 1 => Ok(t[0]),
         (crate::Selection::MainMovie, None) => Ok(0),
         (sel, Some(disc)) if !matches!(sel, crate::Selection::Titles(_)) => {
-            match crate::mux::resolve_selection_with_audio(disc, sel, &plan.streams.audio)
+            match crate::mux::resolve_selection_with_audio(disc, sel, &plan.streams.audio)?
                 .as_slice()
             {
                 [one] => Ok(*one),
