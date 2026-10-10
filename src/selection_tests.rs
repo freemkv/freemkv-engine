@@ -74,38 +74,183 @@ fn authored_launch_missing_unmatched_and_ambiguous_preferences_hold() {
     }
 }
 
+// Every launch-proof guard, one mutation each, with the reason it must hold for: removing
+// any guard (or swapping Invalid for Incomplete) lets a malformed proof select a title.
 #[test]
 fn authored_launch_inconsistent_proof_never_falls_back_to_canonical_movie() {
-    use libfreemkv::disc::DvdLaunchEvidence;
-    for mutation in 0..9 {
-        let mut titles = launch_titles();
+    use SelectionReviewReason::{
+        IncompleteLaunchProof as Incomplete, InvalidLaunchProof as Invalid,
+    };
+    use libfreemkv::disc::{DvdLaunchEvidence, DvdLaunchRoute};
+    fn root(t: &mut DiscTitle) -> (&mut u8, &mut u16, &mut usize, &mut DvdLaunchRoute) {
         let DvdLaunchEvidence::VerifiedRoot {
-            routes,
-            title_count,
+            vts,
             pgcn,
-            ..
-        } = &mut titles[0].selection_evidence.dvd_launch
+            title_count,
+            routes,
+        } = &mut t.selection_evidence.dvd_launch
         else {
             unreachable!()
         };
-        match mutation {
-            0 => *title_count = 3,
-            1 => *pgcn = 2,
-            2 => routes[0].traces.clear(),
-            3 => routes[0].audio_pid = 0x999,
-            4 => routes[0].audio_language = "de".into(),
-            5 => routes[0].button = 1,
-            6 => routes[0].target_part = 2,
-            8 => routes[0].target_title = 1,
-            _ => titles[0].selection_evidence.dvd_launch = DvdLaunchEvidence::Unknown,
-        }
+        (vts, pgcn, title_count, &mut routes[0])
+    }
+    type Mutation = fn(&mut Vec<DiscTitle>);
+    let cases: [(&str, Mutation, SelectionReviewReason); 24] = [
+        ("title_count", |t| *root(&mut t[0]).2 = 3, Invalid),
+        (
+            "vts 0",
+            |t| {
+                for title in t.iter_mut() {
+                    let (vts, _, _, route) = root(title);
+                    (*vts, route.target_vts) = (0, 0);
+                }
+            },
+            Invalid,
+        ),
+        (
+            "pgcn 0",
+            |t| t.iter_mut().for_each(|title| *root(title).1 = 0),
+            Invalid,
+        ),
+        ("root differs", |t| *root(&mut t[0]).1 = 2, Invalid),
+        ("duplicate playlist", |t| t[1].playlist_id = 2, Invalid),
+        (
+            "duplicate destination",
+            |t| root(&mut t[0]).3.target_title = 1,
+            Invalid,
+        ),
+        (
+            "und language",
+            |t| {
+                root(&mut t[0]).3.audio_language = "und".into();
+                if let Some(libfreemkv::Stream::Audio(a)) = t[0].streams.first_mut() {
+                    a.language = "und".into();
+                }
+            },
+            Invalid,
+        ),
+        (
+            "unknown language",
+            |t| root(&mut t[0]).3.audio_language = "xx-nope".into(),
+            Invalid,
+        ),
+        ("target vts", |t| root(&mut t[0]).3.target_vts = 2, Invalid),
+        (
+            "target title 0",
+            |t| root(&mut t[0]).3.target_title = 0,
+            Invalid,
+        ),
+        (
+            "target part",
+            |t| root(&mut t[0]).3.target_part = 2,
+            Invalid,
+        ),
+        (
+            "audio stream > 7",
+            |t| root(&mut t[0]).3.audio_stream = 8,
+            Invalid,
+        ),
+        ("button 0", |t| root(&mut t[0]).3.button = 0, Invalid),
+        ("button > 36", |t| root(&mut t[0]).3.button = 37, Invalid),
+        (
+            "duplicate button",
+            |t| root(&mut t[0]).3.button = 1,
+            Invalid,
+        ),
+        (
+            "no display mask",
+            |t| root(&mut t[0]).3.display_masks.clear(),
+            Invalid,
+        ),
+        ("no trace", |t| root(&mut t[0]).3.traces.clear(), Invalid),
+        (
+            "empty trace",
+            |t| root(&mut t[0]).3.traces = vec![vec![]],
+            Invalid,
+        ),
+        (
+            "pid absent",
+            |t| root(&mut t[0]).3.audio_pid = 0x999,
+            Invalid,
+        ),
+        (
+            "two streams on the pid",
+            |t| {
+                let again = t[0].streams[0].clone();
+                t[0].streams.push(again);
+            },
+            Invalid,
+        ),
+        (
+            "pid language differs",
+            |t| root(&mut t[0]).3.audio_language = "de".into(),
+            Invalid,
+        ),
+        (
+            "buttons not contiguous",
+            |t| root(&mut t[0]).3.button = 3,
+            Incomplete,
+        ),
+        (
+            "a title without proof",
+            |t| t[0].selection_evidence.dvd_launch = DvdLaunchEvidence::Unknown,
+            Incomplete,
+        ),
+        (
+            "a title under review",
+            |t| {
+                t[0].selection_evidence.dvd_launch = DvdLaunchEvidence::Review(
+                    libfreemkv::disc::DvdLaunchReviewReason::AmbiguousNavigation,
+                )
+            },
+            Incomplete,
+        ),
+    ];
+    for (name, mutate, reason) in cases {
+        let mut titles = launch_titles();
+        mutate(&mut titles);
         let report = SelectionModel::from_titles(&titles).select(
             &Selection::MainMovie,
             &StreamFilter::Langs(vec!["de".into()]),
         );
-        assert!(report.requires_review(), "mutation {mutation}");
-        assert!(report.indices.is_empty());
+        assert_eq!(report.review_reason, Some(reason), "{name}");
+        assert!(report.indices.is_empty(), "{name}");
+        assert_eq!(report.candidates, vec![0, 1], "{name}");
     }
+}
+
+// Launch evidence that is only `Review(_)` (no verified root) holds a language request for
+// review instead of falling through to the canonical-first title; with no language
+// requested there is no launch decision to make, and MainMovie stays canonical.
+#[test]
+fn launch_review_without_a_verified_root_holds_a_language_request() {
+    use libfreemkv::disc::{DvdLaunchEvidence, DvdLaunchReviewReason};
+    let mut titles = launch_titles();
+    for title in &mut titles {
+        title.selection_evidence.dvd_launch =
+            DvdLaunchEvidence::Review(DvdLaunchReviewReason::UnsupportedNavigation);
+    }
+    let model = SelectionModel::from_titles(&titles);
+    let report = model.select(
+        &Selection::MainMovie,
+        &StreamFilter::Langs(vec!["de".into()]),
+    );
+    assert_eq!(
+        report.review_reason,
+        Some(SelectionReviewReason::IncompleteLaunchProof)
+    );
+    assert_eq!(report.candidates, vec![0, 1]);
+    let prefs = SelectionPreferences {
+        presentation_language: Some("de".into()),
+    };
+    assert!(
+        model
+            .select_with_preferences(&Selection::MainMovie, &StreamFilter::All, &prefs)
+            .requires_review()
+    );
+    let canonical = model.select(&Selection::MainMovie, &StreamFilter::All);
+    assert_eq!(canonical.review_reason, None);
+    assert_eq!(canonical.indices, vec![0]);
 }
 
 // Synthetic evidence contract fixture, not a claim about a real menu schema.
