@@ -124,25 +124,26 @@ fn dedups_duplicate_angle_titles() {
     assert_eq!(known_episode_titles(&titles), vec![0, 2]);
 }
 
-// A shared opening does not establish the identity of the whole episode.
+// A shared opening does not establish the identity of the whole episode. DVD titles, so
+// each has a cell identity: equal first cell, different later cells (or lengths).
 #[test]
 fn episodes_sharing_an_opening_clip_are_all_kept() {
     let ep = 24.0 * 60.0;
-    let episode = |body: u32, dur: f64| {
-        let mut t = title(dur, 500);
-        t.extents.push(Extent {
-            start_lba: body,
-            sector_count: 1000,
-        });
-        t
-    };
     let titles = vec![
-        episode(1000, ep),
-        episode(2000, ep),
-        episode(3000, ep + 30.0),
+        spans(ep, &[(500, 1000), (1000, 1000)]),
+        spans(ep, &[(500, 1000), (2000, 1000)]),
+        spans(ep + 30.0, &[(500, 1000), (3000, 1000)]),
     ];
+    let ids: Vec<_> = titles.iter().map(crate::presentation::identity).collect();
+    assert!(
+        ids.iter().all(Option::is_some),
+        "fixture: DVD cell identities"
+    );
     assert_eq!(known_episode_titles(&titles), vec![0, 1, 2]);
-    let same_start = vec![title(ep, 1000), title(ep + 60.0, 1000)];
+    let same_start = vec![
+        spans(ep, &[(1000, 1000)]),
+        spans(ep + 60.0, &[(1000, 1060)]),
+    ];
     assert_eq!(known_episode_titles(&same_start), vec![0, 1]);
 }
 
