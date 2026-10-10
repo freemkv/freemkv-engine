@@ -188,3 +188,31 @@ fn selection_resolvers_return_the_review() {
         freemkv_engine::resolve_selection_with_audio;
     let _: fn(SelectionReview) -> libfreemkv::Error = libfreemkv::Error::from;
 }
+
+/// The integration guide and the security policy name the current release line, so a front
+/// end copying the dependency block builds the APIs the guide documents.
+#[test]
+fn docs_pin_the_current_release_line() {
+    let version = env!("CARGO_PKG_VERSION");
+    let line = version.rsplit_once('.').unwrap().0;
+    let guide = include_str!("../USING_THE_ENGINE.md");
+    for dep in ["freemkv-engine", "libfreemkv"] {
+        assert!(
+            guide.contains(&format!("{dep} = \"{line}\"")),
+            "{dep} {line}"
+        );
+    }
+    for (at, _) in guide.match_indices("tag = \"v") {
+        let tag = &guide[at + 8..].split('"').next().unwrap();
+        assert_eq!(*tag, version, "a patch tag in the guide");
+    }
+    for stale in ["= \"1.7\"", "v1.7.7"] {
+        assert!(!guide.contains(stale), "{stale}");
+    }
+    let policy = include_str!("../SECURITY.md");
+    assert!(
+        policy.contains(&format!("| {line}.x   | Yes       |")),
+        "{line}.x"
+    );
+    assert!(policy.contains(&format!("Only the current {line}.x line")));
+}

@@ -56,7 +56,8 @@ pub struct Progress {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum Event<'a> {
-    /// A stage of the operation began: `"open"`, `"mux"`, `"verify"`, `"replace"`.
+    /// A stage of the operation began: `"open"`, `"mux"`, `"sync"`, `"verify"`, `"copy"`,
+    /// `"replace"`, `"extract"`.
     Phase { name: &'static str },
     /// Title `idx` (0-based) starts muxing into `dest` (a sink URL).
     TitleStart { idx: usize, dest: &'a str },

@@ -37,3 +37,27 @@ fn engine_sink_is_object_safe() {
     let dynref: &dyn Sink = &s;
     assert!(!dynref.should_cancel());
 }
+
+// Every phase name the engine emits is listed on `Event::Phase`, derived from the source so
+// a new phase cannot go undocumented (a front end maps only the documented names).
+#[test]
+fn every_emitted_phase_is_documented() {
+    let doc = include_str!("sink.rs")
+        .split_once("A stage of the operation began")
+        .and_then(|(_, rest)| rest.split_once("Phase {"))
+        .expect("the Phase doc")
+        .0;
+    let mut emitted = Vec::new();
+    for src in [include_str!("plan.rs"), include_str!("remux.rs")] {
+        for piece in src.split("Event::Phase { name: \"").skip(1) {
+            emitted.push(piece.split('"').next().unwrap());
+        }
+    }
+    assert!(emitted.len() >= 8, "parsed {emitted:?}");
+    for name in emitted {
+        assert!(
+            doc.contains(&format!("`\"{name}\"`")),
+            "{name} missing: {doc}"
+        );
+    }
+}
