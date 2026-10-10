@@ -51,6 +51,8 @@ pub struct Reason {
     ///                          carries (detail = audio|subtitle|subtitle_forced)
     /// "unknown-language"       a requested tag names no language (detail = tag)
     /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
+    /// "selection-review-required" authored episode roster unavailable/invalid
+    ///                          (detail = SelectionReviewReason::key())
     /// ```
     pub key: String,
     /// Optional machine detail for the message (e.g. the offending index).
@@ -108,7 +110,14 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     // Does the selection resolve to a title? Ask the ONE function that decides
     // it (pure) rather than restate the policy here: `Longest` can resolve to
     // NOTHING (all-NaN durations), which a prior duplicated assumption missed.
-    let resolved = crate::mux::resolve_job_selection(disc, job);
+    let report = crate::SelectionModel::from_disc(disc).select(&job.selection, &job.streams.audio);
+    if let Some(reason) = report.review_reason {
+        reasons.push(Reason::with_detail(
+            "selection-review-required",
+            reason.key(),
+        ));
+    }
+    let resolved = report.indices;
     if reasons.is_empty() && resolved.is_empty() {
         reasons.push(Reason::new("empty-selection"));
     }

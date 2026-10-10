@@ -440,23 +440,13 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     Ok(())
 }
 
-// Move `landing` onto the target. Without `replace`, a hard link lands it only if the target
-// is still absent (a plain rename would overwrite one that appeared after the re-check); a
-// filesystem with no hard links falls back to the rename.
+// Publish atomically without overwriting unless replacement was requested.
+// Unsupported no-replace operations fail closed.
 fn land(landing: &Path, job: &RemuxJob) -> io::Result<()> {
     if job.replace {
         return std::fs::rename(landing, &job.target);
     }
-    match std::fs::hard_link(landing, &job.target) {
-        Ok(()) => {
-            if let Err(e) = std::fs::remove_file(landing) {
-                tracing::warn!(target: "freemkv::engine", "could not remove {}: {e}", landing.display());
-            }
-            Ok(())
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(target_exists(&job.target)),
-        Err(_) => std::fs::rename(landing, &job.target),
-    }
+    libfreemkv::io::publish::no_replace(landing, &job.target)
 }
 
 fn target_exists(target: &Path) -> io::Error {
@@ -471,16 +461,20 @@ fn pick_title(
     audio: &StreamFilter,
 ) -> io::Result<usize> {
     let sel = title.map_or(Selection::MainMovie, |i| Selection::Titles(vec![i]));
-    crate::mux::resolve_selection_with_audio(disc, &sel, audio)
-        .first()
-        .copied()
-        .ok_or_else(|| {
-            libfreemkv::Error::DiscTitleRange {
-                index: title.unwrap_or(0),
-                count: disc.titles.len(),
-            }
-            .into()
-        })
+    let report = crate::SelectionModel::from_disc(disc).select(&sel, audio);
+    if let Some(reason) = report.review_reason {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Title selection needs review: {}", reason.key()),
+        ));
+    }
+    report.indices.first().copied().ok_or_else(|| {
+        libfreemkv::Error::DiscTitleRange {
+            index: title.unwrap_or(0),
+            count: disc.titles.len(),
+        }
+        .into()
+    })
 }
 
 fn partial_path(target: &Path) -> PathBuf {

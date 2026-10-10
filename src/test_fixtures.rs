@@ -576,6 +576,7 @@ fn manual_disc(img: &EncryptedBdImage, uk_ro: &[u8], titles: &[&[usize]]) -> Dis
                 })
                 .collect();
             libfreemkv::DiscTitle {
+                selection_evidence: Default::default(),
                 playlist: format!("{t:05}.mpls"),
                 size_bytes: extents.iter().map(|e| e.sector_count as u64 * 2048).sum(),
                 extents,
@@ -637,4 +638,36 @@ fn keydb_then_unreadable_answers_its_first_request() {
     let calls = Calls::default();
     let set = resolve(&fx, scope, specs, &calls);
     assert!(set.is_ok(), "{:?} after {:?}", set.err(), calls.all());
+}
+// Synthetic complete roster for selection-policy tests, not a real schema parser.
+pub(crate) fn authored_episodes(titles: &mut [libfreemkv::DiscTitle], members: &[usize]) {
+    let title_count = titles.len();
+    let mut identities = std::collections::HashMap::new();
+    let mut orders = std::collections::HashMap::new();
+    let mut next = 0;
+    for &index in members {
+        let identity = crate::presentation::identity(&titles[index]);
+        let ordinal = identity
+            .as_ref()
+            .and_then(|id| identities.get(id))
+            .copied()
+            .unwrap_or_else(|| {
+                let ordinal = next;
+                next += 1;
+                if let Some(id) = identity {
+                    identities.insert(id, ordinal);
+                }
+                ordinal
+            });
+        orders.insert(index, ordinal);
+    }
+    for (index, title) in titles.iter_mut().enumerate() {
+        title.playlist_id = index as u16;
+        title.selection_evidence.episodes = libfreemkv::disc::EpisodeEvidence::Authored {
+            roster: "fixture:complete-menu".into(),
+            title_count,
+            member: members.contains(&index),
+            ordinal: orders.get(&index).copied(),
+        };
+    }
 }

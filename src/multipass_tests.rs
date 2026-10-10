@@ -348,6 +348,7 @@ fn end_of_recovery_lost_ms_scopes_divisor_to_the_passed_title() {
 /// matters for `bytes_bad_in_title` / the scope-aware gates.
 fn test_title(start_lba: u32, sector_count: u32) -> libfreemkv::DiscTitle {
     libfreemkv::DiscTitle {
+        selection_evidence: Default::default(),
         playlist: "00800.mpls".to_string(),
         playlist_id: 800,
         duration_secs: 7200.0,

@@ -23,6 +23,12 @@ mod outcome;
 mod plan;
 mod preflight;
 mod presentation;
+mod selection;
+pub use presentation::PresentationIdentity;
+pub use selection::{
+    SelectionBasis, SelectionModel, SelectionPreferences, SelectionReport, SelectionReviewReason,
+    SelectionTitle,
+};
 // The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 

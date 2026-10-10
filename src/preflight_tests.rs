@@ -1,6 +1,32 @@
 use super::*;
 use crate::job::RipMode;
 
+#[test]
+fn unknown_episode_roster_blocks_every_automatic_route_but_not_explicit_choices() {
+    let mut disc = disc_with(2, false, false);
+    for title in &mut disc.titles {
+        title.duration_secs = 2400.0;
+    }
+    let mut job = Job::new("iso://fixture", "mkv://fixture");
+    job.selection = Selection::Episodes;
+    let report = crate::SelectionModel::from_disc(&disc).select(&job.selection, &job.streams.audio);
+    assert!(report.requires_review());
+    assert_eq!(report.candidates, vec![0, 1]);
+    assert!(crate::episode_titles(&disc.titles).is_empty());
+    assert!(crate::resolve_selection(&disc, &job.selection).is_empty());
+    assert!(crate::resolve_job_selection(&disc, &job).is_empty());
+    assert_eq!(
+        preflight(&disc, &job).reasons(),
+        &[Reason::with_detail(
+            "selection-review-required",
+            "missing-episode-roster"
+        )]
+    );
+    job.selection = Selection::Titles(vec![1, 0]);
+    assert_eq!(crate::resolve_job_selection(&disc, &job), vec![1, 0]);
+    assert_eq!(preflight(&disc, &job), Preflight::Ready);
+}
+
 // Multipass implies raw, and the engine must be the place that knows it.
 // Decryption is orthogonal to the read policy (EO6): a decrypting multipass job is not
 // blocked for being multipass.

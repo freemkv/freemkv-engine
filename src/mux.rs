@@ -52,49 +52,9 @@ pub(crate) fn log_safe(s: &str) -> String {
 /// the max-duration title (may differ from the canonical feature on odd
 /// authoring).
 pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize> {
-    let n = disc.titles.len();
-    match sel {
-        Selection::MainMovie => {
-            if n == 0 {
-                vec![]
-            } else {
-                vec![0]
-            }
-        }
-        Selection::All => (0..n).collect(),
-        Selection::Episodes => crate::episodes::episode_titles(&disc.titles),
-        // FIRST of the equal maxima, not the last: `Iterator::max_by` keeps the
-        // LAST tied element, but playlist obfuscation authors decoys with the
-        // SAME runtime as the feature, which is conventionally the lowest index.
-        Selection::Longest => disc
-            .titles
-            .iter()
-            .enumerate()
-            // Drop non-finite durations BEFORE folding: rejecting only inside
-            // the comparison isn't enough, since a NaN in the accumulator is
-            // never displaced (`NaN > d` and `t > NaN` are both false).
-            .filter(|(_, t)| t.duration_secs.is_finite())
-            // `<=` is safe only because the filter above already removed every
-            // non-finite duration; without it the two forms would differ.
-            .fold(None::<(usize, f64)>, |best, (i, t)| match best {
-                Some((_, d)) if t.duration_secs <= d => best,
-                _ => Some((i, t.duration_secs)),
-            })
-            .map(|(i, _)| vec![i])
-            .unwrap_or_default(),
-        Selection::Titles(indices) => {
-            // Range-filter AND de-duplicate. A repeated index (a UI adding the
-            // same title twice, or `-t 1 -t 1`) would mux it twice, inflating
-            // `titles_written` past what's on disk and mis-flipping `multi_title`.
-            let mut seen = std::collections::HashSet::new();
-            indices
-                .iter()
-                .copied()
-                .filter(|&i| i < n)
-                .filter(|&i| seen.insert(i))
-                .collect()
-        }
-    }
+    crate::SelectionModel::from_disc(disc)
+        .select(sel, &StreamFilter::All)
+        .indices
 }
 
 /// Resolve a job's selection, ranking equivalent main or episode presentations
@@ -111,34 +71,9 @@ pub fn resolve_selection_with_audio(
     selection: &Selection,
     audio: &StreamFilter,
 ) -> Vec<usize> {
-    if matches!(selection, Selection::Episodes) {
-        return crate::episodes::episode_titles_with_audio(&disc.titles, audio);
-    }
-    let base = resolve_selection(disc, selection);
-    if !matches!(selection, Selection::MainMovie)
-        || !matches!(audio, StreamFilter::Langs(_))
-        || base.len() != 1
-    {
-        return base;
-    }
-    let base_idx = base[0];
-    let Some(identity) = crate::presentation::identity(&disc.titles[base_idx]) else {
-        return base;
-    };
-    let preference = crate::streams::AudioPreference::new(audio);
-    let mut best = base_idx;
-    let mut score = preference.score(&disc.titles[best]);
-    for (i, title) in disc.titles.iter().enumerate() {
-        if crate::presentation::identity(title).as_ref() != Some(&identity) {
-            continue;
-        }
-        let candidate = preference.score(title);
-        if candidate > score {
-            best = i;
-            score = candidate;
-        }
-    }
-    vec![best]
+    crate::SelectionModel::from_disc(disc)
+        .select(selection, audio)
+        .indices
 }
 
 /// The result of muxing one title, from the loop's point of view.

@@ -102,7 +102,7 @@ fn regression_authored_intervals_preserve_distinct_episodes_and_main_content() {
         clipped_audio("eng", 0, 1200),
         clipped_audio("deu", 1200, 2520),
     ];
-    assert_eq!(crate::episode_titles(&d.titles), vec![0, 1]);
+    assert_eq!(known_episode_titles(&d.titles), vec![0, 1]);
     assert_eq!(
         resolve_selection_with_audio(
             &d,
@@ -144,11 +144,7 @@ fn regression_missing_or_invalid_identity_never_equates_presentations() {
         b.streams = audio_title("deu", 1000).streams;
         let mut d = disc(0, false, false);
         d.titles = vec![a, b];
-        assert_eq!(
-            crate::episode_titles(&d.titles),
-            vec![0, 1],
-            "shape {shape}"
-        );
+        assert_eq!(known_episode_titles(&d.titles), vec![0, 1], "shape {shape}");
         assert_eq!(
             resolve_selection_with_audio(
                 &d,
@@ -180,6 +176,7 @@ fn regression_episodes_choose_audio_before_dedup_in_either_disc_order() {
             }
             let mut d = disc(0, false, false);
             d.titles = if reversed { vec![b, a] } else { vec![a, b] };
+            mark_authored(&mut d.titles);
             let mut job = Job::new("disc://", "mkv://out");
             job.selection = Selection::Episodes;
             job.streams.audio = StreamFilter::Langs(vec!["German".into()]);
@@ -211,6 +208,7 @@ fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
     both.streams.extend(clipped_audio("deu", 0, 1200).streams);
     let mut d = disc(0, false, false);
     d.titles = vec![duplicate_tracks, both, a];
+    mark_authored(&mut d.titles);
     let audio = StreamFilter::Langs(vec!["en".into(), "eng".into(), "de".into()]);
     for selection in [Selection::MainMovie, Selection::Episodes] {
         assert_eq!(
@@ -241,7 +239,7 @@ fn regression_dvd_cell_order_and_content_format_are_identity() {
     b.extents.reverse();
     let mut c = a.clone();
     c.content_format = libfreemkv::ContentFormat::MpegPs;
-    assert_eq!(crate::episode_titles(&[a, b, c]), vec![0, 1, 2]);
+    assert_eq!(known_episode_titles(&[a, b, c]), vec![0, 1, 2]);
 }
 
 #[test]
@@ -259,8 +257,9 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
             d.titles.push(t);
         }
     }
+    mark_authored(&mut d.titles);
     let audio = StreamFilter::Langs(vec!["de".into()]);
-    assert_eq!(crate::episode_titles(&d.titles), vec![0, 2, 4]);
+    assert_eq!(known_episode_titles(&d.titles), vec![0, 2, 4]);
     assert_eq!(
         resolve_selection_with_audio(&d, &Selection::Episodes, &audio),
         vec![1, 3, 5]
@@ -270,11 +269,11 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
     let mut shifted = d.titles[1].clone();
     shifted.clips[1].in_time += 1;
     d.titles.extend([reordered, shifted]);
-    // No menu evidence exists here to reject distinct decoys as non-episodes.
-    assert_eq!(
-        resolve_selection_with_audio(&d, &Selection::Episodes, &audio),
-        vec![1, 3, 5, 6, 7]
-    );
+    // Newly added titles are not covered by the original roster: hold for review.
+    let report = crate::SelectionModel::from_disc(&d).select(&Selection::Episodes, &audio);
+    assert!(report.indices.is_empty());
+    assert!(report.requires_review());
+    assert_eq!(report.candidates, vec![1, 3, 5, 6, 7]);
 }
 
 #[test]
@@ -289,7 +288,7 @@ fn regression_identity_ignores_runtime_and_size_when_authored_intervals_match() 
         let mut b = a.clone();
         b.duration_secs = 1320.0;
         b.size_bytes += 10_000;
-        assert_eq!(crate::episode_titles(&[a, b]), vec![0]);
+        assert_eq!(known_episode_titles(&[a, b]), vec![0]);
     }
 }
 
@@ -1142,4 +1141,15 @@ fn duplicate_title_indices_are_deduped_preserving_first_seen_order() {
         resolve_selection(&d, &Selection::Titles(vec![9, 3, 9, 3])),
         vec![3]
     );
+}
+
+fn mark_authored(titles: &mut [libfreemkv::DiscTitle]) {
+    let members = (0..titles.len()).collect::<Vec<_>>();
+    crate::test_fixtures::authored_episodes(titles, &members);
+}
+
+fn known_episode_titles(titles: &[libfreemkv::DiscTitle]) -> Vec<usize> {
+    let mut titles = titles.to_vec();
+    mark_authored(&mut titles);
+    crate::episode_titles(&titles)
 }

@@ -335,14 +335,13 @@ impl AudioPreference {
     }
 
     // Count requested languages, not tracks: duplicate tracks add no coverage.
-    pub(crate) fn score(&self, title: &libfreemkv::DiscTitle) -> usize {
+    pub(crate) fn score_languages(&self, languages: &[String]) -> usize {
         self.0
             .iter()
             .filter(|&&language| {
-                title.streams.iter().any(|stream| {
-                    matches!(stream, libfreemkv::Stream::Audio(audio)
-                        if stream_lang(&audio.language) == Some(language))
-                })
+                languages
+                    .iter()
+                    .any(|tag| stream_lang(tag) == Some(language))
             })
             .count()
     }
@@ -436,7 +435,7 @@ fn stream_lang(tag: &str) -> Option<Language> {
     }
 }
 
-fn normalize_lang(tag: &str) -> Option<Language> {
+pub(crate) fn normalize_lang(tag: &str) -> Option<Language> {
     let t = tag.trim();
     if t.is_empty() {
         return None;

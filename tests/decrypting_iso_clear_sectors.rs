@@ -260,6 +260,7 @@ fn disc(fx: &Fixture) -> Disc {
         capacity_bytes: cap as u64 * SECTOR as u64,
         layers: 1,
         titles: vec![DiscTitle {
+            selection_evidence: Default::default(),
             playlist: "00000.mpls".into(),
             playlist_id: 0,
             duration_secs: 1.0,

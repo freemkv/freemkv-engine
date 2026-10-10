@@ -34,8 +34,8 @@ pub enum Selection {
     Longest,
     /// An explicit set of canonical title indices.
     Titles(Vec<usize>),
-    /// Heuristic episode candidates with equivalent presentations deduplicated.
-    /// Runtime clustering is not menu evidence: it can omit episodes or retain decoys.
+    /// Authored episode roster with equivalent presentations deduplicated.
+    /// Missing or incomplete evidence requires review and explicit title choices.
     Episodes,
 }
 

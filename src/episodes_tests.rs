@@ -13,7 +13,7 @@ fn title(dur_secs: f64, start_lba: u32) -> DiscTitle {
 }
 
 #[test]
-fn picks_the_episode_cluster_and_drops_play_all_and_extras() {
+fn runtime_cluster_and_extras_require_review() {
     // 6 × ~44-min episodes, a ~264-min "play all" (their sum), a 2-min extra.
     let ep = 44.0 * 60.0;
     let mut titles = vec![title(ep * 6.0, 100)];
@@ -21,7 +21,7 @@ fn picks_the_episode_cluster_and_drops_play_all_and_extras() {
         titles.push(title(ep + (k as f64), 1000 + k * 100));
     }
     titles.push(title(2.0 * 60.0, 50));
-    assert_eq!(episode_titles(&titles), vec![1, 2, 3, 4, 5, 6]);
+    assert_unknown(&titles);
 }
 
 fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
@@ -121,7 +121,7 @@ fn dedups_duplicate_angle_titles() {
         spans(ep, &[(1000, 1000)]),
         spans(ep, &[(2000, 1000)]),
     ];
-    assert_eq!(episode_titles(&titles), vec![0, 2]);
+    assert_eq!(known_episode_titles(&titles), vec![0, 2]);
 }
 
 // A shared opening does not establish the identity of the whole episode.
@@ -141,9 +141,9 @@ fn episodes_sharing_an_opening_clip_are_all_kept() {
         episode(2000, ep),
         episode(3000, ep + 30.0),
     ];
-    assert_eq!(episode_titles(&titles), vec![0, 1, 2]);
+    assert_eq!(known_episode_titles(&titles), vec![0, 1, 2]);
     let same_start = vec![title(ep, 1000), title(ep + 60.0, 1000)];
-    assert_eq!(episode_titles(&same_start), vec![0, 1]);
+    assert_eq!(known_episode_titles(&same_start), vec![0, 1]);
 }
 
 #[test]
@@ -164,7 +164,7 @@ fn alternate_playlists_for_one_program_are_selected_once() {
             titles.push(t);
         }
     }
-    assert_eq!(episode_titles(&titles), vec![0, 2, 4]);
+    assert_eq!(known_episode_titles(&titles), vec![0, 2, 4]);
 }
 
 #[test]
@@ -173,14 +173,14 @@ fn dvd_variants_with_the_same_cells_are_selected_once_even_when_duration_differs
     let mut german = spans(46.0 * 60.0, &[(10_000, 80_000), (100_000, 20_000)]);
     english.playlist = "VTS_01_7.VOB".into();
     german.playlist = "VTS_01_4.VOB".into();
-    assert_eq!(episode_titles(&[english, german]), vec![0]);
+    assert_eq!(known_episode_titles(&[english, german]), vec![0]);
 }
 
 #[test]
 fn dvd_titles_with_different_cells_remain_distinct_despite_similar_duration() {
     let a = spans(48.0 * 60.0, &[(10_000, 80_000), (100_000, 20_000)]);
     let b = spans(47.0 * 60.0, &[(200_000, 80_000), (300_000, 20_000)]);
-    assert_eq!(episode_titles(&[a, b]), vec![0, 1]);
+    assert_eq!(known_episode_titles(&[a, b]), vec![0, 1]);
 }
 
 #[test]
@@ -213,13 +213,13 @@ fn distinct_programs_with_shared_intro_are_not_collapsed() {
         program("episode-a", 20_000),
         program("episode-b", 30_000),
     ];
-    assert_eq!(episode_titles(&titles), vec![0, 2]);
+    assert_eq!(known_episode_titles(&titles), vec![0, 2]);
 }
 
 #[test]
-fn single_qualifying_title_passes_through() {
+fn one_long_title_is_not_an_episode_roster() {
     let titles = vec![title(90.0 * 60.0, 1000), title(60.0, 50)];
-    assert_eq!(episode_titles(&titles), vec![0]);
+    assert_unknown(&titles);
 }
 
 // A play-all spanning the given episode titles' extents.
@@ -229,27 +229,26 @@ fn play_all(eps: &[&DiscTitle]) -> DiscTitle {
     t
 }
 
-// Play-alls never displace the episodes, even when as many or more of them exist: they
-// play the episodes' extents, or run for the episodes' summed length.
+// Structural play-all hints cannot establish menu reachability.
 #[test]
-fn play_all_titles_never_displace_the_episode_length() {
+fn play_all_structure_alone_does_not_prove_a_roster() {
     let ep = 44.0 * 60.0;
     let (a, b) = (title(ep, 1000), title(ep * 1.02, 2000));
-    assert_eq!(episode_titles(&[a.clone(), play_all(&[&a, &a])]), vec![0]);
+    assert_unknown(&[a.clone(), play_all(&[&a, &a])]);
     let (p2, p3) = (play_all(&[&a, &a]), play_all(&[&a, &a, &a]));
-    assert_eq!(episode_titles(&[a.clone(), p2.clone(), p3]), vec![0]);
+    assert_unknown(&[a.clone(), p2.clone(), p3]);
     let titles = [
         a.clone(),
         b.clone(),
         play_all(&[&a, &b]),
         play_all(&[&b, &a]),
     ];
-    assert_eq!(episode_titles(&titles), vec![0, 1]);
+    assert_unknown(&titles);
 }
 
-// Equal-size groups of extras and episodes: the episodes win (reviewer cases).
+// Similar runtimes do not distinguish extras from episodes.
 #[test]
-fn as_many_extras_as_episodes_keep_the_episodes() {
+fn equal_groups_of_extras_and_episodes_require_review() {
     let m = 60.0;
     let t = |ds: &[f64]| -> Vec<DiscTitle> {
         ds.iter()
@@ -258,14 +257,14 @@ fn as_many_extras_as_episodes_keep_the_episodes() {
             .collect()
     };
     let three = t(&[44.0, 44.5, 45.0, 15.0, 15.0, 15.0]);
-    assert_eq!(episode_titles(&three), vec![0, 1, 2]);
+    assert_unknown(&three);
     let four = t(&[44.0, 44.0, 44.5, 44.5, 20.0, 20.5, 20.0, 20.5, 177.0]);
-    assert_eq!(episode_titles(&four), vec![0, 1, 2, 3]);
+    assert_unknown(&four);
 }
 
 // Bench case: two episodes and two play-alls of their summed length, no shared extents.
 #[test]
-fn densest_cluster_beats_upper_median() {
+fn density_and_upper_median_do_not_authorize_episodes() {
     let m = 60.0;
     let t = |ds: &[f64]| -> Vec<DiscTitle> {
         ds.iter()
@@ -273,11 +272,8 @@ fn densest_cluster_beats_upper_median() {
             .map(|(k, d)| title(d * m, 1000 + k as u32 * 100))
             .collect()
     };
-    assert_eq!(episode_titles(&t(&[44.0, 44.5, 88.0, 88.5])), vec![0, 1]);
-    assert_eq!(
-        episode_titles(&t(&[44.0, 44.5, 88.0, 88.5, 120.0])),
-        vec![0, 1]
-    );
+    assert_unknown(&t(&[44.0, 44.5, 88.0, 88.5]));
+    assert_unknown(&t(&[44.0, 44.5, 88.0, 88.5, 120.0]));
 }
 
 // A title with no extents has no content identity: equal durations are not duplicates.
@@ -288,11 +284,26 @@ fn titles_without_extents_are_never_deduped() {
     let mut b = title(ep, 0);
     a.extents.clear();
     b.extents.clear();
-    assert_eq!(episode_titles(&[a, b, title(ep, 0)]), vec![0, 1, 2]);
+    assert_eq!(known_episode_titles(&[a, b, title(ep, 0)]), vec![0, 1, 2]);
 }
 
 #[test]
-fn none_qualify_yields_empty() {
+fn short_and_unknown_durations_remain_review_candidates() {
     let titles = vec![title(120.0, 10), title(90.0, 20), title(f64::NAN, 30)];
-    assert!(episode_titles(&titles).is_empty());
+    assert_unknown(&titles);
+}
+
+fn known_episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
+    let mut titles = titles.to_vec();
+    let members = (0..titles.len()).collect::<Vec<_>>();
+    crate::test_fixtures::authored_episodes(&mut titles, &members);
+    super::episode_titles(&titles)
+}
+
+fn assert_unknown(titles: &[DiscTitle]) {
+    let report = crate::SelectionModel::from_titles(titles)
+        .select(&crate::Selection::Episodes, &crate::StreamFilter::All);
+    assert!(super::episode_titles(titles).is_empty());
+    assert!(report.requires_review());
+    assert_eq!(report.candidates, (0..titles.len()).collect::<Vec<_>>());
 }

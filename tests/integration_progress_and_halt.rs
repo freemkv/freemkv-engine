@@ -120,6 +120,7 @@ fn synthetic_disc(capacity_sectors: u32) -> Disc {
 /// streams (DiscStream still iterates sectors and would emit BytesRead).
 fn synthetic_title(sector_count: u32) -> DiscTitle {
     DiscTitle {
+        selection_evidence: Default::default(),
         playlist: String::new(),
         playlist_id: 0,
         duration_secs: 0.0,

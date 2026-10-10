@@ -42,6 +42,44 @@ freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", ta
 
 ---
 
+## Selection
+
+Build an owned `SelectionModel::from_titles(&disc.titles)` at scan time and carry
+it to the UI. Call `model.select(&selection, &audio)` whenever preferences change;
+planners and rippers use the same model, not a separate language/role pool.
+Use `select_with_preferences(&selection, &audio, &SelectionPreferences {
+presentation_language: Some("de".into()) })` to choose a content presentation
+independently of retained audio. `Audio All` retains every audio stream of the
+chosen title; it does not combine different title presentations. An absent explicit
+presentation preference falls back to requested audio languages, never UI locale.
+Freeze the report's executable indices into `Selection::Titles` before execution.
+
+Bounded DVD root-launch evidence is separate from episode rosters and exact identity.
+It verifies register-aware direct full-title choices from one root menu, equivalent
+display groups, and exact interleaved extents. The selected logical audio slot maps
+through PGC audio controls to a physical PID and the VTS language attribute, checked
+against scanned streams. Missing, unmatched, ambiguous or inconsistent launch proof
+requires review; unsupported navigation is not inferred from runtime or title suffixes.
+This is not a complete DVD VM or proof of semantic TV episodes.
+
+`SelectionReport.indices` are executable; `candidates` are review/display only.
+If `requires_review()` is true, ask for explicit title choices before starting.
+Preflight reports `selection-review-required` with the typed reason's key as detail.
+
+Episode selection requires a complete, consistent authored roster. The bounded DVD
+producer supports an unconditional single VMGM menu and exact play-all partition of
+reachable full standalone titles in one VTS. It does not support conditional/menu
+chains, VTS menus, chapter jumps, angles or multi-PGC titles. Reachability alone,
+First-Play and label/JAR hints cannot establish a roster. Unknown episodes therefore
+hold for review and retain conservative candidates, without runtime clustering.
+Authored `ordinal` preserves partition order through scan sorting and audio
+alternate selection; contradictory or incomplete ordering requires review.
+An authored program partition does **not** establish TV semantics (a movie could
+author chapter titles). Request Episodes only from user intent or TV metadata, not
+merely because a structural roster exists. Explicit choices remain available.
+Explicit title selections bypass this hold. Movie selection remains canonical,
+with requested audio choosing only an exactly equivalent authored presentation.
+
 ## The one rule: everything goes through the `Sink`
 
 The engine **never prints and never blocks on the UI thread**. Every diagnostic,
@@ -161,10 +199,11 @@ match preflight(&disc, &job) {
     Preflight::Blocked(reasons) => {
         for r in &reasons {
             // r.key is a STABLE identifier you localize (never English).
-            // The COMPLETE set the engine emits — map all six, or a
+            // The COMPLETE set the engine emits — map all seven, or a
             // blocked Start renders with no explanation:
             //   "no-titles" | "empty-selection" | "title-out-of-range"
             //   | "language-unmatched" | "unknown-language" | "encrypted-no-key"
+            //   | "selection-review-required"
             // "unknown-language": a requested tag names no language;
             // r.detail is the tag as given.
             // "language-unmatched": a language-filtered stream class the job
