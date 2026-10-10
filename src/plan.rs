@@ -639,7 +639,7 @@ fn title(
                 return title_off_drive(plan, device, keys, sources, &topts, &watch);
             }
             _ => {
-                let idx = title_index(plan, None)?;
+                let idx = title_index(plan, image_disc(plan)?.as_ref())?;
                 let need_keys = keys.is_none() && !plan.raw;
                 let need_title = topts.selection.is_none() && !plan.streams.is_all();
                 let (found, scanned) = match need_keys || need_title {
@@ -761,9 +761,29 @@ fn url_source(
     Ok((keys?, title))
 }
 
+// An image or folder source scanned, so a title run resolves a non-explicit selection against
+// its disc, never as title 0 unscanned. `None`: explicit titles, or a single-title source.
+fn image_disc(plan: &Plan) -> crate::Result<Option<libfreemkv::Disc>> {
+    if matches!(plan.titles, crate::Selection::Titles(_)) {
+        return Ok(None);
+    }
+    match libfreemkv::parse_url(&plan.source) {
+        libfreemkv::StreamUrl::Iso { .. } | libfreemkv::StreamUrl::Dir { .. } => {
+            let src = crate::ImageSource::from_url(&plan.source).ok_or_else(|| {
+                libfreemkv::Error::StreamUrlInvalid {
+                    url: plan.source.clone(),
+                }
+            })?;
+            Ok(Some(crate::scan_image(&src)?.0))
+        }
+        _ => Ok(None),
+    }
+}
+
 // The one title a title run muxes: `Titles([i])` is title `i`; another selection is resolved
-// against the scanned disc (review is E9086); `MainMovie` with no scanned disc is title 0.
-// Anything naming several titles is not a title run.
+// against the scanned disc (review is E9086). With no disc (a single-title source, never an
+// image or folder: see `image_disc`) `MainMovie` is its only title, 0. Anything naming several
+// titles is not a title run.
 fn title_index(plan: &Plan, disc: Option<&libfreemkv::Disc>) -> crate::Result<usize> {
     match (&plan.titles, disc) {
         (crate::Selection::Titles(t), _) if t.len() == 1 => Ok(t[0]),

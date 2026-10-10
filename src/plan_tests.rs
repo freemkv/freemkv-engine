@@ -274,3 +274,49 @@ fn a_title_run_needing_review_is_its_coded_refusal() {
         );
     }
 }
+
+// An image or folder title run resolves its selection against the SCANNED disc, never as
+// title 0 before the scan: a selection that needs review is refused (E9086) before output.
+#[test]
+fn an_image_title_run_resolves_its_selection_after_the_scan() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "src.iso");
+    let folder = dir.path().join("tree");
+    fx.write_folder(&folder);
+    let out = dir.path().join("t.mkv");
+    for source in [
+        format!("iso://{}", iso.display()),
+        format!("dir://{}", folder.display()),
+    ] {
+        let p = Plan {
+            titles: Selection::Episodes,
+            ..plan(&source, &format!("mkv://{}", out.display()))
+        };
+        let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+        let err = run_with(&p, with(f), &crate::NoopSink).expect_err("needs review");
+        assert!(
+            matches!(
+                err,
+                libfreemkv::Error::SelectionReviewRequired {
+                    reason: "missing-episode-roster"
+                }
+            ),
+            "{source}: {err:?}"
+        );
+        assert!(!out.exists(), "nothing is written");
+    }
+    // A proved main title still runs from the scan.
+    let p = Plan {
+        titles: Selection::MainMovie,
+        ..plan(
+            &format!("iso://{}", iso.display()),
+            &format!("mkv://{}", out.display()),
+        )
+    };
+    let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+    let Report::Title { outcome } = run_with(&p, with(f), &crate::NoopSink).expect("muxes") else {
+        panic!("a title report")
+    };
+    assert!(outcome.completed, "{outcome:?}");
+}
