@@ -329,18 +329,21 @@ fn main_title_lost_ms_scales_by_own_size_and_runtime() {
 }
 
 // `end_of_recovery_lost_ms` must scope BOTH the bad-byte count AND its ms divisor to the
-// passed `title`, never to `disc.titles.first()`.
+// passed `title`: a title away from LBA 0, with damage outside it that must not count, at its
+// own byte rate (not the 10 kB/s of the sibling test's title).
 #[test]
 fn end_of_recovery_lost_ms_scopes_divisor_to_the_passed_title() {
-    let mut title = test_title(0, 100);
-    title.size_bytes = 1_000_000;
-    title.duration_secs = 100.0;
-    let (ms, why) = end_of_recovery_lost_ms(true, &title, &[(0, 100_000)]);
+    let mut title = test_title(1000, 100);
+    title.size_bytes = 2_000_000;
+    title.duration_secs = 50.0;
+    let inside = (1000 * 2048, 40_000);
+    let (ms, why) = end_of_recovery_lost_ms(true, &title, &[(0, 100_000), inside]);
     assert!(
         why.is_none(),
         "measurable loss must not be flagged: {why:?}"
     );
-    assert!((ms - 10_000.0).abs() < 1e-6, "expected 10s, got {ms}");
+    // 40_000 in-title bytes at 2_000_000 B / 50 s = 1 s.
+    assert!((ms - 1_000.0).abs() < 1e-6, "expected 1s, got {ms}");
 }
 
 /// Minimal `DiscTitle` whose single extent spans `[start_lba, start_lba +

@@ -392,6 +392,7 @@ fn a_panic_inside_the_watched_call_propagates_instead_of_hanging() {
 fn cancel_is_honoured_during_a_damage_cooldown() {
     struct NotReadyReader {
         capacity: u32,
+        reads: usize,
     }
     impl libfreemkv::SectorSource for NotReadyReader {
         fn read_sectors(
@@ -401,6 +402,7 @@ fn cancel_is_honoured_during_a_damage_cooldown() {
             _buf: &mut [u8],
             _recovery: bool,
         ) -> libfreemkv::Result<usize> {
+            self.reads += 1;
             Err(libfreemkv::error::Error::ScsiError {
                 opcode: libfreemkv::scsi::SCSI_READ_10,
                 status: libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION,
@@ -424,14 +426,17 @@ fn cancel_is_honoured_during_a_damage_cooldown() {
     }
     impl Sink for DelayedCancelSink {
         fn should_cancel(&self) -> bool {
-            self.start.elapsed() > std::time::Duration::from_millis(50)
+            self.start.elapsed() > std::time::Duration::from_millis(500)
         }
     }
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("cd.iso");
     let sectors = 4096u32;
     let disc = clean_disc(sectors);
-    let mut reader = NotReadyReader { capacity: sectors };
+    let mut reader = NotReadyReader {
+        capacity: sectors,
+        reads: 0,
+    };
     let mut job = Job::new("disc:///dev/null", iso.to_string_lossy());
     // Multipass, so the sweep skips on error and reaches the cooldown
     // instead of aborting at the first failed read. Multipass implies raw.
@@ -439,21 +444,20 @@ fn cancel_is_honoured_during_a_damage_cooldown() {
     job.raw = true;
 
     // ONE origin for the sink's cancel-delay and the measurement below.
-    // Separate instants used to let filesystem setup eat into the sink's
-    // 50 ms window, so a slow runner failed the test on its own lower bound.
     let start = std::time::Instant::now();
     let sink = DelayedCancelSink { start };
     let r = recover_to_iso(&disc, &mut reader, &iso, &job, &sink)
         .expect("a cancelled rip halts, it does not error");
     let elapsed = start.elapsed();
 
+    // The sink cancels only after 500 ms, far longer than this disc takes to sweep with no
+    // pause and far shorter than the 3 s NOT_READY cooldown: being still alive to halt, after
+    // exactly one read, is what shows the rip sat in the cooldown when Stop arrived.
     assert!(r.halted, "a cancelling sink must halt the rip");
-    assert!(
-        elapsed >= std::time::Duration::from_millis(50),
-        "finished in {elapsed:?} — faster than the sink's own 50 ms \
-             cancel-delay, so this never actually entered the NOT_READY \
-             cooldown at all (the fixture made the interesting branch \
-             unreachable again)"
+    assert_eq!(
+        reader.reads, 1,
+        "one NOT_READY read, then the cooldown: 0 = the fixture never reached it; \
+             more = the sweep read on instead of pausing"
     );
     assert!(
         elapsed < std::time::Duration::from_millis(2500),

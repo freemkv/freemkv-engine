@@ -164,3 +164,41 @@ fn an_observed_cancel_is_sticky() {
     let r = EngineOutcome::from_result(Err::<u8, _>(Error::Halted), &h, |_| false);
     assert!(r.is_stopped(), "{r:?}");
 }
+
+// `wait` that runs out uncancelled reports `false` (a normal pause, not a Stop), after the
+// whole duration; a cancel during it reports `true` within a slice.
+#[test]
+fn wait_reports_a_timeout_as_false_and_a_cancel_as_true() {
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, None);
+    let t0 = Instant::now();
+    assert!(
+        !h.wait(Duration::from_millis(30)),
+        "an uncancelled wait times out"
+    );
+    assert!(t0.elapsed() >= Duration::from_millis(30));
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(Duration::from_millis(20));
+            op.cancel();
+        });
+        let t0 = Instant::now();
+        assert!(
+            h.wait(Duration::from_secs(30)),
+            "a cancel cuts the wait short"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(5));
+    });
+}
+
+// Only a legacy entry with no flag and no Sink is unwired: its private token never cancels.
+#[test]
+fn is_wired_unless_only_a_private_token_can_cancel() {
+    let sink = Cancels(AtomicBool::new(false));
+    let flag = Some(Arc::new(AtomicBool::new(false)));
+    assert!(!EngineHalt::legacy(None).is_wired());
+    assert!(EngineHalt::legacy(flag.clone()).is_wired());
+    assert!(EngineHalt::legacy(None).with_sink(&sink).is_wired());
+    assert!(EngineHalt::new(&Halt::new(), None).is_wired());
+    assert!(EngineHalt::new(&Halt::new(), flag).is_wired());
+}

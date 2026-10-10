@@ -88,20 +88,15 @@ fn sweep_and_patch_options_are_default() {
     _is_default::<freemkv_engine::PatchOptions<'static>>();
 
     // The §12.1 raw-sweep shape, minus `keys` (a KU-E1 field): a default names
-    // nothing to decrypt, resume, or persist. Keys are memory only (§2.1).
-    let s = freemkv_engine::SweepOptions {
-        decrypt: false,
-        ..Default::default()
-    };
+    // nothing to decrypt, resume, or persist. Keys are memory only (§2.1). The
+    // Default itself is asserted: no field is set by hand before checking it.
+    let s = freemkv_engine::SweepOptions::default();
     assert!(!s.decrypt && !s.resume && !s.skip_on_error);
     assert!(s.batch_sectors.is_none());
     assert!(s.progress.is_none() && s.halt.is_none());
     assert!(s.keys.is_none());
 
-    let p = freemkv_engine::PatchOptions {
-        decrypt: false,
-        ..Default::default()
-    };
+    let p = freemkv_engine::PatchOptions::default();
     assert!(!p.decrypt && !p.full_recovery && !p.reverse);
     assert!(p.block_sectors.is_none() && p.wedged_threshold == 0);
     assert!(p.progress.is_none() && p.halt.is_none() && p.keys.is_none());
