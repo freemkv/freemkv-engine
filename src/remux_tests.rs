@@ -684,15 +684,60 @@ fn the_main_title_is_the_default_and_a_missing_title_is_range_error() {
         css_error: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     };
-    assert_eq!(pick_title(&disc, None).unwrap(), 0);
-    assert_eq!(pick_title(&disc, Some(1)).unwrap(), 1);
-    let e = pick_title(&disc, Some(5)).unwrap_err();
+    assert_eq!(pick_title(&disc, None, &StreamFilter::All).unwrap(), 0);
+    assert_eq!(pick_title(&disc, Some(1), &StreamFilter::All).unwrap(), 1);
+    let e = pick_title(&disc, Some(5), &StreamFilter::All).unwrap_err();
     assert_eq!(
         crate::error_code(&e),
         Some(libfreemkv::Error::DiscTitleRange { index: 5, count: 2 }.code())
     );
     disc.titles.clear();
-    assert!(pick_title(&disc, None).is_err());
+    assert!(pick_title(&disc, None, &StreamFilter::All).is_err());
+}
+
+#[test]
+fn remux_main_title_honors_an_equivalent_audio_language_presentation() {
+    let mut english = title(3600.0);
+    english.extents = vec![libfreemkv::disc::Extent {
+        start_lba: 7,
+        sector_count: 10,
+    }];
+    english
+        .streams
+        .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
+            pid: 0x1100,
+            codec: libfreemkv::Codec::TrueHd,
+            channels: libfreemkv::AudioChannels::Stereo,
+            language: "eng".into(),
+            sample_rate: libfreemkv::SampleRate::S48,
+            secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+    let mut german = english.clone();
+    if let Some(libfreemkv::Stream::Audio(a)) = german.streams.first_mut() {
+        a.language = "deu".into();
+    }
+    let disc = libfreemkv::Disc {
+        volume_id: String::new(),
+        meta_title: None,
+        format: libfreemkv::DiscFormat::BluRay,
+        capacity_sectors: 1,
+        capacity_bytes: 2048,
+        layers: 1,
+        titles: vec![english, german],
+        region: libfreemkv::disc::DiscRegion::Free,
+        aacs: None,
+        css: None,
+        encrypted: false,
+        aacs_error: None,
+        css_error: None,
+        content_format: libfreemkv::ContentFormat::BdTs,
+    };
+    assert_eq!(
+        pick_title(&disc, None, &StreamFilter::Langs(vec!["deu".into()])).unwrap(),
+        1
+    );
 }
 
 #[test]

@@ -769,7 +769,9 @@ fn title_index(plan: &Plan, disc: Option<&libfreemkv::Disc>) -> crate::Result<us
         (crate::Selection::Titles(t), _) if t.len() == 1 => Ok(t[0]),
         (crate::Selection::MainMovie, None) => Ok(0),
         (sel, Some(disc)) if !matches!(sel, crate::Selection::Titles(_)) => {
-            match crate::mux::resolve_selection(disc, sel).as_slice() {
+            match crate::mux::resolve_selection_with_audio(disc, sel, &plan.streams.audio)
+                .as_slice()
+            {
                 [one] => Ok(*one),
                 _ => Err(libfreemkv::Error::StreamUrlInvalid {
                     url: plan.dest.clone(),

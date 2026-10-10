@@ -8,11 +8,10 @@
 
 use crate::engine_halt::{EngineHalt, HaltSink};
 use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
-use crate::job::{Selection, StreamChoice};
+use crate::job::{Selection, StreamChoice, StreamFilter};
 use crate::keys::{KeyParams, key_source_factory};
 use crate::mux::{
-    RipOutcome, TitleResult, classify_title_error, mux_iso_title, mux_title, resolve_selection,
-    run_titles,
+    RipOutcome, TitleResult, classify_title_error, mux_iso_title, mux_title, run_titles,
 };
 use crate::sink::{Event, Level, Sink};
 use libfreemkv::halt::{Stall, StallTimer, WAIT_SLICE};
@@ -392,7 +391,7 @@ fn remux_iso_sources_at(
             ..OpenImageOptions::resolve(sources)
         };
         let opened = open_image_with(&job.iso, opts)?;
-        let idx = pick_title(&opened.disc, job.title)?;
+        let idx = pick_title(&opened.disc, job.title, &job.streams.audio)?;
         let keys = opened.keys_for(&[idx], Some(h))?;
         Ok((opened, idx, keys))
     };
@@ -466,9 +465,13 @@ fn target_exists(target: &Path) -> io::Error {
 }
 
 // The requested title, or the main title by the same rule a rip's default uses.
-fn pick_title(disc: &libfreemkv::Disc, title: Option<usize>) -> io::Result<usize> {
+fn pick_title(
+    disc: &libfreemkv::Disc,
+    title: Option<usize>,
+    audio: &StreamFilter,
+) -> io::Result<usize> {
     let sel = title.map_or(Selection::MainMovie, |i| Selection::Titles(vec![i]));
-    resolve_selection(disc, &sel)
+    crate::mux::resolve_selection_with_audio(disc, &sel, audio)
         .first()
         .copied()
         .ok_or_else(|| {

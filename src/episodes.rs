@@ -22,7 +22,7 @@ const PLAY_ALL_SUM_MIN_SECS: f64 = 15.0;
 /// sum-title, extras/menus (far from the episode-length cluster), and
 /// duplicate-content titles.
 pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
-    dedup_by_content(titles, episode_cluster(titles, EPISODE_MIN_SECS))
+    dedup_by_program(titles, episode_cluster(titles, EPISODE_MIN_SECS))
 }
 
 /// A title's role, stated only where the disc's own structure proves it.
@@ -140,21 +140,46 @@ fn plays_all(titles: &[DiscTitle], long: &[usize], short: &[usize]) -> bool {
     })
 }
 
-// Drop titles whose content duplicates a kept one (the same whole extent list and duration:
-// episodes often share an opening clip). A title with no extents has no content identity,
-// so it is always kept.
-fn dedup_by_content(titles: &[DiscTitle], indices: Vec<usize>) -> Vec<usize> {
-    let mut seen = HashSet::new();
+// Drop alternate playlists for the same authored program. Physical extents are not a
+// playlist identity: alternate STN selections may read the same ordered clips through
+// different extents. The ordered clip program is the stable identity we want for
+// episode fan-out: alternate playlists can carry different in/out points and slightly
+// different durations while still referring to the same authored episode. Synthetic/
+// minimal titles without clip metadata use physical extents as a conservative fallback.
+fn dedup_by_program(titles: &[DiscTitle], indices: Vec<usize>) -> Vec<usize> {
+    let mut seen_programs = HashSet::new();
+    let mut seen_extents = HashSet::new();
     indices
         .into_iter()
         .filter(|&i| {
             let t = &titles[i];
-            let extents: Vec<(u32, u32)> = t
-                .extents
-                .iter()
-                .map(|e| (e.start_lba, e.sector_count))
-                .collect();
-            extents.is_empty() || seen.insert((extents, t.duration_secs.round() as i64))
+            if !t.clips.is_empty() {
+                let program: Vec<String> = t.clips.iter().map(|c| c.clip_id.clone()).collect();
+                seen_programs.insert(program)
+            } else {
+                let extents: Vec<(u32, u32)> = t
+                    .extents
+                    .iter()
+                    .map(|e| (e.start_lba, e.sector_count))
+                    .collect();
+                // DVD has no authored clip list in this model. Physical cell
+                // extents are the stable fallback identity; language or
+                // authoring variants may report different runtimes while
+                // referring to the same cells. Duration is corroboration,
+                // never part of identity.
+                if extents.is_empty() {
+                    true
+                } else {
+                    // A single shared cell is commonly an opening/recap. It
+                    // is not enough to establish program identity, so retain
+                    // runtime as corroborating identity in that degenerate
+                    // shape. Multi-cell DVD programs have stable structure
+                    // and deliberately ignore small language-version runtime
+                    // differences.
+                    let duration = (t.duration_secs * 1000.0).round() as u64;
+                    seen_extents.insert((extents, (t.extents.len() == 1).then_some(duration)))
+                }
+            }
         })
         .collect()
 }

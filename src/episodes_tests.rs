@@ -143,6 +143,76 @@ fn episodes_sharing_an_opening_clip_are_all_kept() {
 }
 
 #[test]
+fn alternate_playlists_for_one_program_are_selected_once() {
+    let ep = 53.0 * 60.0;
+    let mut titles = Vec::new();
+    for (n, start) in [("islands", 1000), ("mountains", 2000), ("jungles", 3000)] {
+        for (alternate, extent_start) in [(0, start), (1, start + 10_000)] {
+            let mut t = title(ep, extent_start);
+            t.clips = vec![libfreemkv::Clip {
+                clip_id: n.into(),
+                in_time: alternate * 90,
+                out_time: 53 * 45_000 - alternate * 90,
+                duration_secs: ep,
+                source_packets: 0,
+                feed_span: None,
+            }];
+            titles.push(t);
+        }
+    }
+    assert_eq!(episode_titles(&titles), vec![0, 2, 4]);
+}
+
+#[test]
+fn dvd_variants_with_the_same_cells_are_selected_once_even_when_duration_differs() {
+    let mut english = spans(48.0 * 60.0, &[(10_000, 80_000), (100_000, 20_000)]);
+    let mut german = spans(46.0 * 60.0, &[(10_000, 80_000), (100_000, 20_000)]);
+    english.playlist = "VTS_01_7.VOB".into();
+    german.playlist = "VTS_01_4.VOB".into();
+    assert_eq!(episode_titles(&[english, german]), vec![0]);
+}
+
+#[test]
+fn dvd_titles_with_different_cells_remain_distinct_despite_similar_duration() {
+    let a = spans(48.0 * 60.0, &[(10_000, 80_000), (100_000, 20_000)]);
+    let b = spans(47.0 * 60.0, &[(200_000, 80_000), (300_000, 20_000)]);
+    assert_eq!(episode_titles(&[a, b]), vec![0, 1]);
+}
+
+#[test]
+fn distinct_programs_with_shared_intro_are_not_collapsed() {
+    let ep = 53.0 * 60.0;
+    let program = |body: &str, extent_start: u32| {
+        let mut t = title(ep, extent_start);
+        t.clips = vec![
+            libfreemkv::Clip {
+                clip_id: "shared-intro".into(),
+                in_time: 0,
+                out_time: 30 * 45_000,
+                duration_secs: 30.0,
+                source_packets: 0,
+                feed_span: None,
+            },
+            libfreemkv::Clip {
+                clip_id: body.into(),
+                in_time: 0,
+                out_time: 52 * 45_000,
+                duration_secs: 52.0 * 60.0,
+                source_packets: 0,
+                feed_span: None,
+            },
+        ];
+        t
+    };
+    let titles = vec![
+        program("episode-a", 1000),
+        program("episode-a", 20_000),
+        program("episode-b", 30_000),
+    ];
+    assert_eq!(episode_titles(&titles), vec![0, 2]);
+}
+
+#[test]
 fn single_qualifying_title_passes_through() {
     let titles = vec![title(90.0 * 60.0, 1000), title(60.0, 50)];
     assert_eq!(episode_titles(&titles), vec![0]);

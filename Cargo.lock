@@ -296,7 +296,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-engine"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "anyhow",
  "freemkv-keysources",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "freemkv-keysources"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "base64",
  "flate2",
@@ -323,12 +323,15 @@ dependencies = [
 
 [[package]]
 name = "freemkv-unlock"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "aes",
+ "anyhow",
  "base64",
+ "h8-asm",
  "num-bigint",
  "num-traits",
+ "pioneer-optical",
  "rand",
  "serde",
  "serde_json",
@@ -360,6 +363,12 @@ dependencies = [
  "r-efi",
  "rand_core",
 ]
+
+[[package]]
+name = "h8-asm"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07f60b20bbdeac16166434ca88ab1ea59438a0d5fcc79399c5efd6f7469c5a93"
 
 [[package]]
 name = "hashbrown"
@@ -538,7 +547,7 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libfreemkv"
-version = "1.7.7"
+version = "1.8.3"
 dependencies = [
  "aes",
  "base64",
@@ -668,6 +677,18 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pioneer-optical"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a072ef7f1c811e86e88bc4016f01d0ac057449aae21e57f31b0bcff537438fa0"
+dependencies = [
+ "flate2",
+ "h8-asm",
+ "miniz_oxide",
+ "serde",
+]
 
 [[package]]
 name = "potential_utf"

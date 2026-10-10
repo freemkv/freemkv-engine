@@ -108,7 +108,7 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     // Does the selection resolve to a title? Ask the ONE function that decides
     // it (pure) rather than restate the policy here: `Longest` can resolve to
     // NOTHING (all-NaN durations), which a prior duplicated assumption missed.
-    let resolved = crate::mux::resolve_selection(disc, &job.selection);
+    let resolved = crate::mux::resolve_job_selection(disc, job);
     if reasons.is_empty() && resolved.is_empty() {
         reasons.push(Reason::new("empty-selection"));
     }

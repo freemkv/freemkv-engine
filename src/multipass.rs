@@ -553,7 +553,7 @@ fn measured_titles<'a>(
     job: &Job,
     empty: &'a libfreemkv::DiscTitle,
 ) -> Vec<&'a libfreemkv::DiscTitle> {
-    let picked: Vec<_> = crate::mux::resolve_selection(disc, &job.selection)
+    let picked: Vec<_> = crate::mux::resolve_job_selection(disc, job)
         .into_iter()
         .filter_map(|i| disc.titles.get(i))
         .collect();

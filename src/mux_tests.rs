@@ -32,6 +32,53 @@ fn disc(n: usize, encrypted: bool, has_key: bool) -> libfreemkv::Disc {
     }
 }
 
+fn audio_title(lang: &str, start: u32) -> libfreemkv::DiscTitle {
+    let mut t = libfreemkv::DiscTitle::empty();
+    t.duration_secs = 3600.0;
+    t.extents = vec![libfreemkv::disc::Extent {
+        start_lba: start,
+        sector_count: 1000,
+    }];
+    t.streams
+        .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
+            pid: 0x1100,
+            codec: libfreemkv::Codec::TrueHd,
+            channels: libfreemkv::AudioChannels::Stereo,
+            language: lang.into(),
+            sample_rate: libfreemkv::SampleRate::S48,
+            secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+    t
+}
+
+#[test]
+fn main_movie_language_prefers_an_equivalent_language_presentation() {
+    let mut d = disc(0, false, false);
+    d.titles = vec![audio_title("eng", 1000), audio_title("deu", 1000)];
+    let mut job = Job::new("disc://", "mkv://out");
+    job.streams.audio = StreamFilter::Langs(vec!["deu".into()]);
+    assert_eq!(resolve_job_selection(&d, &job), vec![1]);
+}
+
+#[test]
+fn all_audio_does_not_change_main_movie_program_choice() {
+    let mut d = disc(0, false, false);
+    d.titles = vec![audio_title("eng", 1000), audio_title("deu", 1000)];
+    let job = Job::new("disc://", "mkv://out");
+    assert_eq!(resolve_job_selection(&d, &job), vec![0]);
+}
+
+#[test]
+fn language_preference_does_not_switch_to_a_distinct_program() {
+    let mut d = disc(0, false, false);
+    d.titles = vec![audio_title("eng", 1000), audio_title("deu", 9000)];
+    let mut job = Job::new("disc://", "mkv://out");
+    job.streams.audio = StreamFilter::Langs(vec!["deu".into()]);
+    assert_eq!(resolve_job_selection(&d, &job), vec![0]);
+}
+
 fn stub_err() -> std::io::Error {
     // E_MKV_INVALID is a skippable stub per is_skippable_title_stub.
     libfreemkv::Error::MkvInvalid.into()
