@@ -322,6 +322,32 @@ enum Wanted {
     Langs(Vec<Language>),
 }
 
+pub(crate) struct AudioPreference(Vec<Language>);
+
+impl AudioPreference {
+    pub(crate) fn new(audio: &StreamFilter) -> Self {
+        let Ok(Wanted::Langs(mut wanted)) = Wanted::compile(audio) else {
+            return Self(Vec::new());
+        };
+        let mut seen = std::collections::HashSet::new();
+        wanted.retain(|language| seen.insert(*language));
+        Self(wanted)
+    }
+
+    // Count requested languages, not tracks: duplicate tracks add no coverage.
+    pub(crate) fn score(&self, title: &libfreemkv::DiscTitle) -> usize {
+        self.0
+            .iter()
+            .filter(|&&language| {
+                title.streams.iter().any(|stream| {
+                    matches!(stream, libfreemkv::Stream::Audio(audio)
+                        if stream_lang(&audio.language) == Some(language))
+                })
+            })
+            .count()
+    }
+}
+
 impl Wanted {
     fn compile(sel: &StreamFilter) -> Result<Wanted, StreamSelError> {
         Ok(match sel {

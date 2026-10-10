@@ -22,6 +22,7 @@ mod mux;
 mod outcome;
 mod plan;
 mod preflight;
+mod presentation;
 // The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 

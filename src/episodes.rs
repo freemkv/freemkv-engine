@@ -1,14 +1,13 @@
 //! TV episode-title selection ([`crate::Selection::Episodes`]).
 //!
-//! A TV disc lists every title: the episodes, usually a "play all" title whose
-//! runtime is the SUM of the episodes, plus extras/menus and sometimes duplicate
-//! angles. The episodes are the *episode cluster*: the group of similar-length
-//! titles, so every episode is kept and the play-all/extras are dropped.
+//! Runtime clustering supplies candidates, not menu-reachability evidence.
+//! Deduplication independently requires exact authored presentation identity.
+//! Explicit title selection bypasses both steps.
 
 use libfreemkv::DiscTitle;
-use std::collections::HashSet;
+use std::collections::HashMap;
 
-// Shortest title that counts as an episode (10 min); anything shorter is a menu or extra.
+// Candidate floor (10 min), not proof that shorter titles are menus or extras.
 const EPISODE_MIN_SECS: f64 = 600.0;
 // Titles within this fraction of an episode's length (but at least the floor) are the
 // same episode length.
@@ -18,11 +17,18 @@ const EPISODE_TOLERANCE_MIN_SECS: f64 = 300.0;
 const PLAY_ALL_SUM_FRAC: f64 = 0.01;
 const PLAY_ALL_SUM_MIN_SECS: f64 = 15.0;
 
-/// The episode titles of a TV disc, in disc order: drops the "play all"
-/// sum-title, extras/menus (far from the episode-length cluster), and
-/// duplicate-content titles.
+/// Heuristic episode candidates, deduplicated by authored presentation identity.
+/// Runtime clustering can omit episodes or retain decoys; menu reachability is
+/// unavailable here. Missing identity leaves a candidate distinct.
 pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
-    dedup_by_program(titles, episode_cluster(titles, EPISODE_MIN_SECS))
+    episode_titles_with_audio(titles, &crate::StreamFilter::All)
+}
+
+pub(crate) fn episode_titles_with_audio(
+    titles: &[DiscTitle],
+    audio: &crate::StreamFilter,
+) -> Vec<usize> {
+    dedup_by_program(titles, episode_cluster(titles, EPISODE_MIN_SECS), audio)
 }
 
 /// A title's role, stated only where the disc's own structure proves it.
@@ -140,48 +146,29 @@ fn plays_all(titles: &[DiscTitle], long: &[usize], short: &[usize]) -> bool {
     })
 }
 
-// Drop alternate playlists for the same authored program. Physical extents are not a
-// playlist identity: alternate STN selections may read the same ordered clips through
-// different extents. The ordered clip program is the stable identity we want for
-// episode fan-out: alternate playlists can carry different in/out points and slightly
-// different durations while still referring to the same authored episode. Synthetic/
-// minimal titles without clip metadata use physical extents as a conservative fallback.
-fn dedup_by_program(titles: &[DiscTitle], indices: Vec<usize>) -> Vec<usize> {
-    let mut seen_programs = HashSet::new();
-    let mut seen_extents = HashSet::new();
-    indices
-        .into_iter()
-        .filter(|&i| {
-            let t = &titles[i];
-            if !t.clips.is_empty() {
-                let program: Vec<String> = t.clips.iter().map(|c| c.clip_id.clone()).collect();
-                seen_programs.insert(program)
-            } else {
-                let extents: Vec<(u32, u32)> = t
-                    .extents
-                    .iter()
-                    .map(|e| (e.start_lba, e.sector_count))
-                    .collect();
-                // DVD has no authored clip list in this model. Physical cell
-                // extents are the stable fallback identity; language or
-                // authoring variants may report different runtimes while
-                // referring to the same cells. Duration is corroboration,
-                // never part of identity.
-                if extents.is_empty() {
-                    true
-                } else {
-                    // A single shared cell is commonly an opening/recap. It
-                    // is not enough to establish program identity, so retain
-                    // runtime as corroborating identity in that degenerate
-                    // shape. Multi-cell DVD programs have stable structure
-                    // and deliberately ignore small language-version runtime
-                    // differences.
-                    let duration = (t.duration_secs * 1000.0).round() as u64;
-                    seen_extents.insert((extents, (t.extents.len() == 1).then_some(duration)))
+// Keep program order; replace only its representative when audio coverage improves.
+// Missing identity is never evidence that two titles are the same program.
+fn dedup_by_program(
+    titles: &[DiscTitle],
+    indices: Vec<usize>,
+    audio: &crate::StreamFilter,
+) -> Vec<usize> {
+    let preference = crate::streams::AudioPreference::new(audio);
+    let mut groups = HashMap::new();
+    let mut chosen: Vec<usize> = Vec::new();
+    for i in indices {
+        if let Some(identity) = crate::presentation::identity(&titles[i]) {
+            if let Some(&slot) = groups.get(&identity) {
+                if preference.score(&titles[i]) > preference.score(&titles[chosen[slot]]) {
+                    chosen[slot] = i;
                 }
+                continue;
             }
-        })
-        .collect()
+            groups.insert(identity, chosen.len());
+        }
+        chosen.push(i);
+    }
+    chosen
 }
 
 #[cfg(test)]

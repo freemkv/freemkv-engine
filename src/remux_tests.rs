@@ -698,6 +698,7 @@ fn the_main_title_is_the_default_and_a_missing_title_is_range_error() {
 #[test]
 fn remux_main_title_honors_an_equivalent_audio_language_presentation() {
     let mut english = title(3600.0);
+    english.content_format = libfreemkv::ContentFormat::DvdPs;
     english.extents = vec![libfreemkv::disc::Extent {
         start_lba: 7,
         sector_count: 10,

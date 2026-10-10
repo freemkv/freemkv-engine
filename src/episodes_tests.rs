@@ -26,6 +26,7 @@ fn picks_the_episode_cluster_and_drops_play_all_and_extras() {
 
 fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
     let mut t = title(dur, 0);
+    t.content_format = libfreemkv::ContentFormat::DvdPs;
     t.extents = spans
         .iter()
         .map(|&(start_lba, sector_count)| Extent {
@@ -115,12 +116,15 @@ fn a_film_disc_proves_no_roles() {
 #[test]
 fn dedups_duplicate_angle_titles() {
     let ep = 44.0 * 60.0;
-    let titles = vec![title(ep, 1000), title(ep, 1000), title(ep, 2000)];
+    let titles = vec![
+        spans(ep, &[(1000, 1000)]),
+        spans(ep, &[(1000, 1000)]),
+        spans(ep, &[(2000, 1000)]),
+    ];
     assert_eq!(episode_titles(&titles), vec![0, 2]);
 }
 
-// Episodes that open on the same intro clip are different content: only a matching
-// extent list and duration is a duplicate.
+// A shared opening does not establish the identity of the whole episode.
 #[test]
 fn episodes_sharing_an_opening_clip_are_all_kept() {
     let ep = 24.0 * 60.0;
@@ -147,12 +151,12 @@ fn alternate_playlists_for_one_program_are_selected_once() {
     let ep = 53.0 * 60.0;
     let mut titles = Vec::new();
     for (n, start) in [("islands", 1000), ("mountains", 2000), ("jungles", 3000)] {
-        for (alternate, extent_start) in [(0, start), (1, start + 10_000)] {
+        for extent_start in [start, start + 10_000] {
             let mut t = title(ep, extent_start);
             t.clips = vec![libfreemkv::Clip {
                 clip_id: n.into(),
-                in_time: alternate * 90,
-                out_time: 53 * 45_000 - alternate * 90,
+                in_time: 0,
+                out_time: 53 * 60 * 45_000,
                 duration_secs: ep,
                 source_packets: 0,
                 feed_span: None,
@@ -196,7 +200,7 @@ fn distinct_programs_with_shared_intro_are_not_collapsed() {
             libfreemkv::Clip {
                 clip_id: body.into(),
                 in_time: 0,
-                out_time: 52 * 45_000,
+                out_time: 52 * 60 * 45_000,
                 duration_secs: 52.0 * 60.0,
                 source_packets: 0,
                 feed_span: None,

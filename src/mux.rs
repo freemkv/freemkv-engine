@@ -97,22 +97,23 @@ pub fn resolve_selection(disc: &libfreemkv::Disc, sel: &Selection) -> Vec<usize>
     }
 }
 
-/// Resolve a job's title selection, allowing a preferred audio language to
-/// choose an equivalent presentation of the main program. `Selection` remains
-/// the title-scope choice; language only ranks structurally equivalent titles.
-/// If no equivalent presentation contains the requested language, the normal
-/// main-title choice is retained rather than silently switching programs.
+/// Resolve a job's selection, ranking equivalent main or episode presentations
+/// by requested audio-language coverage. Ties retain the first presentation.
+/// Explicit titles, All and Longest retain their selection semantics.
 pub fn resolve_job_selection(disc: &libfreemkv::Disc, job: &Job) -> Vec<usize> {
     resolve_selection_with_audio(disc, &job.selection, &job.streams.audio)
 }
 
-/// Like [`resolve_selection`], but ranks equivalent main-title presentations
-/// against an audio-language preference.
+/// Like [`resolve_selection`], but ranks equivalent main/episode presentations
+/// by requested audio-language coverage. Missing identity never equates titles.
 pub fn resolve_selection_with_audio(
     disc: &libfreemkv::Disc,
     selection: &Selection,
     audio: &StreamFilter,
 ) -> Vec<usize> {
+    if matches!(selection, Selection::Episodes) {
+        return crate::episodes::episode_titles_with_audio(&disc.titles, audio);
+    }
     let base = resolve_selection(disc, selection);
     if !matches!(selection, Selection::MainMovie)
         || !matches!(audio, StreamFilter::Langs(_))
@@ -121,28 +122,23 @@ pub fn resolve_selection_with_audio(
         return base;
     }
     let base_idx = base[0];
-    let base_title = &disc.titles[base_idx];
-    let equivalent = |candidate: &libfreemkv::DiscTitle| {
-        if !base_title.clips.is_empty() && !candidate.clips.is_empty() {
-            return base_title
-                .clips
-                .iter()
-                .map(|c| &c.clip_id)
-                .eq(candidate.clips.iter().map(|c| &c.clip_id));
-        }
-        base_title.extents == candidate.extents
+    let Some(identity) = crate::presentation::identity(&disc.titles[base_idx]) else {
+        return base;
     };
-    disc.titles
-        .iter()
-        .enumerate()
-        .filter(|(i, t)| *i == base_idx || equivalent(t))
-        .find(|(_, t)| {
-            crate::streams::resolve_stream_selection(t, audio, &StreamFilter::None).is_ok_and(
-                |s| matches!(s.audio, libfreemkv::PidFilter::Only(ref pids) if !pids.is_empty()),
-            )
-        })
-        .map(|(i, _)| vec![i])
-        .unwrap_or(base)
+    let preference = crate::streams::AudioPreference::new(audio);
+    let mut best = base_idx;
+    let mut score = preference.score(&disc.titles[best]);
+    for (i, title) in disc.titles.iter().enumerate() {
+        if crate::presentation::identity(title).as_ref() != Some(&identity) {
+            continue;
+        }
+        let candidate = preference.score(title);
+        if candidate > score {
+            best = i;
+            score = candidate;
+        }
+    }
+    vec![best]
 }
 
 /// The result of muxing one title, from the loop's point of view.

@@ -34,6 +34,7 @@ fn disc(n: usize, encrypted: bool, has_key: bool) -> libfreemkv::Disc {
 
 fn audio_title(lang: &str, start: u32) -> libfreemkv::DiscTitle {
     let mut t = libfreemkv::DiscTitle::empty();
+    t.content_format = libfreemkv::ContentFormat::DvdPs;
     t.duration_secs = 3600.0;
     t.extents = vec![libfreemkv::disc::Extent {
         start_lba: start,
@@ -77,6 +78,219 @@ fn language_preference_does_not_switch_to_a_distinct_program() {
     let mut job = Job::new("disc://", "mkv://out");
     job.streams.audio = StreamFilter::Langs(vec!["deu".into()]);
     assert_eq!(resolve_job_selection(&d, &job), vec![0]);
+}
+
+fn clipped_audio(lang: &str, start: u32, end: u32) -> libfreemkv::DiscTitle {
+    let mut t = audio_title(lang, 1000);
+    t.content_format = libfreemkv::ContentFormat::BdTs;
+    t.duration_secs = f64::from(end - start);
+    t.clips = vec![libfreemkv::Clip {
+        clip_id: "00001".into(),
+        in_time: start * 45_000,
+        out_time: end * 45_000,
+        duration_secs: t.duration_secs,
+        source_packets: 0,
+        feed_span: None,
+    }];
+    t
+}
+
+#[test]
+fn regression_authored_intervals_preserve_distinct_episodes_and_main_content() {
+    let mut d = disc(0, false, false);
+    d.titles = vec![
+        clipped_audio("eng", 0, 1200),
+        clipped_audio("deu", 1200, 2520),
+    ];
+    assert_eq!(crate::episode_titles(&d.titles), vec![0, 1]);
+    assert_eq!(
+        resolve_selection_with_audio(
+            &d,
+            &Selection::MainMovie,
+            &StreamFilter::Langs(vec!["de".into()])
+        ),
+        vec![0]
+    );
+    d.titles[1].clips[0].in_time = 0;
+    assert_eq!(
+        resolve_selection_with_audio(
+            &d,
+            &Selection::MainMovie,
+            &StreamFilter::Langs(vec!["de".into()])
+        ),
+        vec![0]
+    );
+}
+
+#[test]
+fn regression_missing_or_invalid_identity_never_equates_presentations() {
+    for shape in 0..5 {
+        let mut a = clipped_audio("eng", 0, 1200);
+        match shape {
+            0 => {
+                a.clips.clear();
+                a.extents.clear();
+            }
+            1 => a.clips.clear(),
+            2 => a.clips[0].clip_id.clear(),
+            3 => a.clips[0].out_time = a.clips[0].in_time,
+            _ => {
+                a.clips.clear();
+                a.content_format = libfreemkv::ContentFormat::DvdPs;
+                a.extents[0].sector_count = 0;
+            }
+        }
+        let mut b = a.clone();
+        b.streams = audio_title("deu", 1000).streams;
+        let mut d = disc(0, false, false);
+        d.titles = vec![a, b];
+        assert_eq!(
+            crate::episode_titles(&d.titles),
+            vec![0, 1],
+            "shape {shape}"
+        );
+        assert_eq!(
+            resolve_selection_with_audio(
+                &d,
+                &Selection::MainMovie,
+                &StreamFilter::Langs(vec!["de".into()])
+            ),
+            vec![0],
+            "shape {shape}"
+        );
+    }
+}
+
+#[test]
+fn regression_episodes_choose_audio_before_dedup_in_either_disc_order() {
+    for dvd in [false, true] {
+        for reversed in [false, true] {
+            let mut a = clipped_audio("eng", 0, 2880);
+            let mut b = clipped_audio("deu", 0, 2880);
+            if dvd {
+                for t in [&mut a, &mut b] {
+                    t.clips.clear();
+                    t.content_format = libfreemkv::ContentFormat::DvdPs;
+                    t.extents.push(libfreemkv::disc::Extent {
+                        start_lba: 9000,
+                        sector_count: 100,
+                    });
+                }
+                b.duration_secs = 2760.0;
+            }
+            let mut d = disc(0, false, false);
+            d.titles = if reversed { vec![b, a] } else { vec![a, b] };
+            let mut job = Job::new("disc://", "mkv://out");
+            job.selection = Selection::Episodes;
+            job.streams.audio = StreamFilter::Langs(vec!["German".into()]);
+            assert_eq!(
+                resolve_job_selection(&d, &job),
+                vec![usize::from(!reversed)]
+            );
+            assert_eq!(crate::preflight(&d, &job), crate::Preflight::Ready);
+            job.streams.audio = StreamFilter::Langs(vec!["jpn".into()]);
+            assert_eq!(resolve_job_selection(&d, &job), vec![0]);
+            assert!(matches!(
+                crate::preflight(&d, &job),
+                crate::Preflight::Blocked(_)
+            ));
+            for audio in [StreamFilter::All, StreamFilter::None] {
+                job.streams.audio = audio;
+                assert_eq!(resolve_job_selection(&d, &job), vec![0]);
+            }
+        }
+    }
+}
+
+#[test]
+fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
+    let a = clipped_audio("eng", 0, 1200);
+    let mut duplicate_tracks = a.clone();
+    duplicate_tracks.streams.extend(a.streams.clone());
+    let mut both = a.clone();
+    both.streams.extend(clipped_audio("deu", 0, 1200).streams);
+    let mut d = disc(0, false, false);
+    d.titles = vec![duplicate_tracks, both, a];
+    let audio = StreamFilter::Langs(vec!["en".into(), "eng".into(), "de".into()]);
+    for selection in [Selection::MainMovie, Selection::Episodes] {
+        assert_eq!(
+            resolve_selection_with_audio(&d, &selection, &audio),
+            vec![1]
+        );
+    }
+    for selection in [
+        Selection::Titles(vec![2, 0]),
+        Selection::All,
+        Selection::Longest,
+    ] {
+        assert_eq!(
+            resolve_selection_with_audio(&d, &selection, &audio),
+            resolve_selection(&d, &selection)
+        );
+    }
+}
+
+#[test]
+fn regression_dvd_cell_order_and_content_format_are_identity() {
+    let mut a = audio_title("eng", 1000);
+    a.extents.push(libfreemkv::disc::Extent {
+        start_lba: 9000,
+        sector_count: 100,
+    });
+    let mut b = a.clone();
+    b.extents.reverse();
+    let mut c = a.clone();
+    c.content_format = libfreemkv::ContentFormat::MpegPs;
+    assert_eq!(crate::episode_titles(&[a, b, c]), vec![0, 1, 2]);
+}
+
+#[test]
+fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
+    let mut d = disc(0, false, false);
+    for program in ["episode-a", "episode-b", "episode-c"] {
+        for lang in ["eng", "deu"] {
+            let mut t = clipped_audio(lang, 30, 1230);
+            t.clips[0].clip_id = program.into();
+            let mut intro = t.clips[0].clone();
+            intro.clip_id = "shared-intro".into();
+            intro.in_time = 0;
+            intro.out_time = 30 * 45_000;
+            t.clips.insert(0, intro);
+            d.titles.push(t);
+        }
+    }
+    let audio = StreamFilter::Langs(vec!["de".into()]);
+    assert_eq!(crate::episode_titles(&d.titles), vec![0, 2, 4]);
+    assert_eq!(
+        resolve_selection_with_audio(&d, &Selection::Episodes, &audio),
+        vec![1, 3, 5]
+    );
+    let mut reordered = d.titles[1].clone();
+    reordered.clips.reverse();
+    let mut shifted = d.titles[1].clone();
+    shifted.clips[1].in_time += 1;
+    d.titles.extend([reordered, shifted]);
+    // No menu evidence exists here to reject distinct decoys as non-episodes.
+    assert_eq!(
+        resolve_selection_with_audio(&d, &Selection::Episodes, &audio),
+        vec![1, 3, 5, 6, 7]
+    );
+}
+
+#[test]
+fn regression_identity_ignores_runtime_and_size_when_authored_intervals_match() {
+    for dvd in [false, true] {
+        let mut a = if dvd {
+            audio_title("eng", 1000)
+        } else {
+            clipped_audio("eng", 0, 1200)
+        };
+        a.duration_secs = 1200.0;
+        let mut b = a.clone();
+        b.duration_secs = 1320.0;
+        b.size_bytes += 10_000;
+        assert_eq!(crate::episode_titles(&[a, b]), vec![0]);
+    }
 }
 
 fn stub_err() -> std::io::Error {
