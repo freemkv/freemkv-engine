@@ -441,12 +441,15 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
 }
 
 // Publish atomically without overwriting unless replacement was requested.
-// Unsupported no-replace operations fail closed.
+// Unsupported no-replace operations fail closed; a target found there is E9084.
 fn land(landing: &Path, job: &RemuxJob) -> io::Result<()> {
     if job.replace {
         return std::fs::rename(landing, &job.target);
     }
-    libfreemkv::io::publish::no_replace(landing, &job.target)
+    libfreemkv::io::publish::no_replace(landing, &job.target).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => target_exists(&job.target),
+        _ => e,
+    })
 }
 
 fn target_exists(target: &Path) -> io::Error {

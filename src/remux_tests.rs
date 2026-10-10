@@ -767,3 +767,19 @@ fn a_remux_main_title_needing_review_is_its_coded_refusal() {
     assert_eq!(pick_title(&disc, None, &de).unwrap(), 1);
     assert_eq!(pick_title(&disc, Some(0), &StreamFilter::All).unwrap(), 0);
 }
+
+// A target that appears after the re-check is still the typed refusal (E9084) when
+// publication finds it, and is never overwritten.
+#[test]
+fn a_target_appearing_before_publication_is_its_coded_refusal() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let landing = dir.path().join("Movie.mkv.partial");
+    std::fs::write(&landing, b"new").unwrap();
+    std::fs::write(&target, b"raced in").unwrap();
+    let e = super::land(&landing, &job(target.clone(), false)).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+    let code = libfreemkv::error::E_REMUX_TARGET_EXISTS;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert_eq!(std::fs::read(&target).unwrap(), b"raced in");
+}
