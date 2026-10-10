@@ -66,12 +66,19 @@ This is not a complete DVD VM or proof of semantic TV episodes.
 If `requires_review()` is true, ask for explicit title choices before starting.
 Preflight reports `selection-review-required` with the typed reason's key as detail.
 
-Episode selection requires a complete, consistent authored roster. The bounded DVD
-producer supports an unconditional single VMGM menu and exact play-all partition of
-reachable full standalone titles in one VTS. It does not support conditional/menu
-chains, VTS menus, chapter jumps, angles or multi-PGC titles. Reachability alone,
-First-Play and label/JAR hints cannot establish a roster. Unknown episodes therefore
-hold for review and retain conservative candidates, without runtime clustering.
+Episode selection requires a complete, consistent authored roster. Two producers
+exist. The bounded DVD producer supports an unconditional single VMGM menu and exact
+play-all partition of reachable full standalone titles in one VTS; it does not support
+conditional/menu chains, VTS menus, chapter jumps, angles or multi-PGC titles. The
+Blu-ray producer (`bd-playall-partition-v1:<playlist>`) is independent of HDMV and BD-J
+navigation: the longest non-looping playlist must be the exact concatenation (clip id,
+in/out ticks) of other playlists, each used once, with exactly one possible cut, no
+other multi-clip playlist sharing its clips, and no member under half the mean member
+length. Discs with no such play-all (episodes chained only in menu code, extras-only,
+nested or competing play-alls, a recap inside the play-all) get no roster.
+Reachability alone, First-Play and label/JAR hints cannot establish a roster. Unknown
+episodes therefore hold for review and retain conservative candidates, without
+runtime clustering.
 Authored `ordinal` preserves partition order through scan sorting and audio
 alternate selection; contradictory or incomplete ordering requires review.
 An authored program partition does **not** establish TV semantics (a movie could
