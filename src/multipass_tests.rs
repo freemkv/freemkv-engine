@@ -2659,3 +2659,43 @@ fn a_decrypting_multipass_job_runs() {
     let map = Mapfile::load(&disc.mapfile_for(&iso)).unwrap();
     assert_eq!(map.raw(), Some(false), "a decrypting run's image");
 }
+
+// engine_halt.rs: every production cancellation read goes through `EngineHalt::is_cancelled`.
+// `recover`'s halt always carries the Sink probe (`with_sink`), so a direct
+// `sink.should_cancel()` there only double-polls the sink and bypasses the sticky latch.
+#[test]
+fn recover_reads_cancellation_only_through_the_engine_halt() {
+    let src = include_str!("multipass.rs");
+    let body = src
+        .split_once("pub(crate) fn recover(")
+        .expect("recover is defined")
+        .1
+        .split_once("\n}\n")
+        .expect("recover's body ends")
+        .0;
+    assert!(
+        body.contains("halt.is_cancelled()"),
+        "fixture: the body parsed"
+    );
+    assert!(!body.contains("should_cancel()"), "a direct sink read");
+    for entry in [
+        "pub fn multipass_rip(",
+        "pub fn multipass_rip_with(",
+        "pub fn multipass_rip_staged(",
+    ] {
+        let at = src.split_once(entry).expect(entry).1;
+        let call = at.split_once("recover(").expect("calls recover").0;
+        assert!(
+            call.contains(".with_sink(sink)"),
+            "{entry} wires the Sink probe"
+        );
+    }
+    let plan = include_str!("plan.rs");
+    let at = plan.split_once("crate::multipass::recover(").unwrap().0;
+    assert!(
+        at.rsplit_once("let eh = ")
+            .unwrap()
+            .1
+            .contains(".with_sink(sink)")
+    );
+}

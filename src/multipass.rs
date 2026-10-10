@@ -992,7 +992,7 @@ pub(crate) fn recover(
     } else {
         for n in 1..=plan.patch_passes as u32 {
             let pass = n + 1;
-            if sink.should_cancel() || halt.is_cancelled() {
+            if halt.is_cancelled() {
                 milestone(sink, RecoveryEvent::Stopped { pass });
                 halted = true;
                 break;
@@ -1066,7 +1066,7 @@ pub(crate) fn recover(
             );
 
             let exit = pass_exit(pr.halted, pr.wedged_exit);
-            if exit == PassExit::Cancelled || sink.should_cancel() || halt.is_cancelled() {
+            if exit == PassExit::Cancelled || halt.is_cancelled() {
                 halted = true;
                 break;
             }
@@ -1117,7 +1117,7 @@ pub(crate) fn recover(
         }
     }
     // A Stop that landed as the last pass ended still keeps the image resumable.
-    halted |= sink.should_cancel() || halt.is_cancelled();
+    halted |= halt.is_cancelled();
 
     if halted {
         // Severity comes from damage actually recorded — hard-coding Clean here
