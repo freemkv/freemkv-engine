@@ -23,10 +23,12 @@ project follows semantic versioning.
 - MainMovie never holds for review: an invalid or unmatched language keeps title 0. E9086 is for episode-roster reasons only.
 - **Recovery hosts**: `PassHost` loses its `resume_sweep`, `sweep_attempt`, `patch_failed` and `continue_after_wedge` hooks (breaking for hosts that implemented them); their policy is in `MultipassOpts`. `MultipassOpts` gains four public fields, so struct literals need `..Default::default()`. A zero `max_sweep_attempts` counts as 1.
 - An image opened without an explicit key scope scopes its keys to the main title's pick (or, when the main title needs review, its candidates).
+- `OpenImageOptions::halt` also stops the image scan, not only the key resolve, and an open whose halt is already raised now returns `Halted`, even with held keys or a pre-scanned disc.
 
 ### Fixed
 
 - Image and folder title runs resolve their selection against the scanned disc; `MainMovie`, `Longest` and `Episodes` were taken as title 0 without a scan.
+- Such a run opens the image once (one engine scan, under the run's Stop) and resolves its selection on that open, so a non-explicit selection gets the sidecar and identity checks, and errors, of the explicit title. libfreemkv's mux still probes the image itself.
 - A remux target that appears before publication is the typed E9084 refusal; on a filesystem without hard links the old fallback rename could overwrite it.
 - An incomplete image mux is no longer counted as written (Halted after a Stop, else E9078).
 - A single subtitle list (normal and forced equal) is checked once in preflight over every subtitle (detail `subtitle`).

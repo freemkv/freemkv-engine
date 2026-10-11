@@ -1400,3 +1400,40 @@ fn a_stop_during_the_last_title_is_halted_not_written() {
         "no truncated file is kept"
     );
 }
+
+/// A halt raised before the open stops it with no work, whether the disc is scanned here or
+/// given (J14), and whatever the keys: a held set (`Known`) included.
+#[test]
+fn an_open_whose_halt_is_raised_is_halted() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "d.iso");
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let halt = libfreemkv::Halt::new();
+    halt.cancel();
+    let calls = Calls::default();
+    for prescanned in [false, true] {
+        let disc = || prescanned.then(|| bd_image(&[Some(K1)], 1).disc);
+        let known = OpenImageOptions::known(set.clone());
+        let resolving = OpenImageOptions::resolve(factory(&[(Answer::Keydb, &[K1])], &calls));
+        for opts in [known, resolving] {
+            let opts = OpenImageOptions {
+                disc: disc(),
+                halt: Some(halt.clone()),
+                ..opts
+            };
+            let r = open_image_with(&ImageSource::Iso(iso.clone()), opts).map(|_| ());
+            assert!(
+                matches!(r, Err(Error::Halted)),
+                "prescanned {prescanned}: {r:?}"
+            );
+        }
+    }
+    assert_eq!(calls.len(), 0, "no key request");
+}

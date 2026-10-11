@@ -638,13 +638,10 @@ fn title(
                 return title_off_drive(plan, device, keys, sources, &topts, &watch);
             }
             _ => {
-                let idx = title_index(plan, image_disc(plan)?.as_ref())?;
                 let need_keys = keys.is_none() && !plan.raw;
                 let need_title = topts.selection.is_none() && !plan.streams.is_all();
-                let (found, scanned) = match need_keys || need_title {
-                    true => url_source(plan, idx, need_keys, sources, &watch)?,
-                    false => (None, None),
-                };
+                let (idx, found, scanned) =
+                    url_source(plan, need_keys, need_title, sources, &watch)?;
                 let keys = keys.or(found);
                 let mux = opts(idx, scanned.as_ref())?;
                 watch.mux(&plan.source, 0, |ctx| {
@@ -707,76 +704,77 @@ fn title_off_drive(
     title(plan, with, sources, watch.sink)
 }
 
-// A URL source's keys and scanned title for title `idx`: an image or folder is opened (its
-// keys acquired over the title when `need_keys`); a loose clip's keys come from its disc
-// folder; a container or stream has neither.
+// A URL source's title index, keys and title. An image is opened once under the run's halt by
+// the image open itself, a non-explicit selection resolved on that scan, so every selection
+// meets the same checks; `mux_url` still re-probes it (libfreemkv takes no opened image).
 #[allow(clippy::type_complexity)]
 fn url_source(
     plan: &Plan,
-    idx: usize,
     need_keys: bool,
+    need_title: bool,
     sources: &libfreemkv::KeySourceFactory,
     watch: &Watch<'_>,
 ) -> crate::Result<(
+    usize,
     Option<libfreemkv::keys::KeyRing>,
     Option<libfreemkv::DiscTitle>,
 )> {
     let halt = watch.halt.clone().unwrap_or_default();
-    let (keys, title, trace) = match libfreemkv::parse_url(&plan.source) {
+    let keys_event = |trace: &libfreemkv::aacs::trace::ResolutionTrace, ring| {
+        if need_keys {
+            watch.sink.event(&Event::Keys { trace, ring });
+        }
+    };
+    let src = match libfreemkv::parse_url(&plan.source) {
         libfreemkv::StreamUrl::Iso { .. } | libfreemkv::StreamUrl::Dir { .. } => {
-            let src = crate::ImageSource::from_url(&plan.source).ok_or_else(|| {
+            crate::ImageSource::from_url(&plan.source).ok_or_else(|| {
                 libfreemkv::Error::StreamUrlInvalid {
                     url: plan.source.clone(),
                 }
-            })?;
-            let scope = match need_keys {
-                true => libfreemkv::keys::KeyScope::Titles(vec![idx]),
-                false => libfreemkv::keys::KeyScope::None,
-            };
-            let opts = crate::OpenImageOptions {
-                scope: Some(scope),
-                halt: Some(halt),
-                ..crate::OpenImageOptions::resolve(sources.clone())
-            };
-            let (opened, trace) = crate::open_image_with_traced(&src, opts);
-            let title = opened
-                .as_ref()
-                .ok()
-                .and_then(|o| o.disc.titles.get(idx).cloned());
-            (opened.map(|o| need_keys.then_some(o.keys)), title, trace)
+            })?
         }
         libfreemkv::StreamUrl::M2ts { path } if need_keys => {
+            let idx = title_index(plan, None)?;
             let (keys, trace) = crate::keys::resolve_loose_clip(&path, sources, Some(&halt));
-            (keys, None, trace)
+            keys_event(&trace, keys.as_ref().ok().and_then(Option::as_ref));
+            return Ok((idx, keys?, None));
         }
-        _ => return Ok((None, None)),
+        _ => return Ok((title_index(plan, None)?, None, None)),
     };
-    if need_keys {
-        watch.sink.event(&Event::Keys {
-            trace: &trace,
-            ring: keys.as_ref().ok().and_then(Option::as_ref),
-        });
+    let explicit = match plan.titles {
+        crate::Selection::Titles(_) => Some(title_index(plan, None)?),
+        _ => None,
+    };
+    if !need_keys && !need_title {
+        let idx = match explicit {
+            Some(idx) => idx,
+            None => {
+                let (disc, _) = crate::image::scan_image_halted(&src, Some(&halt))?;
+                title_index(plan, Some(&disc))?
+            }
+        };
+        return Ok((idx, None, None));
     }
-    Ok((keys?, title))
-}
-
-// An image or folder source scanned, so a title run resolves a non-explicit selection against
-// its disc, never as title 0 unscanned. `None`: explicit titles, or a single-title source.
-fn image_disc(plan: &Plan) -> crate::Result<Option<libfreemkv::Disc>> {
-    if matches!(plan.titles, crate::Selection::Titles(_)) {
-        return Ok(None);
-    }
-    match libfreemkv::parse_url(&plan.source) {
-        libfreemkv::StreamUrl::Iso { .. } | libfreemkv::StreamUrl::Dir { .. } => {
-            let src = crate::ImageSource::from_url(&plan.source).ok_or_else(|| {
-                libfreemkv::Error::StreamUrlInvalid {
-                    url: plan.source.clone(),
-                }
-            })?;
-            Ok(Some(crate::scan_image(&src)?.0))
-        }
-        _ => Ok(None),
-    }
+    let opts = crate::OpenImageOptions {
+        halt: Some(halt),
+        ..crate::OpenImageOptions::resolve(sources.clone())
+    };
+    let probed = crate::image::probe_image(&src, opts).inspect_err(|_| {
+        keys_event(&Default::default(), None);
+    })?;
+    let idx = match explicit {
+        Some(idx) => idx,
+        None => title_index(plan, Some(probed.disc()))?,
+    };
+    let scope = match need_keys {
+        true => libfreemkv::keys::KeyScope::Titles(vec![idx]),
+        false => libfreemkv::keys::KeyScope::None,
+    };
+    let (opened, trace) = probed.key_traced(scope);
+    keys_event(&trace, opened.as_ref().ok().map(|o| &o.keys));
+    let opened = opened?;
+    let title = opened.disc.titles.get(idx).cloned();
+    Ok((idx, need_keys.then_some(opened.keys), title))
 }
 
 // The one title a title run muxes: `Titles([i])` is title `i`; another selection resolves

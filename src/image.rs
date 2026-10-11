@@ -86,7 +86,8 @@ pub struct OpenImageOptions {
     pub scope: Option<KeyScope>,
     /// An in-memory VID from a drive scan (KU §4.2), checked against the sidecar `vidfp`.
     pub vid: Option<[u8; 16]>,
-    /// Stops the resolve and its retry waits.
+    /// Stops the open (`Halted`): raised before it, no work is done (a given disc or a held
+    /// set included); raised later, it stops the image scan, the resolve and its retry waits.
     pub halt: Option<libfreemkv::Halt>,
 }
 
@@ -179,10 +180,61 @@ pub fn stream_info(
 pub fn scan_image(
     src: &ImageSource,
 ) -> crate::Result<(libfreemkv::Disc, Box<dyn libfreemkv::SectorSource>)> {
-    let opts = libfreemkv::ScanOptions::default();
-    match src {
+    scan_image_halted(src, None)
+}
+
+// [`scan_image`] stopped by `halt`: a Stop raised before, during or by the end of the scan
+// ends it `Halted`.
+pub(crate) fn scan_image_halted(
+    src: &ImageSource,
+    halt: Option<&libfreemkv::Halt>,
+) -> crate::Result<(libfreemkv::Disc, Box<dyn libfreemkv::SectorSource>)> {
+    halt.map_or(Ok(()), libfreemkv::Halt::check)?;
+    #[cfg(test)]
+    scan_hook::fire(scan_hook::At::Start);
+    let opts = libfreemkv::ScanOptions {
+        halt: halt.cloned(),
+        ..Default::default()
+    };
+    let scanned = match src {
         ImageSource::Iso(p) => libfreemkv::scan_iso(p, opts),
         ImageSource::Dir(p) => libfreemkv::scan_dir(p, opts),
+    }?;
+    #[cfg(test)]
+    scan_hook::fire(scan_hook::At::Done);
+    halt.map_or(Ok(()), libfreemkv::Halt::check)?;
+    Ok(scanned)
+}
+
+// A test's view of this thread's image scans: called as each starts and as each completes.
+#[cfg(test)]
+pub(crate) mod scan_hook {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum At {
+        Start,
+        Done,
+    }
+
+    type Hook = Box<dyn Fn(At)>;
+
+    thread_local! {
+        static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(crate) fn set(hook: impl Fn(At) + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(super) fn fire(at: At) {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow().as_ref() {
+                hook(at)
+            }
+        });
     }
 }
 
@@ -212,8 +264,20 @@ pub fn open_image_with_traced(
     crate::Result<OpenedImage>,
     libfreemkv::aacs::trace::ResolutionTrace,
 ) {
+    traced(|walk| key(probe(src, opts)?, walk))
+}
+
+// Run an open with a fresh walk; a refusal is logged with the walk so far.
+fn traced(
+    open: impl FnOnce(
+        &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
+    ) -> crate::Result<OpenedImage>,
+) -> (
+    crate::Result<OpenedImage>,
+    libfreemkv::aacs::trace::ResolutionTrace,
+) {
     let trace = std::sync::Mutex::new(Default::default());
-    let r = open_image_inner(src, opts, &trace);
+    let r = open(&trace);
     let trace = trace.into_inner().unwrap_or_else(|e| e.into_inner());
     if let Err(e) = &r {
         tracing::info!(target: "freemkv::keys", error = %e, walk = ?trace.keys, "image open refused");
@@ -221,11 +285,56 @@ pub fn open_image_with_traced(
     (r, trace)
 }
 
-fn open_image_inner(
-    src: &ImageSource,
-    opts: OpenImageOptions,
-    walk: &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
-) -> crate::Result<OpenedImage> {
+/// The first half of [`open_image_with`], for a caller that picks the key scope from the
+/// disc (a title run's selection): the sidecar read, the disc scanned under `opts.halt` (or
+/// the caller's checked, J14) and its identity checked, before any key is asked.
+/// [`Probed::key_traced`] finishes the same open; `opts.scope` is unused.
+pub(crate) fn probe_image(src: &ImageSource, opts: OpenImageOptions) -> crate::Result<Probed> {
+    let r = probe(src, opts);
+    if let Err(e) = &r {
+        tracing::info!(target: "freemkv::keys", error = %e, "image open refused");
+    }
+    r
+}
+
+/// An image open up to its keys: see [`probe_image`].
+pub(crate) struct Probed {
+    source: ImageSource,
+    sidecar: Option<Mapfile>,
+    disc: libfreemkv::Disc,
+    reader: Box<dyn libfreemkv::SectorSource>,
+    prescanned: bool,
+    keys: KeyInput,
+    scope: Option<KeyScope>,
+    vid: Option<[u8; 16]>,
+    vid_in_hand: Option<[u8; 32]>,
+    halt: Option<libfreemkv::Halt>,
+}
+
+impl Probed {
+    /// The disc the open scanned (or was given).
+    pub(crate) fn disc(&self) -> &libfreemkv::Disc {
+        &self.disc
+    }
+
+    /// The rest of the open: the keys of `scope` from the options' key input, checked against
+    /// the sidecar again, with the resolve's walk (as [`open_image_with_traced`]).
+    pub(crate) fn key_traced(
+        self,
+        scope: KeyScope,
+    ) -> (
+        crate::Result<OpenedImage>,
+        libfreemkv::aacs::trace::ResolutionTrace,
+    ) {
+        let probed = Probed {
+            scope: Some(scope),
+            ..self
+        };
+        traced(|walk| key(probed, walk))
+    }
+}
+
+fn probe(src: &ImageSource, opts: OpenImageOptions) -> crate::Result<Probed> {
     let OpenImageOptions {
         keys,
         disc,
@@ -233,9 +342,11 @@ fn open_image_inner(
         vid,
         halt,
     } = opts;
+    // One rule whether the disc is scanned here or given: a raised halt does no open work.
+    halt.as_ref().map_or(Ok(()), libfreemkv::Halt::check)?;
     let sidecar = load_sidecar(src)?;
     let prescanned = disc.is_some();
-    let (disc, mut reader) = match disc {
+    let (disc, reader) = match disc {
         Some(_) if matches!(src, ImageSource::Dir(_)) => {
             // J14 holds for `iso://` only: a folder muxes through `input()`, which scans it.
             tracing::error!(
@@ -255,9 +366,8 @@ fn open_image_inner(
             check_prescanned(&disc, reader.as_mut(), map, in_hand, &proven)?;
             (disc, reader)
         }
-        None => scan_image(src)?,
+        None => scan_image_halted(src, halt.as_ref())?,
     };
-    let scope = scope.unwrap_or_else(|| KeyScope::Titles(crate::keys::main_scope(&disc)));
     let vid_in_hand = in_hand_vid_fingerprint(&disc, vid, keys.held());
     if let Some(map) = &sidecar {
         let identity = DiscIdentity {
@@ -267,6 +377,37 @@ fn open_image_inner(
         };
         identity_ok(map, &identity)?;
     }
+    Ok(Probed {
+        source: src.clone(),
+        sidecar,
+        disc,
+        reader,
+        prescanned,
+        keys,
+        scope,
+        vid,
+        vid_in_hand,
+        halt,
+    })
+}
+
+fn key(
+    probed: Probed,
+    walk: &std::sync::Mutex<libfreemkv::aacs::trace::ResolutionTrace>,
+) -> crate::Result<OpenedImage> {
+    let Probed {
+        source,
+        sidecar,
+        disc,
+        mut reader,
+        prescanned,
+        keys,
+        scope,
+        vid,
+        vid_in_hand,
+        halt,
+    } = probed;
+    let scope = scope.unwrap_or_else(|| KeyScope::Titles(crate::keys::main_scope(&disc)));
     let scope_log = format!("{scope:?}");
     let halt = halt.as_ref();
     let (set, sources, trace) = match keys {
@@ -303,7 +444,7 @@ fn open_image_inner(
     }
     log_status(&set, &scope_log);
     Ok(OpenedImage {
-        source: src.clone(),
+        source,
         won: set.status().origin.map(str::to_string),
         top_up: std::sync::Mutex::new(TopUp::new(set.clone(), &scope)),
         disc,

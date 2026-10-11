@@ -325,3 +325,436 @@ fn an_image_title_run_resolves_its_selection_after_the_scan() {
     };
     assert!(outcome.completed, "{outcome:?}");
 }
+
+// How a title run over an image is keyed: from the key sources, or raw / with the keys
+// held, each with a stream filter (so the run opens the image for its title), or raw
+// keeping every stream (so nothing is opened but a non-explicit selection's scan).
+#[derive(Clone, Copy, Debug)]
+enum Keying {
+    Resolve,
+    RawFilter,
+    HeldFilter,
+    RawAll,
+}
+
+const KEYINGS: [Keying; 4] = [
+    Keying::Resolve,
+    Keying::RawFilter,
+    Keying::HeldFilter,
+    Keying::RawAll,
+];
+
+// A Sink that notes whether a run reached its mux (the engine logs `mux: …` as it starts).
+#[derive(Default)]
+struct MuxSeen(std::sync::atomic::AtomicBool);
+
+impl crate::Sink for MuxSeen {
+    fn log(&self, _: crate::Level, msg: &str) {
+        if msg.starts_with("mux: ") {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+// A title run of `titles` from `source` to `out`, keyed by `keying`, under `halt`; and
+// whether it reached the mux, past every check of the open.
+fn image_title_run(
+    fx: &crate::test_fixtures::Fx,
+    source: &str,
+    out: &std::path::Path,
+    titles: Selection,
+    keying: Keying,
+    halt: Option<libfreemkv::Halt>,
+) -> (crate::Result<Report>, bool) {
+    let filtered = crate::StreamChoice {
+        subtitles: crate::SubtitleFilter {
+            forced: crate::StreamFilter::None,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // Ciphertext muxes to a transport stream, never demuxed into Matroska.
+    let raw = matches!(keying, Keying::RawFilter | Keying::RawAll);
+    let scheme = if raw { "m2ts" } else { "mkv" };
+    let p = Plan {
+        titles,
+        raw,
+        streams: match keying {
+            Keying::RawAll => Default::default(),
+            _ => filtered,
+        },
+        ..plan(source, &format!("{scheme}://{}", out.display()))
+    };
+    let keys = matches!(keying, Keying::HeldFilter).then(|| held_keys(fx, source));
+    let with = RunWith {
+        keys,
+        halt,
+        ..with(factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default()))
+    };
+    let sink = MuxSeen::default();
+    let r = run_with(&p, with, &sink);
+    (r, sink.0.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+// What a run over a sound image comes to: a completed mux, but a raw one, whose ciphertext
+// yields no PES (MuxEmpty, after every open check).
+fn sound(keying: Keying) -> &'static str {
+    match keying {
+        Keying::RawFilter | Keying::RawAll => "MuxEmpty",
+        _ => "ok",
+    }
+}
+
+// The keys a front end holds for `source`: acquired over its own scan's titles (a folder is
+// its own disc), else the fixture disc's (a swept image has no key file of its own to scan).
+fn held_keys(fx: &crate::test_fixtures::Fx, source: &str) -> libfreemkv::keys::KeyRing {
+    let scope = |n: usize| libfreemkv::keys::KeyScope::Titles((0..n).collect());
+    let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+    // libfreemkv's scan, not the engine's: the scan-count test counts only the run's.
+    let scanned = match crate::ImageSource::from_url(source).unwrap() {
+        crate::ImageSource::Iso(p) => libfreemkv::scan_iso(&p, Default::default()),
+        crate::ImageSource::Dir(p) => libfreemkv::scan_dir(&p, Default::default()),
+    };
+    let own = scanned.and_then(|(disc, mut reader)| {
+        let opts = libfreemkv::keys::AcquireOptions::default();
+        let ctx = libfreemkv::Ctx::default();
+        let scope = scope(disc.titles.len());
+        libfreemkv::keys::KeyRing::acquire_for_disc(&disc, &mut *reader, scope, &f, opts, &ctx)
+    });
+    own.map(|r| r.keys).unwrap_or_else(|_| {
+        crate::test_fixtures::resolve(
+            fx,
+            scope(2),
+            &[(Answer::Keydb, &[K1, K2])],
+            &Calls::default(),
+        )
+        .expect("the fixture's keys")
+    })
+}
+
+// A run's result as compared across selections: "ok" for a completed mux, else the error.
+fn verdict(r: crate::Result<Report>) -> String {
+    match r {
+        Ok(Report::Title { outcome }) if outcome.completed => "ok".into(),
+        Ok(other) => format!("{other:?}"),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+// `fx` as a disc folder under `root` whose only key file is `/AACS/DUPLICATE/Unit_Key_RO.inf`.
+fn duplicate_only_folder(fx: &crate::test_fixtures::Fx, root: &std::path::Path) {
+    fx.write_folder(root);
+    std::fs::create_dir_all(root.join("AACS/DUPLICATE")).unwrap();
+    std::fs::rename(
+        root.join("AACS/Unit_Key_RO.inf"),
+        root.join("AACS/DUPLICATE/Unit_Key_RO.inf"),
+    )
+    .unwrap();
+}
+
+// The UDF image of the disc folder `root`, written to `iso`.
+fn iso_of_folder(root: &std::path::Path, iso: &std::path::Path) {
+    use libfreemkv::SectorSource;
+    let mut img = libfreemkv::DirImage::open(root).unwrap();
+    let mut bytes = vec![0u8; img.capacity_sectors() as usize * 2048];
+    for (lba, sector) in bytes.chunks_mut(2048).enumerate() {
+        img.read_sectors(lba as u32, 1, sector, false).unwrap();
+    }
+    std::fs::write(iso, bytes).unwrap();
+}
+
+// A sweep's sidecar for `iso`, of `disc`: its hash, every sector read but `unread`.
+fn swept_sidecar(disc: &libfreemkv::Disc, iso: &std::path::Path, unread: Option<(u32, u32)>) {
+    let total = std::fs::metadata(iso).unwrap().len();
+    let mut map = crate::Mapfile::create(&crate::mapfile_path_for(iso), total, "t").unwrap();
+    map.record(0, total, crate::SectorStatus::Finished).unwrap();
+    if let Some((lba, sectors)) = unread {
+        let (pos, len) = (lba as u64 * 2048, sectors as u64 * 2048);
+        map.record(pos, len, crate::SectorStatus::NonTrimmed)
+            .unwrap();
+    }
+    map.set_disc_hash(&disc.aacs.as_ref().unwrap().disc_hash);
+    map.flush().unwrap();
+}
+
+// What a keyed run (one that opens the image) of a parity image comes to.
+#[derive(Clone, Copy, Debug)]
+enum Expect {
+    // The image's mux: [`sound`].
+    Sound,
+    // Its sidecar does not load (E6011).
+    BadSidecar,
+    // Its sidecar names another disc (E6011 disc-mismatch).
+    Mismatch,
+    // Past every check of the open into the mux, where the synthetic HD DVD clip does not
+    // demux (MkvInvalid).
+    ClipFails,
+}
+
+// The parity table's images: (name, source URL, expected), each built under `dir` from `fx`.
+fn parity_images(
+    fx: &crate::test_fixtures::Fx,
+    dir: &std::path::Path,
+) -> Vec<(&'static str, String, Expect)> {
+    let iso = |name: &str| fx.write(dir, name);
+    let url = |scheme: &str, p: &std::path::Path| format!("{scheme}://{}", p.display());
+    let key_file = *fx.metadata.last().unwrap();
+    let mut images = vec![("valid iso", url("iso", &iso("valid.iso")), Expect::Sound)];
+    let folder = dir.join("valid");
+    fx.write_folder(&folder);
+    images.push(("valid dir", url("dir", &folder), Expect::Sound));
+    let dup = dir.join("dup");
+    duplicate_only_folder(fx, &dup);
+    images.push(("duplicate-only dir", url("dir", &dup), Expect::Sound));
+    let dup_iso = dir.join("dup.iso");
+    iso_of_folder(&dup, &dup_iso);
+    images.push(("duplicate-only iso", url("iso", &dup_iso), Expect::Sound));
+    let garbage = iso("garbage.iso");
+    std::fs::write(crate::mapfile_path_for(&garbage), "not a mapfile\n\x00\x7f").unwrap();
+    images.push((
+        "garbage mapfile iso",
+        url("iso", &garbage),
+        Expect::BadSidecar,
+    ));
+    let garbage_dir = dir.join("garbage");
+    fx.write_folder(&garbage_dir);
+    std::fs::write(crate::mapfile_path_for(&garbage_dir), "not a mapfile\n").unwrap();
+    images.push((
+        "garbage mapfile dir",
+        url("dir", &garbage_dir),
+        Expect::BadSidecar,
+    ));
+    let unread = iso("unread.iso");
+    swept_sidecar(&fx.disc, &unread, Some(key_file));
+    images.push((
+        "sidecar marks key file unread",
+        url("iso", &unread),
+        Expect::Sound,
+    ));
+    let swept = iso("swept.iso");
+    let mut bytes = std::fs::read(&swept).unwrap();
+    bytes[key_file.0 as usize * 2048..(key_file.0 + key_file.1) as usize * 2048].fill(0);
+    std::fs::write(&swept, bytes).unwrap();
+    swept_sidecar(&fx.disc, &swept, Some(key_file));
+    images.push((
+        "swept key file, sidecar marks it unread",
+        url("iso", &swept),
+        Expect::Mismatch,
+    ));
+    let hd = dir.join("hd");
+    hddvd_folder(&hd);
+    let hd_iso = dir.join("hd.iso");
+    iso_of_folder(&hd, &hd_iso);
+    images.push((
+        "hd dvd iso (VTKF key file)",
+        url("iso", &hd_iso),
+        Expect::ClipFails,
+    ));
+    let hd_map = dir.join("hd-map.iso");
+    std::fs::copy(&hd_iso, &hd_map).unwrap();
+    let (hd_disc, _) = crate::scan_image(&crate::ImageSource::Iso(hd_iso)).unwrap();
+    swept_sidecar(&hd_disc, &hd_map, None);
+    images.push((
+        "hd dvd iso with its sidecar",
+        url("iso", &hd_map),
+        Expect::ClipFails,
+    ));
+    images
+}
+
+// A non-explicit selection meets exactly the checks and errors of the explicit title it
+// resolves to: MainMovie and `Titles([main])` give the same result over every image and
+// keying, and each row gives the result it should.
+#[test]
+fn an_image_title_run_selection_does_not_change_its_checks() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let main = title_index(
+        &Plan {
+            titles: Selection::MainMovie,
+            ..Plan::default()
+        },
+        Some(&fx.disc),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for (image, source, expect) in parity_images(&fx, dir.path()) {
+        for keying in KEYINGS {
+            let mut row = Vec::new();
+            for titles in [Selection::MainMovie, Selection::Titles(vec![main])] {
+                let out = dir.path().join("out.mkv");
+                let (r, muxed) = image_title_run(&fx, &source, &out, titles, keying, None);
+                row.push((verdict(r), muxed, out.exists()));
+                let _ = std::fs::remove_file(&out);
+            }
+            assert_eq!(
+                row[0], row[1],
+                "{image}, {keying:?}: MainMovie vs Titles([{main}])"
+            );
+            // A raw run keeping every stream of an explicit title opens nothing (no sidecar
+            // read), so neither selection reads it: the BD image's ciphertext mux, MuxEmpty.
+            // A refusal of the open never reaches the mux.
+            let want = match (expect, keying) {
+                (Expect::ClipFails, _) => ("MkvInvalid", true),
+                (_, Keying::RawAll) => ("MuxEmpty", true),
+                (Expect::Sound, _) => (sound(keying), true),
+                (Expect::BadSidecar, _) => ("MapfileInvalid { kind: \"hex\" }", false),
+                (Expect::Mismatch, _) => ("MapfileInvalid { kind: \"disc-mismatch\" }", false),
+            };
+            let got = (row[0].0.as_str(), row[0].1);
+            assert_eq!(got, want, "{image}, {keying:?}: (verdict, reached the mux)");
+        }
+    }
+}
+
+// A title run on an image scans it once for a non-explicit selection (MainMovie, Longest),
+// whatever it is keyed by, and an explicit title scans no more than before.
+#[test]
+fn an_image_title_run_scans_the_image_once() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "src.iso");
+    let folder = dir.path().join("tree");
+    fx.write_folder(&folder);
+    let out = dir.path().join("o.mkv");
+    let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = scans.clone();
+    crate::image::scan_hook::set(move |at| {
+        if at == crate::image::scan_hook::At::Start {
+            seen.set(seen.get() + 1)
+        }
+    });
+    for source in [
+        format!("iso://{}", iso.display()),
+        format!("dir://{}", folder.display()),
+    ] {
+        for keying in KEYINGS {
+            for titles in [
+                Selection::MainMovie,
+                Selection::Longest,
+                Selection::Titles(vec![0]),
+            ] {
+                scans.set(0);
+                let (r, _) = image_title_run(&fx, &source, &out, titles.clone(), keying, None);
+                assert_eq!(verdict(r), sound(keying), "{source} {titles:?} {keying:?}");
+                let want = match (&titles, keying) {
+                    (Selection::Titles(_), Keying::RawAll) => 0,
+                    _ => 1,
+                };
+                assert_eq!(scans.get(), want, "{source} {titles:?} {keying:?}");
+                let _ = std::fs::remove_file(&out);
+            }
+        }
+    }
+    crate::image::scan_hook::clear();
+}
+
+// A Stop raised before the image scan, as it starts (past the engine's own check, so only
+// libfreemkv's scan can stop it) or as it completes ends a non-explicit title run `Halted`
+// with no output: the scan itself honours it, and no work follows it.
+#[test]
+fn a_stop_around_the_image_scan_halts_the_title_run() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum When {
+        BeforeScan,
+        AtScanStart,
+        AtScanEnd,
+    }
+    use crate::image::scan_hook::{self, At};
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "src.iso");
+    let folder = dir.path().join("tree");
+    fx.write_folder(&folder);
+    let out = dir.path().join("o.mkv");
+    for source in [
+        format!("iso://{}", iso.display()),
+        format!("dir://{}", folder.display()),
+    ] {
+        for keying in [Keying::Resolve, Keying::RawAll] {
+            for titles in [
+                Selection::MainMovie,
+                Selection::Longest,
+                Selection::Episodes,
+            ] {
+                for when in [When::BeforeScan, When::AtScanStart, When::AtScanEnd] {
+                    let halt = libfreemkv::Halt::new();
+                    if when == When::BeforeScan {
+                        halt.cancel();
+                    }
+                    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+                    let (log, stop) = (seen.clone(), halt.clone());
+                    scan_hook::set(move |at| {
+                        log.borrow_mut().push(at);
+                        match (when, at) {
+                            (When::AtScanStart, At::Start) | (When::AtScanEnd, At::Done) => {
+                                stop.cancel()
+                            }
+                            _ => {}
+                        }
+                    });
+                    let r =
+                        image_title_run(&fx, &source, &out, titles.clone(), keying, Some(halt)).0;
+                    scan_hook::clear();
+                    let case = format!("{source} {titles:?} {keying:?} {when:?}");
+                    assert!(
+                        matches!(r, Err(libfreemkv::Error::Halted)),
+                        "{case}: {}",
+                        verdict(r)
+                    );
+                    let want: &[At] = match when {
+                        When::BeforeScan => &[],
+                        When::AtScanStart => &[At::Start],
+                        When::AtScanEnd => &[At::Start, At::Done],
+                    };
+                    assert_eq!(*seen.borrow(), want, "{case}");
+                    assert!(!out.exists(), "{case}: nothing is written");
+                }
+            }
+        }
+    }
+}
+
+// An HD DVD-shaped disc folder under `root`: `/HVDVD_TS/FEATURE.EVO` (a clear head pack
+// with H.264 video and DD+ audio, then scrambled packs) and an `/AACS` directory whose
+// only unit-key file is `VTKF000.AACS`, so the disc hash comes from it.
+fn hddvd_folder(root: &std::path::Path) {
+    fn pes(stream_id: u8, flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![0, 0, 1, stream_id];
+        v.extend_from_slice(&((3 + payload.len()) as u16).to_be_bytes());
+        v.extend_from_slice(&[flags, 0, 0]);
+        v.extend_from_slice(payload);
+        v
+    }
+    let pack_header = [0, 0, 1, 0xBA, 0x44, 0, 4, 0, 4, 1, 1, 0x89, 0xC3, 0xF8];
+    let mut head = pack_header.to_vec();
+    let video = [
+        0, 0, 1, 0x67, 0x42, 0, 0x1E, 0xAB, 0xCD, 0, 0, 1, 0x65, 0x88, 0,
+    ];
+    head.extend(pes(0xE2, 0x80, &video));
+    for sub in [0xC0u8, 0xC1] {
+        head.extend(pes(0xBD, 0x80, &[sub, 1, 0, 0, 0x0B, 0x77, 0xDE, 0xAD]));
+    }
+    head.resize(2048, 0xFF);
+    let mut evo = head;
+    for _ in 0..63 {
+        let mut pack = pack_header.to_vec();
+        pack.extend(pes(0xE2, 0x80 | 0x30, &[0x5A; 64]));
+        pack.resize(2048, 0xFF);
+        evo.extend(pack);
+    }
+    let write = |rel: &str, bytes: &[u8]| {
+        let p = root.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    };
+    write("HVDVD_TS/FEATURE.EVO", &evo);
+    let vtkf = libfreemkv::test_util::unit_key_ro(
+        libfreemkv::aacs::mkb::AacsVersion::V10,
+        &[[0xEE; 16]],
+        &[1],
+    );
+    write("AACS/VTKF000.AACS", &vtkf);
+    write("AACS/MKBROM.AACS", &[0u8; 2048]);
+    // libfreemkv lays out a BD or DVD tree only; the scan reads HVDVD_TS before VIDEO_TS.
+    std::fs::create_dir_all(root.join("VIDEO_TS")).unwrap();
+}
