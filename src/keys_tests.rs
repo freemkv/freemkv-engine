@@ -379,13 +379,19 @@ fn key_status_reads_the_set() {
     ));
 }
 
-// A plain rip scopes its keys to the main title alone, even when another cut exists.
+// A plain rip scopes its keys to the main title alone, even when another cut exists; a disc
+// with no titles scopes none.
 #[test]
 fn a_plain_rip_scopes_keys_to_the_main_title() {
     let d = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
     assert_eq!(
         rip_scope(&d, &[], RipOutput::Streams),
         KeyScope::Titles(vec![0])
+    );
+    let empty = crate::test_fixtures::disc_of(Vec::new());
+    assert_eq!(
+        rip_scope(&empty, &[], RipOutput::Streams),
+        KeyScope::Titles(vec![])
     );
 }
 
