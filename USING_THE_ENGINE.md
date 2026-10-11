@@ -5,7 +5,7 @@ decrypt, mux, raw reads) and the front-ends. **The UI needs no direct
 libfreemkv dependency for the disc model and cancellation**: the engine
 re-exports them. A few types are not re-exported (`DeviceTarget`,
 `DriveCredentials`, `SectorSource`, `keys::KeyRing`, `DecryptStatus`), so
-add `libfreemkv = "1.9"` (with the same `[patch.crates-io]` block) to name them.
+add `libfreemkv = "1.8"` (with the same `[patch.crates-io]` block) to name them.
 
 ```
 libfreemkv        ← primitives (unchanged)
@@ -20,23 +20,23 @@ than pinning a hardcoded version, and lints on stable). It is
 
 ```toml
 [dependencies]
-freemkv-engine = "1.9"
+freemkv-engine = "1.8"
 
 # REQUIRED. freemkv-engine, libfreemkv and freemkv-keysources are NOT published
 # on crates.io — they are consumed by git tag. This block must live in YOUR OWN
 # workspace-root manifest: Cargo only honours [patch] in the root of the crate
 # being built, so the engine's own patch table redirects nothing for you. Use
-# the tag of the engine version you pin (v1.9.0 here) for every entry; add
+# the tag of the engine version you pin (v1.8.4 here) for every entry; add
 # freemkv-i18n at the same tag if you depend on it.
 [patch.crates-io]
-libfreemkv         = { git = "https://github.com/freemkv/libfreemkv",         tag = "v1.9.0" }
-freemkv-engine     = { git = "https://github.com/freemkv/freemkv-engine",     tag = "v1.9.0" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.9.0" }
+libfreemkv         = { git = "https://github.com/freemkv/libfreemkv",         tag = "v1.8.4" }
+freemkv-engine     = { git = "https://github.com/freemkv/freemkv-engine",     tag = "v1.8.4" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.8.4" }
 ```
 
 > **Heads-up on the `libfreemkv` name:** an old `libfreemkv` **1.1.0** still sits
 > on crates.io. It is unmaintained and unrelated to current releases. Without the
-> `[patch.crates-io]` above, `libfreemkv = "1.9"` fails to resolve and
+> `[patch.crates-io]` above, `libfreemkv = "1.8"` fails to resolve and
 > `libfreemkv = "1"` silently pulls that abandoned 1.1.0. The patch block is what
 > makes the git-tag source authoritative — do not omit it.
 
