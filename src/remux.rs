@@ -563,10 +563,13 @@ fn coded_io(e: io::Error) -> io::Error {
 }
 
 /// The error of a remux whose target filesystem can neither rename without replacing nor
-/// hard-link: the verified output is kept at `kept` for a manual publish, never replacing a
-/// file: `<target>.verified`, else the first free `<target>.verified.<n>`, else (a name too
-/// long for the folder) `freemkv-remux-<n>.verified` beside it. Its code and text are the I/O
-/// error's (E5000), shown once (it has no `source`); its kind is `Unsupported`.
+/// hard-link: the verified output is kept at `kept` for a manual publish, under the first name
+/// it can take of `<target>.verified`, `<target>.verified.<n>`, then (all of those taken or not
+/// creatable, e.g. too long) `freemkv-remux-<n>.verified` beside the target. Each name is first
+/// created empty and exclusively, then the output renamed over it: a file already there is never
+/// replaced and two remuxes never keep to one name, but a writer that replaces that placeholder
+/// before the rename loses its file. Its code and text are the I/O error's (E5000), shown once
+/// (it has no `source`); its kind is `Unsupported`.
 #[derive(Debug)]
 pub struct RemuxUnpublished {
     pub kept: PathBuf,
@@ -613,12 +616,15 @@ fn verified_path(target: &Path) -> PathBuf {
     target.with_file_name(name)
 }
 
-// Move the verified `landing` to the first free kept name. The filesystem has no no-replace
-// rename, so each name is checked absent, then renamed to; the target's lock serializes every
-// engine remux to it, so only a foreign writer can race that check. `None`: no name was taken.
-fn keep_unpublished(landing: &Path, target: &Path, sink: &dyn Sink) -> Option<PathBuf> {
-    let free = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound);
-    let kept = kept_names(target).find(|name| free(name) && std::fs::rename(landing, name).is_ok());
+// Move the verified `landing` to the first kept name this remux can reserve (see `keep_at`).
+// `None`: no name was taken.
+fn keep_unpublished(
+    landing: &Path,
+    target: &Path,
+    sink: &dyn Sink,
+    rio: &dyn RemuxIo,
+) -> Option<PathBuf> {
+    let kept = kept_names(target).find(|name| keep_at(landing, name, rio));
     let msg = match &kept {
         Some(kept) => {
             let shown = crate::mux::log_safe(&kept.display().to_string());
@@ -629,6 +635,49 @@ fn keep_unpublished(landing: &Path, target: &Path, sink: &dyn Sink) -> Option<Pa
     };
     sink.log(Level::Warn, &msg);
     kept
+}
+
+// Reserve `name` by creating it empty and exclusively (O_EXCL, which a share without no-replace
+// rename still honours), then rename `landing` over that placeholder. A failed rename removes the
+// placeholder only while it is still the empty file this call created.
+fn keep_at(landing: &Path, name: &Path, rio: &dyn RemuxIo) -> bool {
+    let reserved = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(name);
+    let Ok(placeholder) = reserved else {
+        return false;
+    };
+    let ours = placeholder.metadata().ok().and_then(|m| file_id(&m));
+    drop(placeholder);
+    if rio.keep(landing, name).is_ok() {
+        return true;
+    }
+    let still_ours = |m: std::fs::Metadata| m.is_file() && m.len() == 0 && file_id(&m) == ours;
+    if ours.is_some() && std::fs::symlink_metadata(name).is_ok_and(still_ours) {
+        let _ = std::fs::remove_file(name);
+    }
+    false
+}
+
+// A file's identity on Unix: its device and inode. Other platforms have none here (a creation
+// time passes to a file renamed in over it), so no file is ever proven the same there.
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(not(unix))]
+type FileId = ();
+
+fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some((meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
 }
 
 fn target_exists(target: &Path) -> io::Error {
@@ -751,6 +800,10 @@ pub(crate) trait RemuxIo: Sync {
     /// Move `landing` to `target`, replacing it.
     fn replace(&self, landing: &Path, target: &Path) -> io::Result<()> {
         std::fs::rename(landing, target)
+    }
+    /// Move an unpublished `landing` over the placeholder this remux reserved at `name`.
+    fn keep(&self, landing: &Path, name: &Path) -> io::Result<()> {
+        std::fs::rename(landing, name)
     }
 }
 
@@ -878,7 +931,7 @@ fn land_verified(
         // mux again, so the verified output is kept for a manual publish.
         if !job.replace
             && e.kind() == io::ErrorKind::Unsupported
-            && let Some(kept) = keep_unpublished(landing, &job.target, sink)
+            && let Some(kept) = keep_unpublished(landing, &job.target, sink, rio)
         {
             remote_guard.as_mut().unwrap_or(&mut guard).disarm();
             let kind = e.kind();

@@ -346,8 +346,11 @@ then renames it over the target; it returns a `RemuxReport`. Without
 filesystem that can neither rename without replacing nor hard-link, the remux
 fails E5000 (kind `Unsupported`) and keeps the verified output for the user to
 publish by hand: `RemuxUnpublished::of(&err).map(|u| &u.kept)` names it
-(`<target>.verified`, or a numbered or short name beside it, never a file it
-replaced). Show that path; a retry fails the same way after a whole mux.
+(`<target>.verified`, or a numbered or short name beside it). The name is
+created empty and exclusively before the output is renamed over it, so a file
+already there is never replaced. Show that path; a retry fails the same way
+after a whole mux. If no kept name can be taken, the error is the same E5000
+(kind `Unsupported`) but `RemuxUnpublished::of` is `None`: nothing was kept.
 
 ---
 

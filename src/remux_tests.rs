@@ -1082,6 +1082,142 @@ fn a_kept_output_whose_name_does_not_fit_is_kept_outside_the_partial() {
     assert_eq!(std::fs::read(&kept).unwrap(), new);
 }
 
+// OS primitives whose `keep` first runs `during` once (another writer, or another remux
+// keeping meanwhile), then moves as production does, or fails when `fails`.
+struct KeepRace<'a> {
+    during: &'a (dyn Fn(&Path) + Sync),
+    ran: AtomicBool,
+    fails: bool,
+}
+impl<'a> KeepRace<'a> {
+    fn new(during: &'a (dyn Fn(&Path) + Sync), fails: bool) -> Self {
+        let ran = AtomicBool::new(false);
+        KeepRace { during, ran, fails }
+    }
+}
+impl RemuxIo for KeepRace<'_> {
+    fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+        OsRemuxIo.sync(f, h, p)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+        OsRemuxIo.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        OsRemuxIo.create_new(path)
+    }
+    fn timing(&self) -> RemuxTiming {
+        RemuxTiming::default()
+    }
+    fn keep(&self, landing: &Path, name: &Path) -> io::Result<()> {
+        if !self.ran.swap(true, Ordering::SeqCst) {
+            (self.during)(name);
+        }
+        match self.fails {
+            true => Err(io::Error::other("rename failed")),
+            false => std::fs::rename(landing, name),
+        }
+    }
+}
+
+// Two remuxes to different long-named targets in one folder (each holding only its own
+// target's lock) both fall back to the shared short names: they never keep to the same one.
+#[test]
+fn concurrent_keeps_to_different_targets_never_share_a_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ta, tb) = (
+        dir.path().join("a".repeat(250)),
+        dir.path().join("b".repeat(250)),
+    );
+    let (la, lb) = (dir.path().join("a.landing"), dir.path().join("b.landing"));
+    std::fs::write(&la, b"title A").unwrap();
+    std::fs::write(&lb, b"title B").unwrap();
+    let b_kept = Mutex::new(None);
+    let b_keeps = |_: &Path| {
+        *b_kept.lock().unwrap() = keep_unpublished(&lb, &tb, &crate::NoopSink, &OsRemuxIo);
+    };
+    let rio = KeepRace::new(&b_keeps, false);
+    let a_kept = keep_unpublished(&la, &ta, &crate::NoopSink, &rio).expect("A kept");
+    let b_kept = b_kept.lock().unwrap().clone().expect("B kept");
+    assert_ne!(a_kept, b_kept);
+    assert_eq!(std::fs::read(&a_kept).unwrap(), b"title A");
+    assert_eq!(std::fs::read(&b_kept).unwrap(), b"title B");
+}
+
+// A writer that creates a kept name (exclusively) while the keep runs never has its file
+// replaced: the name is reserved before the output moves there.
+#[test]
+fn a_kept_name_created_during_the_keep_is_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let landing = partial_path(&target);
+    std::fs::write(&landing, b"verified").unwrap();
+    let created = AtomicBool::new(false);
+    let foreign = |name: &Path| {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(name);
+        if f.and_then(|mut f| f.write_all(b"foreign")).is_ok() {
+            created.store(true, Ordering::SeqCst);
+        }
+    };
+    let rio = KeepRace::new(&foreign, false);
+    let kept = keep_unpublished(&landing, &target, &crate::NoopSink, &rio).expect("kept");
+    assert_eq!(std::fs::read(&kept).unwrap(), b"verified");
+    let name = verified_path(&target);
+    let intact = std::fs::read(&name).is_ok_and(|b| b == b"foreign");
+    assert!(
+        !created.load(Ordering::SeqCst) || intact,
+        "the foreign file stays"
+    );
+}
+
+// A move that fails removes only the placeholder the keep reserved: a file another writer
+// put over it meanwhile stays, and no other placeholder is left behind.
+#[test]
+fn a_failed_keep_removes_only_its_own_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let landing = partial_path(&target);
+    std::fs::write(&landing, b"verified").unwrap();
+    let swap = |name: &Path| {
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"foreign").unwrap();
+        std::fs::rename(&other, name).unwrap();
+    };
+    let rio = KeepRace::new(&swap, true);
+    assert_eq!(
+        keep_unpublished(&landing, &target, &crate::NoopSink, &rio),
+        None
+    );
+    assert_eq!(std::fs::read(verified_path(&target)).unwrap(), b"foreign");
+    let left: Vec<_> = kept_names(&target).skip(1).filter(|n| n.exists()).collect();
+    assert!(left.is_empty(), "{left:?}");
+    assert_eq!(std::fs::read(&landing).unwrap(), b"verified");
+}
+
+// Every kept name taken: the remux fails E5000 (kind Unsupported) with no `RemuxUnpublished`,
+// its partial is removed, and every file at a kept name is left as it was.
+#[test]
+fn an_unpublished_remux_with_every_kept_name_taken_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let names: Vec<PathBuf> = kept_names(&target).collect();
+    assert_eq!(names.len(), 2 * KEPT_NAMES);
+    for name in &names {
+        std::fs::write(name, b"taken").unwrap();
+    }
+    let e = unpublished(&target, &mkv(600.0, Some(598), 2), &NoPublishIo);
+    assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+    let code = libfreemkv::error::E_IO_ERROR;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert!(RemuxUnpublished::of(&e).is_none());
+    assert!(!partial_path(&target).exists() && !target.exists());
+    for name in &names {
+        assert_eq!(std::fs::read(name).unwrap(), b"taken", "{}", name.display());
+    }
+}
+
 // A kept output's error shows the coded I/O text once: it is not also a source in the chain.
 #[test]
 fn an_unpublished_remux_error_shows_its_text_once_in_the_chain() {
