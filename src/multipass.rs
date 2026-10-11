@@ -691,6 +691,7 @@ pub struct MultipassOpts {
     pub is_iso_output: bool,
     /// Sweep attempts allowed: a transport fault the host recovers from
     /// ([`PassHost::recover_transport`]) sweeps again until this many have run.
+    /// 0 is treated as 1.
     pub max_sweep_attempts: u32,
     /// Whether the sweep resumes the image's mapfile: `Some` decides (the server's Resume),
     /// `None` resumes a mapfile written in the run's raw/decrypt mode.
@@ -948,7 +949,7 @@ pub(crate) fn recover(
         let mut last_err = None;
         let sr = loop {
             attempt += 1;
-            if attempt > opts.max_sweep_attempts {
+            if attempt > opts.max_sweep_attempts.max(1) {
                 return Err(last_err.unwrap_or(libfreemkv::Error::SourceTerminated));
             }
             let bridge = ProgressBridge::new(sink);
