@@ -2789,7 +2789,7 @@ fn sweep_attempts_stop_at_the_configured_cap() {
             true
         }
     }
-    for (cap, calls) in [(1, vec![1]), (3, vec![1, 2, 3])] {
+    for (cap, calls) in [(0, vec![1]), (1, vec![1]), (3, vec![1, 2, 3])] {
         let (_dir, iso) = scratch_iso("sweep-attempts");
         let disc = test_disc(4096, vec![test_title(0, 4096)]);
         let opts = MultipassOpts {
