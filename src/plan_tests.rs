@@ -957,3 +957,54 @@ fn a_held_key_main_movie_run_with_its_own_selection_still_follows_the_audio() {
     };
     assert_eq!(muxed_audio(&p, with, &out), ["deu"]);
 }
+
+// An image run's recovery follows the plan's audio filter: on the branch-variant image with
+// German audio, every pass reports the German cut as its main title, whether the run takes
+// recovery passes, a single one, or one per invocation.
+#[test]
+fn an_image_run_recovery_reports_the_audio_picked_main_title() {
+    #[derive(Default)]
+    struct Sizes(std::sync::Mutex<Vec<Option<u64>>>);
+    impl crate::Sink for Sizes {
+        fn event(&self, e: &crate::Event<'_>) {
+            if let crate::Event::Pass(p) = e {
+                self.0.lock().unwrap().push(p.main_title_size_bytes);
+            }
+        }
+    }
+    let fx = crate::test_fixtures::branch_image();
+    let german = Some(fx.disc.titles[1].size_bytes);
+    assert_ne!(german, Some(fx.disc.titles[0].size_bytes));
+    let dir = tempfile::tempdir().unwrap();
+    let src = fx.write(dir.path(), "src.iso");
+    let multipass = crate::MultipassOpts {
+        max_passes: 2,
+        ..Default::default()
+    };
+    for (n, passes) in [Some(multipass), Some(Default::default()), None]
+        .into_iter()
+        .enumerate()
+    {
+        let dst = dir.path().join(format!("{n}.iso"));
+        let p = Plan {
+            streams: StreamChoice {
+                audio: crate::StreamFilter::Langs(vec!["de".into()]),
+                ..StreamChoice::default()
+            },
+            multipass: true,
+            ..plan(
+                &format!("iso://{}", src.display()),
+                &format!("iso://{}", dst.display()),
+            )
+        };
+        let with = RunWith {
+            passes,
+            ..with(factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default()))
+        };
+        let sink = Sizes::default();
+        run_with(&p, with, &sink).expect("the image copies");
+        let sizes = sink.0.into_inner().unwrap();
+        assert!(!sizes.is_empty(), "{passes:?}");
+        assert!(sizes.iter().all(|&z| z == german), "{passes:?}: {sizes:?}");
+    }
+}
