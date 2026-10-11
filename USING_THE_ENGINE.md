@@ -351,6 +351,10 @@ created empty and exclusively before the output is renamed over it, so a file
 already there is never replaced. Show that path; a retry fails the same way
 after a whole mux. If no kept name can be taken, the error is the same E5000
 (kind `Unsupported`) but `RemuxUnpublished::of` is `None`: nothing was kept.
+That is always the case on a filesystem whose rename also refuses an existing
+destination (e.g. sshfs to an SFTP-v3 server without the `posix-rename` and
+`hardlink` extensions): no kept name can be taken there, so publish to another
+filesystem.
 
 ---
 
