@@ -33,7 +33,6 @@ fn roster(titles: &mut [DiscTitle], members: &[usize]) {
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
             roster: "fixture:verified-episode-menu".into(),
             title_count,
-            member: members.contains(&index),
             ordinal: orders.get(&index).copied(),
         };
     }
@@ -62,7 +61,7 @@ fn authored_partition_order_survives_scan_order_and_audio_alternates() {
         }
     }
     assert_eq!(select(&titles).indices, vec![1, 2]);
-    for (index, ordinal) in [(0, None), (0, Some(0)), (0, Some(2)), (1, Some(4))] {
+    for (index, ordinal) in [(0, Some(0)), (0, Some(2)), (1, Some(4))] {
         let mut invalid = titles.clone();
         if let EpisodeEvidence::Authored { ordinal: order, .. } =
             &mut invalid[index].selection_evidence.episodes
@@ -108,11 +107,9 @@ fn reported_planet_earth_order_and_vpc_intervals_never_use_size_order_or_fuzzy_i
     assert!(!report.requires_review());
     for (vpc, order) in [(2, 0), (6, 1)] {
         let mut conflicting = titles.clone();
-        if let EpisodeEvidence::Authored {
-            member, ordinal, ..
-        } = &mut conflicting[vpc].selection_evidence.episodes
+        if let EpisodeEvidence::Authored { ordinal, .. } =
+            &mut conflicting[vpc].selection_evidence.episodes
         {
-            *member = true;
             *ordinal = Some(order);
         }
         let held = select(&conflicting);
@@ -177,7 +174,7 @@ fn observed_seventeen_title_authored_roster_selects_three_exact_programs() {
             for (ordinal, selected) in selected.iter().enumerate() {
                 assert!(matches!(
                     selected.selection_evidence.episodes,
-                    EpisodeEvidence::Authored { member: true, ordinal: Some(order), title_count: 17, .. }
+                    EpisodeEvidence::Authored { ordinal: Some(order), title_count: 17, .. }
                         if order == ordinal
                 ));
             }
@@ -192,7 +189,7 @@ fn authored_order_is_required_and_unknown_identity_cannot_share_a_slot() {
         title(2, "b", 200.0, "deu"),
         title(3, "extra", 300.0, "eng"),
     ];
-    for case in 0..5 {
+    for case in 0..3 {
         let mut titles = original.clone();
         roster(&mut titles, &[0, 1]);
         for (index, title) in titles.iter_mut().enumerate() {
@@ -200,15 +197,13 @@ fn authored_order_is_required_and_unknown_identity_cannot_share_a_slot() {
                 &mut title.selection_evidence.episodes
             {
                 match case {
-                    0 => *ordinal = None,
-                    1 if index == 2 => *ordinal = Some(2),
-                    2 if index == 1 => *ordinal = Some(usize::MAX),
-                    3 if index < 2 => {
+                    0 if index == 1 => *ordinal = Some(usize::MAX),
+                    1 if index < 2 => {
                         *ordinal = Some(0);
                         title.clips.clear();
                         rescan(title);
                     }
-                    4 if index < 2 => *ordinal = Some(0),
+                    2 if index < 2 => *ordinal = Some(0),
                     _ => {}
                 }
             }

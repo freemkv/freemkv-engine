@@ -261,7 +261,6 @@ impl SelectionModel {
             let EpisodeEvidence::Authored {
                 roster,
                 title_count,
-                member,
                 ordinal,
             } = &title.evidence.episodes
             else {
@@ -278,8 +277,7 @@ impl SelectionModel {
             }
             source = Some(roster);
             observed += 1;
-            if *member {
-                let ordinal = ordinal.ok_or(SelectionReviewReason::IncompleteEpisodeRoster)?;
+            if let Some(ordinal) = *ordinal {
                 if let Some(previous) = by_order.insert(ordinal, title.index) {
                     let identity = title.presentation.as_ref();
                     if identity.is_none() || identity != self.titles[previous].presentation.as_ref()
@@ -295,8 +293,6 @@ impl SelectionModel {
                     return Err(SelectionReviewReason::InvalidEpisodeRoster);
                 }
                 members.push((ordinal, title.index));
-            } else if ordinal.is_some() {
-                return Err(SelectionReviewReason::InvalidEpisodeRoster);
             }
         }
         let source = source.ok_or(SelectionReviewReason::MissingEpisodeRoster)?;
