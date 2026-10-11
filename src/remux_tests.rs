@@ -979,11 +979,13 @@ fn libc_estale() -> i32 {
     if cfg!(target_os = "linux") { 116 } else { 70 }
 }
 
-// A disc whose two titles are cuts of one programme (exact aliases), title 0 English and
-// title 1 German, as scanned from the image `iso`: title 1 still muxes its own clip (K2).
+// The image `iso` as two aliased cuts, title 0 English and title 1 German (still muxing its
+// own clip, K2). The identity comes from title 0's clips: the fixture's playlists declare no
+// playback type, so the scan proves no segments.
 fn branch_disc(iso: &Path) -> libfreemkv::Disc {
     let (mut disc, _) = libfreemkv::scan_iso(iso, Default::default()).unwrap();
-    let shared = disc.titles[0].selection_evidence.segments.clone();
+    let shared = libfreemkv::disc::ContentSegment::from_clips(&disc.titles[0].clips);
+    assert!(!shared.is_empty(), "title 0's clips describe it");
     for (title, language) in disc.titles.iter_mut().zip(["eng", "deu"]) {
         title.selection_evidence.segments = shared.clone();
         for stream in &mut title.streams {
