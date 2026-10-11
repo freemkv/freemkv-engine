@@ -2,7 +2,7 @@
 
 use crate::{PresentationIdentity, Selection, StreamFilter};
 use libfreemkv::DiscTitle;
-use libfreemkv::disc::{EpisodeEvidence, MovieSelectionBasis, TitleSelectionEvidence};
+use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
 
 /// Content-presentation preference, independent of which streams are retained. Soft:
@@ -35,7 +35,7 @@ pub enum SelectionBasis {
     Explicit,
     All,
     Longest,
-    Movie(MovieSelectionBasis),
+    Movie,
     AuthoredEpisodes { roster: String },
     UncertainReview,
 }
@@ -177,7 +177,7 @@ impl SelectionModel {
                     return SelectionReport {
                         indices: Vec::new(),
                         candidates: Vec::new(),
-                        basis: SelectionBasis::Movie(MovieSelectionBasis::CanonicalFallback),
+                        basis: SelectionBasis::Movie,
                         review_reason: None,
                     };
                 };
@@ -195,7 +195,7 @@ impl SelectionModel {
                         }
                     }
                 }
-                (vec![best], SelectionBasis::Movie(main.evidence.movie_basis))
+                (vec![best], SelectionBasis::Movie)
             }
             Selection::All => ((0..self.titles.len()).collect(), SelectionBasis::All),
             Selection::Titles(indices) => {
@@ -261,7 +261,6 @@ impl SelectionModel {
             let EpisodeEvidence::Authored {
                 roster,
                 title_count,
-                member,
                 ordinal,
             } = &title.evidence.episodes
             else {
@@ -278,8 +277,7 @@ impl SelectionModel {
             }
             source = Some(roster);
             observed += 1;
-            if *member {
-                let ordinal = ordinal.ok_or(SelectionReviewReason::IncompleteEpisodeRoster)?;
+            if let Some(ordinal) = *ordinal {
                 if let Some(previous) = by_order.insert(ordinal, title.index) {
                     let identity = title.presentation.as_ref();
                     if identity.is_none() || identity != self.titles[previous].presentation.as_ref()
@@ -295,8 +293,6 @@ impl SelectionModel {
                     return Err(SelectionReviewReason::InvalidEpisodeRoster);
                 }
                 members.push((ordinal, title.index));
-            } else if ordinal.is_some() {
-                return Err(SelectionReviewReason::InvalidEpisodeRoster);
             }
         }
         let source = source.ok_or(SelectionReviewReason::MissingEpisodeRoster)?;

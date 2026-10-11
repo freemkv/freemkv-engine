@@ -6,7 +6,6 @@ use libfreemkv::disc::ContentSegment;
 fn rescan(title: &mut DiscTitle) {
     title.selection_evidence.segments = ContentSegment::from_clips(&title.clips);
 }
-use libfreemkv::disc::NavigationSource;
 
 // Synthetic evidence contract fixture, not a claim about a real menu schema.
 fn roster(titles: &mut [DiscTitle], members: &[usize]) {
@@ -34,7 +33,6 @@ fn roster(titles: &mut [DiscTitle], members: &[usize]) {
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
             roster: "fixture:verified-episode-menu".into(),
             title_count,
-            member: members.contains(&index),
             ordinal: orders.get(&index).copied(),
         };
     }
@@ -63,7 +61,7 @@ fn authored_partition_order_survives_scan_order_and_audio_alternates() {
         }
     }
     assert_eq!(select(&titles).indices, vec![1, 2]);
-    for (index, ordinal) in [(0, None), (0, Some(0)), (0, Some(2)), (1, Some(4))] {
+    for (index, ordinal) in [(0, Some(0)), (0, Some(2)), (1, Some(4))] {
         let mut invalid = titles.clone();
         if let EpisodeEvidence::Authored { ordinal: order, .. } =
             &mut invalid[index].selection_evidence.episodes
@@ -109,11 +107,9 @@ fn reported_planet_earth_order_and_vpc_intervals_never_use_size_order_or_fuzzy_i
     assert!(!report.requires_review());
     for (vpc, order) in [(2, 0), (6, 1)] {
         let mut conflicting = titles.clone();
-        if let EpisodeEvidence::Authored {
-            member, ordinal, ..
-        } = &mut conflicting[vpc].selection_evidence.episodes
+        if let EpisodeEvidence::Authored { ordinal, .. } =
+            &mut conflicting[vpc].selection_evidence.episodes
         {
-            *member = true;
             *ordinal = Some(order);
         }
         let held = select(&conflicting);
@@ -178,7 +174,7 @@ fn observed_seventeen_title_authored_roster_selects_three_exact_programs() {
             for (ordinal, selected) in selected.iter().enumerate() {
                 assert!(matches!(
                     selected.selection_evidence.episodes,
-                    EpisodeEvidence::Authored { member: true, ordinal: Some(order), title_count: 17, .. }
+                    EpisodeEvidence::Authored { ordinal: Some(order), title_count: 17, .. }
                         if order == ordinal
                 ));
             }
@@ -193,7 +189,7 @@ fn authored_order_is_required_and_unknown_identity_cannot_share_a_slot() {
         title(2, "b", 200.0, "deu"),
         title(3, "extra", 300.0, "eng"),
     ];
-    for case in 0..5 {
+    for case in 0..3 {
         let mut titles = original.clone();
         roster(&mut titles, &[0, 1]);
         for (index, title) in titles.iter_mut().enumerate() {
@@ -201,15 +197,13 @@ fn authored_order_is_required_and_unknown_identity_cannot_share_a_slot() {
                 &mut title.selection_evidence.episodes
             {
                 match case {
-                    0 => *ordinal = None,
-                    1 if index == 2 => *ordinal = Some(2),
-                    2 if index == 1 => *ordinal = Some(usize::MAX),
-                    3 if index < 2 => {
+                    0 if index == 1 => *ordinal = Some(usize::MAX),
+                    1 if index < 2 => {
                         *ordinal = Some(0);
                         title.clips.clear();
                         rescan(title);
                     }
-                    4 if index < 2 => *ordinal = Some(0),
+                    2 if index < 2 => *ordinal = Some(0),
                     _ => {}
                 }
             }
@@ -241,10 +235,8 @@ fn authored_six_alternates_keep_three_uneven_short_episodes_and_reject_distinct_
 }
 
 #[test]
-fn unknown_is_a_review_hold_not_runtime_or_movie_hint_proof() {
-    let mut titles = vec![title(0, "a", 90.0, "eng"), title(1, "b", 2400.0, "deu")];
-    titles[0].selection_evidence.navigation = Some(NavigationSource::HdmvFirstPlay);
-    titles[0].selection_evidence.authoring_hint = true;
+fn unknown_is_a_review_hold_not_runtime_proof() {
+    let titles = vec![title(0, "a", 90.0, "eng"), title(1, "b", 2400.0, "deu")];
     let report = select(&titles);
     assert!(report.indices.is_empty());
     assert_eq!(report.candidates, vec![0, 1]);
@@ -323,16 +315,14 @@ fn excluded_equivalent_cannot_supply_audio_to_an_authored_episode() {
 }
 
 #[test]
-fn owned_model_preserves_movie_provenance_audio_and_explicit_choices() {
-    let mut titles = vec![title(0, "a", 100.0, "eng"), title(1, "a", 200.0, "deu")];
-    let basis = MovieSelectionBasis::Navigation(NavigationSource::DvdFirstPlay);
-    titles[0].selection_evidence.movie_basis = basis;
+fn owned_model_preserves_audio_and_explicit_choices() {
+    let titles = vec![title(0, "a", 100.0, "eng"), title(1, "a", 200.0, "deu")];
     let model = SelectionModel::from_titles(&titles);
     drop(titles);
     let audio = StreamFilter::Langs(vec!["de".into()]);
     let movie = model.select(&Selection::MainMovie, &audio);
     assert_eq!(movie.indices, vec![1]);
-    assert_eq!(movie.basis, SelectionBasis::Movie(basis));
+    assert_eq!(movie.basis, SelectionBasis::Movie);
     for (selection, expected) in [
         (Selection::Titles(vec![1, 0, 1, 99]), vec![1, 0]),
         (Selection::All, vec![0, 1]),

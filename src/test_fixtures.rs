@@ -667,7 +667,6 @@ pub(crate) fn authored_episodes(titles: &mut [libfreemkv::DiscTitle], members: &
         title.selection_evidence.episodes = libfreemkv::disc::EpisodeEvidence::Authored {
             roster: "fixture:complete-menu".into(),
             title_count,
-            member: members.contains(&index),
             ordinal: orders.get(&index).copied(),
         };
     }

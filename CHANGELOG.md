@@ -15,6 +15,7 @@ project follows semantic versioning.
 
 - DVD authored-launch selection: `SelectionBasis::AuthoredLaunch`, the review reasons `incomplete-launch-proof`, `invalid-launch-proof`, `missing-presentation-language`, `invalid-presentation-language`, `unmatched-presentation-language` and `ambiguous-presentation-language`, and `SelectionTitle::audio_by_pid`. On untraceable DVDs (most of them) it held every main-movie pick for review whenever an audio language was set.
 - `PresentationIdentity` is an opaque list of content segments rather than an enum of clip and DVD-cell variants.
+- `SelectionBasis::Movie` carries no payload; libfreemkv dropped `MovieSelectionBasis`.
 
 ## [1.8.3] — 2026-10-08
 
