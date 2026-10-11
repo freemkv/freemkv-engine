@@ -1184,12 +1184,11 @@ fn an_unsupported_replacing_rename_keeps_nothing() {
 }
 
 // The image `iso` as two aliased cuts, title 0 English and title 1 German (still muxing its
-// own clip, K2). The identity comes from title 0's clips: the fixture's playlists declare no
-// playback type, so the scan proves no segments.
+// own clip, K2): both carry the segments the scan found for title 0.
 fn branch_disc(iso: &Path) -> libfreemkv::Disc {
     let (mut disc, _) = libfreemkv::scan_iso(iso, Default::default()).unwrap();
-    let shared = libfreemkv::disc::ContentSegment::from_clips(&disc.titles[0].clips);
-    assert!(!shared.is_empty(), "title 0's clips describe it");
+    let shared = disc.titles[0].selection_evidence.segments.clone();
+    assert!(!shared.is_empty(), "the scan describes title 0 by segments");
     for (title, language) in disc.titles.iter_mut().zip(["eng", "deu"]) {
         title.selection_evidence.segments = shared.clone();
         for stream in &mut title.streams {
