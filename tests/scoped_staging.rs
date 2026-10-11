@@ -257,6 +257,7 @@ fn mp_opts() -> freemkv_engine::MultipassOpts {
         max_passes: 2,
         abort_on_lost_secs: 0,
         is_iso_output: false,
+        ..Default::default()
     }
 }
 

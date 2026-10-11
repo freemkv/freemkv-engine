@@ -689,6 +689,51 @@ pub struct MultipassOpts {
     /// It does NOT widen the MILLISECOND figure — [`MultipassResult::main_lost_ms`] stays
     /// main-title-scoped regardless.
     pub is_iso_output: bool,
+    /// Sweep attempts allowed: a transport fault the host recovers from
+    /// ([`PassHost::recover_transport`]) sweeps again until this many have run.
+    pub max_sweep_attempts: u32,
+    /// Whether the sweep resumes the image's mapfile: `Some` decides (the server's Resume),
+    /// `None` resumes a mapfile written in the run's raw/decrypt mode.
+    pub resume_sweep: Option<bool>,
+    /// What a failed patch pass does to the run.
+    pub on_patch_failure: OnPatchFailure,
+    /// What a patch pass that ended on a transport fault does to the run.
+    pub after_wedge: AfterWedge,
+}
+
+impl Default for MultipassOpts {
+    /// Single-pass, no loss tolerance, a title deliverable; the recovery policy of an
+    /// engine-only run (one sweep attempt, a failed patch pass fails, a wedge stops).
+    fn default() -> Self {
+        MultipassOpts {
+            max_passes: 0,
+            abort_on_lost_secs: 0,
+            is_iso_output: false,
+            max_sweep_attempts: 1,
+            resume_sweep: None,
+            on_patch_failure: OnPatchFailure::Fail,
+            after_wedge: AfterWedge::Stop,
+        }
+    }
+}
+
+/// What a recovery does when a patch pass fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnPatchFailure {
+    /// The run fails with the pass's error.
+    Fail,
+    /// The passes end and the recovery finishes with what was read (promotion, loss gate);
+    /// the failure is reported as [`RecoveryEvent::PatchFailed`].
+    Finish,
+}
+
+/// What a recovery does after a patch pass ends on a transport fault.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterWedge {
+    /// The recovery ends there, its damage left retryable and unpromoted.
+    Stop,
+    /// The pass counts like any other: the no-progress rule decides.
+    Continue,
 }
 
 /// Drive the full multipass STRATEGY LOOP: sweep, then patch passes until the
@@ -799,29 +844,17 @@ pub fn multipass_rip_staged(
 }
 
 /// What a front end does around the passes of a recovery: it owns the reader the passes
-/// read, and may bring a lost transport back, un-wedge the drive before a patch pass, or
-/// end the passes on a failed one and keep what was read (the server's autorip 1.7.7
-/// policy). Every method but [`reader`](Self::reader) defaults to what an engine-only run
-/// does; [`ReaderHost`] is that host over a plain reader.
+/// read, and may bring a lost transport back or un-wedge the drive before a patch pass.
+/// The recovery's policy is data ([`MultipassOpts`]); [`ReaderHost`] is the host over a
+/// plain reader.
 pub trait PassHost {
     /// The sector source every pass reads. A host that recovers a lost transport may
     /// return a different (re-opened) drive afterwards.
     fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource;
 
-    /// Whether to resume the image's mapfile in the sweep: `Some` decides (the server's
-    /// Resume), `None` (default) resumes a mapfile written in the run's raw/decrypt mode.
-    fn resume_sweep(&self) -> Option<bool> {
-        None
-    }
-
-    /// Whether sweep attempt `attempt` (1-based) may start. Default: the first only.
-    fn sweep_attempt(&mut self, attempt: u32) -> bool {
-        attempt == 1
-    }
-
     /// Sweep attempt `attempt` failed on a transport fault `e` (a bridge crash): bring the
-    /// drive back and return `true` to sweep again, resuming the mapfile. Default: `false`,
-    /// the run fails with `e`.
+    /// drive back and return `true` to sweep again, resuming the mapfile, while
+    /// [`MultipassOpts::max_sweep_attempts`] allows. Default: `false`, the run fails with `e`.
     fn recover_transport(&mut self, _attempt: u32, _e: &libfreemkv::Error) -> bool {
         false
     }
@@ -829,19 +862,6 @@ pub trait PassHost {
     /// Patch pass `pass` (2 = the first patch pass) is about to read: the moment to
     /// un-wedge the drive. Default: nothing.
     fn before_patch(&mut self, _pass: u32) {}
-
-    /// Patch pass `pass` failed with `e`: `true` ends the passes and finishes the recovery
-    /// with what was read (promotion, loss gate); `false` (default) fails the run with `e`.
-    fn patch_failed(&mut self, _pass: u32, _e: &libfreemkv::Error) -> bool {
-        false
-    }
-
-    /// A patch pass ended on a transport fault: `true` treats it as any other pass (the
-    /// no-progress rule decides); `false` (default) ends the recovery there, its damage
-    /// left retryable and unpromoted.
-    fn continue_after_wedge(&mut self) -> bool {
-        false
-    }
 }
 
 /// A [`PassHost`] over a plain reader: one sweep attempt, nothing between passes.
@@ -906,7 +926,7 @@ pub(crate) fn recover(
     // ── Pass 1: the sweep over a mapfile this version wrote (or as the host decides): it
     // refuses another disc's map, sweeps the other raw/decrypt mode fresh, else re-reads
     // NonTried. A transport fault the host recovers from sweeps again, resuming. ──
-    let resume = host.resume_sweep().unwrap_or(map_mode.is_some());
+    let resume = opts.resume_sweep.unwrap_or(map_mode.is_some());
     let resumed = match (&prior, resume && map_mode == Some(job.raw)) {
         (Some(m), true) => m.stats(),
         _ => MapStats::default(),
@@ -928,7 +948,7 @@ pub(crate) fn recover(
         let mut last_err = None;
         let sr = loop {
             attempt += 1;
-            if !host.sweep_attempt(attempt) {
+            if attempt > opts.max_sweep_attempts {
                 return Err(last_err.unwrap_or(libfreemkv::Error::SourceTerminated));
             }
             let bridge = ProgressBridge::new(sink);
@@ -1044,7 +1064,10 @@ pub(crate) fn recover(
             let pr =
                 match crate::recovery::patch_in(disc, host.reader(), iso_path, &patch_opts, halt) {
                     Ok(pr) => pr,
-                    Err(e) if host.patch_failed(pass, &e) => break,
+                    Err(e) if opts.on_patch_failure == OnPatchFailure::Finish => {
+                        milestone(sink, RecoveryEvent::PatchFailed { pass, error: &e });
+                        break;
+                    }
                     Err(e) => return Err(e),
                 };
             passes += 1;
@@ -1073,7 +1096,7 @@ pub(crate) fn recover(
             // A transport fault is NOT an exhausted pass: unreached ranges are
             // still retryable, and falling through would promote them to
             // permanently Unreadable, so a re-run would skip them forever.
-            if exit == PassExit::Wedged && !host.continue_after_wedge() {
+            if exit == PassExit::Wedged && opts.after_wedge == AfterWedge::Stop {
                 sink.log(
                     Level::Warn,
                     "multipass_rip: patch pass ended on a transport fault — \
