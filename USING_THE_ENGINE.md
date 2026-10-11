@@ -58,7 +58,7 @@ MainMovie is title 0 unless another cut of it carries more of the wanted languag
 (the presentation language, else the audio filter's languages). A cut qualifies when
 the authored content it shares with title 0 appears in the same order in both and is
 more than half of each, by the title's `selection_evidence.segments` (clip in/out on
-Blu-ray, UHD and HD DVD; cell sectors on DVD; the same rule for every format). Ties go
+Blu-ray and UHD, clip range from `clipTimeBegin` on HD DVD; cell sectors on DVD; the same rule for every format). Ties go
 to the earlier title. Exact aliases qualify; so does an extended cut built by seamless
 branching. Logo-sharing extras, single episodes of a play-all, reordered decoys and
 separate full copies do not. MainMovie never holds for review on language: an unknown

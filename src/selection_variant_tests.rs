@@ -229,3 +229,61 @@ fn main_movie_never_reviews_and_decides_the_same_for_dvd_and_bd_shapes() {
         }
     }
 }
+
+const CANDIDATE_HAS_HUGE_EXTRAS: Layout =
+    &[(&["A", "C"], &["eng"]), (&["A", "C", "copy"], &["deu"])];
+const SHARED_IS_EXACTLY_HALF: Layout = &[(&["A", "C"], &["eng"]), (&["A", "X"], &["deu"])];
+const TITLE_ZERO_UNDESCRIBED: Layout = &[(&[], &["eng"]), (&["A", "C"], &["deu"])];
+const DUPLICATED_SEGMENT: Layout = &[(&["A", "A", "C"], &["eng"]), (&["A", "C"], &["deu"])];
+const DUPLICATED_SEGMENT_REVERSED: Layout =
+    &[(&["A", "C"], &["eng"]), (&["A", "A", "C"], &["deu"])];
+
+// Sharing most of title 0 is not enough: the shared content must also be most of the candidate.
+#[test]
+fn a_candidate_dominated_by_its_own_extras_keeps_title_zero() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let pick = picks(
+            shape,
+            CANDIDATE_HAS_HUGE_EXTRAS,
+            Some("de"),
+            &StreamFilter::All,
+        );
+        assert_eq!(pick, vec![0], "{shape:?}");
+    }
+}
+
+// "More than half" is strict: exactly half shared is not a variant.
+#[test]
+fn sharing_exactly_half_keeps_title_zero() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let pick = picks(
+            shape,
+            SHARED_IS_EXACTLY_HALF,
+            Some("de"),
+            &StreamFilter::All,
+        );
+        assert_eq!(pick, vec![0], "{shape:?}");
+    }
+}
+
+#[test]
+fn a_title_zero_without_segments_keeps_title_zero() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let pick = picks(
+            shape,
+            TITLE_ZERO_UNDESCRIBED,
+            Some("de"),
+            &StreamFilter::All,
+        );
+        assert_eq!(pick, vec![0], "{shape:?}");
+    }
+}
+
+// A repeated segment makes the shared orders differ, so the titles are not variants.
+#[test]
+fn a_duplicated_segment_is_not_a_variant() {
+    for layout in [DUPLICATED_SEGMENT, DUPLICATED_SEGMENT_REVERSED] {
+        let pick = picks(Shape::Bd, layout, Some("de"), &StreamFilter::All);
+        assert_eq!(pick, vec![0], "{layout:?}");
+    }
+}
