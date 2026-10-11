@@ -175,6 +175,69 @@ fn a_file_replaced_after_the_open_is_never_removed() {
     assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
 }
 
+// The watch keeps the identity the mux read from its own handle, not the file at the path
+// when the event arrives: one renamed in before a late event stays, and an opening that
+// reports no identity removes nothing.
+#[test]
+fn the_watch_keeps_the_identity_the_mux_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let title = libfreemkv::DiscTitle::empty();
+    let late = |_, _, dest: &str, sink: &dyn Sink| {
+        let path = Path::new(dest.strip_prefix("mkv://").unwrap());
+        std::fs::write(path, b"half a title").unwrap();
+        let file = file_id(path);
+        let other = dir.path().join("other.mkv");
+        std::fs::write(&other, b"another rip").unwrap();
+        std::fs::rename(&other, path).unwrap();
+        let title = &title;
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, late);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
+    let unknown = |_, _, dest: &str, sink: &dyn Sink| {
+        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title").unwrap();
+        let (title, file) = (&title, None);
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, unknown);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"half a title");
+}
+
+// A destination that is a symlink is never removed: the link stays (the run did not create
+// it), and so does the file the mux wrote through it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_destination_is_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, pool) = (dir.path().join("t0.mkv"), dir.path().join("pool.mkv"));
+    std::os::unix::fs::symlink(&pool, &out).unwrap();
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let failed = |_, _, dest: &str, sink: &dyn Sink| {
+        let mut f = std::fs::File::create(dest.strip_prefix("mkv://").unwrap()).unwrap();
+        f.write_all(b"half a title").unwrap();
+        let file = libfreemkv::io::artifact_lock::file_identity_of(&f).ok();
+        let title = &libfreemkv::DiscTitle::empty();
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, failed);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert!(std::fs::symlink_metadata(&out).unwrap().is_symlink());
+    assert_eq!(std::fs::read(&pool).unwrap(), b"half a title");
+}
+
 // `land_verified` as the legacy `remux_iso` runs it: no op token, the OS primitives.
 pub(super) fn land(
     job: &RemuxJob,
@@ -1462,8 +1525,8 @@ fn only_a_file_sink_names_an_output_file() {
     }
 }
 
-// A real mux of an image title reports its output opening to the title's `OpenedWatch`,
-// the evidence a failed title uses to remove what it wrote.
+// A real mux of an image title reports its output opening, with the identity of the file it
+// opened, to the title's `OpenedWatch`: the evidence a failed title uses to remove its file.
 #[test]
 fn a_real_mux_reports_its_output_opening_to_the_watch() {
     use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
@@ -1477,15 +1540,19 @@ fn a_real_mux_reports_its_output_opening_to_the_watch() {
         &Calls::default(),
     );
     let opened = crate::open_image_with(&iso, OpenImageOptions::known(set.unwrap())).unwrap();
-    let dest = format!("mkv://{}", dir.path().join("t.mkv").display());
+    let out = dir.path().join("t.mkv");
+    let dest = format!("mkv://{}", out.display());
     let watch = OpenedWatch::new(&crate::NoopSink, &dest);
     assert!(watch.opened.get().is_none());
     let selection = libfreemkv::StreamSelection::default();
     let mux = mux_options(false);
     let r = mux_opened_title(&opened, &opened.keys, 0, selection, &dest, &mux, &watch);
     assert!(r.unwrap().completed);
-    assert!(
-        watch.opened.get().is_some(),
+    let file = file_id(&out);
+    assert!(file.is_some());
+    assert_eq!(
+        watch.opened.get(),
+        Some(&file),
         "OutputOpened reached the watch"
     );
 }
