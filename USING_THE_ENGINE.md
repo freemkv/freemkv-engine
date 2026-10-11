@@ -341,7 +341,13 @@ let outcome = mux_image_titles(&opened, &plan, &|idx| dest_url(idx), &sink);
 `KeyInput::Seeded` tops up a set that left forensic keys pending. To re-mux one
 title of an existing image in place, `remux_iso(&RemuxJob { .. }, &key_params,
 &sink)` muxes to `<target>.partial`, verifies the MKV (`verify_mkv`) and only
-then renames it over the target; it returns a `RemuxReport`.
+then renames it over the target; it returns a `RemuxReport`. Without
+`replace` the target must not exist and publication never overwrites one. On a
+filesystem that can neither rename without replacing nor hard-link, the remux
+fails E5000 (kind `Unsupported`) and keeps the verified output for the user to
+publish by hand: `RemuxUnpublished::of(&err).map(|u| &u.kept)` names it
+(`<target>.verified`, or a numbered or short name beside it, never a file it
+replaced). Show that path; a retry fails the same way after a whole mux.
 
 ---
 
