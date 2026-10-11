@@ -200,9 +200,18 @@ fn docs_pin_the_current_release_line() {
             "{dep} {line}"
         );
     }
-    for (at, _) in guide.match_indices("tag = \"v") {
-        let tag = &guide[at + 8..].split('"').next().unwrap();
-        assert_eq!(*tag, version, "a patch tag in the guide");
+    let tags: Vec<&str> = guide
+        .match_indices("tag = \"v")
+        .map(|(at, _)| guide[at + 8..].split('"').next().unwrap())
+        .collect();
+    assert!(!tags.is_empty(), "the guide pins a tag");
+    for tag in &tags {
+        assert_eq!(*tag, tags[0], "every tag in the guide agrees");
+        assert_eq!(
+            tag.rsplit_once('.').map(|(l, _)| l),
+            Some(line),
+            "a tag on the release line"
+        );
     }
     for stale in ["= \"1.7\"", "v1.7.7"] {
         assert!(!guide.contains(stale), "{stale}");

@@ -11,11 +11,24 @@ project follows semantic versioning.
 - MainMovie stays title 0 unless another cut of it carries more of the wanted languages (`presentation_language`, else the audio filter's languages). A cut qualifies when the content it shares with title 0 is in the same order in both and is more than half of each, compared on libfreemkv's format-neutral `selection_evidence.segments`, with one rule for DVD, Blu-ray, UHD and HD DVD. Exact aliases still qualify, and so do seamless-branching extended cuts. Logo-sharing extras, play-all episodes, reordered decoys and separate full copies do not. A DVD whose German and English versions share cells now gives German for `-a de` or presentation language `de`, as the 1.8.3 GUI did.
 - MainMovie never holds for review. An invalid or unmatched language keeps title 0, so front ends validate language tags at input with the new `is_language_tag`. E9086 is now for episode-roster reasons only.
 - Selection API: `SelectionModel::select(&selection, &audio, presentation: Option<&str>)` returns `Result<Vec<usize>, SelectionReview>`, and the new infallible `SelectionModel::main_title(&audio, presentation)` is the MainMovie pick. `resolve_selection(&disc, &selection, &audio, presentation)` is the one disc-level resolver.
+- `MultipassOpts` gains `max_sweep_attempts`, `resume_sweep`, `on_patch_failure` and `after_wedge` (with the enums `OnPatchFailure` and `AfterWedge`, and `impl Default`): recovery policy is data. `PassHost` loses its `resume_sweep`, `sweep_attempt`, `patch_failed` and `continue_after_wedge` hooks (breaking for hosts that implemented them).
+
+### Added
+
+- `RecoveryEvent::PatchFailed`, `keys::covers_scope`, `keys::drive_credentials`, and `SelectionReview` (with `From<SelectionReview> for libfreemkv::Error`).
+
+### Fixed
+
+- Image and folder title runs resolve their selection against the scanned disc, and a selection that needs review is refused with E9086.
+- A target that appears before publication is the typed E9084 refusal.
+- An incomplete image mux is no longer counted as written.
+- A single subtitle list is checked once in preflight (detail `subtitle`).
+- The staged copy's speed and ETA come from `SpeedEstimator`.
 
 ### Removed
 
 - DVD authored-launch selection: `SelectionBasis::AuthoredLaunch`, the review reasons `incomplete-launch-proof`, `invalid-launch-proof`, `missing-presentation-language`, `invalid-presentation-language`, `unmatched-presentation-language` and `ambiguous-presentation-language`, and `SelectionTitle::audio_by_pid`. On untraceable DVDs (most of them) it held every main-movie pick for review whenever an audio language was set.
-- `PresentationIdentity` is an opaque list of content segments rather than an enum of clip and DVD-cell variants.
+- `PresentationIdentity` (now crate-private; it was an enum of clip and DVD-cell variants).
 - `title_roles`, `TitleRole` and `episode_titles`: the structural play-all hint ran beside the authored roster and only labelled GUI rows; `SelectionModel::select(&Selection::Episodes, ..)` is the episode set.
 - `SelectionReport`, `SelectionBasis`, `SelectionPreferences`, `SelectionModel::{select_with_preferences, titles, from_disc}`, the public `SelectionTitle`, `resolve_job_selection` and `resolve_selection_with_audio`: use `select`/`resolve_selection` with their `presentation` argument.
 

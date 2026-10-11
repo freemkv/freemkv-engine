@@ -58,11 +58,12 @@ MainMovie is title 0 unless another cut of it carries more of the wanted languag
 (the presentation language, else the audio filter's languages). A cut qualifies when
 the authored content it shares with title 0 appears in the same order in both and is
 more than half of each, by the title's `selection_evidence.segments` (clip in/out on
-Blu-ray and UHD, clip range from `clipTimeBegin` on HD DVD; cell sectors on DVD; the same rule for every format). Ties go
-to the earlier title. Exact aliases qualify; so does an extended cut built by seamless
-branching. Logo-sharing extras, single episodes of a play-all, reordered decoys and
-separate full copies do not. MainMovie never holds for review on language: an unknown
-or unmatched language keeps title 0, so front ends validate language tags at input.
+Blu-ray and UHD, clip range from `clipTimeBegin` on HD DVD; cell sectors on DVD; the
+same rule for every format). Ties go to the earlier title. Exact aliases qualify; so
+does an extended cut built by seamless branching. Logo-sharing extras, single episodes
+of a play-all, reordered decoys and separate full copies do not. MainMovie never holds
+for review on language: an unknown or unmatched language keeps title 0, so front ends
+validate language tags at input.
 
 `select` returns the executable indices, or `Err(SelectionReview)` whose `candidates`
 are review/display only: ask for explicit title choices before starting.
@@ -194,8 +195,8 @@ job.raw = true;                     // Multi requires raw (see preflight below)
 ```
 
 `resolve_selection(&disc, &job.selection, &job.streams.audio, None)` turns the
-selection into concrete 0-based title indices, or `Err(SelectionReview { reason, candidates })` when the
-evidence proves no automatic choice. Review is never an empty list (only an
+selection into concrete 0-based title indices, or
+`Err(SelectionReview { reason, candidates })` when the evidence proves no automatic choice. Review is never an empty list (only an
 explicit `Titles([])` is). Converted to an error it is E9086
 (`SelectionReviewRequired`, detail = `reason.key()`); `candidates` may size a key
 scope or a damage measurement, but never authorize a rip.
@@ -257,6 +258,7 @@ let mp: MultipassResult = multipass_rip(
         max_passes: 5,
         abort_on_lost_secs: 0,   // 0 = require a perfect rip
         is_iso_output: false,    // true forces 100% (an ISO backup ignores the tolerance)
+        ..Default::default()
     },
     &sink,
 )?;

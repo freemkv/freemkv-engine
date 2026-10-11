@@ -7,7 +7,7 @@ use std::collections::HashSet;
 /// Exact ordered authored content segments, never duration/size similarity. Format-neutral:
 /// the scanner describes every format's titles as segments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct PresentationIdentity(Vec<ContentSegment>);
+pub(crate) struct PresentationIdentity(Vec<ContentSegment>);
 
 pub(crate) fn identity(title: &DiscTitle) -> Option<PresentationIdentity> {
     let segments = &title.selection_evidence.segments;

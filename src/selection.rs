@@ -1,6 +1,7 @@
 //! Owned selection snapshot shared by scan/UI, planners, and execution.
 
-use crate::{PresentationIdentity, Selection, StreamFilter};
+use crate::presentation::PresentationIdentity;
+use crate::{Selection, StreamFilter};
 use libfreemkv::DiscTitle;
 use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
