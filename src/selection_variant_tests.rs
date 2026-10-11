@@ -293,3 +293,24 @@ fn a_duplicated_segment_is_not_a_variant() {
         assert_eq!(pick, vec![0], "{layout:?}");
     }
 }
+
+// Requested languages are a set: `en` and `eng` are one language, so they cannot outvote `de`.
+#[test]
+fn duplicate_requested_languages_count_once() {
+    const GERMAN_FIRST: Layout = &[
+        (&["A", "B-de", "C"], &["deu"]),
+        (&["A", "B-en", "C"], &["eng"]),
+    ];
+    for shape in [Shape::Dvd, Shape::Bd] {
+        assert_eq!(
+            picks(shape, GERMAN_FIRST, None, &langs(&["en", "eng", "de"])),
+            vec![0],
+            "{shape:?}: a tie keeps title 0"
+        );
+        assert_eq!(
+            picks(shape, GERMAN_FIRST, None, &langs(&["en", "eng"])),
+            vec![1],
+            "{shape:?}"
+        );
+    }
+}

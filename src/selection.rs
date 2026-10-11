@@ -13,7 +13,8 @@ struct SelectionTitle {
     playlist_id: u16,
     duration_secs: f64,
     presentation: Option<PresentationIdentity>,
-    audio_languages: Vec<String>,
+    // Resolved once per model; `None` is a tag selection cannot resolve.
+    audio_languages: Vec<Option<isolang::Language>>,
     evidence: TitleSelectionEvidence,
 }
 
@@ -73,7 +74,9 @@ impl SelectionModel {
                         .streams
                         .iter()
                         .filter_map(|stream| match stream {
-                            libfreemkv::Stream::Audio(audio) => Some(audio.language.clone()),
+                            libfreemkv::Stream::Audio(audio) => {
+                                Some(crate::streams::audio_language(&audio.language))
+                            }
                             _ => None,
                         })
                         .collect(),
@@ -92,18 +95,20 @@ impl SelectionModel {
         audio: &StreamFilter,
         presentation: Option<&str>,
     ) -> Result<Vec<usize>, SelectionReview> {
-        let scores = self.scores(audio, presentation);
         Ok(match selection {
             Selection::Episodes => match self.episode_roster() {
-                Ok(members) => self.representatives(members, &scores),
+                Ok(members) => self.representatives(members, &self.scores(audio, presentation)),
                 Err(reason) => {
                     return Err(SelectionReview {
                         reason,
-                        candidates: self.representatives((0..self.titles.len()).collect(), &scores),
+                        candidates: self.representatives(
+                            (0..self.titles.len()).collect(),
+                            &self.scores(audio, presentation),
+                        ),
                     });
                 }
             },
-            Selection::MainMovie => self.main_by(&scores).into_iter().collect(),
+            Selection::MainMovie => self.main_title(audio, presentation).into_iter().collect(),
             Selection::All => (0..self.titles.len()).collect(),
             Selection::Titles(indices) => {
                 let mut seen = HashSet::new();
@@ -129,13 +134,13 @@ impl SelectionModel {
     /// The main title, which never needs review: title 0 unless another cut of it carries
     /// more of the wanted languages (as [`select`](Self::select)). `None`: no titles.
     pub fn main_title(&self, audio: &StreamFilter, presentation: Option<&str>) -> Option<usize> {
-        self.main_by(&self.scores(audio, presentation))
-    }
-
-    fn main_by(&self, scores: &[usize]) -> Option<usize> {
         let main = self.titles.first()?;
         let mut best = 0;
-        if let Some(identity) = &main.presentation {
+        // Languages only matter against a described title 0 with something to compare to.
+        if let Some(identity) = &main.presentation
+            && self.titles.len() > 1
+        {
+            let scores = self.scores(audio, presentation);
             for (index, title) in self.titles.iter().enumerate().skip(1) {
                 if scores[index] > scores[best]
                     && title

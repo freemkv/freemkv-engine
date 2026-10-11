@@ -77,12 +77,12 @@ fn a_stale_mapfile_that_cannot_be_removed_aborts_the_fresh_sweep() {
 fn the_sweep_batch_defaults_by_mode_and_format() {
     use libfreemkv::DiscFormat::*;
 
-    // skip-on-error (multipass Pass 1): one ECC block, so one skipped
-    // batch loses exactly one ECC block.
+    // skip-on-error (multipass Pass 1): one physical ECC block (32 sectors on UHD, Blu-ray
+    // and HD DVD, 16 on DVD), so one skipped batch loses exactly one ECC block.
     assert_eq!(sweep_batch_sectors(None, true, Uhd), 32);
     assert_eq!(sweep_batch_sectors(None, true, BluRay), 32);
     assert_eq!(sweep_batch_sectors(None, true, Dvd), 16);
-    assert_eq!(sweep_batch_sectors(None, true, HdDvd), 16);
+    assert_eq!(sweep_batch_sectors(None, true, HdDvd), 32);
 
     // Clean sweep: the larger optical batch, regardless of format.
     assert_eq!(sweep_batch_sectors(None, false, Uhd), 60);

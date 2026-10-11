@@ -266,9 +266,10 @@ fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
     }
 }
 
-// Cell order is identity; extents that are not cells (an HD DVD .evo) describe nothing.
+// Cell order is identity: the same cells in another order are another presentation, the same
+// cells in the same order are one. (Extents that are not cells map to no segments in libfreemkv.)
 #[test]
-fn regression_dvd_cell_order_is_identity_and_non_cell_extents_are_not() {
+fn regression_dvd_cell_order_is_identity() {
     let mut a = audio_title("eng", 1000);
     a.extents.push(libfreemkv::disc::Extent {
         start_lba: 9000,
@@ -278,10 +279,8 @@ fn regression_dvd_cell_order_is_identity_and_non_cell_extents_are_not() {
     let mut b = a.clone();
     b.extents.reverse();
     b.selection_evidence.segments = ContentSegment::from_cell_extents(&b.extents);
-    let mut c = a.clone();
-    c.content_format = libfreemkv::ContentFormat::MpegPs;
-    scan_clips(&mut c);
-    assert_eq!(known_episode_titles(&[a, b, c]), vec![0, 1, 2]);
+    let twin = a.clone();
+    assert_eq!(known_episode_titles(&[a, b, twin]), vec![0, 1]);
 }
 
 #[test]

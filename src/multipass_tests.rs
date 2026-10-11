@@ -2814,3 +2814,279 @@ fn sweep_attempts_stop_at_the_configured_cap() {
         assert_eq!(host.1, calls, "cap {cap}");
     }
 }
+
+// ── The main title: a branch variant picked by the audio filter ──
+
+// Records every pass tick's main-title size and bad bytes, and the recovery milestones.
+#[derive(Default)]
+struct EventLog {
+    sizes: std::sync::Mutex<Vec<Option<u64>>>,
+    bad: std::sync::Mutex<Vec<u64>>,
+    patch_failed: std::sync::atomic::AtomicU32,
+}
+impl Sink for EventLog {
+    fn event(&self, e: &crate::sink::Event<'_>) {
+        match e {
+            crate::sink::Event::Pass(p) => {
+                self.sizes.lock().unwrap().push(p.main_title_size_bytes);
+                self.bad.lock().unwrap().push(p.bytes_bad_in_main_title);
+            }
+            crate::sink::Event::Recovery(crate::sink::RecoveryEvent::PatchFailed { .. }) => {
+                self.patch_failed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn audio_title(
+    mut title: libfreemkv::DiscTitle,
+    extents: &[(u32, u32)],
+    language: &str,
+) -> libfreemkv::DiscTitle {
+    title.extents = extents
+        .iter()
+        .map(|&(start_lba, sector_count)| libfreemkv::disc::Extent {
+            start_lba,
+            sector_count,
+        })
+        .collect();
+    title.size_bytes = extents.iter().map(|e| e.1 as u64 * 2048).sum();
+    title.selection_evidence.segments =
+        libfreemkv::disc::ContentSegment::from_cell_extents(&title.extents);
+    title
+        .streams
+        .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
+            pid: 0x80,
+            codec: libfreemkv::Codec::Ac3,
+            channels: libfreemkv::AudioChannels::Stereo,
+            language: language.into(),
+            sample_rate: libfreemkv::SampleRate::S48,
+            secondary: false,
+            purpose: libfreemkv::LabelPurpose::Normal,
+            label: String::new(),
+        }));
+    title
+}
+
+// Title 0 (English) and a branch variant (German) share one cell; each has its own other
+// cell. LBA 1000 is damaged, inside the variant only.
+fn variant_disc() -> libfreemkv::Disc {
+    let base = test_title(0, 1);
+    test_disc(
+        4096,
+        vec![
+            audio_title(base.clone(), &[(0, 100), (300, 60)], "eng"),
+            audio_title(base, &[(0, 100), (1000, 50)], "deu"),
+        ],
+    )
+}
+
+fn variant_rip(audio: crate::StreamFilter, tag: &str) -> (MultipassResult, EventLog) {
+    let (_dir, iso) = scratch_iso(tag);
+    let disc = variant_disc();
+    let mut reader = MultiSpotReader {
+        capacity: 4096,
+        spots: vec![Spot {
+            lba: 1000,
+            heal_after: u32::MAX,
+            attempts: 0,
+        }],
+    };
+    let mut job = raw_job(&iso);
+    job.streams.audio = audio;
+    let opts = MultipassOpts {
+        max_passes: 3,
+        abort_on_lost_secs: 0,
+        is_iso_output: false,
+        ..Default::default()
+    };
+    let log = EventLog::default();
+    let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &log).expect("a result");
+    (result, log)
+}
+
+#[test]
+fn measured_scope_and_progress_follow_the_audio_filter_to_the_variant() {
+    let (main_size, variant_size) = (Some(160 * 2048), Some(150 * 2048));
+    let langs = |l: &str| crate::StreamFilter::Langs(vec![l.into()]);
+
+    let (all, all_log) = variant_rip(crate::StreamFilter::All, "variant-all");
+    assert_eq!(
+        all.passes, 1,
+        "damage outside title 0 earns no patch: {all:?}"
+    );
+    assert_eq!(all.main_lost_ms, 0.0);
+    assert!(all_log.bad.lock().unwrap().iter().all(|&b| b == 0));
+    assert!(
+        all_log
+            .sizes
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|&z| z == main_size)
+    );
+
+    let (de, de_log) = variant_rip(langs("deu"), "variant-deu");
+    assert!(de.passes > 1, "the variant is measured: {de:?}");
+    assert!(de.main_lost_ms > 0.0, "{de:?}");
+    assert!(
+        de_log.bad.lock().unwrap().iter().any(|&b| b > 0),
+        "live progress reports damage in the same main title: {:?}",
+        de_log.bad.lock().unwrap()
+    );
+    let sizes = de_log.sizes.lock().unwrap();
+    assert!(
+        !sizes.is_empty() && sizes.iter().all(|&z| z == variant_size),
+        "{sizes:?}"
+    );
+}
+
+#[test]
+fn measured_titles_follow_the_job_audio_filter() {
+    let empty = libfreemkv::DiscTitle::empty();
+    let disc = variant_disc();
+    let mut job = raw_job(std::path::Path::new("x.iso"));
+    let first = |job: &Job| measured_titles(&disc, job, &empty)[0].extents[1].start_lba;
+    assert_eq!(first(&job), 300, "no audio preference: title 0");
+    job.streams.audio = crate::StreamFilter::Langs(vec!["deu".into()]);
+    assert_eq!(first(&job), 1000, "the German variant");
+    assert_eq!(progress_main_title(&disc, &job), Some(1));
+    job.streams.audio = crate::StreamFilter::All;
+    assert_eq!(progress_main_title(&disc, &job), Some(0));
+}
+
+// ── Patch failure and sweep resume policy ──
+
+// Bad at LBA 1000 during the sweep; every read once a patch pass is about to start is a
+// key stop, which fails the patch pass.
+struct PatchBreaker {
+    inner: MultiSpotReader,
+    patching: bool,
+}
+impl libfreemkv::SectorSource for PatchBreaker {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> libfreemkv::Result<usize> {
+        if self.patching {
+            return Err(libfreemkv::Error::WholeDiscKeyMissing);
+        }
+        self.inner.read_sectors(lba, count, buf, recovery)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.inner.capacity
+    }
+}
+impl PassHost for PatchBreaker {
+    fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource {
+        self
+    }
+    fn before_patch(&mut self, _pass: u32) {
+        self.patching = true;
+    }
+}
+
+fn patch_failure_run(
+    policy: OnPatchFailure,
+    tag: &str,
+) -> (crate::Result<MultipassResult>, EventLog) {
+    let (_dir, iso, _map, disc) = in_title_damage_fixture(tag);
+    let mut host = PatchBreaker {
+        inner: never_healing_reader(),
+        patching: false,
+    };
+    let opts = MultipassOpts {
+        max_passes: 3,
+        on_patch_failure: policy,
+        is_iso_output: false,
+        ..Default::default()
+    };
+    let log = EventLog::default();
+    let op = libfreemkv::Halt::new();
+    let halt = crate::EngineHalt::new(&op, None);
+    let r = recover(
+        &disc,
+        &mut host,
+        &iso,
+        &raw_job(&iso),
+        &opts,
+        None,
+        &log,
+        &halt,
+    );
+    (r, log)
+}
+
+#[test]
+fn a_failed_patch_pass_fails_the_run_by_default() {
+    let (r, log) = patch_failure_run(OnPatchFailure::Fail, "patch-fail-default");
+    assert!(
+        matches!(r, Err(libfreemkv::Error::WholeDiscKeyMissing)),
+        "{r:?}"
+    );
+    assert_eq!(
+        log.patch_failed.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[test]
+fn a_failed_patch_pass_finishes_the_run_under_the_finish_policy() {
+    let (r, log) = patch_failure_run(OnPatchFailure::Finish, "patch-fail-finish");
+    let r = r.expect("Finish ends the passes and reports what was read");
+    assert_eq!(r.passes, 1, "{r:?}");
+    assert_eq!(
+        log.patch_failed.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+}
+
+// `resume_sweep` overrides the host's default (resume iff a mapfile of this mode exists).
+#[test]
+fn resume_sweep_overrides_whether_the_sweep_rereads_a_finished_image() {
+    let reads_in_second_run = |resume: Option<bool>, prior_map: bool, tag: &str| {
+        let (_dir, iso) = scratch_iso(tag);
+        let disc = test_disc(2048, vec![test_title(0, 2048)]);
+        let opts = MultipassOpts {
+            max_passes: 2,
+            resume_sweep: resume,
+            is_iso_output: true,
+            ..Default::default()
+        };
+        if prior_map {
+            let mut first = PatternReader { capacity: 2048 };
+            multipass_rip(
+                &disc,
+                &mut first,
+                &iso,
+                &raw_job(&iso),
+                &opts,
+                &crate::NoopSink,
+            )
+            .expect("first run");
+        }
+        let (mut r2, reads) = stamp_reader(0xB2);
+        multipass_rip(
+            &disc,
+            &mut r2,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            &crate::NoopSink,
+        )
+        .expect("second run");
+        // Bound first: the guard must drop before `reads`.
+        #[allow(clippy::let_and_return)]
+        let n = reads.lock().unwrap().len();
+        n
+    };
+    assert_eq!(reads_in_second_run(None, true, "resume-none"), 0);
+    assert_eq!(reads_in_second_run(Some(true), true, "resume-true"), 0);
+    assert!(reads_in_second_run(Some(false), true, "resume-false") > 1000);
+    assert!(reads_in_second_run(Some(true), false, "resume-true-nomap") > 1000);
+}

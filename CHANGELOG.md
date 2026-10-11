@@ -17,6 +17,9 @@ project follows semantic versioning.
 
 ### Changed
 
+- **HD DVD recovery** pass-1 batches are 32 sectors (one physical ECC block) instead of 16, so damage jumps also double (32 to 64 MiB first jump, cap 2 to 4 GiB) as on Blu-ray. v1.8.3 mapfiles still resume.
+- **Recovery progress** reports the same main title as `MultipassResult::main_lost_ms` (the first title the job's selection and audio filter deliver) instead of always title 0.
+- An empty authored episode roster is `incomplete-episode-roster`, not an empty selection.
 - **`resolve_selection` signature**: `resolve_selection(&disc, &selection, &audio, presentation: Option<&str>)` returns `Result<Vec<usize>, SelectionReview>` (it was `resolve_selection(&disc, &selection) -> Vec<usize>`). It is the one disc-level resolver, also used by preflight, title runs, remux and multipass.
 - **`Selection::Episodes` is the authored episode roster**, with equivalent presentations deduplicated, in place of the similar-length cluster guess. A disc without complete roster evidence is a review (E9086 on a run, `selection-review-required` in preflight), never an empty or guessed list (a roster naming no episode is `incomplete-episode-roster`); key scopes and loss measurement use the review's candidates.
 - **MainMovie** stays title 0 unless another cut of it carries more of the wanted languages (`presentation_language`, else the audio filter's languages). A cut qualifies when the content it shares with title 0 is in the same order in both and is more than half of each, compared on libfreemkv's format-neutral `selection_evidence.segments`, with one rule for DVD, Blu-ray, UHD and HD DVD. Exact aliases and seamless-branching extended cuts qualify; logo-sharing extras, reordered decoys and separate full copies do not. An episode of a play-all qualifies only if it is itself more than half of the play-all's content, so one of three or more comparable episodes does not. Remux's default title uses the same pick.
