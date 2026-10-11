@@ -94,7 +94,6 @@ fn a_title_that_never_opened_its_output_never_deletes_the_file_there() {
 
 // Through the title loop: a title whose mux opened (so truncated) its output and then failed
 // (a write error, no outcome) or stopped removes what it left there, known by its watch.
-#[cfg(unix)]
 #[test]
 fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -133,7 +132,6 @@ fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
 
 // A title whose mux opened its output removes only that file: one another writer put at the
 // path after the open (a finished rip renamed into place) stays when the title fails or stops.
-#[cfg(unix)]
 #[test]
 fn a_file_replaced_after_the_open_is_never_removed() {
     let dir = tempfile::tempdir().unwrap();
@@ -1491,7 +1489,6 @@ fn a_real_mux_reports_its_output_opening_to_the_watch() {
 
 // The production title closure hands the real mux the title's watch, not the outer sink: a
 // real mux that opened its output and then failed (an Err, no outcome) leaves nothing there.
-#[cfg(unix)]
 #[test]
 fn a_real_mux_failing_after_its_open_removes_its_output() {
     let dir = tempfile::tempdir().unwrap();

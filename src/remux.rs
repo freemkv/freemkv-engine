@@ -70,7 +70,7 @@ impl MuxPlan {
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`, under the
 /// [`run_titles`] loop policy, each bracketed by [`Event::TitleStart`] / [`Event::TitleDone`].
 /// A title that fails or stops removes the file at a file sink's path only while it is the
-/// one its own mux opened (same device and inode as at the open; without inodes, never): a
+/// one its own mux opened (same file identity as at the open, e.g. device and inode): a
 /// file put there after the open, one it never opened, or a folder sink (`/`) stays.
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it before
@@ -194,7 +194,7 @@ fn output_file(dest: &str) -> Option<PathBuf> {
 struct OpenedWatch<'a> {
     inner: &'a dyn Sink,
     path: Option<PathBuf>,
-    opened: std::sync::OnceLock<Option<FileId>>,
+    opened: std::sync::OnceLock<Option<(u64, u64)>>,
 }
 
 impl<'a> OpenedWatch<'a> {
@@ -210,10 +210,7 @@ impl<'a> OpenedWatch<'a> {
     fn still_opened(&self) -> Option<&Path> {
         let path = self.path.as_deref()?;
         let opened = (*self.opened.get()?)?;
-        let now = std::fs::symlink_metadata(path)
-            .ok()
-            .and_then(|m| file_id(&m));
-        (now == Some(opened)).then_some(path)
+        (file_id(path) == Some(opened)).then_some(path)
     }
 }
 
@@ -232,11 +229,8 @@ impl Sink for OpenedWatch<'_> {
     }
     fn event(&self, e: &Event<'_>) {
         if matches!(e, Event::OutputOpened { .. }) {
-            let id = || {
-                let path = self.path.as_deref()?;
-                file_id(&std::fs::symlink_metadata(path).ok()?)
-            };
-            self.opened.get_or_init(id);
+            self.opened
+                .get_or_init(|| self.path.as_deref().and_then(file_id));
         }
         self.inner.event(e)
     }
@@ -672,36 +666,24 @@ fn keep_at(landing: &Path, name: &Path, rio: &dyn RemuxIo) -> bool {
     let Ok(placeholder) = reserved else {
         return false;
     };
-    let ours = placeholder.metadata().ok().and_then(|m| file_id(&m));
+    let ours = file_id(name);
     drop(placeholder);
     if rio.keep(landing, name).is_ok() {
         return true;
     }
-    let still_ours = |m: std::fs::Metadata| m.is_file() && m.len() == 0 && file_id(&m) == ours;
-    if ours.is_some() && std::fs::symlink_metadata(name).is_ok_and(still_ours) {
+    let empty_file = |m: std::fs::Metadata| m.is_file() && m.len() == 0;
+    if ours.is_some()
+        && std::fs::symlink_metadata(name).is_ok_and(empty_file)
+        && file_id(name) == ours
+    {
         let _ = std::fs::remove_file(name);
     }
     false
 }
 
-// A file's identity on Unix: its device and inode. Other platforms have none here (a creation
-// time passes to a file renamed in over it), so no file is ever proven the same there.
-#[cfg(unix)]
-type FileId = (u64, u64);
-#[cfg(not(unix))]
-type FileId = ();
-
-fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some((meta.dev(), meta.ino()))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = meta;
-        None
-    }
+// The identity of the file at `path`: device and inode, or volume serial and file index.
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    libfreemkv::io::artifact_lock::file_identity(path).ok()
 }
 
 fn target_exists(target: &Path) -> io::Error {
