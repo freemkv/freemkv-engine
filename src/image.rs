@@ -3,7 +3,7 @@
 //! front, into the rip's in-memory key set (keys-upfront design, KU §3.2, §4.2); no mux
 //! of it ever asks a key source.
 
-use crate::keys::{KeyParams, key_source_factory, log_status};
+use crate::keys::{KeyParams, covers_scope, key_source_factory, log_status, scope_keyed};
 use crate::recovery::mapfile::{DiscIdentity, Mapfile, check_identity, vid_fingerprint};
 use libfreemkv::keys::{KeyRing, KeyScope};
 use libfreemkv::{Error, KeySourceFactory};
@@ -272,7 +272,7 @@ fn open_image_inner(
     let (set, sources, trace) = match keys {
         KeyInput::Known(set) => (known(&disc, set, &scope)?, None, Default::default()),
         KeyInput::Seeded(f, seed)
-            if seed.is_for(&disc.media_id()) && covers(&seed, &disc, &scope) =>
+            if covers_scope(&seed, &disc, &scope) && !seed.forensic_pending() =>
         {
             (seed, Some(f), Default::default())
         }
@@ -421,7 +421,7 @@ impl OpenedImage {
         halt: Option<&libfreemkv::Halt>,
     ) -> crate::Result<KeyRing> {
         let mut held = self.top_up.lock().unwrap_or_else(|e| e.into_inner());
-        if keys_scope(&held.keys, &self.disc, &KeyScope::Titles(titles.to_vec())) {
+        if scope_keyed(&held.keys, &self.disc, &KeyScope::Titles(titles.to_vec())) {
             return Ok(held.keys.clone());
         }
         let Some(sources) = &self.sources else {
@@ -537,7 +537,7 @@ fn check_prescanned(
         });
     }
     let norm = |h: &str| libfreemkv::hex::strip_hex_prefix(h).to_ascii_lowercase();
-    let disc_hash = disc.aacs.as_ref().map(|a| norm(&a.disc_hash));
+    let disc_hash = disc.intrinsic_id().map(norm);
     // One UDF parse serves both reads. An OS error reading the image is that error, never
     // "a different disc"; a key file the image does not hold (or zeroed metadata) is.
     let fs = not_os_error(libfreemkv::read_filesystem(reader))?;
@@ -643,10 +643,8 @@ fn in_hand_vid_fingerprint(
     vid: Option<[u8; 16]>,
     seed: Option<&KeyRing>,
 ) -> Option<[u8; 32]> {
-    let real = |v: &[u8; 16]| *v != [0u8; 16];
-    let disc_vid = disc.aacs.as_ref().map(|a| a.volume_id).filter(real);
-    vid.filter(real)
-        .or(disc_vid)
+    vid.filter(|v| *v != [0u8; 16])
+        .or(disc.aacs_volume_id())
         .map(|v| vid_fingerprint(&v))
         .or_else(|| seed.and_then(|s| s.vid_fingerprint()))
 }
@@ -655,18 +653,6 @@ fn identity_ok(map: &Mapfile, identity: &DiscIdentity) -> crate::Result<()> {
     check_identity(map, identity).map_err(|_| Error::MapfileInvalid {
         kind: "disc-mismatch",
     })
-}
-
-// Whether `set` keys `scope` of `disc`. A set with no AACS key (`none()`) never keys an
-// AACS disc's titles, though `covers(scope)` (no disc) says so; a clear disc needs none.
-fn keys_scope(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
-    let aacs_needed = disc.aacs.is_some() && *scope != KeyScope::None;
-    (set.is_aacs() || !aacs_needed) && set.covers(scope)
-}
-
-// `keys_scope`, and no forensic keys left Pending.
-fn covers(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
-    keys_scope(set, disc, scope) && !set.forensic_pending()
 }
 
 // KU §3.2 `Known`: the set as-is; what it does not cover refuses, with no request.
@@ -678,10 +664,10 @@ fn known(disc: &libfreemkv::Disc, set: KeyRing, scope: &KeyScope) -> crate::Resu
     if set.forensic_pending() {
         return Err(Error::FmtsKeyMissing);
     }
-    if !keys_scope(&set, disc, scope) {
+    if !scope_keyed(&set, disc, scope) {
         return Err(Error::NoDiscKey {
-            disc_hash: disc.aacs.as_ref().map_or_else(String::new, |a| {
-                libfreemkv::hex::strip_hex_prefix(&a.disc_hash).to_string()
+            disc_hash: disc.intrinsic_id().map_or_else(String::new, |h| {
+                libfreemkv::hex::strip_hex_prefix(h).to_string()
             }),
         });
     }

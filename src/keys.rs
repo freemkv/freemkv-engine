@@ -189,7 +189,7 @@ pub fn resolve_loose_clip(
     // A folder that is not a readable disc looks up nothing: a clear clip still opens, an
     // encrypted one refuses E7022 in `input()`. An OS read error (EIO, EACCES) surfaces.
     let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
-        Ok((disc, _)) if disc.aacs.is_none() => return (Ok(None), ResolutionTrace::new()),
+        Ok((disc, _)) if !disc.needs_key_lookup() => return (Ok(None), ResolutionTrace::new()),
         r => r,
     };
     let (disc, mut reader) = match scanned {
@@ -307,6 +307,26 @@ pub(crate) fn log_status(keys: &KeyRing, scope: &str) {
 /// `AacsKeysMissing`, `ForensicPending`); CSS and clear discs as the library reads them.
 pub fn key_status(disc: &libfreemkv::Disc, set: &KeyRing) -> DecryptStatus {
     libfreemkv::keys::decrypt_status(disc, Some(set))
+}
+
+/// Whether `set` keys `scope` of `disc`: a set for this disc that covers `scope`, and an
+/// AACS set when the scope reads an AACS disc's titles (`covers` alone holds for any
+/// non-AACS set).
+pub fn covers_scope(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+    set.is_for(&disc.media_id()) && scope_keyed(set, disc, scope)
+}
+
+// `covers_scope` without the identity check, for a set already bound to `disc`.
+pub(crate) fn scope_keyed(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeyScope) -> bool {
+    let aacs_needed = disc.needs_key_lookup() && *scope != KeyScope::None;
+    (set.is_aacs() || !aacs_needed) && set.covers(scope)
+}
+
+/// The drive handshake's host certificates from the keydb at `path`; `None` when it
+/// yields none (missing, unreadable, or certificate-free).
+pub fn drive_credentials(path: &std::path::Path) -> Option<libfreemkv::DriveCredentials> {
+    let host_certs = freemkv_keysources::KeydbSource::new(path).host_certs();
+    (!host_certs.is_empty()).then_some(libfreemkv::DriveCredentials { host_certs })
 }
 
 /// Which key source won, from a resolution trace: the first

@@ -388,3 +388,57 @@ fn a_plain_rip_scopes_keys_to_the_main_title() {
         KeyScope::Titles(vec![0])
     );
 }
+
+// `covers_scope`: this disc's set, covering the scope, and AACS keys for an AACS disc's
+// titles; no scope needs no AACS key.
+#[test]
+fn covers_scope_needs_this_discs_aacs_set_over_the_scope() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+    let main = KeyScope::Titles(vec![0]);
+    let set = resolve_for_rip(&fx.disc, &mut fx.source(), main.clone(), &f, None, None).unwrap();
+    assert!(covers_scope(&set, &fx.disc, &main));
+    assert!(!covers_scope(&set, &fx.disc, &KeyScope::Titles(vec![0, 1])));
+    assert!(!covers_scope(&KeyRing::none(), &fx.disc, &main));
+    let other = bd_image(&[Some(K1)], 1);
+    assert_ne!(other.disc.media_id(), fx.disc.media_id());
+    assert!(!covers_scope(&set, &other.disc, &main));
+    let old = |s: &KeyRing, d: &libfreemkv::Disc, sc: &KeyScope| {
+        let aacs_titles = d.aacs.is_some() && *sc != KeyScope::None;
+        s.is_for(&d.media_id()) && s.covers(sc) && (s.is_aacs() || !aacs_titles)
+    };
+    let mut clear = bd_image(&[None], 1).disc;
+    clear.aacs = None;
+    clear.encrypted = false;
+    for d in [&fx.disc, &other.disc, &clear] {
+        for s in [&set, &KeyRing::none()] {
+            for sc in [&main, &KeyScope::None, &KeyScope::WholeDisc] {
+                assert_eq!(covers_scope(s, d, sc), old(s, d, sc), "{sc:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn drive_credentials_reads_the_keydb_host_certificate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keydb.cfg");
+    assert!(
+        drive_credentials(&path).is_none(),
+        "no keydb, no credentials"
+    );
+    std::fs::write(&path, "| DK | DEVICE_KEY 0x00\n").unwrap();
+    assert!(
+        drive_credentials(&path).is_none(),
+        "a keydb without HC rows"
+    );
+    let hc = format!(
+        "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+        "00".repeat(20),
+        "00".repeat(92)
+    );
+    std::fs::write(&path, hc).unwrap();
+    let creds = drive_credentials(&path).expect("the HC row");
+    assert_eq!(creds.host_certs.len(), 1);
+}
