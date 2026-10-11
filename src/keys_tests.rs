@@ -442,3 +442,23 @@ fn drive_credentials_reads_the_keydb_host_certificate() {
     let creds = drive_credentials(&path).expect("the HC row");
     assert_eq!(creds.host_certs.len(), 1);
 }
+
+// A loose clip's disc-folder scan runs under the run's Stop: a Stop raised before it scans
+// nothing and ends `Halted`, never "no keys" (which would read the clip keyless).
+#[test]
+fn a_loose_clip_scan_honours_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = bd_image(&[Some(K1)], 1).write_folder(&dir.path().join("enc"));
+    let calls = Calls::default();
+    let f = factory(&[(Answer::Keydb, &[K1])], &calls);
+    let scans = std::rc::Rc::new(std::cell::Cell::new(0));
+    let seen = scans.clone();
+    crate::image::scan_hook::set(move |_| seen.set(seen.get() + 1));
+    let halt = libfreemkv::Halt::new();
+    halt.cancel();
+    let (set, _) = resolve_loose_clip(&clip, &f, Some(&halt));
+    crate::image::scan_hook::clear();
+    assert!(matches!(set, Err(libfreemkv::Error::Halted)), "{set:?}");
+    assert_eq!(scans.get(), 0, "the stopped scan does no work");
+    assert_eq!(calls.len(), 0);
+}
