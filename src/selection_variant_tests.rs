@@ -223,6 +223,7 @@ fn main_movie_never_reviews_and_decides_the_same_for_dvd_and_bd_shapes() {
 const CANDIDATE_HAS_HUGE_EXTRAS: Layout =
     &[(&["A", "C"], &["eng"]), (&["A", "C", "copy"], &["deu"])];
 const SHARED_IS_EXACTLY_HALF: Layout = &[(&["A", "C"], &["eng"]), (&["A", "X"], &["deu"])];
+const CANDIDATE_SHARES_EXACTLY_HALF: Layout = &[(&["E1"], &["eng"]), (&["E1", "E2"], &["deu"])];
 const TITLE_ZERO_UNDESCRIBED: Layout = &[(&[], &["eng"]), (&["A", "C"], &["deu"])];
 const DUPLICATED_SEGMENT: Layout = &[(&["A", "A", "C"], &["eng"]), (&["A", "C"], &["deu"])];
 const DUPLICATED_SEGMENT_REVERSED: Layout =
@@ -249,6 +250,21 @@ fn sharing_exactly_half_keeps_title_zero() {
         let pick = picks(
             shape,
             SHARED_IS_EXACTLY_HALF,
+            Some("de"),
+            &StreamFilter::All,
+        );
+        assert_eq!(pick, vec![0], "{shape:?}");
+    }
+}
+
+// The candidate side is strict too: content that is exactly half of the candidate (and all of
+// title 0) is not a variant.
+#[test]
+fn a_candidate_that_is_exactly_half_shared_keeps_title_zero() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let pick = picks(
+            shape,
+            CANDIDATE_SHARES_EXACTLY_HALF,
             Some("de"),
             &StreamFilter::All,
         );

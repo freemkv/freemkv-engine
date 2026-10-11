@@ -60,8 +60,10 @@ the authored content it shares with title 0 appears in the same order in both an
 more than half of each, by the title's `selection_evidence.segments` (clip in/out on
 Blu-ray and UHD, clip range from `clipTimeBegin` on HD DVD; cell sectors on DVD; the
 same rule for every format). Ties go to the earlier title. Exact aliases qualify; so
-does an extended cut built by seamless branching. Logo-sharing extras, single episodes
-of a play-all, reordered decoys and separate full copies do not. MainMovie never holds
+does an extended cut built by seamless branching. Logo-sharing extras, reordered decoys
+and separate full copies do not. An episode of a play-all qualifies only when it is
+itself more than half of the play-all's content (one episode of three or more
+comparable ones is not); the rule is about shared weight, not about what the title is. MainMovie never holds
 for review on language: an unknown or unmatched language keeps title 0, so front ends
 validate language tags at input.
 

@@ -231,6 +231,10 @@ impl SelectionModel {
         if observed != self.titles.len() {
             return Err(SelectionReviewReason::IncompleteEpisodeRoster);
         }
+        if members.is_empty() {
+            // A roster that names no episode proves nothing to select.
+            return Err(SelectionReviewReason::IncompleteEpisodeRoster);
+        }
         if !(0..by_order.len()).all(|ordinal| by_order.contains_key(&ordinal)) {
             return Err(SelectionReviewReason::InvalidEpisodeRoster);
         }
