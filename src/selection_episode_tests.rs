@@ -38,10 +38,6 @@ fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
     t
 }
 
-// As on a real DVD: every episode ends on one shared end-card cell that the play-all holds
-// once, and an episode can be authored twice with only the audio differing.
-// Decoy playlists repeat the feature's sectors exactly: none is smaller than another.
-// Two cuts sharing most sectors overlap, so a title holding both plays no episodes.
 #[test]
 fn dedups_duplicate_angle_titles() {
     let ep = 44.0 * 60.0;
