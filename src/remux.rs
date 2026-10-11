@@ -8,7 +8,7 @@
 
 use crate::engine_halt::{EngineHalt, HaltSink};
 use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
-use crate::job::{Selection, StreamChoice, StreamFilter};
+use crate::job::{StreamChoice, StreamFilter};
 use crate::keys::{KeyParams, key_source_factory};
 use crate::mux::{
     RipOutcome, TitleResult, classify_title_error, mux_iso_title, mux_title, run_titles,
@@ -480,10 +480,11 @@ fn pick_title(
     title: Option<usize>,
     audio: &StreamFilter,
 ) -> io::Result<usize> {
-    let sel = title.map_or(Selection::MainMovie, |i| Selection::Titles(vec![i]));
-    let indices = crate::mux::resolve_selection_with_audio(disc, &sel, audio)
-        .map_err(|review| io::Error::from(libfreemkv::Error::from(review)))?;
-    indices.first().copied().ok_or_else(|| {
+    let picked = match title {
+        Some(index) => (index < disc.titles.len()).then_some(index),
+        None => crate::SelectionModel::from_titles(&disc.titles).main_title(audio, None),
+    };
+    picked.ok_or_else(|| {
         libfreemkv::Error::DiscTitleRange {
             index: title.unwrap_or(0),
             count: disc.titles.len(),

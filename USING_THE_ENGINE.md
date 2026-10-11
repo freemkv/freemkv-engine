@@ -45,14 +45,14 @@ freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", ta
 ## Selection
 
 Build an owned `SelectionModel::from_titles(&disc.titles)` at scan time and carry
-it to the UI. Call `model.select(&selection, &audio)` whenever preferences change;
-planners and rippers use the same model, not a separate language/role pool.
-Use `select_with_preferences(&selection, &audio, &SelectionPreferences {
-presentation_language: Some("de".into()) })` to choose a content presentation
-independently of retained audio. `Audio All` retains every audio stream of the
-chosen title; it does not combine different title presentations. An absent explicit
-presentation preference falls back to requested audio languages, never UI locale.
-Freeze the report's executable indices into `Selection::Titles` before execution.
+it to the UI. Call `model.select(&selection, &audio, presentation)` whenever preferences
+change; planners and rippers use the same model, not a separate language/role pool.
+`presentation` (e.g. `Some("de")`) chooses a content presentation independently of
+retained audio. `Audio All` retains every audio stream of the chosen title; it does
+not combine different title presentations. An absent explicit presentation preference
+falls back to requested audio languages, never UI locale. Freeze the executable
+indices `select` returns into `Selection::Titles` before execution.
+`model.main_title(&audio, presentation)` is the MainMovie pick, which never reviews.
 
 MainMovie is title 0 unless another cut of it carries more of the wanted languages
 (the presentation language, else the audio filter's languages). A cut qualifies when
@@ -64,8 +64,8 @@ branching. Logo-sharing extras, single episodes of a play-all, reordered decoys 
 separate full copies do not. MainMovie never holds for review on language: an unknown
 or unmatched language keeps title 0, so front ends validate language tags at input.
 
-`SelectionReport.indices` are executable; `candidates` are review/display only.
-If `requires_review()` is true, ask for explicit title choices before starting.
+`select` returns the executable indices, or `Err(SelectionReview)` whose `candidates`
+are review/display only: ask for explicit title choices before starting.
 Preflight reports `selection-review-required` with the typed reason's key as detail.
 
 Episode selection requires a complete, consistent authored roster. Two producers
@@ -193,8 +193,8 @@ job.raw = true;                     // Multi requires raw (see preflight below)
 // The loss tolerance lives on MultipassOpts, not the Job.
 ```
 
-`resolve_selection(&disc, &job.selection)` turns the selection into concrete
-0-based title indices, or `Err(SelectionReview { reason, candidates })` when the
+`resolve_selection(&disc, &job.selection, &job.streams.audio, None)` turns the
+selection into concrete 0-based title indices, or `Err(SelectionReview { reason, candidates })` when the
 evidence proves no automatic choice. Review is never an empty list (only an
 explicit `Titles([])` is). Converted to an error it is E9086
 (`SelectionReviewRequired`, detail = `reason.key()`); `candidates` may size a key
@@ -406,7 +406,7 @@ the default scheduler.
 fn rip(src: PathBuf, iso_out: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
     let (disc, mut reader) = scan_image(&ImageSource::from_path(&src))?;
     let sources = key_source_factory(&KeyParams::default());
-    let titles = resolve_selection(&disc, &Selection::MainMovie)?; // never a review
+    let titles = resolve_selection(&disc, &Selection::MainMovie, &StreamFilter::All, None)?;
     let scope = rip_scope(&disc, &titles, RipOutput::Streams);
     let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
     update_keydb_strip(key_status(&disc, &set));
