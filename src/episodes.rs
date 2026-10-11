@@ -6,8 +6,8 @@ use libfreemkv::DiscTitle;
 /// Use `SelectionModel::select` for review candidates and the typed reason.
 pub fn episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
     crate::SelectionModel::from_titles(titles)
-        .select(&crate::Selection::Episodes, &crate::StreamFilter::All)
-        .indices
+        .select(&crate::Selection::Episodes, &crate::StreamFilter::All, None)
+        .unwrap_or_default()
 }
 
 /// Legacy structural-containment hint, not menu reachability or an episode roster.

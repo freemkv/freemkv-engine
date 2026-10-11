@@ -305,9 +305,9 @@ fn known_episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
 }
 
 fn assert_unknown(titles: &[DiscTitle]) {
-    let report = crate::SelectionModel::from_titles(titles)
-        .select(&crate::Selection::Episodes, &crate::StreamFilter::All);
+    let review = crate::SelectionModel::from_titles(titles)
+        .select(&crate::Selection::Episodes, &crate::StreamFilter::All, None)
+        .unwrap_err();
     assert!(super::episode_titles(titles).is_empty());
-    assert!(report.requires_review());
-    assert_eq!(report.candidates, (0..titles.len()).collect::<Vec<_>>());
+    assert_eq!(review.candidates, (0..titles.len()).collect::<Vec<_>>());
 }

@@ -25,10 +25,7 @@ mod preflight;
 mod presentation;
 mod selection;
 pub use presentation::PresentationIdentity;
-pub use selection::{
-    SelectionBasis, SelectionModel, SelectionPreferences, SelectionReport, SelectionReview,
-    SelectionReviewReason, SelectionTitle,
-};
+pub use selection::{SelectionModel, SelectionReview, SelectionReviewReason};
 // The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 
@@ -74,8 +71,8 @@ pub use multipass::{
 };
 pub use mux::{
     RipOutcome, TitleAction, TitleError, TitleResult, classify_title_error, decide_title,
-    mux_title, open_scan, open_scan_with, resolve_job_selection, resolve_selection,
-    resolve_selection_with_audio, run_episodes, run_titles, run_titles_with,
+    mux_title, open_scan, open_scan_with, resolve_selection, run_episodes, run_titles,
+    run_titles_with,
 };
 pub use outcome::{DamageSeverity, KeyStatus, Outcome, RipFile};
 pub use plan::{Held, KeyParamsData, Output, Plan, Report, RunWith, TitleOptions, run, run_with};

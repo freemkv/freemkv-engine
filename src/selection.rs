@@ -5,39 +5,20 @@ use libfreemkv::DiscTitle;
 use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
 
-/// Content-presentation preference, independent of which streams are retained. Soft:
-/// MainMovie switches from title 0 only to another cut of it carrying the language
-/// (see [`SelectionModel::select_with_preferences`]) and never holds for review.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SelectionPreferences {
-    pub presentation_language: Option<String>,
-}
-
 /// Lightweight title data; indices refer to the original canonical scan order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SelectionTitle {
-    pub index: usize,
-    pub playlist_id: u16,
-    pub playlist: String,
-    pub duration_secs: f64,
-    pub presentation: Option<PresentationIdentity>,
-    pub audio_languages: Vec<String>,
-    pub evidence: TitleSelectionEvidence,
+struct SelectionTitle {
+    index: usize,
+    playlist_id: u16,
+    duration_secs: f64,
+    presentation: Option<PresentationIdentity>,
+    audio_languages: Vec<String>,
+    evidence: TitleSelectionEvidence,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SelectionModel {
     titles: Vec<SelectionTitle>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SelectionBasis {
-    Explicit,
-    All,
-    Longest,
-    Movie,
-    AuthoredEpisodes { roster: String },
-    UncertainReview,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,32 +36,6 @@ impl SelectionReviewReason {
             Self::IncompleteEpisodeRoster => "incomplete-episode-roster",
             Self::ConflictingEpisodeRoster => "conflicting-episode-roster",
             Self::InvalidEpisodeRoster => "invalid-episode-roster",
-        }
-    }
-}
-
-/// `indices` alone are executable. Review candidates never authorize a rip.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SelectionReport {
-    pub indices: Vec<usize>,
-    pub candidates: Vec<usize>,
-    pub basis: SelectionBasis,
-    pub review_reason: Option<SelectionReviewReason>,
-}
-
-impl SelectionReport {
-    pub fn requires_review(&self) -> bool {
-        self.review_reason.is_some()
-    }
-
-    /// The executable `indices`, or the review this selection needs (reason and candidates).
-    pub fn into_result(self) -> Result<Vec<usize>, SelectionReview> {
-        match self.review_reason {
-            Some(reason) => Err(SelectionReview {
-                reason,
-                candidates: self.candidates,
-            }),
-            None => Ok(self.indices),
         }
     }
 }
@@ -111,7 +66,6 @@ impl SelectionModel {
                 .map(|(index, title)| SelectionTitle {
                     index,
                     playlist_id: title.playlist_id,
-                    playlist: title.playlist.clone(),
                     duration_secs: title.duration_secs,
                     presentation: crate::presentation::identity(title),
                     audio_languages: title
@@ -128,108 +82,83 @@ impl SelectionModel {
         }
     }
 
-    pub fn from_disc(disc: &libfreemkv::Disc) -> Self {
-        Self::from_titles(&disc.titles)
-    }
-
-    pub fn titles(&self) -> &[SelectionTitle] {
-        &self.titles
-    }
-
-    pub fn select(&self, selection: &Selection, audio: &StreamFilter) -> SelectionReport {
-        self.select_with_preferences(selection, audio, &SelectionPreferences::default())
-    }
-
-    pub fn select_with_preferences(
+    /// The executable titles `selection` names, or the review it needs. `audio` (or an
+    /// explicit `presentation` language, which outranks it) picks among equivalent cuts.
+    /// Only `Episodes` can need review; an empty disc's `MainMovie` is no titles.
+    pub fn select(
         &self,
         selection: &Selection,
         audio: &StreamFilter,
-        preferences: &SelectionPreferences,
-    ) -> SelectionReport {
-        let presentation_audio = preferences
-            .presentation_language
-            .as_ref()
-            .map(|language| StreamFilter::Langs(vec![language.clone()]));
-        let audio = presentation_audio.as_ref().unwrap_or(audio);
-        let preference = crate::streams::AudioPreference::new(audio);
-        let scores: Vec<_> = self
-            .titles
-            .iter()
-            .map(|title| preference.score_languages(&title.audio_languages))
-            .collect();
-        let (indices, basis) = match selection {
+        presentation: Option<&str>,
+    ) -> Result<Vec<usize>, SelectionReview> {
+        let scores = self.scores(audio, presentation);
+        Ok(match selection {
             Selection::Episodes => match self.episode_roster() {
-                Ok((roster, members)) => (
-                    self.representatives(members, &scores),
-                    SelectionBasis::AuthoredEpisodes { roster },
-                ),
+                Ok(members) => self.representatives(members, &scores),
                 Err(reason) => {
-                    return SelectionReport {
-                        indices: Vec::new(),
+                    return Err(SelectionReview {
+                        reason,
                         candidates: self.representatives((0..self.titles.len()).collect(), &scores),
-                        basis: SelectionBasis::UncertainReview,
-                        review_reason: Some(reason),
-                    };
+                    });
                 }
             },
-            Selection::MainMovie => {
-                let Some(main) = self.titles.first() else {
-                    return SelectionReport {
-                        indices: Vec::new(),
-                        candidates: Vec::new(),
-                        basis: SelectionBasis::Movie,
-                        review_reason: None,
-                    };
-                };
-                // Title 0 unless another cut of it carries more of the wanted languages.
-                let mut best = 0;
-                if let Some(identity) = &main.presentation {
-                    for (index, title) in self.titles.iter().enumerate().skip(1) {
-                        if scores[index] > scores[best]
-                            && title
-                                .presentation
-                                .as_ref()
-                                .is_some_and(|other| other.branch_variant(identity))
-                        {
-                            best = index;
-                        }
-                    }
-                }
-                (vec![best], SelectionBasis::Movie)
-            }
-            Selection::All => ((0..self.titles.len()).collect(), SelectionBasis::All),
+            Selection::MainMovie => self.main_by(&scores).into_iter().collect(),
+            Selection::All => (0..self.titles.len()).collect(),
             Selection::Titles(indices) => {
                 let mut seen = HashSet::new();
-                (
-                    indices
-                        .iter()
-                        .copied()
-                        .filter(|&index| index < self.titles.len() && seen.insert(index))
-                        .collect(),
-                    SelectionBasis::Explicit,
-                )
-            }
-            Selection::Longest => {
-                let best = self
-                    .titles
+                indices
                     .iter()
-                    .filter(|title| title.duration_secs.is_finite())
-                    .fold(None::<&SelectionTitle>, |best, title| match best {
-                        Some(previous) if title.duration_secs <= previous.duration_secs => best,
-                        _ => Some(title),
-                    });
-                (
-                    best.map(|title| vec![title.index]).unwrap_or_default(),
-                    SelectionBasis::Longest,
-                )
+                    .copied()
+                    .filter(|&index| index < self.titles.len() && seen.insert(index))
+                    .collect()
             }
-        };
-        SelectionReport {
-            candidates: indices.clone(),
-            indices,
-            basis,
-            review_reason: None,
+            Selection::Longest => self
+                .titles
+                .iter()
+                .filter(|title| title.duration_secs.is_finite())
+                .fold(None::<&SelectionTitle>, |best, title| match best {
+                    Some(previous) if title.duration_secs <= previous.duration_secs => best,
+                    _ => Some(title),
+                })
+                .map(|title| vec![title.index])
+                .unwrap_or_default(),
+        })
+    }
+
+    /// The main title, which never needs review: title 0 unless another cut of it carries
+    /// more of the wanted languages (as [`select`](Self::select)). `None`: no titles.
+    pub fn main_title(&self, audio: &StreamFilter, presentation: Option<&str>) -> Option<usize> {
+        self.main_by(&self.scores(audio, presentation))
+    }
+
+    fn main_by(&self, scores: &[usize]) -> Option<usize> {
+        let main = self.titles.first()?;
+        let mut best = 0;
+        if let Some(identity) = &main.presentation {
+            for (index, title) in self.titles.iter().enumerate().skip(1) {
+                if scores[index] > scores[best]
+                    && title
+                        .presentation
+                        .as_ref()
+                        .is_some_and(|other| other.branch_variant(identity))
+                {
+                    best = index;
+                }
+            }
         }
+        Some(best)
+    }
+
+    // Each title's coverage of the wanted languages: the presentation language, else `audio`.
+    fn scores(&self, audio: &StreamFilter, presentation: Option<&str>) -> Vec<usize> {
+        let presentation_audio =
+            presentation.map(|language| StreamFilter::Langs(vec![language.to_string()]));
+        let preference =
+            crate::streams::AudioPreference::new(presentation_audio.as_ref().unwrap_or(audio));
+        self.titles
+            .iter()
+            .map(|title| preference.score_languages(&title.audio_languages))
+            .collect()
     }
 
     fn representatives(&self, indices: Vec<usize>, scores: &[usize]) -> Vec<usize> {
@@ -250,7 +179,7 @@ impl SelectionModel {
         chosen
     }
 
-    fn episode_roster(&self) -> Result<(String, Vec<usize>), SelectionReviewReason> {
+    fn episode_roster(&self) -> Result<Vec<usize>, SelectionReviewReason> {
         let mut source = None;
         let mut members = Vec::new();
         let mut observed = 0;
@@ -295,7 +224,9 @@ impl SelectionModel {
                 members.push((ordinal, title.index));
             }
         }
-        let source = source.ok_or(SelectionReviewReason::MissingEpisodeRoster)?;
+        if source.is_none() {
+            return Err(SelectionReviewReason::MissingEpisodeRoster);
+        }
         if observed != self.titles.len() {
             return Err(SelectionReviewReason::IncompleteEpisodeRoster);
         }
@@ -303,10 +234,7 @@ impl SelectionModel {
             return Err(SelectionReviewReason::InvalidEpisodeRoster);
         }
         members.sort_by_key(|&(ordinal, _)| ordinal);
-        Ok((
-            source.clone(),
-            members.into_iter().map(|(_, index)| index).collect(),
-        ))
+        Ok(members.into_iter().map(|(_, index)| index).collect())
     }
 }
 

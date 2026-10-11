@@ -1,4 +1,5 @@
 use super::*;
+use crate::Job;
 use crate::sink::NoopSink;
 use libfreemkv::disc::ContentSegment;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -67,7 +68,10 @@ fn main_movie_language_prefers_an_equivalent_language_presentation() {
     d.titles = vec![audio_title("eng", 1000), audio_title("deu", 1000)];
     let mut job = Job::new("disc://", "mkv://out");
     job.streams.audio = StreamFilter::Langs(vec!["deu".into()]);
-    assert_eq!(resolve_job_selection(&d, &job).unwrap(), vec![1]);
+    assert_eq!(
+        resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
+        vec![1]
+    );
 }
 
 #[test]
@@ -75,7 +79,10 @@ fn all_audio_does_not_change_main_movie_program_choice() {
     let mut d = disc(0, false, false);
     d.titles = vec![audio_title("eng", 1000), audio_title("deu", 1000)];
     let job = Job::new("disc://", "mkv://out");
-    assert_eq!(resolve_job_selection(&d, &job).unwrap(), vec![0]);
+    assert_eq!(
+        resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
+        vec![0]
+    );
 }
 
 #[test]
@@ -84,7 +91,10 @@ fn language_preference_does_not_switch_to_a_distinct_program() {
     d.titles = vec![audio_title("eng", 1000), audio_title("deu", 9000)];
     let mut job = Job::new("disc://", "mkv://out");
     job.streams.audio = StreamFilter::Langs(vec!["deu".into()]);
-    assert_eq!(resolve_job_selection(&d, &job).unwrap(), vec![0]);
+    assert_eq!(
+        resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
+        vec![0]
+    );
 }
 
 fn clipped_audio(lang: &str, start: u32, end: u32) -> libfreemkv::DiscTitle {
@@ -112,10 +122,11 @@ fn regression_authored_intervals_preserve_distinct_episodes_and_main_content() {
     ];
     assert_eq!(known_episode_titles(&d.titles), vec![0, 1]);
     assert_eq!(
-        resolve_selection_with_audio(
+        resolve_selection(
             &d,
             &Selection::MainMovie,
-            &StreamFilter::Langs(vec!["de".into()])
+            &StreamFilter::Langs(vec!["de".into()]),
+            None
         )
         .unwrap(),
         vec![0]
@@ -123,10 +134,11 @@ fn regression_authored_intervals_preserve_distinct_episodes_and_main_content() {
     d.titles[1].clips[0].in_time = 0;
     scan_clips(&mut d.titles[1]);
     assert_eq!(
-        resolve_selection_with_audio(
+        resolve_selection(
             &d,
             &Selection::MainMovie,
-            &StreamFilter::Langs(vec!["de".into()])
+            &StreamFilter::Langs(vec!["de".into()]),
+            None
         )
         .unwrap(),
         vec![0]
@@ -162,10 +174,11 @@ fn regression_missing_or_invalid_identity_never_equates_presentations() {
         d.titles = vec![a, b];
         assert_eq!(known_episode_titles(&d.titles), vec![0, 1], "shape {shape}");
         assert_eq!(
-            resolve_selection_with_audio(
+            resolve_selection(
                 &d,
                 &Selection::MainMovie,
-                &StreamFilter::Langs(vec!["de".into()])
+                &StreamFilter::Langs(vec!["de".into()]),
+                None
             )
             .unwrap(),
             vec![0],
@@ -199,19 +212,25 @@ fn regression_episodes_choose_audio_before_dedup_in_either_disc_order() {
             job.selection = Selection::Episodes;
             job.streams.audio = StreamFilter::Langs(vec!["German".into()]);
             assert_eq!(
-                resolve_job_selection(&d, &job).unwrap(),
+                resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
                 vec![usize::from(!reversed)]
             );
             assert_eq!(crate::preflight(&d, &job), crate::Preflight::Ready);
             job.streams.audio = StreamFilter::Langs(vec!["jpn".into()]);
-            assert_eq!(resolve_job_selection(&d, &job).unwrap(), vec![0]);
+            assert_eq!(
+                resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
+                vec![0]
+            );
             assert!(matches!(
                 crate::preflight(&d, &job),
                 crate::Preflight::Blocked(_)
             ));
             for audio in [StreamFilter::All, StreamFilter::None] {
                 job.streams.audio = audio;
-                assert_eq!(resolve_job_selection(&d, &job).unwrap(), vec![0]);
+                assert_eq!(
+                    resolve_selection(&d, &job.selection, &job.streams.audio, None).unwrap(),
+                    vec![0]
+                );
             }
         }
     }
@@ -230,7 +249,7 @@ fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
     let audio = StreamFilter::Langs(vec!["en".into(), "eng".into(), "de".into()]);
     for selection in [Selection::MainMovie, Selection::Episodes] {
         assert_eq!(
-            resolve_selection_with_audio(&d, &selection, &audio).unwrap(),
+            resolve_selection(&d, &selection, &audio, None).unwrap(),
             vec![1]
         );
     }
@@ -240,8 +259,8 @@ fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
         Selection::Longest,
     ] {
         assert_eq!(
-            resolve_selection_with_audio(&d, &selection, &audio).unwrap(),
-            resolve_selection(&d, &selection).unwrap()
+            resolve_selection(&d, &selection, &audio, None).unwrap(),
+            resolve_selection(&d, &selection, &StreamFilter::All, None).unwrap()
         );
     }
 }
@@ -284,7 +303,7 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
     let audio = StreamFilter::Langs(vec!["de".into()]);
     assert_eq!(known_episode_titles(&d.titles), vec![0, 2, 4]);
     assert_eq!(
-        resolve_selection_with_audio(&d, &Selection::Episodes, &audio).unwrap(),
+        resolve_selection(&d, &Selection::Episodes, &audio, None).unwrap(),
         vec![1, 3, 5]
     );
     let mut reordered = d.titles[1].clone();
@@ -295,10 +314,8 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
     scan_clips(&mut shifted);
     d.titles.extend([reordered, shifted]);
     // Newly added titles are not covered by the original roster: hold for review.
-    let report = crate::SelectionModel::from_disc(&d).select(&Selection::Episodes, &audio);
-    assert!(report.indices.is_empty());
-    assert!(report.requires_review());
-    assert_eq!(report.candidates, vec![1, 3, 5, 6, 7]);
+    let review = resolve_selection(&d, &Selection::Episodes, &audio, None).unwrap_err();
+    assert_eq!(review.candidates, vec![1, 3, 5, 6, 7]);
 }
 
 #[test]
@@ -332,7 +349,7 @@ fn hard_err() -> std::io::Error {
 fn selection_main_movie_is_title_zero() {
     let d = disc(5, false, false);
     assert_eq!(
-        resolve_selection(&d, &Selection::MainMovie).unwrap(),
+        resolve_selection(&d, &Selection::MainMovie, &StreamFilter::All, None).unwrap(),
         vec![0]
     );
 }
@@ -341,7 +358,7 @@ fn selection_main_movie_is_title_zero() {
 fn selection_all_is_every_title() {
     let d = disc(3, false, false);
     assert_eq!(
-        resolve_selection(&d, &Selection::All).unwrap(),
+        resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap(),
         vec![0, 1, 2]
     );
 }
@@ -349,7 +366,10 @@ fn selection_all_is_every_title() {
 #[test]
 fn selection_longest_picks_max_duration() {
     let d = disc(4, false, false); // durations 60,120,180,240 → index 3
-    assert_eq!(resolve_selection(&d, &Selection::Longest).unwrap(), vec![3]);
+    assert_eq!(
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap(),
+        vec![3]
+    );
 }
 
 // Ties go to the FIRST title, not the last (`max_by` would pick the LAST of equal maxima,
@@ -362,7 +382,7 @@ fn selection_longest_breaks_a_tie_towards_the_first_title() {
     d.titles[3].duration_secs = 7200.0;
     d.titles[4].duration_secs = 7200.0;
     assert_eq!(
-        resolve_selection(&d, &Selection::Longest).unwrap(),
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap(),
         vec![1],
         "the first of the equal-longest playlists is the feature; the later \
              ones are decoys"
@@ -376,7 +396,7 @@ fn selection_longest_ignores_a_leading_title_with_no_measurable_duration() {
     let mut d = disc(3, false, false); // 60, 120, 180
     d.titles[0].duration_secs = f64::NAN;
     assert_eq!(
-        resolve_selection(&d, &Selection::Longest).unwrap(),
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap(),
         vec![2],
         "a leading NaN must not win the longest-title selection"
     );
@@ -387,7 +407,7 @@ fn selection_longest_ignores_a_leading_title_with_no_measurable_duration() {
         t.duration_secs = f64::NAN;
     }
     assert!(
-        resolve_selection(&d, &Selection::Longest)
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None)
             .unwrap()
             .is_empty()
     );
@@ -398,7 +418,7 @@ fn selection_longest_ignores_a_title_with_no_measurable_duration() {
     let mut d = disc(3, false, false); // 60, 120, 180
     d.titles[2].duration_secs = f64::NAN;
     assert_eq!(
-        resolve_selection(&d, &Selection::Longest).unwrap(),
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap(),
         vec![1],
         "an unmeasurable title is not the longest one"
     );
@@ -408,7 +428,7 @@ fn selection_longest_ignores_a_title_with_no_measurable_duration() {
 fn selection_longest_on_an_empty_disc_selects_nothing() {
     let d = disc(0, false, false);
     assert_eq!(
-        resolve_selection(&d, &Selection::Longest).unwrap(),
+        resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap(),
         Vec::<usize>::new()
     );
 }
@@ -417,7 +437,7 @@ fn selection_longest_on_an_empty_disc_selects_nothing() {
 fn selection_explicit_drops_out_of_range() {
     let d = disc(2, false, false);
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![0, 9])).unwrap(),
+        resolve_selection(&d, &Selection::Titles(vec![0, 9]), &StreamFilter::All, None).unwrap(),
         vec![0]
     );
 }
@@ -428,12 +448,12 @@ fn selection_explicit_drops_out_of_range() {
 fn selection_explicit_index_equal_to_the_title_count_is_out_of_range() {
     let d = disc(3, false, false); // valid indices are 0, 1, 2
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![3])).unwrap(),
+        resolve_selection(&d, &Selection::Titles(vec![3]), &StreamFilter::All, None).unwrap(),
         Vec::<usize>::new(),
         "index == title count is one past the end, not a fourth title"
     );
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![2, 3])).unwrap(),
+        resolve_selection(&d, &Selection::Titles(vec![2, 3]), &StreamFilter::All, None).unwrap(),
         vec![2],
         "the last valid index still survives the same filter"
     );
@@ -466,7 +486,7 @@ fn episodes_that_all_fail_are_a_failed_rip() {
 #[test]
 fn a_single_non_explicit_title_stub_is_fatal_not_skipped() {
     let d = disc(4, false, false); // durations 60..240 → longest is index 3
-    let indices = resolve_selection(&d, &Selection::Longest).unwrap();
+    let indices = resolve_selection(&d, &Selection::Longest, &StreamFilter::All, None).unwrap();
     assert_eq!(indices, vec![3], "one title, and not the feature");
 
     let outcome = run_titles(&indices, false, &NoopSink, |_| Err(stub_err()));
@@ -896,7 +916,7 @@ fn fail_fast_on_disc_level_no_key_stops_after_first_title() {
     // The user's scenario: 54 titles, no key. The FIRST title's mux returns
     // a disc-level no-key error → stop; do NOT iterate the other 53.
     let d = disc(54, true, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let calls = AtomicUsize::new(0);
     let outcome = run_titles(&indices, false, &NoopSink, |_| {
         calls.fetch_add(1, Ordering::Relaxed);
@@ -914,7 +934,7 @@ fn fail_fast_on_disc_level_no_key_stops_after_first_title() {
 fn halt_from_mux_is_a_full_stop_not_per_title() {
     // First title halts → the loop stops immediately, does NOT visit title 2.
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let visited = AtomicUsize::new(0);
     let outcome = run_titles(&indices, false, &NoopSink, |idx| {
         visited.fetch_add(1, Ordering::Relaxed);
@@ -980,7 +1000,7 @@ fn skippable_stub_on_non_feature_multi_title_is_skipped() {
     // All-titles rip (explicit=false): title 0 ok, title 1 a stub (skipped),
     // title 2 ok.
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let outcome = run_titles(&indices, false, &NoopSink, |idx| {
         if idx == 1 { Err(stub_err()) } else { Ok(()) }
     });
@@ -993,7 +1013,7 @@ fn skippable_stub_on_non_feature_multi_title_is_skipped() {
 #[test]
 fn the_failure_cause_says_which_failure_it_was() {
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
 
     let run = |e: fn() -> std::io::Error| {
         run_titles(&indices, false, &NoopSink, move |idx| {
@@ -1035,7 +1055,7 @@ fn the_failure_cause_says_which_failure_it_was() {
 #[test]
 fn stub_on_the_feature_is_fatal() {
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let outcome = run_titles(&indices, false, &NoopSink, |idx| {
         if idx == 0 { Err(stub_err()) } else { Ok(()) }
     });
@@ -1055,7 +1075,8 @@ fn explicit_single_title_stub_is_fatal() {
     // `-t 2` explicitly (explicit=true): a stub there is what the user asked
     // for → fatal.
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::Titles(vec![1])).unwrap();
+    let indices =
+        resolve_selection(&d, &Selection::Titles(vec![1]), &StreamFilter::All, None).unwrap();
     let outcome = run_titles(&indices, true, &NoopSink, |_| Err(stub_err()));
     assert_eq!(
         outcome,
@@ -1073,7 +1094,8 @@ fn explicit_single_title_stub_is_fatal() {
 #[test]
 fn explicit_multi_title_stub_is_fatal() {
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::Titles(vec![1, 2])).unwrap();
+    let indices =
+        resolve_selection(&d, &Selection::Titles(vec![1, 2]), &StreamFilter::All, None).unwrap();
     let outcome = run_titles(&indices, true, &NoopSink, |idx| {
         if idx == 1 { Err(stub_err()) } else { Ok(()) }
     });
@@ -1118,7 +1140,7 @@ fn disc_text_in_a_log_line_has_no_control_characters() {
 fn hard_failure_on_non_feature_is_still_fatal() {
     // A non-stub hard error is never skippable, even on a bonus title.
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let outcome = run_titles(&indices, false, &NoopSink, |idx| {
         if idx == 1 { Err(hard_err()) } else { Ok(()) }
     });
@@ -1145,7 +1167,7 @@ fn should_cancel_between_titles_stops_the_rip() {
         }
     }
     let d = disc(3, false, false);
-    let indices = resolve_selection(&d, &Selection::All).unwrap();
+    let indices = resolve_selection(&d, &Selection::All, &StreamFilter::All, None).unwrap();
     let sink = CancelAfterFirst {
         seen: AtomicUsize::new(0),
     };
@@ -1162,18 +1184,30 @@ fn should_cancel_between_titles_stops_the_rip() {
 fn duplicate_title_indices_are_deduped_preserving_first_seen_order() {
     let d = disc(4, false, true);
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![1, 1])).unwrap(),
+        resolve_selection(&d, &Selection::Titles(vec![1, 1]), &StreamFilter::All, None).unwrap(),
         vec![1],
         "a repeated index must collapse to one"
     );
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![2, 0, 2, 1, 0])).unwrap(),
+        resolve_selection(
+            &d,
+            &Selection::Titles(vec![2, 0, 2, 1, 0]),
+            &StreamFilter::All,
+            None
+        )
+        .unwrap(),
         vec![2, 0, 1],
         "de-duplication must keep first-seen order"
     );
     // Out-of-range entries are still dropped, and dedupe applies after.
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![9, 3, 9, 3])).unwrap(),
+        resolve_selection(
+            &d,
+            &Selection::Titles(vec![9, 3, 9, 3]),
+            &StreamFilter::All,
+            None
+        )
+        .unwrap(),
         vec![3]
     );
 }
@@ -1195,16 +1229,16 @@ fn known_episode_titles(titles: &[libfreemkv::DiscTitle]) -> Vec<usize> {
 fn a_selection_needing_review_is_an_error_with_its_candidates() {
     let branch = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
     assert_eq!(
-        resolve_selection(&branch, &Selection::MainMovie),
+        resolve_selection(&branch, &Selection::MainMovie, &StreamFilter::All, None),
         Ok(vec![0])
     );
     let de = StreamFilter::Langs(vec!["de".into()]);
     assert_eq!(
-        resolve_selection_with_audio(&branch, &Selection::MainMovie, &de),
+        resolve_selection(&branch, &Selection::MainMovie, &de, None),
         Ok(vec![1])
     );
     let d = disc(3, false, false);
-    let review = resolve_selection(&d, &Selection::Episodes).unwrap_err();
+    let review = resolve_selection(&d, &Selection::Episodes, &StreamFilter::All, None).unwrap_err();
     assert_eq!(
         review.reason,
         crate::SelectionReviewReason::MissingEpisodeRoster
@@ -1215,7 +1249,7 @@ fn a_selection_needing_review_is_an_error_with_its_candidates() {
         "E9086: missing-episode-roster"
     );
     assert_eq!(
-        resolve_selection(&d, &Selection::Titles(vec![])),
+        resolve_selection(&d, &Selection::Titles(vec![]), &StreamFilter::All, None),
         Ok(vec![])
     );
 }
