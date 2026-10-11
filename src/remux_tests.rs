@@ -1488,3 +1488,23 @@ fn a_real_mux_reports_its_output_opening_to_the_watch() {
         "OutputOpened reached the watch"
     );
 }
+
+// The production title closure hands the real mux the title's watch, not the outer sink: a
+// real mux that opened its output and then failed (an Err, no outcome) leaves nothing there.
+#[cfg(unix)]
+#[test]
+fn a_real_mux_failing_after_its_open_removes_its_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opened, ..) = opened_image(dir.path());
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let fail_after_open = |muxed: io::Result<libfreemkv::MuxOutcome>| {
+        assert!(muxed?.output_opened, "the real mux opened its output");
+        Err(io::Error::other("E6000: 12"))
+    };
+    let sink = crate::NoopSink;
+    let r = mux_image_titles_then(&opened, &plan, &dest, &sink, &Halt::new(), fail_after_open);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert!(!out.exists(), "the failed title's output is removed");
+}

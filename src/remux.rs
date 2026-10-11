@@ -93,6 +93,19 @@ pub fn mux_image_titles_with(
     sink: &dyn Sink,
     halt: &Halt,
 ) -> RipOutcome {
+    mux_image_titles_then(opened, plan, dest, sink, halt, |muxed| muxed)
+}
+
+// `mux_image_titles_with`, each title's real mux result passed through `then`: the identity,
+// but a test's `then` can fail a mux after its output opened.
+fn mux_image_titles_then(
+    opened: &OpenedImage,
+    plan: &MuxPlan,
+    dest: &dyn Fn(usize) -> String,
+    sink: &dyn Sink,
+    halt: &Halt,
+    then: impl Fn(io::Result<libfreemkv::MuxOutcome>) -> io::Result<libfreemkv::MuxOutcome>,
+) -> RipOutcome {
     let halt = EngineHalt::new(halt, None).with_sink(sink);
     let sink = &HaltSink {
         inner: sink,
@@ -103,7 +116,9 @@ pub fn mux_image_titles_with(
         Err(e) => return refused_up_front(e, plan, dest, sink),
     };
     mux_titles(plan, dest, sink, &halt, |idx, selection, dest, watch| {
-        mux_opened_title(opened, &keys, idx, selection, dest, &plan.mux, watch)
+        then(mux_opened_title(
+            opened, &keys, idx, selection, dest, &plan.mux, watch,
+        ))
     })
 }
 
