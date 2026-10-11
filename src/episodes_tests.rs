@@ -156,6 +156,7 @@ fn alternate_playlists_for_one_program_are_selected_once() {
         for extent_start in [start, start + 10_000] {
             let mut t = title(ep, extent_start);
             t.clips = vec![libfreemkv::Clip {
+                marks_on_pes_clock: true,
                 clip_id: n.into(),
                 in_time: 0,
                 out_time: 53 * 60 * 45_000,
@@ -193,6 +194,7 @@ fn distinct_programs_with_shared_intro_are_not_collapsed() {
         let mut t = title(ep, extent_start);
         t.clips = vec![
             libfreemkv::Clip {
+                marks_on_pes_clock: true,
                 clip_id: "shared-intro".into(),
                 in_time: 0,
                 out_time: 30 * 45_000,
@@ -201,6 +203,7 @@ fn distinct_programs_with_shared_intro_are_not_collapsed() {
                 feed_span: None,
             },
             libfreemkv::Clip {
+                marks_on_pes_clock: true,
                 clip_id: body.into(),
                 in_time: 0,
                 out_time: 52 * 60 * 45_000,

@@ -39,6 +39,7 @@ fn titles(shape: Shape, layout: Layout) -> Vec<DiscTitle> {
                 let (unit, start, len) = segment(name);
                 match shape {
                     Shape::Bd => title.clips.push(libfreemkv::Clip {
+                        marks_on_pes_clock: true,
                         clip_id: unit.into(),
                         in_time: 90 + start,
                         out_time: 90 + start + len,

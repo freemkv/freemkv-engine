@@ -685,6 +685,7 @@ pub(crate) fn clip_title(
     title.playlist = format!("{id:05}.mpls");
     title.duration_secs = secs;
     title.clips = vec![libfreemkv::Clip {
+        marks_on_pes_clock: true,
         clip_id: program.into(),
         in_time: 90,
         out_time: 900_090,
@@ -719,6 +720,7 @@ pub(crate) fn branch_titles() -> Vec<libfreemkv::DiscTitle> {
             title.clips = ["a", &format!("b-{language}"), "c"]
                 .into_iter()
                 .map(|clip| libfreemkv::Clip {
+                    marks_on_pes_clock: true,
                     clip_id: clip.into(),
                     ..title.clips[0].clone()
                 })

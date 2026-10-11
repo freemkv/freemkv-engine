@@ -92,6 +92,7 @@ fn clipped_audio(lang: &str, start: u32, end: u32) -> libfreemkv::DiscTitle {
     t.content_format = libfreemkv::ContentFormat::BdTs;
     t.duration_secs = f64::from(end - start);
     t.clips = vec![libfreemkv::Clip {
+        marks_on_pes_clock: true,
         clip_id: "00001".into(),
         in_time: start * 45_000,
         out_time: end * 45_000,
