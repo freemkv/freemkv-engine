@@ -223,6 +223,7 @@ fn main_movie_never_reviews_and_decides_the_same_for_dvd_and_bd_shapes() {
 const CANDIDATE_HAS_HUGE_EXTRAS: Layout =
     &[(&["A", "C"], &["eng"]), (&["A", "C", "copy"], &["deu"])];
 const SHARED_IS_EXACTLY_HALF: Layout = &[(&["A", "C"], &["eng"]), (&["A", "X"], &["deu"])];
+const CANDIDATE_SHARES_EXACTLY_HALF: Layout = &[(&["E1"], &["eng"]), (&["E1", "E2"], &["deu"])];
 const TITLE_ZERO_UNDESCRIBED: Layout = &[(&[], &["eng"]), (&["A", "C"], &["deu"])];
 const DUPLICATED_SEGMENT: Layout = &[(&["A", "A", "C"], &["eng"]), (&["A", "C"], &["deu"])];
 const DUPLICATED_SEGMENT_REVERSED: Layout =
@@ -256,6 +257,21 @@ fn sharing_exactly_half_keeps_title_zero() {
     }
 }
 
+// The candidate side is strict too: content that is exactly half of the candidate (and all of
+// title 0) is not a variant.
+#[test]
+fn a_candidate_that_is_exactly_half_shared_keeps_title_zero() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let pick = picks(
+            shape,
+            CANDIDATE_SHARES_EXACTLY_HALF,
+            Some("de"),
+            &StreamFilter::All,
+        );
+        assert_eq!(pick, vec![0], "{shape:?}");
+    }
+}
+
 #[test]
 fn a_title_zero_without_segments_keeps_title_zero() {
     for shape in [Shape::Dvd, Shape::Bd] {
@@ -275,5 +291,26 @@ fn a_duplicated_segment_is_not_a_variant() {
     for layout in [DUPLICATED_SEGMENT, DUPLICATED_SEGMENT_REVERSED] {
         let pick = picks(Shape::Bd, layout, Some("de"), &StreamFilter::All);
         assert_eq!(pick, vec![0], "{layout:?}");
+    }
+}
+
+// Requested languages are a set: `en` and `eng` are one language, so they cannot outvote `de`.
+#[test]
+fn duplicate_requested_languages_count_once() {
+    const GERMAN_FIRST: Layout = &[
+        (&["A", "B-de", "C"], &["deu"]),
+        (&["A", "B-en", "C"], &["eng"]),
+    ];
+    for shape in [Shape::Dvd, Shape::Bd] {
+        assert_eq!(
+            picks(shape, GERMAN_FIRST, None, &langs(&["en", "eng", "de"])),
+            vec![0],
+            "{shape:?}: a tie keeps title 0"
+        );
+        assert_eq!(
+            picks(shape, GERMAN_FIRST, None, &langs(&["en", "eng"])),
+            vec![1],
+            "{shape:?}"
+        );
     }
 }

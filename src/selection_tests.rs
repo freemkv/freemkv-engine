@@ -280,6 +280,29 @@ fn partial_conflicting_invalid_and_sliced_rosters_fail_closed() {
 }
 
 #[test]
+fn empty_complete_roster_is_incomplete_not_an_empty_selection() {
+    let mut titles = vec![title(0, "a", 90.0, "eng"), title(1, "b", 2400.0, "deu")];
+    roster(&mut titles, &[]);
+    assert_eq!(
+        select(&titles).map_err(|review| review.reason),
+        Err(SelectionReviewReason::IncompleteEpisodeRoster)
+    );
+}
+
+#[test]
+fn ordinal_gap_is_an_invalid_roster() {
+    let mut titles = vec![title(0, "a", 90.0, "eng"), title(1, "b", 2400.0, "deu")];
+    roster(&mut titles, &[0, 1]);
+    if let EpisodeEvidence::Authored { ordinal, .. } = &mut titles[1].selection_evidence.episodes {
+        *ordinal = Some(2);
+    }
+    assert_eq!(
+        select(&titles).map_err(|review| review.reason),
+        Err(SelectionReviewReason::InvalidEpisodeRoster)
+    );
+}
+
+#[test]
 fn exact_intervals_and_unknown_identity_remain_conservative_under_authored_roster() {
     let a = title(0, "intro", 1200.0, "eng");
     let mut b = a.clone();

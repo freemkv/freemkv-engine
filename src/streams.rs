@@ -341,15 +341,12 @@ impl AudioPreference {
         Self(wanted)
     }
 
-    // Count requested languages, not tracks: duplicate tracks add no coverage.
-    pub(crate) fn score_languages(&self, languages: &[String]) -> usize {
+    // Count requested languages, not tracks: duplicate tracks add no coverage. `languages` are
+    // a title's tags already resolved by [`stream_lang`], once per title.
+    pub(crate) fn score_languages(&self, languages: &[Option<Language>]) -> usize {
         self.0
             .iter()
-            .filter(|&&language| {
-                languages
-                    .iter()
-                    .any(|tag| stream_lang(tag) == Some(language))
-            })
+            .filter(|&&language| languages.contains(&Some(language)))
             .count()
     }
 }
@@ -435,7 +432,7 @@ fn resolve_subtitles(
 /// Normalize a language tag (a name, 639-1, 639-2/T, 639-2/B, or 639-3 code) to
 /// a language identity, case-insensitively. `None` if unrecognized.
 // A stream's language: an untagged one is `und` (undetermined), as the refusal reports it.
-fn stream_lang(tag: &str) -> Option<Language> {
+pub(crate) fn stream_lang(tag: &str) -> Option<Language> {
     match tag.trim().is_empty() {
         true => Some(Language::Und),
         false => normalize_lang(tag),

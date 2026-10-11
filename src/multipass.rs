@@ -546,6 +546,17 @@ pub(crate) fn end_of_recovery_lost_ms(
     (main_title_lost_ms(title, main_bad_bytes), None)
 }
 
+// The first title this rip delivers (for `MainMovie`, the one measured_titles measures). A
+// selection resolving to nothing has none: `usize::MAX` is no index, so progress reports no
+// main title rather than title 0.
+fn progress_main_title(disc: &libfreemkv::Disc, job: &Job) -> Option<usize> {
+    crate::resolve_selection(disc, &job.selection, &job.streams.audio, None)
+        .unwrap_or_else(|review| review.candidates)
+        .into_iter()
+        .find(|&i| i < disc.titles.len())
+        .or(Some(usize::MAX))
+}
+
 // The titles this rip delivers (`Job::selection`; a selection needing review: its candidates),
 // whose damage the loop measures. Never empty: with none, the extent-less `empty` title makes
 // any damage unmeasurable, not clean.
@@ -629,7 +640,7 @@ pub struct MultipassResult {
     /// Good bytes recovered across all passes.
     pub good_bytes: u64,
     /// Playback milliseconds lost in the ripped titles: those
-    /// [`Job::selection`] resolves to, summed per title (title 0 for the default `MainMovie`).
+    /// [`Job::selection`] resolves to, summed per title (the default `MainMovie`: the cut the audio filter picks).
     ///
     /// Always scoped to those titles' own extents, even on an ISO rip (an unreadable menu is
     /// not lost feature playback). A title missing its size or duration is timed at an
@@ -920,6 +931,7 @@ pub(crate) fn recover(
     }
     let empty_title = libfreemkv::DiscTitle::empty();
     let titles = measured_titles(disc, job, &empty_title);
+    let main_title = progress_main_title(disc, job);
     if !plan.multipass {
         return single_pass(disc, host.reader(), iso_path, job, scope, sink, halt);
     }
@@ -962,13 +974,14 @@ pub(crate) fn recover(
                 halt: None,
                 keys: job.keys.clone(),
             };
-            match crate::recovery::sweep_in(
+            match crate::recovery::sweep_titled(
                 disc,
                 host.reader(),
                 iso_path,
                 &sweep_opts,
                 scope.clone(),
                 halt,
+                main_title,
             ) {
                 Ok(sr) => break sr,
                 Err(e) if e.is_scsi_transport_failure() && !halt.is_cancelled() => {
@@ -1062,15 +1075,21 @@ pub(crate) fn recover(
                 keys: job.keys.clone(),
                 ..PatchOptions::for_patch_pass(pass_should_decrypt(job.raw), Some(&bridge), None)
             };
-            let pr =
-                match crate::recovery::patch_in(disc, host.reader(), iso_path, &patch_opts, halt) {
-                    Ok(pr) => pr,
-                    Err(e) if opts.on_patch_failure == OnPatchFailure::Finish => {
-                        milestone(sink, RecoveryEvent::PatchFailed { pass, error: &e });
-                        break;
-                    }
-                    Err(e) => return Err(e),
-                };
+            let pr = match crate::recovery::patch_titled(
+                disc,
+                host.reader(),
+                iso_path,
+                &patch_opts,
+                halt,
+                progress_main_title(disc, job),
+            ) {
+                Ok(pr) => pr,
+                Err(e) if opts.on_patch_failure == OnPatchFailure::Finish => {
+                    milestone(sink, RecoveryEvent::PatchFailed { pass, error: &e });
+                    break;
+                }
+                Err(e) => return Err(e),
+            };
             passes += 1;
             last_good = pr.bytes_good;
             last_unreadable = pr.bytes_unreadable;
@@ -1338,7 +1357,15 @@ fn single_pass(
                 keys: copy_opts.keys.clone(),
             };
             let scope = crate::recovery::sector_scope_to_bytes(scope);
-            crate::recovery::sweep_in(disc, reader, iso_path, &sweep_opts, Some(scope), halt)?
+            crate::recovery::sweep_titled(
+                disc,
+                reader,
+                iso_path,
+                &sweep_opts,
+                Some(scope),
+                halt,
+                progress_main_title(disc, job),
+            )?
         }
         None => crate::recovery::copy_in(disc, reader, iso_path, &copy_opts, halt)?,
     };

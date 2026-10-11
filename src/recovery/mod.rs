@@ -12,7 +12,7 @@ use libfreemkv::error::{Error, Result};
 use libfreemkv::extract_scsi_context;
 use libfreemkv::sector::SectorSource;
 
-pub(crate) use patch::patch_in;
+pub(crate) use patch::patch_titled;
 pub use patch::{patch, patch_with};
 
 /// A genuine read fault — the drive answered with a status/sense, or the
@@ -594,7 +594,7 @@ fn patch_internal(
         keys: opts.keys.clone(),
         ..PatchOptions::for_patch_pass(opts.decrypt, opts.progress, opts.halt.clone())
     };
-    let pr = patch::patch_in(disc, reader, path, &patch_opts, halt)?;
+    let pr = patch::patch_titled(disc, reader, path, &patch_opts, halt, None)?;
     tracing::info!(
         target: "freemkv::disc",
         phase = "patch_done",
@@ -737,6 +737,18 @@ pub(crate) fn sector_scope_to_bytes(scope: &[(u32, u32)]) -> Vec<(u64, u64)> {
 // Minimum interval between sweep progress reports (patch's PROGRESS_TICK_MS).
 const SWEEP_TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
+// The title a pass's progress reports as the main one: `main_title` (an index into
+// `disc.titles`, the first title the run delivers), else title 0.
+pub(crate) fn progress_title(
+    disc: &libfreemkv::Disc,
+    main_title: Option<usize>,
+) -> Option<&libfreemkv::DiscTitle> {
+    match main_title {
+        Some(i) => disc.titles.get(i),
+        None => disc.titles.first(),
+    }
+}
+
 // A sweep's progress bar: `work_*` run 0..=100% over the pass's domain (its scope, or the
 // whole disc), counting what the mapfile already held as done, so a resume starts there.
 struct SweepBar {
@@ -751,7 +763,7 @@ impl SweepBar {
     // One tick after `done` bytes of this pass's regions, `good` of them read clean.
     fn tick(
         &self,
-        disc: &libfreemkv::Disc,
+        main_title: Option<&libfreemkv::DiscTitle>,
         snap: Option<&sweep::ProgressSnapshot>,
         main_title_bad: u64,
         located: &libfreemkv::progress::LocatedProgress,
@@ -775,7 +787,6 @@ impl SweepBar {
                 b.bytes_retryable.saturating_add(done.saturating_sub(good)),
             ),
         };
-        let main_title = disc.titles.first();
         libfreemkv::progress::PassProgress {
             kind: libfreemkv::progress::PassKind::Sweep,
             work_done: self.done_before.saturating_add(done).min(self.domain),
@@ -803,10 +814,25 @@ pub(crate) fn sweep_in(
     scope: Option<Vec<(u64, u64)>>,
     halt: &EngineHalt<'_>,
 ) -> Result<CopyResult> {
-    halt.linked(|lib| sweep_linked(disc, reader, path, opts, scope, halt, lib))
+    sweep_titled(disc, reader, path, opts, scope, halt, None)
+}
+
+// `sweep_in` reporting `main_title` (an index into `disc.titles`; `None`: title 0) as the
+// main title in its progress.
+pub(crate) fn sweep_titled(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &SweepOptions,
+    scope: Option<Vec<(u64, u64)>>,
+    halt: &EngineHalt<'_>,
+    main_title: Option<usize>,
+) -> Result<CopyResult> {
+    halt.linked(|lib| sweep_linked(disc, reader, path, opts, scope, halt, lib, main_title))
 }
 
 // `sweep_in` with `lib`, the libfreemkv token that follows `halt`.
+#[allow(clippy::too_many_arguments)]
 fn sweep_linked(
     disc: &libfreemkv::Disc,
     reader: &mut dyn SectorSource,
@@ -815,6 +841,7 @@ fn sweep_linked(
     scope: Option<Vec<(u64, u64)>>,
     halt: &EngineHalt<'_>,
     lib: &libfreemkv::Halt,
+    main_title: Option<usize>,
 ) -> Result<CopyResult> {
     use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
@@ -1039,10 +1066,11 @@ fn sweep_linked(
     let mut last_log_time = std::time::Instant::now();
     let mut read_ctx = read_error::ReadCtx::for_sweep(batch);
     let mut cached_snapshot: Option<ProgressSnapshot> = None;
+    let main_title = progress_title(disc, main_title);
     // Derived from `cached_snapshot.bad_ranges` + the main title only, changing
     // exactly when a new snapshot lands — not once per batch. The old per-iteration
     // recompute ran `bytes_bad_in_title` (O(ranges x extents)) up to 1.6M times/rip.
-    let (mut cached_main_title_bad, mut cached_located) = match disc.titles.first() {
+    let (mut cached_main_title_bad, mut cached_located) = match main_title {
         Some(t) => (
             bytes_bad_in_title(t, &prior_damage),
             locate_ranges(&prior_damage, t),
@@ -1258,7 +1286,7 @@ fn sweep_linked(
 
             // Drain any consumer-side stats snapshot.
             if let Some(snap) = try_recv_progress(&prog_rx) {
-                if let Some(t) = disc.titles.first() {
+                if let Some(t) = main_title {
                     cached_main_title_bad = bytes_bad_in_title(t, &snap.bad_ranges);
                     cached_located = locate_ranges(&snap.bad_ranges, t);
                 }
@@ -1313,7 +1341,7 @@ fn sweep_linked(
                 if !tick_owed {
                     last_tick = Some(std::time::Instant::now());
                     let pp = bar.tick(
-                        disc,
+                        main_title,
                         cached_snapshot.as_ref(),
                         cached_main_title_bad,
                         &cached_located,
@@ -1337,7 +1365,7 @@ fn sweep_linked(
         && let Some(reporter) = opts.progress
     {
         let pp = bar.tick(
-            disc,
+            main_title,
             cached_snapshot.as_ref(),
             cached_main_title_bad,
             &cached_located,

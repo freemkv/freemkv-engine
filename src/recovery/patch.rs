@@ -90,7 +90,7 @@ pub(super) struct SharedPatchState {
 }
 
 impl SharedPatchState {
-    /// `title` is the main feature (`disc.titles.first()`); `None` on a disc
+    /// `title` is the main feature (`patch_titled`'s `main_title`, else title 0); `None` on a disc
     /// with no titles, where there is nothing to locate damage against.
     fn from_map(map: &Mapfile, title: Option<&libfreemkv::DiscTitle>) -> Self {
         let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());
@@ -605,6 +605,8 @@ struct PatchCtx<'a, 'o> {
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
     shared: &'a Mutex<SharedPatchState>,
     opts: &'a PatchOptions<'o>,
+    // Index into `disc.titles` of the title progress reports as the main one; `None`: title 0.
+    main_title: Option<usize>,
     // The op's cancellation (with `opts.halt`) and the libfreemkv token that follows it.
     halt: &'a EngineHalt<'a>,
     lib: &'a libfreemkv::halt::Halt,
@@ -969,7 +971,7 @@ impl PatchCtx<'_, '_> {
             // Progress heartbeat: a throttled closure pushing a fresh snapshot to the
             // reporter on every read, so the bar/speed move during a handler, not just
             // at section end. Scoped here so its `self.state` borrow ends before below.
-            let disc = self.disc;
+            let main_title = super::progress_title(self.disc, self.main_title);
             let opts = self.opts;
             let shared = self.shared;
             let total_bytes = self.total_bytes;
@@ -995,7 +997,8 @@ impl PatchCtx<'_, '_> {
                 };
                 if due {
                     last_tick.set(Some(t));
-                    if report_patch_progress(disc, state, opts, total_bytes, shared, ext_halt) {
+                    if report_patch_progress(main_title, state, opts, total_bytes, shared, ext_halt)
+                    {
                         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
@@ -1072,7 +1075,7 @@ impl PatchCtx<'_, '_> {
         }
 
         if report_patch_progress(
-            self.disc,
+            super::progress_title(self.disc, self.main_title),
             &self.state,
             self.opts,
             self.total_bytes,
@@ -1110,7 +1113,7 @@ impl PatchCtx<'_, '_> {
 // pipeline-shared mapfile snapshot. `true` once `halt` is cancelled at this report
 // (outer loop should set `state.halted` and break).
 pub(super) fn report_patch_progress(
-    disc: &libfreemkv::Disc,
+    main_title: Option<&libfreemkv::DiscTitle>,
     state: &PatchLoopState,
     opts: &PatchOptions,
     total_bytes: u64,
@@ -1133,7 +1136,6 @@ pub(super) fn report_patch_progress(
         )
     };
     let kind = pass_kind(state.initial_batch, opts.reverse);
-    let main_title = disc.titles.first();
     // Progress = bytes RECOVERED, not a per-range counter, since breadth-first
     // tiers bring back readable bulk before any range "finishes". `still_bad_work` is the
     // damage inside the scope, as `work_total` is.
@@ -1238,7 +1240,20 @@ pub(crate) fn patch_in(
     opts: &PatchOptions,
     halt: &EngineHalt<'_>,
 ) -> Result<PatchOutcome> {
-    halt.linked(|lib| patch_linked(disc, reader, path, opts, halt, lib))
+    patch_titled(disc, reader, path, opts, halt, None)
+}
+
+// `patch_in` reporting `main_title` (an index into `disc.titles`; `None`: title 0) as the
+// main title in its progress.
+pub(crate) fn patch_titled(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &PatchOptions,
+    halt: &EngineHalt<'_>,
+    main_title: Option<usize>,
+) -> Result<PatchOutcome> {
+    halt.linked(|lib| patch_linked(disc, reader, path, opts, halt, lib, main_title))
 }
 
 // `patch_in` with `lib`, the libfreemkv token that follows `halt`.
@@ -1249,6 +1264,7 @@ fn patch_linked(
     opts: &PatchOptions,
     halt: &EngineHalt<'_>,
     lib: &libfreemkv::halt::Halt,
+    main_title: Option<usize>,
 ) -> Result<PatchOutcome> {
     use libfreemkv::io::pipeline::{Pipeline, WRITE_THROUGH_DEPTH};
 
@@ -1332,7 +1348,12 @@ fn patch_linked(
     // snapshot lets producer callbacks read consumer effects. Disown taken
     // BEFORE the move so abandoned teardown can still stop a stale mapfile write.
     let map_disown = map.disown_handle();
-    let (sink, shared) = PatchSink::new(path, map, is_regular, disc.titles.first().cloned())?;
+    let (sink, shared) = PatchSink::new(
+        path,
+        map,
+        is_regular,
+        super::progress_title(disc, main_title).cloned(),
+    )?;
     // WRITE_THROUGH_DEPTH (=1): patch reads one sector per recovery decision and
     // checks consumer-published stats inline. Sweep's depth-4 default would let
     // recovered sectors queue between decisions, breaking this per-sector lockstep.
@@ -1387,6 +1408,7 @@ fn patch_linked(
         pipe: &pipe,
         shared: &shared,
         opts,
+        main_title,
         halt,
         lib,
         total_bytes,

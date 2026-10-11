@@ -626,8 +626,9 @@ fn a_poisoned_snapshot_lock_does_not_cascade_the_panic() {
     };
     let opts = PatchOptions::for_patch_pass(true, Some(&reporter), None);
     let state = PatchLoopState::new(0, 1, 0);
+    let disc = guard_disc(4);
     assert!(!report_patch_progress(
-        &guard_disc(4),
+        disc.titles.first(),
         &state,
         &opts,
         8192,
