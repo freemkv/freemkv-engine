@@ -4,7 +4,7 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
-## [Unreleased]
+## [1.9.0] — 2026-10-11
 
 ### Added
 
