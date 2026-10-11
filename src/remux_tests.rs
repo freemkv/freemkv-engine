@@ -1279,28 +1279,46 @@ fn a_kept_name_created_during_the_keep_is_never_replaced() {
     );
 }
 
-// A move that fails removes only the placeholder the keep reserved: a file another writer
-// put over it meanwhile stays, and no other placeholder is left behind.
-#[test]
-fn a_failed_keep_removes_only_its_own_placeholder() {
+// Every keep fails, the first after `during` touched its placeholder: the file then at the
+// first kept name is returned; no other placeholder is left and the output stays.
+fn failed_keep(during: &(dyn Fn(&Path) + Sync)) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("Movie.mkv");
     let landing = partial_path(&target);
     std::fs::write(&landing, b"verified").unwrap();
-    let swap = |name: &Path| {
-        let other = dir.path().join("other");
-        std::fs::write(&other, b"foreign").unwrap();
-        std::fs::rename(&other, name).unwrap();
-    };
-    let rio = KeepRace::new(&swap, true);
+    let rio = KeepRace::new(during, true);
     assert_eq!(
         keep_unpublished(&landing, &target, &crate::NoopSink, &rio),
         None
     );
-    assert_eq!(std::fs::read(verified_path(&target)).unwrap(), b"foreign");
     let left: Vec<_> = kept_names(&target).skip(1).filter(|n| n.exists()).collect();
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(std::fs::read(&landing).unwrap(), b"verified");
+    std::fs::read(verified_path(&target)).expect("the first kept name stays")
+}
+
+// A move that fails never removes an empty file another writer renamed over the placeholder:
+// it is not the file the keep created.
+#[test]
+fn a_failed_keep_leaves_a_foreign_empty_file_at_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let swap = |name: &Path| {
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, name).unwrap();
+    };
+    assert_eq!(failed_keep(&swap), b"");
+}
+
+// A move that fails never removes its own placeholder once another writer wrote into it:
+// it is no longer the empty file the keep created.
+#[test]
+fn a_failed_keep_leaves_its_placeholder_once_written_into() {
+    let write_in = |name: &Path| {
+        let mut f = std::fs::OpenOptions::new().write(true).open(name).unwrap();
+        f.write_all(b"written in place").unwrap();
+    };
+    assert_eq!(failed_keep(&write_in), b"written in place");
 }
 
 // Every kept name taken: the remux fails E5000 (kind Unsupported) with no `RemuxUnpublished`,
