@@ -410,7 +410,7 @@ pub(crate) fn sweep_batch_sectors(
 ) -> u16 {
     match requested {
         Some(b) => b.max(1),
-        None if skip_on_error => ecc_sectors(format),
+        None if skip_on_error => format.ecc_block_sectors(),
         None => DEFAULT_BATCH_SECTORS_OPTICAL,
     }
 }
@@ -1576,18 +1576,6 @@ pub(crate) fn sleep_secs_or_halt(secs: u64, halt: &EngineHalt<'_>) -> bool {
 }
 
 const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
-
-pub(crate) fn ecc_sectors(format: libfreemkv::DiscFormat) -> u16 {
-    match format {
-        // BD-family 64 KiB ECC block (32 × 2048). FMTS is a UHD BD disc.
-        libfreemkv::DiscFormat::Uhd
-        | libfreemkv::DiscFormat::Fmts
-        | libfreemkv::DiscFormat::BluRay => 32,
-        // 32 KiB ECC block (16 × 2048) — DVD and HD-DVD.
-        libfreemkv::DiscFormat::Dvd | libfreemkv::DiscFormat::HdDvd => 16,
-        libfreemkv::DiscFormat::Unknown => 32,
-    }
-}
 
 #[cfg(test)]
 mod ku_tests;
