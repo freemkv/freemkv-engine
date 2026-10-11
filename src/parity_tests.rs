@@ -382,6 +382,7 @@ fn parity_engine_multipass() {
             max_passes,
             abort_on_lost_secs: 0,
             is_iso_output: is_iso,
+            ..Default::default()
         };
         match crate::multipass_rip(&fx.disc, &mut drive.clone(), &iso, &job, &opts, &NoopSink) {
             Ok(r) => {

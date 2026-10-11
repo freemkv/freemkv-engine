@@ -235,6 +235,7 @@ fn every_gate_passes(fx: &Fx, disc: &libfreemkv::Disc, keys: Option<KeyRing>) {
         max_passes: 0,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     crate::multipass_rip(disc, &mut fx.source(), &iso("mp.iso"), &job, &single, &sink)
         .expect("single-pass multipass_rip");
@@ -308,6 +309,7 @@ fn legacy_banked_keys_pass_no_engine_gate() {
         max_passes: 0,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let mp = crate::multipass_rip(disc, &mut fx.source(), &iso("m.iso"), &job, &single, &sink);
     no_key(mp.map(drop), "multipass_rip");

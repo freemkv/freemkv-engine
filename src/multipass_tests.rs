@@ -549,63 +549,63 @@ fn a_transport_fault_ends_the_pass_instead_of_exhausting_the_recovery() {
     );
 }
 
+// Marginal (RECOVERED) errors at `bad_lba` while the sweep walks
+// forward, then a TRANSPORT FAILURE (status 0xFF) once the sweep
+// reaches the end and the patch pass returns for the leftover range.
+struct WedgeOnPatchReader {
+    capacity: u32,
+    bad_lba: u32,
+    sweep_done: bool,
+}
+impl libfreemkv::SectorSource for WedgeOnPatchReader {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> libfreemkv::Result<usize> {
+        let end = lba + count as u32;
+        if end >= self.capacity {
+            self.sweep_done = true;
+        }
+        if lba <= self.bad_lba && self.bad_lba < end {
+            return Err(libfreemkv::Error::DiscRead {
+                sector: self.bad_lba as u64,
+                status: Some(if self.sweep_done {
+                    libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE
+                } else {
+                    libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION
+                }),
+                sense: if self.sweep_done {
+                    None
+                } else {
+                    // RECOVERED (marginal): the sweep marks NonTrimmed
+                    // without the 30s damage-zone cooldown a hard error
+                    // would earn — the pass this test is about is the patch one.
+                    Some(libfreemkv::scsi::ScsiSense {
+                        sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
+                        asc: 0x17,
+                        ascq: 0x01,
+                    })
+                },
+            });
+        }
+        let n = ((count as usize) * 2048).min(buf.len());
+        buf[..n].fill(0);
+        // BYTES, per `SectorSource::read_sectors`' contract.
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        self.capacity
+    }
+}
+
 // A transport fault is not an exhausted pass, and must not be reported as a cancel either —
 // drives a real `multipass_rip` end to end, since the old hand-built-result version tested
 // nothing.
 #[test]
 fn a_wedged_result_is_distinguishable_from_a_cancelled_one() {
-    // Marginal (RECOVERED) errors at `bad_lba` while the sweep walks
-    // forward, then a TRANSPORT FAILURE (status 0xFF) once the sweep
-    // reaches the end and the patch pass returns for the leftover range.
-    struct WedgeOnPatchReader {
-        capacity: u32,
-        bad_lba: u32,
-        sweep_done: bool,
-    }
-    impl libfreemkv::SectorSource for WedgeOnPatchReader {
-        fn read_sectors(
-            &mut self,
-            lba: u32,
-            count: u16,
-            buf: &mut [u8],
-            _recovery: bool,
-        ) -> libfreemkv::Result<usize> {
-            let end = lba + count as u32;
-            if end >= self.capacity {
-                self.sweep_done = true;
-            }
-            if lba <= self.bad_lba && self.bad_lba < end {
-                return Err(libfreemkv::Error::DiscRead {
-                    sector: self.bad_lba as u64,
-                    status: Some(if self.sweep_done {
-                        libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE
-                    } else {
-                        libfreemkv::scsi::SCSI_STATUS_CHECK_CONDITION
-                    }),
-                    sense: if self.sweep_done {
-                        None
-                    } else {
-                        // RECOVERED (marginal): the sweep marks NonTrimmed
-                        // without the 30s damage-zone cooldown a hard error
-                        // would earn — the pass this test is about is the patch one.
-                        Some(libfreemkv::scsi::ScsiSense {
-                            sense_key: libfreemkv::scsi::SENSE_KEY_RECOVERED_ERROR,
-                            asc: 0x17,
-                            ascq: 0x01,
-                        })
-                    },
-                });
-            }
-            let n = ((count as usize) * 2048).min(buf.len());
-            buf[..n].fill(0);
-            // BYTES, per `SectorSource::read_sectors`' contract.
-            Ok(n)
-        }
-        fn capacity_sectors(&self) -> u32 {
-            self.capacity
-        }
-    }
-
     let (_dir, iso) = scratch_iso("wedged-patch-pass");
     let sectors = 8192u32;
     let disc = test_disc(sectors, vec![test_title(0, sectors)]);
@@ -618,6 +618,7 @@ fn a_wedged_result_is_distinguishable_from_a_cancelled_one() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     // Logs only; nothing cancels, so `halted` can only come from the code
     // under test.
@@ -884,6 +885,7 @@ fn single_pass_reports_loss_as_unquantified_on_a_damaged_disc() {
         max_passes: 0,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let r = multipass_rip(
@@ -937,6 +939,7 @@ fn multipass_rip_single_pass_mode_is_one_dispatch_no_retry_loop() {
         max_passes: 0,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -981,6 +984,7 @@ fn multipass_rip_clean_disc_converges_with_zero_patch_passes() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1018,6 +1022,7 @@ fn multipass_rip_writes_each_sector_to_its_own_lba() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1076,6 +1081,7 @@ fn multipass_rip_recoverable_bad_sector_converges_after_a_patch_pass() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1132,6 +1138,7 @@ fn multipass_rip_unscopable_mkv_loss_still_runs_patch_passes() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: false,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1177,6 +1184,7 @@ fn multipass_rip_permanent_loss_past_tolerance_aborts() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1247,6 +1255,7 @@ fn multipass_rip_respects_max_passes_bound_even_with_ongoing_progress() {
         max_passes: 1,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1298,6 +1307,7 @@ fn multipass_rip_scope_bad_bytes_wiring_drives_convergence_by_output_kind() {
             max_passes: 5,
             abort_on_lost_secs: 0,
             is_iso_output: false,
+            ..Default::default()
         };
         let result = multipass_rip(
             &disc,
@@ -1331,6 +1341,7 @@ fn multipass_rip_scope_bad_bytes_wiring_drives_convergence_by_output_kind() {
             max_passes: 5,
             abort_on_lost_secs: 0,
             is_iso_output: true,
+            ..Default::default()
         };
         let result = multipass_rip(
             &disc,
@@ -1619,6 +1630,7 @@ fn multipass_rip_accepts_a_measurable_loss_under_a_generous_tolerance() {
         max_passes: 5,
         abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
         is_iso_output: false,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1664,6 +1676,7 @@ fn iso_damage_outside_the_main_title_is_not_reported_as_main_title_loss() {
         max_passes: 5,
         abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(
@@ -1714,6 +1727,7 @@ fn multipass_rip_aborts_when_the_mapfile_cannot_be_read_at_the_gate() {
         max_passes: 5,
         abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
         is_iso_output: false,
+        ..Default::default()
     };
 
     // Sabotage: the mapfile becomes a DIRECTORY, so `read_to_string`
@@ -1782,6 +1796,7 @@ fn multipass_rip_aborts_when_the_end_of_recovery_promotion_cannot_be_persisted()
         max_passes: 5,
         abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
         is_iso_output: false,
+        ..Default::default()
     };
 
     let tmp_path = {
@@ -1868,6 +1883,7 @@ fn multipass_rip_cancelled_mid_loop_is_halted_and_never_reported_clean() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let sink = HookSink::cancelling("multipass_rip: pass ");
@@ -1950,6 +1966,7 @@ fn a_cancel_with_a_wide_pending_region_is_not_scored_from_it() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
 
     let result = multipass_rip(&disc, &mut reader, &iso, &job, &opts, &CancelAtOnce)
@@ -2133,6 +2150,7 @@ fn a_rerun_after_an_abort_for_loss_resumes_instead_of_wiping_the_image() {
         max_passes: 3,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let (mut r1, _) = stamp_reader(0xA1);
     r1.bad = Some(Spot {
@@ -2177,6 +2195,7 @@ fn a_rerun_after_a_stop_mid_sweep_resumes_instead_of_wiping_the_image() {
         max_passes: 3,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let op = libfreemkv::Halt::new();
     let (mut r1, _) = stamp_reader(0xA1);
@@ -2227,6 +2246,7 @@ fn assert_a_mode_switch_sweeps_fresh(run1_raw: bool) {
         max_passes: if raw { 3 } else { 0 },
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let op = libfreemkv::Halt::new();
     let (mut r1, _) = stamp_reader(0xA1);
@@ -2299,6 +2319,7 @@ fn single_pass(raw: bool) -> (Job, MultipassOpts) {
         max_passes: 0,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     (job, opts)
 }
@@ -2308,6 +2329,7 @@ fn iso_multipass() -> MultipassOpts {
         max_passes: 3,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     }
 }
 
@@ -2463,6 +2485,7 @@ fn another_discs_mapfile_is_refused_only_while_its_image_exists() {
         max_passes: 3,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let rip = |disc: &libfreemkv::Disc| {
         let (mut r, _) = stamp_reader(0xA1);
@@ -2533,6 +2556,7 @@ fn loss_is_measured_over_the_selected_titles_not_the_first_one() {
             max_passes: 5,
             abort_on_lost_secs: 0,
             is_iso_output: false,
+            ..Default::default()
         };
         multipass_rip(
             &disc,
@@ -2648,6 +2672,7 @@ fn a_decrypting_multipass_job_runs() {
         max_passes: 5,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     multipass_rip(
         &disc,
@@ -2704,4 +2729,88 @@ fn recover_reads_cancellation_only_through_the_engine_halt() {
             .1
             .contains(".with_sink(sink)")
     );
+}
+
+// The server's wedge policy (`AfterWedge::Continue`): the wedged pass counts like any other,
+// so the no-progress rule ends the passes and the run is not reported wedged.
+#[test]
+fn a_continue_after_wedge_policy_lets_the_no_progress_rule_decide() {
+    let (_dir, iso) = scratch_iso("wedge-continues");
+    let sectors = 8192u32;
+    let disc = test_disc(sectors, vec![test_title(0, sectors)]);
+    let mut reader = WedgeOnPatchReader {
+        capacity: sectors,
+        bad_lba: 4000,
+        sweep_done: false,
+    };
+    let opts = MultipassOpts {
+        max_passes: 5,
+        is_iso_output: true,
+        after_wedge: AfterWedge::Continue,
+        ..Default::default()
+    };
+    let sink = HookSink::new("never-logged-trigger", false, Box::new(|| {}));
+    let result = multipass_rip(&disc, &mut reader, &iso, &raw_job(&iso), &opts, &sink)
+        .expect("a wedged pass under Continue is a finished recovery");
+    assert!(!result.wedged && !result.halted);
+    assert!(!sink.logged(Level::Warn, "transport fault"));
+}
+
+// Sweep attempts are data (`max_sweep_attempts`): a host that brings the transport back each
+// time gets exactly that many sweeps, then the run fails with the last fault.
+#[test]
+fn sweep_attempts_stop_at_the_configured_cap() {
+    struct DeadBridge;
+    impl libfreemkv::SectorSource for DeadBridge {
+        fn read_sectors(
+            &mut self,
+            lba: u32,
+            _count: u16,
+            _buf: &mut [u8],
+            _recovery: bool,
+        ) -> libfreemkv::Result<usize> {
+            Err(libfreemkv::Error::DiscRead {
+                sector: lba as u64,
+                status: Some(libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                sense: None,
+            })
+        }
+        fn capacity_sectors(&self) -> u32 {
+            4096
+        }
+    }
+    struct Recovering(DeadBridge, Vec<u32>);
+    impl PassHost for Recovering {
+        fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource {
+            &mut self.0
+        }
+        fn recover_transport(&mut self, attempt: u32, _e: &libfreemkv::Error) -> bool {
+            self.1.push(attempt);
+            true
+        }
+    }
+    for (cap, calls) in [(1, vec![1]), (3, vec![1, 2, 3])] {
+        let (_dir, iso) = scratch_iso("sweep-attempts");
+        let disc = test_disc(4096, vec![test_title(0, 4096)]);
+        let opts = MultipassOpts {
+            max_passes: 2,
+            max_sweep_attempts: cap,
+            ..Default::default()
+        };
+        let mut host = Recovering(DeadBridge, Vec::new());
+        let op = libfreemkv::Halt::new();
+        let halt = crate::EngineHalt::new(&op, None);
+        let r = recover(
+            &disc,
+            &mut host,
+            &iso,
+            &raw_job(&iso),
+            &opts,
+            None,
+            &crate::NoopSink,
+            &halt,
+        );
+        assert!(r.is_err_and(|e| e.is_scsi_transport_failure()), "cap {cap}");
+        assert_eq!(host.1, calls, "cap {cap}");
+    }
 }

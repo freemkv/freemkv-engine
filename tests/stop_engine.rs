@@ -511,6 +511,7 @@ fn multipass_stop_between_passes() {
         max_passes: 3,
         abort_on_lost_secs: 0,
         is_iso_output: true,
+        ..Default::default()
     };
     let out = freemkv_engine::multipass_rip_with(
         &op,

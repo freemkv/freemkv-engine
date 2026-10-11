@@ -145,6 +145,12 @@ pub enum RecoveryEvent<'a> {
     },
     /// Before pass `pass` the deliverable's scope was already fully recovered: the passes end.
     Converged { pass: u32 },
+    /// Patch pass `pass` failed with `error` under [`crate::OnPatchFailure::Finish`]: the
+    /// passes end and the recovery finishes with what was read.
+    PatchFailed {
+        pass: u32,
+        error: &'a libfreemkv::Error,
+    },
     /// Pass `pass` recovered nothing (`recovered == 0`): the passes end.
     NoProgress { pass: u32, recovered: u64 },
     /// The end-of-recovery promotion was applied to `map` (`intact` is false when part of
