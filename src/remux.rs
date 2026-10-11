@@ -70,9 +70,9 @@ impl MuxPlan {
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`, under the
 /// [`run_titles`] loop policy, each bracketed by [`Event::TitleStart`] / [`Event::TitleDone`].
 /// A title that fails or stops removes its file sink's path only while that is still the
-/// regular file its mux opened (the identity the mux read from its handle): a symlink, a
-/// folder sink, or a file put there after the open stays, except one swapped in between the
-/// identity check and the unlink (separate steps) or, on FAT/exFAT, one reusing a freed ID.
+/// regular file its mux opened (identity read from its handle): a symlink, a folder sink, or
+/// a file put there after the open stays, except one swapped in between the check and the
+/// unlink, or, on FAT/exFAT/NFS (another client unlinking the open file), one reusing an ID.
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it before
 /// any output. Each title is `opened.disc.titles[idx]`, muxed from the image with no rescan (J14).
@@ -668,7 +668,7 @@ fn keep_at(landing: &Path, name: &Path, rio: &dyn RemuxIo) -> bool {
     let Ok(placeholder) = reserved else {
         return false;
     };
-    let ours = file_id(name);
+    let ours = rio.file_id(name);
     drop(placeholder);
     if rio.keep(landing, name).is_ok() {
         return true;
@@ -676,7 +676,7 @@ fn keep_at(landing: &Path, name: &Path, rio: &dyn RemuxIo) -> bool {
     let empty_file = |m: std::fs::Metadata| m.is_file() && m.len() == 0;
     if ours.is_some()
         && std::fs::symlink_metadata(name).is_ok_and(empty_file)
-        && file_id(name) == ours
+        && rio.file_id(name) == ours
     {
         let _ = std::fs::remove_file(name);
     }
@@ -808,6 +808,10 @@ pub(crate) trait RemuxIo: Sync {
     /// Move `landing` to `target`, replacing it.
     fn replace(&self, landing: &Path, target: &Path) -> io::Result<()> {
         std::fs::rename(landing, target)
+    }
+    /// The identity of the file at `path`; a test seam for an unreadable identity.
+    fn file_id(&self, path: &Path) -> Option<(u64, u64)> {
+        file_id(path)
     }
     /// Move an unpublished `landing` over the placeholder this remux reserved at `name`.
     fn keep(&self, landing: &Path, name: &Path) -> io::Result<()> {

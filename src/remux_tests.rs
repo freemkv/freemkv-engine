@@ -1321,6 +1321,59 @@ fn a_failed_keep_leaves_its_placeholder_once_written_into() {
     assert_eq!(failed_keep(&write_in), b"written in place");
 }
 
+// A symlink left at the kept name, pointing at our moved-aside empty placeholder, is never
+// removed: the check does not follow it.
+#[cfg(unix)]
+#[test]
+fn a_failed_keep_leaves_a_symlink_to_its_placeholder() {
+    let dir = tempfile::tempdir().unwrap();
+    let link = |name: &Path| {
+        let aside = dir.path().join("aside");
+        std::fs::rename(name, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, name).unwrap();
+    };
+    assert_eq!(failed_keep(&link), b"");
+}
+
+// OS primitives as `KeepRace`, but the identity of a file can never be read.
+struct BlindKeep<'a>(KeepRace<'a>);
+impl RemuxIo for BlindKeep<'_> {
+    fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+        self.0.sync(f, h, p)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+        self.0.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        self.0.create_new(path)
+    }
+    fn timing(&self) -> RemuxTiming {
+        self.0.timing()
+    }
+    fn keep(&self, landing: &Path, name: &Path) -> io::Result<()> {
+        self.0.keep(landing, name)
+    }
+    fn file_id(&self, _: &Path) -> Option<(u64, u64)> {
+        None
+    }
+}
+
+// A placeholder whose identity could not be read is never removed: nothing proves it is ours.
+#[test]
+fn a_failed_keep_leaves_a_placeholder_with_no_readable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let landing = partial_path(&target);
+    std::fs::write(&landing, b"verified").unwrap();
+    let nothing = |_: &Path| {};
+    let rio = BlindKeep(KeepRace::new(&nothing, true));
+    assert_eq!(
+        keep_unpublished(&landing, &target, &crate::NoopSink, &rio),
+        None
+    );
+    assert_eq!(std::fs::read(verified_path(&target)).unwrap(), b"");
+}
+
 // Every kept name taken: the remux fails E5000 (kind Unsupported) with no `RemuxUnpublished`,
 // its partial is removed, and every file at a kept name is left as it was.
 #[test]
