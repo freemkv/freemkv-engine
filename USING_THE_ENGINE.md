@@ -54,13 +54,15 @@ chosen title; it does not combine different title presentations. An absent expli
 presentation preference falls back to requested audio languages, never UI locale.
 Freeze the report's executable indices into `Selection::Titles` before execution.
 
-Bounded DVD root-launch evidence is separate from episode rosters and exact identity.
-It verifies register-aware direct full-title choices from one root menu, equivalent
-display groups, and exact interleaved extents. The selected logical audio slot maps
-through PGC audio controls to a physical PID and the VTS language attribute, checked
-against scanned streams. Missing, unmatched, ambiguous or inconsistent launch proof
-requires review; unsupported navigation is not inferred from runtime or title suffixes.
-This is not a complete DVD VM or proof of semantic TV episodes.
+MainMovie is title 0 unless another cut of it carries more of the wanted languages
+(the presentation language, else the audio filter's languages). A cut qualifies when
+the authored content it shares with title 0 appears in the same order in both and is
+more than half of each, by the title's `selection_evidence.segments` (clip in/out on
+Blu-ray, UHD and HD DVD; cell sectors on DVD; the same rule for every format). Ties go
+to the earlier title. Exact aliases qualify; so does an extended cut built by seamless
+branching. Logo-sharing extras, single episodes of a play-all, reordered decoys and
+separate full copies do not. MainMovie never holds for review on language: an unknown
+or unmatched language keeps title 0, so front ends validate language tags at input.
 
 `SelectionReport.indices` are executable; `candidates` are review/display only.
 If `requires_review()` is true, ask for explicit title choices before starting.
@@ -84,10 +86,7 @@ alternate selection; contradictory or incomplete ordering requires review.
 An authored program partition does **not** establish TV semantics (a movie could
 author chapter titles). Request Episodes only from user intent or TV metadata, not
 merely because a structural roster exists. Explicit choices remain available.
-Explicit title selections bypass this hold. Movie selection remains canonical
-(title 0 unless authored launch proof chooses), with requested audio choosing only
-an exactly equivalent authored presentation; launch proof without a matching
-presentation language requires review.
+Explicit title selections bypass this hold. Movie selection never holds (see above).
 
 ## The one rule: everything goes through the `Sink`
 
@@ -263,8 +262,8 @@ let mp: MultipassResult = multipass_rip(
 )?;
 // mp.unreadable_bytes, mp.pending_bytes, mp.good_bytes,
 // mp.main_lost_ms (playback lost in the titles job.selection picks, the main
-//                  title for the default MainMovie (its review candidates when
-//                  it needs review), summed per title, even when
+//                  title for the default MainMovie (the review candidates of
+//                  a selection that needs review), summed per title, even when
 //                  is_iso_output widens the abort gate to the whole disc; a title
 //                  missing its size/duration is timed at an estimated rate;
 //                  NaN = cannot be timed, the loss is then mp.lost_bytes),
@@ -407,7 +406,7 @@ the default scheduler.
 fn rip(src: PathBuf, iso_out: PathBuf, opts: MultipassOpts) -> Result<JoinHandle<Result<()>>> {
     let (disc, mut reader) = scan_image(&ImageSource::from_path(&src))?;
     let sources = key_source_factory(&KeyParams::default());
-    let titles = resolve_selection(&disc, &Selection::MainMovie)?; // review: E9086
+    let titles = resolve_selection(&disc, &Selection::MainMovie)?; // never a review
     let scope = rip_scope(&disc, &titles, RipOutput::Streams);
     let set = resolve_for_rip(&disc, &mut *reader, scope, &sources, None, None)?;
     update_keydb_strip(key_status(&disc, &set));

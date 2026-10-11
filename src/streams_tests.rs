@@ -154,6 +154,16 @@ fn unknown_three_letter_tags_do_not_resolve() {
     }
 }
 
+#[test]
+fn language_tags_front_ends_may_accept() {
+    for tag in ["de", "ger", "deu", "German", " en "] {
+        assert!(is_language_tag(tag), "{tag}");
+    }
+    for tag in ["", "  ", "xx", "zzz", "de,en"] {
+        assert!(!is_language_tag(tag), "{tag}");
+    }
+}
+
 fn audio(pid: u16, lang: &str) -> Stream {
     Stream::Audio(AudioStream {
         pid,

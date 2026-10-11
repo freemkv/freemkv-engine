@@ -258,21 +258,26 @@ fn a_plan_debug_never_prints_the_key_token() {
 // as an invalid destination URL.
 #[test]
 fn a_title_run_needing_review_is_its_coded_refusal() {
-    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::launch_titles());
-    for (sel, reason) in [
-        (Selection::MainMovie, "missing-presentation-language"),
-        (Selection::Episodes, "missing-episode-roster"),
-    ] {
-        let p = Plan {
-            titles: sel,
-            ..plan("disc://", "mkv:///o/a.mkv")
-        };
-        let err = title_index(&p, Some(&disc)).expect_err("needs review");
-        assert!(
-            matches!(err, libfreemkv::Error::SelectionReviewRequired { reason: r } if r == reason),
-            "{err:?}"
-        );
-    }
+    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
+    let p = Plan {
+        titles: Selection::Episodes,
+        ..plan("disc://", "mkv:///o/a.mkv")
+    };
+    let err = title_index(&p, Some(&disc)).expect_err("needs review");
+    assert!(
+        matches!(
+            err,
+            libfreemkv::Error::SelectionReviewRequired {
+                reason: "missing-episode-roster"
+            }
+        ),
+        "{err:?}"
+    );
+    let movie = Plan {
+        titles: Selection::MainMovie,
+        ..p
+    };
+    assert_eq!(title_index(&movie, Some(&disc)).ok(), Some(0));
 }
 
 // An image or folder title run resolves its selection against the SCANNED disc, never as

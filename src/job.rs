@@ -24,8 +24,8 @@ pub enum RipMode {
 /// control and the CLI's title-filter flags.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Selection {
-    /// The main feature only: the canonical presentation the selection model proves (an
-    /// authored launch, else title 0). It may need review (E9086). The common case.
+    /// The main feature only: title 0, or another cut of it in a wanted language (see
+    /// [`crate::SelectionModel`]). Never needs review. The common case.
     #[default]
     MainMovie,
     /// Every title on the disc.

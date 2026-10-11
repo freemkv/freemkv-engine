@@ -1,5 +1,6 @@
 use super::*;
 use crate::sink::NoopSink;
+use libfreemkv::disc::ContentSegment;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn disc(n: usize, encrypted: bool, has_key: bool) -> libfreemkv::Disc {
@@ -51,7 +52,13 @@ fn audio_title(lang: &str, start: u32) -> libfreemkv::DiscTitle {
             purpose: libfreemkv::LabelPurpose::Normal,
             label: String::new(),
         }));
+    t.selection_evidence.segments = ContentSegment::from_cell_extents(&t.extents);
     t
+}
+
+// What the Blu-ray scanner records for `t`'s clips.
+fn scan_clips(t: &mut libfreemkv::DiscTitle) {
+    t.selection_evidence.segments = ContentSegment::from_clips(&t.clips);
 }
 
 #[test]
@@ -92,6 +99,7 @@ fn clipped_audio(lang: &str, start: u32, end: u32) -> libfreemkv::DiscTitle {
         source_packets: 0,
         feed_span: None,
     }];
+    scan_clips(&mut t);
     t
 }
 
@@ -113,6 +121,7 @@ fn regression_authored_intervals_preserve_distinct_episodes_and_main_content() {
         vec![0]
     );
     d.titles[1].clips[0].in_time = 0;
+    scan_clips(&mut d.titles[1]);
     assert_eq!(
         resolve_selection_with_audio(
             &d,
@@ -142,6 +151,11 @@ fn regression_missing_or_invalid_identity_never_equates_presentations() {
                 a.extents[0].sector_count = 0;
             }
         }
+        a.selection_evidence.segments = if shape == 4 {
+            ContentSegment::from_cell_extents(&a.extents)
+        } else {
+            ContentSegment::from_clips(&a.clips)
+        };
         let mut b = a.clone();
         b.streams = audio_title("deu", 1000).streams;
         let mut d = disc(0, false, false);
@@ -174,6 +188,7 @@ fn regression_episodes_choose_audio_before_dedup_in_either_disc_order() {
                         start_lba: 9000,
                         sector_count: 100,
                     });
+                    t.selection_evidence.segments = ContentSegment::from_cell_extents(&t.extents);
                 }
                 b.duration_secs = 2760.0;
             }
@@ -231,17 +246,21 @@ fn regression_audio_ranking_prefers_language_coverage_not_duplicate_tracks() {
     }
 }
 
+// Cell order is identity; extents that are not cells (an HD DVD .evo) describe nothing.
 #[test]
-fn regression_dvd_cell_order_and_content_format_are_identity() {
+fn regression_dvd_cell_order_is_identity_and_non_cell_extents_are_not() {
     let mut a = audio_title("eng", 1000);
     a.extents.push(libfreemkv::disc::Extent {
         start_lba: 9000,
         sector_count: 100,
     });
+    a.selection_evidence.segments = ContentSegment::from_cell_extents(&a.extents);
     let mut b = a.clone();
     b.extents.reverse();
+    b.selection_evidence.segments = ContentSegment::from_cell_extents(&b.extents);
     let mut c = a.clone();
     c.content_format = libfreemkv::ContentFormat::MpegPs;
+    scan_clips(&mut c);
     assert_eq!(known_episode_titles(&[a, b, c]), vec![0, 1, 2]);
 }
 
@@ -257,6 +276,7 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
             intro.in_time = 0;
             intro.out_time = 30 * 45_000;
             t.clips.insert(0, intro);
+            scan_clips(&mut t);
             d.titles.push(t);
         }
     }
@@ -269,8 +289,10 @@ fn regression_six_playlists_preserve_three_episodes_and_distinct_decoys() {
     );
     let mut reordered = d.titles[1].clone();
     reordered.clips.reverse();
+    scan_clips(&mut reordered);
     let mut shifted = d.titles[1].clone();
     shifted.clips[1].in_time += 1;
+    scan_clips(&mut shifted);
     d.titles.extend([reordered, shifted]);
     // Newly added titles are not covered by the original roster: hold for review.
     let report = crate::SelectionModel::from_disc(&d).select(&Selection::Episodes, &audio);
@@ -1171,20 +1193,14 @@ fn known_episode_titles(titles: &[libfreemkv::DiscTitle]) -> Vec<usize> {
 // list a caller would read as "nothing selected"; only an explicit `Titles([])` is empty.
 #[test]
 fn a_selection_needing_review_is_an_error_with_its_candidates() {
-    let launch = crate::test_fixtures::disc_of(crate::test_fixtures::launch_titles());
-    let review = resolve_selection(&launch, &Selection::MainMovie).unwrap_err();
+    let branch = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
     assert_eq!(
-        review.reason,
-        crate::SelectionReviewReason::MissingPresentationLanguage
-    );
-    assert_eq!(review.candidates, vec![0, 1]);
-    assert_eq!(
-        libfreemkv::Error::from(review).to_string(),
-        "E9086: missing-presentation-language"
+        resolve_selection(&branch, &Selection::MainMovie),
+        Ok(vec![0])
     );
     let de = StreamFilter::Langs(vec!["de".into()]);
     assert_eq!(
-        resolve_selection_with_audio(&launch, &Selection::MainMovie, &de),
+        resolve_selection_with_audio(&branch, &Selection::MainMovie, &de),
         Ok(vec![1])
     );
     let d = disc(3, false, false);
@@ -1194,6 +1210,10 @@ fn a_selection_needing_review_is_an_error_with_its_candidates() {
         crate::SelectionReviewReason::MissingEpisodeRoster
     );
     assert_eq!(review.candidates, vec![0, 1, 2]);
+    assert_eq!(
+        libfreemkv::Error::from(review).to_string(),
+        "E9086: missing-episode-roster"
+    );
     assert_eq!(
         resolve_selection(&d, &Selection::Titles(vec![])),
         Ok(vec![])

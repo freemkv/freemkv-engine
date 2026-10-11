@@ -703,6 +703,8 @@ fn remux_main_title_honors_an_equivalent_audio_language_presentation() {
         start_lba: 7,
         sector_count: 10,
     }];
+    english.selection_evidence.segments =
+        libfreemkv::disc::ContentSegment::from_cell_extents(&english.extents);
     english
         .streams
         .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
@@ -753,19 +755,15 @@ fn plan_selection_defaults_to_every_stream() {
     assert_eq!(plan.selection_for(3), only);
 }
 
-// A remux whose main title needs review is refused with the coded reason (E9086), not an
-// uncoded English InvalidInput; an explicit title bypasses the hold.
+// A remux's main title is title 0 unless the audio filter wants another cut's language;
+// an explicit title always wins.
 #[test]
-fn a_remux_main_title_needing_review_is_its_coded_refusal() {
-    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::launch_titles());
-    let e = pick_title(&disc, None, &StreamFilter::All).unwrap_err();
-    assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
-    let code = libfreemkv::error::E_SELECTION_REVIEW_REQUIRED;
-    assert_eq!(crate::error_code(&e), Some(code), "{e}");
-    assert_eq!(e.to_string(), "E9086: missing-presentation-language");
+fn a_remux_main_title_follows_the_audio_filter_among_cuts() {
+    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
+    assert_eq!(pick_title(&disc, None, &StreamFilter::All).unwrap(), 0);
     let de = StreamFilter::Langs(vec!["de".into()]);
     assert_eq!(pick_title(&disc, None, &de).unwrap(), 1);
-    assert_eq!(pick_title(&disc, Some(0), &StreamFilter::All).unwrap(), 0);
+    assert_eq!(pick_title(&disc, Some(0), &de).unwrap(), 0);
 }
 
 // A target that appears after the re-check is still the typed refusal (E9084) when

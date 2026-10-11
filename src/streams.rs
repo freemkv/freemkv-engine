@@ -442,6 +442,13 @@ fn stream_lang(tag: &str) -> Option<Language> {
     }
 }
 
+/// Whether selection understands `tag` as a language (an ISO 639 code or an English
+/// name). Front ends check a presentation language with this before accepting it, since
+/// title selection never reports one it cannot match.
+pub fn is_language_tag(tag: &str) -> bool {
+    normalize_lang(tag).is_some()
+}
+
 pub(crate) fn normalize_lang(tag: &str) -> Option<Language> {
     let t = tag.trim();
     if t.is_empty() {
