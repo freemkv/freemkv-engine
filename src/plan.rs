@@ -81,12 +81,11 @@ impl KeyParamsData {
     // The drive handshake's host certificates, from `cert_keydb`.
     fn credentials(&self) -> Option<libfreemkv::DriveCredentials> {
         let path = self.cert_keydb.as_ref()?;
-        let host_certs = freemkv_keysources::KeydbSource::new(path.as_str()).host_certs();
-        if host_certs.is_empty() {
+        let credentials = crate::keys::drive_credentials(std::path::Path::new(path));
+        if credentials.is_none() {
             tracing::warn!(target: "freemkv::engine", "cert keydb {path}: no host certificate read");
-            return None;
         }
-        Some(libfreemkv::DriveCredentials { host_certs })
+        credentials
     }
 }
 

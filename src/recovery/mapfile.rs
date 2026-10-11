@@ -1195,8 +1195,8 @@ pub(crate) fn stamp_identity(
     disc: &libfreemkv::Disc,
     keys: Option<&libfreemkv::keys::KeyRing>,
 ) {
-    if let Some(a) = &disc.aacs {
-        map.set_disc_hash(&a.disc_hash);
+    if let Some(hash) = disc.intrinsic_id() {
+        map.set_disc_hash(hash);
     }
     if let Some(fp) = disc_vid_fingerprint(disc, keys) {
         map.set_vid_fingerprint(fp);
@@ -1208,10 +1208,7 @@ fn disc_vid_fingerprint(
     disc: &libfreemkv::Disc,
     keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> Option<[u8; 32]> {
-    disc.aacs
-        .as_ref()
-        .map(|a| a.volume_id)
-        .filter(|v| *v != [0u8; 16])
+    disc.aacs_volume_id()
         .map(|v| vid_fingerprint(&v))
         .or_else(|| keys.and_then(|k| k.vid_fingerprint()))
 }
@@ -1230,10 +1227,7 @@ impl DiscIdentity {
     pub(crate) fn of(disc: &libfreemkv::Disc, keys: Option<&libfreemkv::keys::KeyRing>) -> Self {
         let proven = keys.map_or_else(Vec::new, |set| set.proven_key_fingerprints());
         DiscIdentity {
-            disc_hash: disc
-                .aacs
-                .as_ref()
-                .and_then(|a| parse_disc_hash(&a.disc_hash)),
+            disc_hash: disc.intrinsic_id().and_then(parse_disc_hash),
             vidfp: disc_vid_fingerprint(disc, keys),
             proven,
         }
