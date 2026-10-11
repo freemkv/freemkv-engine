@@ -2,7 +2,7 @@
 
 use crate::{PresentationIdentity, Selection, StreamFilter};
 use libfreemkv::DiscTitle;
-use libfreemkv::disc::{EpisodeEvidence, MovieSelectionBasis, TitleSelectionEvidence};
+use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
 
 /// Content-presentation preference, independent of which streams are retained. Soft:
@@ -35,7 +35,7 @@ pub enum SelectionBasis {
     Explicit,
     All,
     Longest,
-    Movie(MovieSelectionBasis),
+    Movie,
     AuthoredEpisodes { roster: String },
     UncertainReview,
 }
@@ -177,7 +177,7 @@ impl SelectionModel {
                     return SelectionReport {
                         indices: Vec::new(),
                         candidates: Vec::new(),
-                        basis: SelectionBasis::Movie(MovieSelectionBasis::CanonicalFallback),
+                        basis: SelectionBasis::Movie,
                         review_reason: None,
                     };
                 };
@@ -195,7 +195,7 @@ impl SelectionModel {
                         }
                     }
                 }
-                (vec![best], SelectionBasis::Movie(main.evidence.movie_basis))
+                (vec![best], SelectionBasis::Movie)
             }
             Selection::All => ((0..self.titles.len()).collect(), SelectionBasis::All),
             Selection::Titles(indices) => {
