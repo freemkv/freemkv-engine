@@ -93,8 +93,8 @@ fn a_title_that_never_opened_its_output_never_deletes_the_file_there() {
 }
 
 // Through the title loop: a title whose mux opened (so truncated) its output and then failed
-// or stopped removes what it left there. A failure after the open (a write error) leaves no
-// outcome, so only the title's watch knows; a stopped mux's outcome says so itself.
+// (a write error, no outcome) or stopped removes what it left there, known by its watch.
+#[cfg(unix)]
 #[test]
 fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -118,8 +118,8 @@ fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let r = mux_titles(&plan, &dest, &sink, &halt, failed);
     assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
     assert!(!out.exists(), "the failed title's partial is removed");
-    let stopped = |_, _, dest: &str, _: &dyn Sink| {
-        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title")?;
+    let stopped = |_, _, dest: &str, sink: &dyn Sink| {
+        opens(dest, sink);
         Ok(libfreemkv::MuxOutcome {
             halted: true,
             ..outcome(false)
@@ -129,6 +129,49 @@ fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let r = mux_titles(&plan, &dest, &sink, &halt, stopped);
     assert_eq!(r, RipOutcome::Halted);
     assert!(!out.exists(), "the stopped title's partial is removed");
+}
+
+// A title whose mux opened its output removes only that file: one another writer put at the
+// path after the open (a finished rip renamed into place) stays when the title fails or stops.
+#[cfg(unix)]
+#[test]
+fn a_file_replaced_after_the_open_is_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let replaced = |dest: &str, sink: &dyn Sink| {
+        let path = dest.strip_prefix("mkv://").unwrap();
+        std::fs::write(path, b"half a title").unwrap();
+        let title = libfreemkv::DiscTitle::empty();
+        sink.event(&Event::OutputOpened {
+            dest,
+            title: &title,
+        });
+        let other = dir.path().join("other.mkv");
+        std::fs::write(&other, b"another rip").unwrap();
+        std::fs::rename(&other, path).unwrap();
+    };
+    let failed = |_, _, dest: &str, sink: &dyn Sink| {
+        replaced(dest, sink);
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, failed);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
+    let stopped = |_, _, dest: &str, sink: &dyn Sink| {
+        replaced(dest, sink);
+        let halted = libfreemkv::MuxOutcome {
+            halted: true,
+            ..outcome(false)
+        };
+        Ok(halted)
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, stopped);
+    assert_eq!(r, RipOutcome::Halted);
+    assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
 }
 
 // `land_verified` as the legacy `remux_iso` runs it: no op token, the OS primitives.
@@ -1433,12 +1476,15 @@ fn a_real_mux_reports_its_output_opening_to_the_watch() {
         &Calls::default(),
     );
     let opened = crate::open_image_with(&iso, OpenImageOptions::known(set.unwrap())).unwrap();
-    let watch = OpenedWatch::new(&crate::NoopSink);
-    assert!(!watch.opened());
     let dest = format!("mkv://{}", dir.path().join("t.mkv").display());
+    let watch = OpenedWatch::new(&crate::NoopSink, &dest);
+    assert!(watch.opened.get().is_none());
     let selection = libfreemkv::StreamSelection::default();
     let mux = mux_options(false);
     let r = mux_opened_title(&opened, &opened.keys, 0, selection, &dest, &mux, &watch);
     assert!(r.unwrap().completed);
-    assert!(watch.opened(), "OutputOpened reached the watch");
+    assert!(
+        watch.opened.get().is_some(),
+        "OutputOpened reached the watch"
+    );
 }

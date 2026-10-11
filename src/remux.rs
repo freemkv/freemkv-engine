@@ -67,15 +67,14 @@ impl MuxPlan {
     }
 }
 
-/// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`,
-/// under the [`run_titles`] loop policy. Each title is bracketed by
-/// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails or stops into a file
-/// sink removes its partial file only if its own mux opened that output; a file another
-/// writer made or changed there is never removed. A directory sink (ending in `/`) is left alone.
+/// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`, under the
+/// [`run_titles`] loop policy, each bracketed by [`Event::TitleStart`] / [`Event::TitleDone`].
+/// A title that fails or stops removes the file at a file sink's path only while it is the
+/// one its own mux opened (same device and inode as at the open; without inodes, never): a
+/// file put there after the open, one it never opened, or a folder sink (`/`) stays.
 ///
-/// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
-/// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
-/// with no rescan (J14).
+/// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it before
+/// any output. Each title is `opened.disc.titles[idx]`, muxed from the image with no rescan (J14).
 pub fn mux_image_titles(
     opened: &OpenedImage,
     plan: &MuxPlan,
@@ -125,13 +124,11 @@ fn mux_titles(
     run_titles(&plan.titles, plan.explicit_selection, sink, |idx| {
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
-        let watch = OpenedWatch::new(sink);
+        let watch = OpenedWatch::new(sink, &dest);
         let result = mux(idx, plan.selection_for(idx), &dest, &watch);
-        let opened_output = watch.opened() || result.as_ref().is_ok_and(|o| o.output_opened);
         let result = result.and_then(|outcome| finished(outcome, idx, halt));
         if result.is_err()
-            && opened_output
-            && let Some(path) = output_file(&dest)
+            && let Some(path) = watch.still_opened()
         {
             let _ = std::fs::remove_file(path);
         }
@@ -177,23 +174,31 @@ fn output_file(dest: &str) -> Option<PathBuf> {
     }
 }
 
-// A title's sink that notes whether the mux opened its output (`Event::OutputOpened`): the
-// run's own evidence that the file at the destination is this title's.
+// A title's sink that notes the identity of the file at its destination when the mux reports
+// opening it (`Event::OutputOpened`): the run's own evidence that the file there is this title's.
 struct OpenedWatch<'a> {
     inner: &'a dyn Sink,
-    opened: std::sync::OnceLock<()>,
+    path: Option<PathBuf>,
+    opened: std::sync::OnceLock<Option<FileId>>,
 }
 
 impl<'a> OpenedWatch<'a> {
-    fn new(inner: &'a dyn Sink) -> Self {
+    fn new(inner: &'a dyn Sink, dest: &str) -> Self {
         OpenedWatch {
             inner,
+            path: output_file(dest),
             opened: std::sync::OnceLock::new(),
         }
     }
 
-    fn opened(&self) -> bool {
-        self.opened.get().is_some()
+    // The destination file, if it is still the one the mux opened (same identity).
+    fn still_opened(&self) -> Option<&Path> {
+        let path = self.path.as_deref()?;
+        let opened = (*self.opened.get()?)?;
+        let now = std::fs::symlink_metadata(path)
+            .ok()
+            .and_then(|m| file_id(&m));
+        (now == Some(opened)).then_some(path)
     }
 }
 
@@ -212,7 +217,11 @@ impl Sink for OpenedWatch<'_> {
     }
     fn event(&self, e: &Event<'_>) {
         if matches!(e, Event::OutputOpened { .. }) {
-            let _ = self.opened.set(());
+            let id = || {
+                let path = self.path.as_deref()?;
+                file_id(&std::fs::symlink_metadata(path).ok()?)
+            };
+            self.opened.get_or_init(id);
         }
         self.inner.event(e)
     }
