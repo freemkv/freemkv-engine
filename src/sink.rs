@@ -87,10 +87,13 @@ pub enum Event<'a> {
     /// A verified file replaced the existing one at `path`.
     Replaced { path: &'a std::path::Path },
     /// A mux's output `dest` opened for `title` as it will be written (libfreemkv's
-    /// `MuxEvents::on_output_opened`): where a front end prints the pre-mux notes.
+    /// `Event::OutputOpened`): where a front end prints the pre-mux notes. `file` is the
+    /// opened file's identity (device and inode, or volume serial and file index), read from
+    /// the mux's own handle; `None` for a non-file sink or when it could not be read.
     OutputOpened {
         dest: &'a str,
         title: &'a libfreemkv::DiscTitle,
+        file: Option<(u64, u64)>,
     },
     /// [`crate::run()`] opened and scanned its source: the drive's device path (`None` for
     /// an image or folder) and the disc.

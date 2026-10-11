@@ -731,19 +731,20 @@ fn write_progress_reaches_the_sink_as_a_mux_progress_tick() {
     assert_eq!(p.bytes_total, 8192);
 }
 
-// The output opening reaches the sink with its dest and title (the front ends print the
-// pre-mux note there), even when the mux returns before the watcher's next poll.
+// The output opening reaches the sink with its dest, title and file identity (the front ends
+// print the pre-mux note there), even when the mux returns before the watcher's next poll.
 #[test]
 fn output_opened_reaches_the_sink_even_from_a_mux_that_returns_at_once() {
+    type Seen = (String, usize, Option<(u64, u64)>);
     #[derive(Default)]
-    struct Opened(std::sync::Mutex<Vec<(String, usize)>>);
+    struct Opened(std::sync::Mutex<Vec<Seen>>);
     impl Sink for Opened {
         fn event(&self, e: &crate::sink::Event<'_>) {
-            if let crate::sink::Event::OutputOpened { dest, title } = e {
+            if let crate::sink::Event::OutputOpened { dest, title, file } = e {
                 self.0
                     .lock()
                     .unwrap()
-                    .push((dest.to_string(), title.streams.len()));
+                    .push((dest.to_string(), title.streams.len(), *file));
             }
         }
     }
@@ -751,11 +752,12 @@ fn output_opened_reaches_the_sink_even_from_a_mux_that_returns_at_once() {
     with_mux_watcher(&sink, "mpg:///o.mpg", |ctx| {
         ctx.events.event(&libfreemkv::Event::OutputOpened {
             title: &libfreemkv::DiscTitle::empty(),
+            file: Some((7, 42)),
         });
     });
     assert_eq!(
         *sink.0.lock().unwrap(),
-        vec![("mpg:///o.mpg".to_string(), 0)]
+        vec![("mpg:///o.mpg".to_string(), 0, Some((7, 42)))]
     );
 }
 

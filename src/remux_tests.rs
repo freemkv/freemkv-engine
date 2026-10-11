@@ -101,10 +101,12 @@ fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let dest = |_: usize| format!("mkv://{}", out.display());
     let plan = MuxPlan::new(vec![0]);
     let opens = |dest: &str, sink: &dyn Sink| {
-        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title").unwrap();
+        let path = Path::new(dest.strip_prefix("mkv://").unwrap());
+        std::fs::write(path, b"half a title").unwrap();
         sink.event(&Event::OutputOpened {
             dest,
             title: &libfreemkv::DiscTitle::empty(),
+            file: file_id(path),
         });
     };
     let (token, sink) = (Halt::new(), Events::default());
@@ -147,6 +149,7 @@ fn a_file_replaced_after_the_open_is_never_removed() {
         sink.event(&Event::OutputOpened {
             dest,
             title: &title,
+            file: file_id(Path::new(path)),
         });
         let other = dir.path().join("other.mkv");
         std::fs::write(&other, b"another rip").unwrap();
@@ -170,6 +173,69 @@ fn a_file_replaced_after_the_open_is_never_removed() {
     let r = mux_titles(&plan, &dest, &sink, &halt, stopped);
     assert_eq!(r, RipOutcome::Halted);
     assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
+}
+
+// The watch keeps the identity the mux read from its own handle, not the file at the path
+// when the event arrives: one renamed in before a late event stays, and an opening that
+// reports no identity removes nothing.
+#[test]
+fn the_watch_keeps_the_identity_the_mux_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let title = libfreemkv::DiscTitle::empty();
+    let late = |_, _, dest: &str, sink: &dyn Sink| {
+        let path = Path::new(dest.strip_prefix("mkv://").unwrap());
+        std::fs::write(path, b"half a title").unwrap();
+        let file = file_id(path);
+        let other = dir.path().join("other.mkv");
+        std::fs::write(&other, b"another rip").unwrap();
+        std::fs::rename(&other, path).unwrap();
+        let title = &title;
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, late);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"another rip");
+    let unknown = |_, _, dest: &str, sink: &dyn Sink| {
+        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title").unwrap();
+        let (title, file) = (&title, None);
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, unknown);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert_eq!(std::fs::read(&out).unwrap(), b"half a title");
+}
+
+// A destination that is a symlink is never removed: the link stays (the run did not create
+// it), and so does the file the mux wrote through it.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_destination_is_never_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (out, pool) = (dir.path().join("t0.mkv"), dir.path().join("pool.mkv"));
+    std::os::unix::fs::symlink(&pool, &out).unwrap();
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let failed = |_, _, dest: &str, sink: &dyn Sink| {
+        let mut f = std::fs::File::create(dest.strip_prefix("mkv://").unwrap()).unwrap();
+        f.write_all(b"half a title").unwrap();
+        let file = libfreemkv::io::artifact_lock::file_identity_of(&f).ok();
+        let title = &libfreemkv::DiscTitle::empty();
+        sink.event(&Event::OutputOpened { dest, title, file });
+        Err(io::Error::other("E6000: 12"))
+    };
+    let r = mux_titles(&plan, &dest, &sink, &halt, failed);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert!(std::fs::symlink_metadata(&out).unwrap().is_symlink());
+    assert_eq!(std::fs::read(&pool).unwrap(), b"half a title");
 }
 
 // `land_verified` as the legacy `remux_iso` runs it: no op token, the OS primitives.
@@ -1213,28 +1279,46 @@ fn a_kept_name_created_during_the_keep_is_never_replaced() {
     );
 }
 
-// A move that fails removes only the placeholder the keep reserved: a file another writer
-// put over it meanwhile stays, and no other placeholder is left behind.
-#[test]
-fn a_failed_keep_removes_only_its_own_placeholder() {
+// Every keep fails, the first after `during` touched its placeholder: the file then at the
+// first kept name is returned; no other placeholder is left and the output stays.
+fn failed_keep(during: &(dyn Fn(&Path) + Sync)) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("Movie.mkv");
     let landing = partial_path(&target);
     std::fs::write(&landing, b"verified").unwrap();
-    let swap = |name: &Path| {
-        let other = dir.path().join("other");
-        std::fs::write(&other, b"foreign").unwrap();
-        std::fs::rename(&other, name).unwrap();
-    };
-    let rio = KeepRace::new(&swap, true);
+    let rio = KeepRace::new(during, true);
     assert_eq!(
         keep_unpublished(&landing, &target, &crate::NoopSink, &rio),
         None
     );
-    assert_eq!(std::fs::read(verified_path(&target)).unwrap(), b"foreign");
     let left: Vec<_> = kept_names(&target).skip(1).filter(|n| n.exists()).collect();
     assert!(left.is_empty(), "{left:?}");
     assert_eq!(std::fs::read(&landing).unwrap(), b"verified");
+    std::fs::read(verified_path(&target)).expect("the first kept name stays")
+}
+
+// A move that fails never removes an empty file another writer renamed over the placeholder:
+// it is not the file the keep created.
+#[test]
+fn a_failed_keep_leaves_a_foreign_empty_file_at_its_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let swap = |name: &Path| {
+        let other = dir.path().join("other");
+        std::fs::write(&other, b"").unwrap();
+        std::fs::rename(&other, name).unwrap();
+    };
+    assert_eq!(failed_keep(&swap), b"");
+}
+
+// A move that fails never removes its own placeholder once another writer wrote into it:
+// it is no longer the empty file the keep created.
+#[test]
+fn a_failed_keep_leaves_its_placeholder_once_written_into() {
+    let write_in = |name: &Path| {
+        let mut f = std::fs::OpenOptions::new().write(true).open(name).unwrap();
+        f.write_all(b"written in place").unwrap();
+    };
+    assert_eq!(failed_keep(&write_in), b"written in place");
 }
 
 // Every kept name taken: the remux fails E5000 (kind Unsupported) with no `RemuxUnpublished`,
@@ -1459,8 +1543,8 @@ fn only_a_file_sink_names_an_output_file() {
     }
 }
 
-// A real mux of an image title reports its output opening to the title's `OpenedWatch`,
-// the evidence a failed title uses to remove what it wrote.
+// A real mux of an image title reports its output opening, with the identity of the file it
+// opened, to the title's `OpenedWatch`: the evidence a failed title uses to remove its file.
 #[test]
 fn a_real_mux_reports_its_output_opening_to_the_watch() {
     use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
@@ -1474,15 +1558,19 @@ fn a_real_mux_reports_its_output_opening_to_the_watch() {
         &Calls::default(),
     );
     let opened = crate::open_image_with(&iso, OpenImageOptions::known(set.unwrap())).unwrap();
-    let dest = format!("mkv://{}", dir.path().join("t.mkv").display());
+    let out = dir.path().join("t.mkv");
+    let dest = format!("mkv://{}", out.display());
     let watch = OpenedWatch::new(&crate::NoopSink, &dest);
     assert!(watch.opened.get().is_none());
     let selection = libfreemkv::StreamSelection::default();
     let mux = mux_options(false);
     let r = mux_opened_title(&opened, &opened.keys, 0, selection, &dest, &mux, &watch);
     assert!(r.unwrap().completed);
-    assert!(
-        watch.opened.get().is_some(),
+    let file = file_id(&out);
+    assert!(file.is_some());
+    assert_eq!(
+        watch.opened.get(),
+        Some(&file),
         "OutputOpened reached the watch"
     );
 }

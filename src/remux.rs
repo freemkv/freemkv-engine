@@ -69,9 +69,10 @@ impl MuxPlan {
 
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`, under the
 /// [`run_titles`] loop policy, each bracketed by [`Event::TitleStart`] / [`Event::TitleDone`].
-/// A title that fails or stops removes the file at a file sink's path only while it is the
-/// one its own mux opened (same file identity as at the open, e.g. device and inode): a
-/// file put there after the open, one it never opened, or a folder sink (`/`) stays.
+/// A title that fails or stops removes its file sink's path only while that is still the
+/// regular file its mux opened (the identity the mux read from its handle): a symlink, a
+/// folder sink, or a file put there after the open stays, except one swapped in between the
+/// identity check and the unlink (separate steps) or, on FAT/exFAT, one reusing a freed ID.
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it before
 /// any output. Each title is `opened.disc.titles[idx]`, muxed from the image with no rescan (J14).
@@ -189,8 +190,8 @@ fn output_file(dest: &str) -> Option<PathBuf> {
     }
 }
 
-// A title's sink that notes the identity of the file at its destination when the mux reports
-// opening it (`Event::OutputOpened`): the run's own evidence that the file there is this title's.
+// A title's sink that notes the identity of the file the mux opened, as `Event::OutputOpened`
+// reports it from the mux's own handle (no path I/O here): the run's evidence of its own file.
 struct OpenedWatch<'a> {
     inner: &'a dyn Sink,
     path: Option<PathBuf>,
@@ -206,11 +207,13 @@ impl<'a> OpenedWatch<'a> {
         }
     }
 
-    // The destination file, if it is still the one the mux opened (same identity).
+    // The destination, if it is still the regular file the mux opened (never a symlink, whose
+    // unlink would remove the link, not the file): same identity. No identity: none.
     fn still_opened(&self) -> Option<&Path> {
         let path = self.path.as_deref()?;
         let opened = (*self.opened.get()?)?;
-        (file_id(path) == Some(opened)).then_some(path)
+        let regular = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file());
+        (regular && file_id(path) == Some(opened)).then_some(path)
     }
 }
 
@@ -228,9 +231,8 @@ impl Sink for OpenedWatch<'_> {
         self.inner.completed(outcome)
     }
     fn event(&self, e: &Event<'_>) {
-        if matches!(e, Event::OutputOpened { .. }) {
-            self.opened
-                .get_or_init(|| self.path.as_deref().and_then(file_id));
+        if let Event::OutputOpened { file, .. } = e {
+            self.opened.get_or_init(|| *file);
         }
         self.inner.event(e)
     }
