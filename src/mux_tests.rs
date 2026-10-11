@@ -1220,7 +1220,9 @@ fn mark_authored(titles: &mut [libfreemkv::DiscTitle]) {
 fn known_episode_titles(titles: &[libfreemkv::DiscTitle]) -> Vec<usize> {
     let mut titles = titles.to_vec();
     mark_authored(&mut titles);
-    crate::episode_titles(&titles)
+    crate::SelectionModel::from_titles(&titles)
+        .select(&Selection::Episodes, &StreamFilter::All, None)
+        .unwrap_or_default()
 }
 
 // A selection that needs review is an Err carrying its reason and candidates, never an empty

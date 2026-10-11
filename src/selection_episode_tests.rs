@@ -38,82 +38,10 @@ fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
     t
 }
 
-#[test]
-fn a_play_all_is_the_title_holding_its_episodes_sectors() {
-    let ep = 44.0 * 60.0;
-    let titles = vec![
-        spans(ep * 3.0, &[(1000, 1000), (2000, 1000), (3000, 1000)]),
-        spans(ep, &[(1000, 1000)]),
-        spans(ep, &[(2000, 1000)]),
-        spans(ep, &[(3000, 1000)]),
-        spans(120.0, &[(1000, 50)]), // a recap inside it: too short to be a part
-        spans(ep, &[(9000, 1000)]),  // same length, elsewhere: proves nothing
-    ];
-    use TitleRole::*;
-    assert_eq!(
-        title_roles(&titles),
-        vec![
-            Some(PlayAll),
-            Some(Episode),
-            Some(Episode),
-            Some(Episode),
-            None,
-            None
-        ]
-    );
-}
-
 // As on a real DVD: every episode ends on one shared end-card cell that the play-all holds
 // once, and an episode can be authored twice with only the audio differing.
-#[test]
-fn episodes_sharing_an_end_card_or_authored_twice_are_all_episodes() {
-    let ep = 48.0 * 60.0;
-    let titles = vec![
-        spans(ep * 2.0, &[(0, 2000), (2000, 2000), (9000, 5)]),
-        spans(ep, &[(0, 2000), (9000, 5)]),
-        spans(ep, &[(0, 2000), (9000, 5)]),
-        spans(ep, &[(2000, 2000), (9000, 5)]),
-    ];
-    use TitleRole::*;
-    assert_eq!(
-        title_roles(&titles),
-        vec![Some(PlayAll), Some(Episode), Some(Episode), Some(Episode)]
-    );
-}
-
 // Decoy playlists repeat the feature's sectors exactly: none is smaller than another.
-#[test]
-fn identical_playlists_are_not_play_alls() {
-    let f = 110.0 * 60.0;
-    let titles = vec![
-        spans(f, &[(0, 9000)]),
-        spans(f, &[(0, 9000)]),
-        spans(f, &[(0, 9000)]),
-    ];
-    assert!(title_roles(&titles).iter().all(Option::is_none));
-}
-
 // Two cuts sharing most sectors overlap, so a title holding both plays no episodes.
-#[test]
-fn overlapping_parts_do_not_make_a_play_all() {
-    let t = 50.0 * 60.0;
-    let titles = vec![
-        spans(t * 2.0, &[(0, 4000)]),
-        spans(t, &[(0, 2500)]),
-        spans(t, &[(500, 2500)]),
-    ];
-    assert!(title_roles(&titles).iter().all(Option::is_none));
-}
-
-#[test]
-fn a_film_disc_proves_no_roles() {
-    let titles = vec![
-        spans(120.0 * 60.0, &[(0, 9000)]),
-        spans(12.0 * 60.0, &[(20_000, 500)]),
-    ];
-    assert!(title_roles(&titles).iter().all(Option::is_none));
-}
-
 #[test]
 fn dedups_duplicate_angle_titles() {
     let ep = 44.0 * 60.0;
@@ -301,13 +229,18 @@ fn known_episode_titles(titles: &[DiscTitle]) -> Vec<usize> {
     let mut titles = titles.to_vec();
     let members = (0..titles.len()).collect::<Vec<_>>();
     crate::test_fixtures::authored_episodes(&mut titles, &members);
-    super::episode_titles(&titles)
+    episodes(&titles).unwrap_or_default()
+}
+
+fn episodes(titles: &[DiscTitle]) -> Result<Vec<usize>, crate::SelectionReview> {
+    crate::SelectionModel::from_titles(titles).select(
+        &crate::Selection::Episodes,
+        &crate::StreamFilter::All,
+        None,
+    )
 }
 
 fn assert_unknown(titles: &[DiscTitle]) {
-    let review = crate::SelectionModel::from_titles(titles)
-        .select(&crate::Selection::Episodes, &crate::StreamFilter::All, None)
-        .unwrap_err();
-    assert!(super::episode_titles(titles).is_empty());
+    let review = episodes(titles).unwrap_err();
     assert_eq!(review.candidates, (0..titles.len()).collect::<Vec<_>>());
 }

@@ -17,6 +17,7 @@ project follows semantic versioning.
 - DVD authored-launch selection: `SelectionBasis::AuthoredLaunch`, the review reasons `incomplete-launch-proof`, `invalid-launch-proof`, `missing-presentation-language`, `invalid-presentation-language`, `unmatched-presentation-language` and `ambiguous-presentation-language`, and `SelectionTitle::audio_by_pid`. On untraceable DVDs (most of them) it held every main-movie pick for review whenever an audio language was set.
 - `PresentationIdentity` is an opaque list of content segments rather than an enum of clip and DVD-cell variants.
 - `SelectionBasis::Movie` carries no payload; libfreemkv dropped `MovieSelectionBasis`.
+- `title_roles`, `TitleRole` and `episode_titles`: the structural play-all hint ran beside the authored roster and only labelled GUI rows; `SelectionModel::select(&Selection::Episodes, ..)` is the episode set.
 - `SelectionReport`, `SelectionBasis`, `SelectionPreferences`, `SelectionModel::{select_with_preferences, titles, from_disc}`, the public `SelectionTitle`, `resolve_job_selection` and `resolve_selection_with_audio`: use `select`/`resolve_selection` with their `presentation` argument.
 
 ## [1.8.3] — 2026-10-08

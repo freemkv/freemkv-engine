@@ -239,6 +239,9 @@ impl SelectionModel {
 }
 
 #[cfg(test)]
+#[path = "selection_episode_tests.rs"]
+mod episode_tests;
+#[cfg(test)]
 #[path = "selection_tests.rs"]
 mod tests;
 #[cfg(test)]
