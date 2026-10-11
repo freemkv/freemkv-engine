@@ -25,7 +25,9 @@ pub struct Plan {
     pub dest: String,
     /// Which titles a title rip reads.
     pub titles: Selection,
-    /// Which audio and subtitle streams a title rip keeps.
+    /// Which audio and subtitle streams a title rip keeps. An image run (`iso://`, `null://`)
+    /// copies sectors, not streams, but its audio filter picks which `MainMovie` cut the run
+    /// measures for `MultipassResult::main_lost_ms` and reports as its progress main title.
     pub streams: StreamChoice,
     /// Keep the ciphertext (`--raw`, "Keep encrypted"): nothing is decrypted and no key
     /// is acquired. Default decrypts.
