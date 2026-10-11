@@ -1,32 +1,135 @@
-#[test]
-fn a_failed_title_removes_only_an_output_it_touched() {
-    let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("t.mkv");
-    let path = p.to_str().unwrap();
-    let before = || Before::of(std::fs::metadata(&p));
-    // Absent before, written by the failed title: removed.
-    let was = before();
-    assert_eq!(was, Before::Absent);
-    std::fs::write(&p, b"partial").unwrap();
-    remove_failed_output(path, was, false);
-    assert!(!p.exists());
-    // Present before and untouched: kept.
-    std::fs::write(&p, b"earlier rip").unwrap();
-    remove_failed_output(path, before(), false);
-    assert_eq!(std::fs::read(&p).unwrap(), b"earlier rip");
-    // Present before and rewritten by the failed title: removed.
-    let was = before();
-    std::fs::write(&p, b"partial rewrite").unwrap();
-    remove_failed_output(path, was, false);
-    assert!(!p.exists());
-    // Whatever was there, a title whose mux opened the output removes it.
-    std::fs::write(&p, b"truncated by the mux").unwrap();
-    remove_failed_output(path, before(), true);
-    assert!(!p.exists());
-}
-
 use super::*;
 use std::sync::Mutex;
+
+// A one-title image (its clip encrypted with K1) opened with its keys, and the sectors of
+// its one clip.
+fn opened_image(dir: &Path) -> (OpenedImage, PathBuf, (u32, u32)) {
+    use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
+    let fx = bd_image(&[Some(K1)], 1);
+    let iso = fx.write(dir, "d.iso");
+    let keydb = [(Answer::Keydb, &[K1][..])];
+    let set = resolve(&fx, KeyScope::Titles(vec![0]), &keydb, &Calls::default()).unwrap();
+    let source = ImageSource::Iso(iso.clone());
+    let opened = crate::open_image_with(&source, OpenImageOptions::known(set)).unwrap();
+    (opened, iso, fx.clip(0))
+}
+
+// A sink with hooks: `on_start` runs at the title's first cancel poll after its TitleStart
+// (inside the mux, before the output opens), which then reports a Stop; `on_opened` runs
+// when the mux opens its output.
+type Hook<'a> = &'a (dyn Fn() + Sync);
+struct Hooked<'a> {
+    on_start: Option<Hook<'a>>,
+    on_opened: Hook<'a>,
+    started: AtomicBool,
+    stopped: AtomicBool,
+}
+
+impl<'a> Hooked<'a> {
+    fn new(on_start: Option<Hook<'a>>, on_opened: Hook<'a>) -> Self {
+        Hooked {
+            on_start,
+            on_opened,
+            started: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    fn stop_at_start(on_start: Hook<'a>) -> Self {
+        Hooked::new(Some(on_start), &|| {})
+    }
+}
+
+impl Sink for Hooked<'_> {
+    fn event(&self, e: &Event<'_>) {
+        match e {
+            Event::TitleStart { .. } => self.started.store(true, Ordering::SeqCst),
+            Event::OutputOpened { .. } => (self.on_opened)(),
+            _ => {}
+        }
+    }
+    fn should_cancel(&self) -> bool {
+        if self.stopped.load(Ordering::SeqCst) {
+            return true;
+        }
+        match self.on_start {
+            Some(hook) if self.started.load(Ordering::SeqCst) => {
+                hook();
+                self.stopped.store(true, Ordering::SeqCst);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+// A title stopped before its mux opened the output never deletes the file at its path, even
+// one another run is writing meanwhile (its stamp changes) or one that appears there after
+// the title started (a concurrent rip to the same path, a stale negative lookup).
+#[test]
+fn a_title_that_never_opened_its_output_never_deletes_the_file_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let (opened, ..) = opened_image(dir.path());
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    // Another writer grows the file at the path while this title runs.
+    std::fs::write(&out, b"another run's").unwrap();
+    let grow = || {
+        let mut f = std::fs::OpenOptions::new().append(true).open(&out).unwrap();
+        f.write_all(b" growing rip").unwrap();
+    };
+    let sink = Hooked::stop_at_start(&grow);
+    let r = mux_image_titles(&opened, &plan, &dest, &sink);
+    assert_eq!(r, RipOutcome::Halted);
+    assert_eq!(std::fs::read(&out).unwrap(), b"another run's growing rip");
+    // The path was absent at title start; another writer creates it before the Stop.
+    std::fs::remove_file(&out).unwrap();
+    let create = || std::fs::write(&out, b"appeared").unwrap();
+    let sink = Hooked::stop_at_start(&create);
+    let r = mux_image_titles(&opened, &plan, &dest, &sink);
+    assert_eq!(r, RipOutcome::Halted);
+    assert_eq!(std::fs::read(&out).unwrap(), b"appeared");
+}
+
+// Through the title loop: a title whose mux opened (so truncated) its output and then failed
+// or stopped removes what it left there. A failure after the open (a write error) leaves no
+// outcome, so only the title's watch knows; a stopped mux's outcome says so itself.
+#[test]
+fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t0.mkv");
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let plan = MuxPlan::new(vec![0]);
+    let opens = |dest: &str, sink: &dyn Sink| {
+        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title").unwrap();
+        sink.event(&Event::OutputOpened {
+            dest,
+            title: &libfreemkv::DiscTitle::empty(),
+        });
+    };
+    let (token, sink) = (Halt::new(), Events::default());
+    let halt = EngineHalt::new(&token, None).with_sink(&sink);
+    let failed = |_, _, dest: &str, sink: &dyn Sink| {
+        opens(dest, sink);
+        Err(io::Error::other("E6000: 12"))
+    };
+    std::fs::write(&out, b"earlier rip").unwrap();
+    let r = mux_titles(&plan, &dest, &sink, &halt, failed);
+    assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
+    assert!(!out.exists(), "the failed title's partial is removed");
+    let stopped = |_, _, dest: &str, _: &dyn Sink| {
+        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title")?;
+        Ok(libfreemkv::MuxOutcome {
+            halted: true,
+            ..outcome(false)
+        })
+    };
+    std::fs::write(&out, b"earlier rip").unwrap();
+    let r = mux_titles(&plan, &dest, &sink, &halt, stopped);
+    assert_eq!(r, RipOutcome::Halted);
+    assert!(!out.exists(), "the stopped title's partial is removed");
+}
 
 // `land_verified` as the legacy `remux_iso` runs it: no op token, the OS primitives.
 pub(super) fn land(
@@ -872,6 +975,27 @@ fn an_incomplete_remux_title_is_reported_done_with_its_error() {
 // hard-link nor rename without replacing); everything else is the OS's.
 struct NoPublishIo;
 impl RemuxIo for NoPublishIo {
+    fn publish(&self, landing: &Path, target: &Path) -> io::Result<()> {
+        NoPublishErrno(45).publish(landing, target)
+    }
+    fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+        OsRemuxIo.sync(f, h, p)
+    }
+    fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+        OsRemuxIo.open_read(path)
+    }
+    fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+        OsRemuxIo.create_new(path)
+    }
+    fn timing(&self) -> RemuxTiming {
+        RemuxTiming::default()
+    }
+}
+
+// As [`NoPublishIo`], the refusal wrapping the OS error `errno` (libfreemkv's publish reports
+// Linux's EINVAL from `RENAME_NOREPLACE` as `Unsupported` around it).
+struct NoPublishErrno(i32);
+impl RemuxIo for NoPublishErrno {
     fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
         OsRemuxIo.sync(f, h, p)
     }
@@ -887,9 +1011,98 @@ impl RemuxIo for NoPublishIo {
     fn publish(&self, _: &Path, _: &Path) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            io::Error::from_raw_os_error(45),
+            io::Error::from_raw_os_error(self.0),
         ))
     }
+    fn replace(&self, landing: &Path, target: &Path) -> io::Result<()> {
+        self.publish(landing, target)
+    }
+}
+
+// An unpublished remux to `target` through `rio`, its mux writing `bytes`.
+fn unpublished(target: &Path, bytes: &[u8], rio: &dyn RemuxIo) -> io::Error {
+    let sink = Events::default();
+    let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    let j = job(target.to_path_buf(), false);
+    let mux = writes(bytes.to_vec(), true);
+    land_verified(&j, 0, &title(600.0), &sink, &halt, rio, None, mux).unwrap_err()
+}
+
+// The refusal libfreemkv makes of Linux's EINVAL (no RENAME_NOREPLACE on NFS or a FUSE share)
+// is `Unsupported` like any other: the verified output is kept, by kind alone.
+#[test]
+fn an_unsupported_publish_from_einval_keeps_the_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let new = mkv(600.0, Some(598), 2);
+    let e = unpublished(&target, &new, &NoPublishErrno(22));
+    assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+    let kept = &RemuxUnpublished::of(&e).expect("kept").kept;
+    assert_eq!(kept, &verified_path(&target));
+    assert_eq!(std::fs::read(kept).unwrap(), new);
+}
+
+// A kept output never replaces a file: an earlier kept copy (or a user's file) at
+// `<target>.verified` stays, and the next is kept at the first free `<target>.verified.<n>`.
+#[test]
+fn an_unpublished_remux_never_overwrites_an_earlier_kept_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("Movie.mkv");
+    let (first, second) = (mkv(600.0, Some(598), 2), mkv(600.0, Some(599), 1));
+    let e = unpublished(&target, &first, &NoPublishIo);
+    let kept = RemuxUnpublished::of(&e).unwrap().kept.clone();
+    assert_eq!(kept, verified_path(&target));
+    let e = unpublished(&target, &second, &NoPublishIo);
+    let again = RemuxUnpublished::of(&e).unwrap().kept.clone();
+    assert_eq!(again, dir.path().join("Movie.mkv.verified.1"));
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        first,
+        "the earlier copy stays"
+    );
+    assert_eq!(std::fs::read(&again).unwrap(), second);
+}
+
+// A target name too long for `<target>.verified` (255 bytes with `.partial`, 256 with
+// `.verified`) keeps the output under a short name beside it, never at `<target>.partial`,
+// which the next remux to the target sweeps first.
+#[test]
+fn a_kept_output_whose_name_does_not_fit_is_kept_outside_the_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join(format!("{}.mkv", "m".repeat(243)));
+    assert_eq!(partial_path(&target).file_name().unwrap().len(), 255);
+    let new = mkv(600.0, Some(598), 2);
+    let e = unpublished(&target, &new, &NoPublishIo);
+    let kept = RemuxUnpublished::of(&e).expect("kept").kept.clone();
+    assert_ne!(kept, partial_path(&target));
+    assert_eq!(kept.parent(), target.parent());
+    assert_eq!(std::fs::read(&kept).unwrap(), new);
+    // The next remux to the target sweeps its stale partial, never the kept output.
+    let _ = unpublished(&target, b"not an mkv", &NoPublishIo);
+    assert_eq!(std::fs::read(&kept).unwrap(), new);
+}
+
+// A kept output's error shows the coded I/O text once: it is not also a source in the chain.
+#[test]
+fn an_unpublished_remux_error_shows_its_text_once_in_the_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = unpublished(
+        &dir.path().join("Movie.mkv"),
+        &mkv(600.0, Some(598), 2),
+        &NoPublishIo,
+    );
+    let mut chain = vec![e.to_string()];
+    let mut next = std::error::Error::source(&e);
+    while let Some(cause) = next {
+        chain.push(cause.to_string());
+        next = cause.source();
+    }
+    assert!(chain[0].starts_with("E5000"), "{chain:?}");
+    let coded = chain
+        .iter()
+        .filter(|text| text.starts_with("E5000"))
+        .count();
+    assert_eq!(coded, 1, "{chain:?}");
 }
 
 // A target filesystem that cannot publish without replacing fails the remux with a coded
@@ -935,7 +1148,7 @@ fn an_unsupported_no_replace_publish_keeps_the_verified_output() {
 }
 
 // With `replace` the publication is a plain rename: its failure is coded (E5000, its own
-// kind) and keeps nothing, an Unsupported one included.
+// kind) and keeps nothing.
 #[test]
 fn a_failed_replacing_rename_is_coded_and_keeps_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -949,43 +1162,33 @@ fn a_failed_replacing_rename_is_coded_and_keeps_nothing() {
     assert!(RemuxUnpublished::of(&e).is_none());
 }
 
-// A stat that fails at title start (ESTALE on a flaky share) is no evidence the output was
-// absent: a Stop or failure that touched nothing never deletes the earlier file at the path.
+// A replacing remux whose rename fails Unsupported is a plain coded failure: no kept output,
+// no `RemuxUnpublished`; its partial is removed and the existing target is untouched.
 #[test]
-fn a_failed_stat_before_the_title_never_deletes_an_earlier_file() {
+fn an_unsupported_replacing_rename_keeps_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let p = dir.path().join("Movie.mkv");
-    let path = p.to_str().unwrap();
-    std::fs::write(&p, b"earlier rip").unwrap();
-    let estale = io::Error::from_raw_os_error(libc_estale());
-    let before = Before::of(Err(estale));
-    assert_eq!(before, Before::Unknown);
-    // The stat works again after the Stop: the file is there, its stamp unknown before.
-    remove_failed_output(path, before, false);
-    assert_eq!(std::fs::read(&p).unwrap(), b"earlier rip");
-    // EACCES and EIO are no evidence either; only NotFound is absent.
-    for errno in [13, 5] {
-        let before = Before::of(Err(io::Error::from_raw_os_error(errno)));
-        remove_failed_output(path, before, false);
-        assert_eq!(std::fs::read(&p).unwrap(), b"earlier rip", "errno {errno}");
-    }
-    // A title whose mux opened (so truncated) the output still removes its partial.
-    remove_failed_output(path, Before::Unknown, true);
-    assert!(!p.exists());
-}
-
-// ESTALE's errno on this platform.
-fn libc_estale() -> i32 {
-    if cfg!(target_os = "linux") { 116 } else { 70 }
+    let target = dir.path().join("Movie.mkv");
+    std::fs::write(&target, b"old").unwrap();
+    let sink = Events::default();
+    let halt = EngineHalt::new(&Halt::new(), None).with_sink(&sink);
+    let mux = writes(mkv(600.0, Some(598), 2), true);
+    let rio = NoPublishErrno(45);
+    let j = job(target.clone(), true);
+    let e = land_verified(&j, 0, &title(600.0), &sink, &halt, &rio, None, mux).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+    let code = libfreemkv::error::E_IO_ERROR;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert!(RemuxUnpublished::of(&e).is_none());
+    assert!(!verified_path(&target).exists() && !partial_path(&target).exists());
+    assert_eq!(std::fs::read(&target).unwrap(), b"old");
 }
 
 // The image `iso` as two aliased cuts, title 0 English and title 1 German (still muxing its
-// own clip, K2). The identity comes from title 0's clips: the fixture's playlists declare no
-// playback type, so the scan proves no segments.
+// own clip, K2): both carry the segments the scan found for title 0.
 fn branch_disc(iso: &Path) -> libfreemkv::Disc {
     let (mut disc, _) = libfreemkv::scan_iso(iso, Default::default()).unwrap();
-    let shared = libfreemkv::disc::ContentSegment::from_clips(&disc.titles[0].clips);
-    assert!(!shared.is_empty(), "title 0's clips describe it");
+    let shared = disc.titles[0].selection_evidence.segments.clone();
+    assert!(!shared.is_empty(), "the scan describes title 0 by segments");
     for (title, language) in disc.titles.iter_mut().zip(["eng", "deu"]) {
         title.selection_evidence.segments = shared.clone();
         for stream in &mut title.streams {
@@ -1062,6 +1265,9 @@ fn only_a_file_sink_names_an_output_file() {
         "m2ts:///o/a.m2ts",
         "mp4:///o/a.mp4",
         "mpg:///o/a.mpg",
+        "fvi:///o/a.fvi",
+        "chapters:///o/a.xml",
+        "json:///o/a.json",
     ] {
         let path = dest.split_once("://").unwrap().1;
         assert_eq!(output_file(dest), Some(PathBuf::from(path)), "{dest}");

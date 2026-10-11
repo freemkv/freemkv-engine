@@ -13,8 +13,8 @@ struct SelectionTitle {
     playlist_id: u16,
     duration_secs: f64,
     presentation: Option<PresentationIdentity>,
-    // Resolved once per model; `None` is a tag selection cannot resolve.
-    audio_languages: Vec<Option<isolang::Language>>,
+    // Raw tags: resolved only when a language preference scores them.
+    audio_tags: Vec<String>,
     evidence: TitleSelectionEvidence,
 }
 
@@ -70,15 +70,9 @@ impl SelectionModel {
                     playlist_id: title.playlist_id,
                     duration_secs: title.duration_secs,
                     presentation: crate::presentation::identity(title),
-                    audio_languages: title
-                        .streams
-                        .iter()
-                        .filter_map(|stream| match stream {
-                            libfreemkv::Stream::Audio(audio) => {
-                                Some(crate::streams::stream_lang(&audio.language))
-                            }
-                            _ => None,
-                        })
+                    audio_tags: title
+                        .audio_streams()
+                        .map(|audio| audio.language.clone())
                         .collect(),
                     evidence: title.selection_evidence.clone(),
                 })
@@ -161,9 +155,17 @@ impl SelectionModel {
             presentation.map(|language| StreamFilter::Langs(vec![language.to_string()]));
         let preference =
             crate::streams::AudioPreference::new(presentation_audio.as_ref().unwrap_or(audio));
+        if preference.is_empty() {
+            return vec![0; self.titles.len()];
+        }
         self.titles
             .iter()
-            .map(|title| preference.score_languages(&title.audio_languages))
+            .map(|title| {
+                let languages: Vec<_> = (title.audio_tags.iter())
+                    .map(|tag| crate::streams::stream_lang(tag))
+                    .collect();
+                preference.score_languages(&languages)
+            })
             .collect()
     }
 

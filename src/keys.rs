@@ -118,12 +118,9 @@ pub fn rip_scope(disc: &libfreemkv::Disc, titles: &[usize], output: RipOutput) -
 }
 
 // The titles a key scope covers for the main title with every audio kept: title 0 (none on
-// an empty disc).
+// an empty disc). With no language wanted no cut outranks title 0, so no model is needed.
 pub(crate) fn main_scope(disc: &libfreemkv::Disc) -> Vec<usize> {
-    crate::SelectionModel::from_titles(&disc.titles)
-        .main_title(&crate::StreamFilter::All, None)
-        .into_iter()
-        .collect()
+    (!disc.titles.is_empty()).then_some(0).into_iter().collect()
 }
 
 /// Resolve a rip's keys ONCE, before any output (KU §2.1, §2.3): the one engine call every

@@ -314,3 +314,38 @@ fn duplicate_requested_languages_count_once() {
         );
     }
 }
+
+// Only scoring resolves stream tags, once per audio stream of a model: building a model and
+// every selection that ranks no language (`All`, `Titles`, `Longest`, MainMovie keeping every
+// audio) resolves none, as on a 999-playlist disc whose unknown tags scan isolang's names.
+#[test]
+fn only_a_language_preference_resolves_stream_tags() {
+    use crate::streams::LANG_LOOKUPS;
+    let lookups = |f: &dyn Fn()| {
+        LANG_LOOKUPS.with(|n| n.set(0));
+        f();
+        LANG_LOOKUPS.with(|n| n.get())
+    };
+    let titles = crate::test_fixtures::branch_titles();
+    let audio_streams = titles.iter().flat_map(|t| t.audio_streams()).count();
+    assert!(audio_streams > 0);
+    let all = StreamFilter::All;
+    let none = lookups(&|| {
+        let model = SelectionModel::from_titles(&titles);
+        for selection in [
+            Selection::All,
+            Selection::Titles(vec![1]),
+            Selection::Longest,
+        ] {
+            model.select(&selection, &all, None).unwrap();
+        }
+        assert_eq!(model.main_title(&all, None), Some(0));
+    });
+    assert_eq!(none, 0);
+    let de = StreamFilter::Langs(vec!["de".into()]);
+    let scored = lookups(&|| {
+        let model = SelectionModel::from_titles(&titles);
+        assert_eq!(model.main_title(&de, None), Some(1));
+    });
+    assert_eq!(scored, audio_streams);
+}

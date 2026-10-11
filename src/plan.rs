@@ -461,6 +461,7 @@ fn image(
     };
     let job = crate::Job {
         selection: plan.titles.clone(),
+        streams: plan.streams.clone(),
         raw: plan.raw,
         keys,
         ..crate::Job::new(plan.source.clone(), path.display().to_string())

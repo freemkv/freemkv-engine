@@ -2992,7 +2992,7 @@ impl PassHost for PatchBreaker {
 }
 
 fn patch_failure_run(
-    policy: OnPatchFailure,
+    policy: Option<OnPatchFailure>,
     tag: &str,
 ) -> (crate::Result<MultipassResult>, EventLog) {
     let (_dir, iso, _map, disc) = in_title_damage_fixture(tag);
@@ -3000,11 +3000,12 @@ fn patch_failure_run(
         inner: never_healing_reader(),
         patching: false,
     };
+    let defaults = MultipassOpts::default();
     let opts = MultipassOpts {
         max_passes: 3,
-        on_patch_failure: policy,
+        on_patch_failure: policy.unwrap_or(defaults.on_patch_failure),
         is_iso_output: false,
-        ..Default::default()
+        ..defaults
     };
     let log = EventLog::default();
     let op = libfreemkv::Halt::new();
@@ -3024,7 +3025,7 @@ fn patch_failure_run(
 
 #[test]
 fn a_failed_patch_pass_fails_the_run_by_default() {
-    let (r, log) = patch_failure_run(OnPatchFailure::Fail, "patch-fail-default");
+    let (r, log) = patch_failure_run(None, "patch-fail-default");
     assert!(
         matches!(r, Err(libfreemkv::Error::WholeDiscKeyMissing)),
         "{r:?}"
@@ -3037,7 +3038,7 @@ fn a_failed_patch_pass_fails_the_run_by_default() {
 
 #[test]
 fn a_failed_patch_pass_finishes_the_run_under_the_finish_policy() {
-    let (r, log) = patch_failure_run(OnPatchFailure::Finish, "patch-fail-finish");
+    let (r, log) = patch_failure_run(Some(OnPatchFailure::Finish), "patch-fail-finish");
     let r = r.expect("Finish ends the passes and reports what was read");
     assert_eq!(r.passes, 1, "{r:?}");
     assert_eq!(
@@ -3124,4 +3125,97 @@ fn an_empty_selection_has_no_main_title_in_progress() {
             "{sizes:?}"
         );
     }
+}
+
+// Every single-pass route reports the cut the audio filter picks as its main title: the
+// scoped and unscoped single pass of `recover`, the per-invocation `one_pass` and the public
+// `recover_to_iso`.
+#[test]
+fn single_passes_report_the_audio_picked_main_title() {
+    let variant_size = Some(150 * 2048);
+    let deu = crate::StreamFilter::Langs(vec!["deu".into()]);
+    let disc = variant_disc();
+    let reader = || MultiSpotReader {
+        capacity: 4096,
+        spots: vec![],
+    };
+    let job = |iso: &std::path::Path| {
+        let mut job = raw_job(iso);
+        job.streams.audio = deu.clone();
+        job
+    };
+    let sizes = |log: &EventLog| log.sizes.lock().unwrap().clone();
+    let single = MultipassOpts {
+        max_passes: 0,
+        ..Default::default()
+    };
+    let whole = [(0u32, 4096u32)];
+    for (tag, scope) in [("single-scoped", Some(&whole[..])), ("single-whole", None)] {
+        let (_dir, iso) = scratch_iso(tag);
+        let (op, log) = (libfreemkv::Halt::new(), EventLog::default());
+        let halt = crate::EngineHalt::new(&op, None);
+        let mut r = reader();
+        let mut host = crate::ReaderHost(&mut r);
+        recover(
+            &disc,
+            &mut host,
+            &iso,
+            &job(&iso),
+            &single,
+            scope,
+            &log,
+            &halt,
+        )
+        .unwrap();
+        let sizes = sizes(&log);
+        assert!(!sizes.is_empty(), "{tag}");
+        assert!(sizes.iter().all(|&z| z == variant_size), "{tag}: {sizes:?}");
+    }
+    let (_dir, iso) = scratch_iso("one-pass");
+    let (op, log) = (libfreemkv::Halt::new(), EventLog::default());
+    let halt = crate::EngineHalt::new(&op, None);
+    one_pass(
+        &disc,
+        &mut reader(),
+        &iso,
+        &job(&iso),
+        true,
+        &log,
+        (&halt, &op),
+    )
+    .unwrap();
+    assert!(
+        sizes(&log).iter().all(|&z| z == variant_size),
+        "{:?}",
+        sizes(&log)
+    );
+    assert!(!sizes(&log).is_empty());
+    let (_dir, iso) = scratch_iso("recover-to-iso");
+    let log = EventLog::default();
+    crate::recover_to_iso(&disc, &mut reader(), &iso, &job(&iso), &log).unwrap();
+    assert!(
+        sizes(&log).iter().all(|&z| z == variant_size),
+        "{:?}",
+        sizes(&log)
+    );
+    assert!(!sizes(&log).is_empty());
+}
+
+// An Episodes recovery on a disc without a roster needs review: progress reports its first
+// candidate, the audio-preferred one of two aliased cuts (title 1), not title 0 or none.
+#[test]
+fn progress_of_a_selection_needing_review_is_its_first_candidate() {
+    let base = test_title(0, 1);
+    let cut = &[(0, 100), (300, 60)];
+    let disc = test_disc(
+        4096,
+        vec![
+            audio_title(base.clone(), cut, "eng"),
+            audio_title(base, cut, "deu"),
+        ],
+    );
+    let mut job = raw_job(std::path::Path::new("x.iso")).with_selection(crate::Selection::Episodes);
+    job.streams.audio = crate::StreamFilter::Langs(vec!["deu".into()]);
+    assert!(crate::resolve_selection(&disc, &job.selection, &job.streams.audio, None).is_err());
+    assert_eq!(progress_main_title(&disc, &job), Some(1));
 }

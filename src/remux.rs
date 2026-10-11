@@ -70,8 +70,8 @@ impl MuxPlan {
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`,
 /// under the [`run_titles`] loop policy. Each title is bracketed by
 /// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails or stops into a file
-/// sink removes its partial file only if it made it (its mux opened the output, or the path
-/// was proven absent or different before); a directory sink (ending in `/`) is left alone.
+/// sink removes its partial file only if its own mux opened that output; a file another
+/// writer made or changed there is never removed. A directory sink (ending in `/`) is left alone.
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
 /// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
@@ -103,20 +103,37 @@ pub fn mux_image_titles_with(
         Ok(keys) => keys,
         Err(e) => return refused_up_front(e, plan, dest, sink),
     };
+    mux_titles(plan, dest, sink, &halt, |idx, selection, dest, watch| {
+        mux_opened_title(opened, &keys, idx, selection, dest, &plan.mux, watch)
+    })
+}
+
+// The title loop of `mux_image_titles_with`, each title muxed by `mux` into the sink it is
+// given (the title's watch, which notes the output opening).
+fn mux_titles(
+    plan: &MuxPlan,
+    dest: &dyn Fn(usize) -> String,
+    sink: &dyn Sink,
+    halt: &EngineHalt<'_>,
+    mux: impl Fn(
+        usize,
+        libfreemkv::StreamSelection,
+        &str,
+        &dyn Sink,
+    ) -> io::Result<libfreemkv::MuxOutcome>,
+) -> RipOutcome {
     run_titles(&plan.titles, plan.explicit_selection, sink, |idx| {
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
-        let selection = plan.selection_for(idx);
-        let out_file = output_file(&dest);
-        let before = out_file
-            .as_deref()
-            .map(|p| Before::of(std::fs::metadata(p)));
         let watch = OpenedWatch::new(sink);
-        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, &watch);
+        let result = mux(idx, plan.selection_for(idx), &dest, &watch);
         let opened_output = watch.opened() || result.as_ref().is_ok_and(|o| o.output_opened);
-        let result = result.and_then(|outcome| finished(outcome, idx, &halt));
-        if let (Err(_), Some(path), Some(before)) = (&result, &out_file, before) {
-            remove_failed_output(path, before, opened_output);
+        let result = result.and_then(|outcome| finished(outcome, idx, halt));
+        if result.is_err()
+            && opened_output
+            && let Some(path) = output_file(&dest)
+        {
+            let _ = std::fs::remove_file(path);
         }
         sink.event(&Event::TitleDone {
             idx,
@@ -157,49 +174,6 @@ fn output_file(dest: &str) -> Option<PathBuf> {
         | U::Chapters { path }
         | U::Json { path } => Some(path),
         _ => None,
-    }
-}
-
-// Length and mtime of a file.
-type Stamp = (u64, Option<std::time::SystemTime>);
-
-fn stamp_of(m: &std::fs::Metadata) -> Stamp {
-    (m.len(), m.modified().ok())
-}
-
-// What a title's output path held before its mux. Only NotFound is `Absent`: a stat that
-// failed otherwise (EIO, ESTALE, EACCES on a flaky share) is `Unknown`, never "absent".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Before {
-    Absent,
-    Present(Stamp),
-    Unknown,
-}
-
-impl Before {
-    fn of(stat: io::Result<std::fs::Metadata>) -> Self {
-        match stat {
-            Ok(m) => Before::Present(stamp_of(&m)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Before::Absent,
-            Err(_) => Before::Unknown,
-        }
-    }
-}
-
-// Remove the file a failed mux left at `path` only when this run made it: the mux opened its
-// output (`opened`), or `before` proved the path absent or of another stamp. An unknown
-// `before` with no opened output never deletes an earlier rip.
-fn remove_failed_output(path: impl AsRef<Path>, before: Before, opened: bool) {
-    let path = path.as_ref();
-    let now = std::fs::metadata(path).map(|m| stamp_of(&m));
-    let created = match (before, now) {
-        (_, Err(_)) => false,
-        (Before::Absent, Ok(_)) => true,
-        (Before::Present(was), Ok(now)) => now != was,
-        (Before::Unknown, Ok(_)) => false,
-    };
-    if opened || created {
-        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -431,7 +405,7 @@ pub struct RemuxReport {
 /// `<target>.partial`, fsync, [`verify_mkv`], then rename over the target and fsync its
 /// folder. On any failure or cancel the partial file and the lock are removed and an
 /// existing target is left exactly as it was; a filesystem that cannot publish without
-/// replacing keeps the verified output as `<target>.verified` ([`RemuxUnpublished`]). The
+/// replacing keeps the verified output beside the target ([`RemuxUnpublished`]). The
 /// chosen title goes to [`Sink::title_opened`]; phases and the mux are reported as [`Event`]s.
 pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Result<RemuxReport> {
     remux_iso_with(job, keys, sink, &Halt::new())
@@ -571,7 +545,7 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
 // coded I/O error (E5000) of its own kind, but a target found there, which is E9084.
 fn land(landing: &Path, job: &RemuxJob, rio: &dyn RemuxIo) -> io::Result<()> {
     let published = match job.replace {
-        true => std::fs::rename(landing, &job.target),
+        true => rio.replace(landing, &job.target),
         false => rio.publish(landing, &job.target),
     };
     published.map_err(|e| match e.kind() {
@@ -589,12 +563,14 @@ fn coded_io(e: io::Error) -> io::Error {
 }
 
 /// The error of a remux whose target filesystem can neither rename without replacing nor
-/// hard-link: the verified output is kept at `kept` (`<target>.verified`) for a manual
-/// publish. Its code and text are the I/O error's (E5000); its kind is `Unsupported`.
+/// hard-link: the verified output is kept at `kept` for a manual publish, never replacing a
+/// file: `<target>.verified`, else the first free `<target>.verified.<n>`, else (a name too
+/// long for the folder) `freemkv-remux-<n>.verified` beside it. Its code and text are the I/O
+/// error's (E5000), shown once (it has no `source`); its kind is `Unsupported`.
 #[derive(Debug)]
 pub struct RemuxUnpublished {
     pub kept: PathBuf,
-    source: io::Error,
+    error: io::Error,
 }
 
 impl RemuxUnpublished {
@@ -606,39 +582,53 @@ impl RemuxUnpublished {
 
 impl std::fmt::Display for RemuxUnpublished {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.source.fmt(f)
+        self.error.fmt(f)
     }
 }
 
-impl std::error::Error for RemuxUnpublished {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.source)
-    }
+impl std::error::Error for RemuxUnpublished {}
+
+// How many numbered names an unpublished output tries, of each form.
+const KEPT_NAMES: usize = 16;
+
+// Where an unpublished verified output may be kept, in order: beside the target, never the
+// `.partial` a retry sweeps, and not an `.mkv` a library lists.
+fn kept_names(target: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    let verified = verified_path(target);
+    let numbered = (1..KEPT_NAMES).map(move |n| {
+        let mut name = verified.file_name().unwrap_or_default().to_os_string();
+        name.push(format!(".{n}"));
+        verified.with_file_name(name)
+    });
+    let short =
+        (1..=KEPT_NAMES).map(|n| target.with_file_name(format!("freemkv-remux-{n}.verified")));
+    std::iter::once(verified_path(target))
+        .chain(numbered)
+        .chain(short)
 }
 
-// Where an unpublished verified output is kept: beside the target, outside the `.partial`
-// a retry sweeps, and not an `.mkv` a library lists.
 fn verified_path(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".verified");
     target.with_file_name(name)
 }
 
-// Keep the verified `landing` as `<target>.verified` (it stays at `landing` if even that
-// rename fails), and name it in the error.
-fn keep_unpublished(landing: &Path, target: &Path, e: io::Error, sink: &dyn Sink) -> io::Error {
-    let verified = verified_path(target);
-    let kept = match std::fs::rename(landing, &verified) {
-        Ok(()) => verified,
-        Err(_) => landing.to_path_buf(),
+// Move the verified `landing` to the first free kept name. The filesystem has no no-replace
+// rename, so each name is checked absent, then renamed to; the target's lock serializes every
+// engine remux to it, so only a foreign writer can race that check. `None`: no name was taken.
+fn keep_unpublished(landing: &Path, target: &Path, sink: &dyn Sink) -> Option<PathBuf> {
+    let free = |p: &Path| matches!(std::fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound);
+    let kept = kept_names(target).find(|name| free(name) && std::fs::rename(landing, name).is_ok());
+    let msg = match &kept {
+        Some(kept) => {
+            let shown = crate::mux::log_safe(&kept.display().to_string());
+            format!("publish unsupported; verified remux kept at {shown}")
+        }
+        None => "publish unsupported, and no name beside the target could keep the verified remux"
+            .into(),
     };
-    let shown = crate::mux::log_safe(&kept.display().to_string());
-    sink.log(
-        Level::Warn,
-        &format!("publish unsupported; verified remux kept at {shown}"),
-    );
-    let kind = e.kind();
-    io::Error::new(kind, RemuxUnpublished { kept, source: e })
+    sink.log(Level::Warn, &msg);
+    kept
 }
 
 fn target_exists(target: &Path) -> io::Error {
@@ -757,6 +747,10 @@ pub(crate) trait RemuxIo: Sync {
     /// Move `landing` to `target` only if `target` is absent.
     fn publish(&self, landing: &Path, target: &Path) -> io::Result<()> {
         libfreemkv::io::publish::no_replace(landing, target)
+    }
+    /// Move `landing` to `target`, replacing it.
+    fn replace(&self, landing: &Path, target: &Path) -> io::Result<()> {
+        std::fs::rename(landing, target)
     }
 }
 
@@ -882,9 +876,13 @@ fn land_verified(
     if let Err(e) = land(landing, job, rio) {
         // No publication without replacing: a retry would fail the same way after the whole
         // mux again, so the verified output is kept for a manual publish.
-        if !job.replace && e.kind() == io::ErrorKind::Unsupported {
+        if !job.replace
+            && e.kind() == io::ErrorKind::Unsupported
+            && let Some(kept) = keep_unpublished(landing, &job.target, sink)
+        {
             remote_guard.as_mut().unwrap_or(&mut guard).disarm();
-            return Err(keep_unpublished(landing, &job.target, e, sink));
+            let kind = e.kind();
+            return Err(io::Error::new(kind, RemuxUnpublished { kept, error: e }));
         }
         return Err(e);
     }

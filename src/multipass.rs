@@ -549,7 +549,7 @@ pub(crate) fn end_of_recovery_lost_ms(
 // The first title this rip delivers (for `MainMovie`, the one measured_titles measures). A
 // selection resolving to nothing has none: `usize::MAX` is no index, so progress reports no
 // main title rather than title 0.
-fn progress_main_title(disc: &libfreemkv::Disc, job: &Job) -> Option<usize> {
+pub(crate) fn progress_main_title(disc: &libfreemkv::Disc, job: &Job) -> Option<usize> {
     crate::resolve_selection(disc, &job.selection, &job.streams.audio, None)
         .unwrap_or_else(|review| review.candidates)
         .into_iter()
@@ -933,7 +933,16 @@ pub(crate) fn recover(
     let titles = measured_titles(disc, job, &empty_title);
     let main_title = progress_main_title(disc, job);
     if !plan.multipass {
-        return single_pass(disc, host.reader(), iso_path, job, scope, sink, halt);
+        return single_pass(
+            disc,
+            host.reader(),
+            iso_path,
+            job,
+            scope,
+            main_title,
+            sink,
+            halt,
+        );
     }
 
     // ── Pass 1: the sweep over a mapfile this version wrote (or as the host decides): it
@@ -1081,7 +1090,7 @@ pub(crate) fn recover(
                 iso_path,
                 &patch_opts,
                 halt,
-                progress_main_title(disc, job),
+                main_title,
             ) {
                 Ok(pr) => pr,
                 Err(e) if opts.on_patch_failure == OnPatchFailure::Finish => {
@@ -1322,17 +1331,20 @@ pub(crate) fn one_pass(
         halt: Some(op.as_arc().clone()),
         keys: job.keys.clone(),
     };
-    crate::recovery::copy_in(disc, reader, iso_path, &opts, halt)
+    let main_title = progress_main_title(disc, job);
+    crate::recovery::copy_titled(disc, reader, iso_path, &opts, halt, main_title)
 }
 
 // The single-pass recovery (`max_passes == 0`): one `copy` dispatch (sweep-or-resume via
 // mapfile state), no retry loop, no ISO-multipass semantics, no abort gate.
+#[allow(clippy::too_many_arguments)]
 fn single_pass(
     disc: &libfreemkv::Disc,
     reader: &mut dyn libfreemkv::SectorSource,
     iso_path: &std::path::Path,
     job: &Job,
     scope: Option<&[(u32, u32)]>,
+    main_title: Option<usize>,
     sink: &dyn Sink,
     halt: &crate::EngineHalt<'_>,
 ) -> crate::Result<MultipassResult> {
@@ -1364,10 +1376,10 @@ fn single_pass(
                 &sweep_opts,
                 Some(scope),
                 halt,
-                progress_main_title(disc, job),
+                main_title,
             )?
         }
-        None => crate::recovery::copy_in(disc, reader, iso_path, &copy_opts, halt)?,
+        None => crate::recovery::copy_titled(disc, reader, iso_path, &copy_opts, halt, main_title)?,
     };
     // Clean is a claim about the DISC, not the plan. `bytes_pending` is safe
     // here (unlike the aggregate `bad_sector_count` forbids) because every

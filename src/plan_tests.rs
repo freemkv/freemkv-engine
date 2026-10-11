@@ -885,3 +885,126 @@ fn a_main_movie_title_run_picks_the_audio_preferred_cut() {
     let all = crate::StreamFilter::All;
     assert_eq!(title_index(&movie(all), Some(&disc)).ok(), Some(0));
 }
+
+// End to end over an image whose two titles are cuts of one programme (the scan's segments
+// prove it): a keyed MainMovie title run with German audio muxes the German cut, title 1;
+// keeping every audio it muxes title 0.
+#[test]
+fn a_keyed_main_movie_title_run_muxes_the_audio_preferred_cut() {
+    let fx = crate::test_fixtures::branch_image();
+    let shared = &fx.disc.titles[1].selection_evidence.segments;
+    assert!(
+        !shared.is_empty(),
+        "the scan describes the cuts by segments"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "src.iso");
+    for (audio, language) in [
+        (crate::StreamFilter::Langs(vec!["de".into()]), "deu"),
+        (crate::StreamFilter::All, "eng"),
+    ] {
+        let out = dir.path().join(format!("{language}.mkv"));
+        let p = Plan {
+            titles: Selection::MainMovie,
+            streams: StreamChoice {
+                audio,
+                ..StreamChoice::default()
+            },
+            ..plan(
+                &format!("iso://{}", iso.display()),
+                &format!("mkv://{}", out.display()),
+            )
+        };
+        let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+        assert_eq!(muxed_audio(&p, with(f), &out), [language]);
+    }
+}
+
+// A title run's muxed audio languages, as the output MKV declares them.
+fn muxed_audio(p: &Plan, with: RunWith<'_>, out: &std::path::Path) -> Vec<String> {
+    let Report::Title { outcome } = run_with(p, with, &crate::NoopSink).expect("muxes") else {
+        panic!("a title report")
+    };
+    assert!(outcome.completed, "{outcome:?}");
+    let file = std::io::BufReader::new(std::fs::File::open(out).unwrap());
+    let probe = libfreemkv::probe_mkv_with_cues(file).unwrap();
+    probe.tracks.into_iter().map(|t| t.language).collect()
+}
+
+// A MainMovie run needing neither keys (held) nor the title's streams (the front end's
+// selection) still scans for an audio filter: German audio muxes the German cut, not title 0.
+#[test]
+fn a_held_key_main_movie_run_with_its_own_selection_still_follows_the_audio() {
+    let fx = crate::test_fixtures::branch_image();
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!("iso://{}", fx.write(dir.path(), "src.iso").display());
+    let out = dir.path().join("o.mkv");
+    let p = Plan {
+        titles: Selection::MainMovie,
+        streams: StreamChoice {
+            audio: crate::StreamFilter::Langs(vec!["de".into()]),
+            ..StreamChoice::default()
+        },
+        ..plan(&source, &format!("mkv://{}", out.display()))
+    };
+    let with = RunWith {
+        keys: Some(held_keys(&fx, &source)),
+        title: TitleOptions {
+            selection: Some(libfreemkv::StreamSelection::default()),
+            ..TitleOptions::default()
+        },
+        ..RunWith::default()
+    };
+    assert_eq!(muxed_audio(&p, with, &out), ["deu"]);
+}
+
+// An image run's recovery follows the plan's audio filter: on the branch-variant image with
+// German audio, every pass reports the German cut as its main title, whether the run takes
+// recovery passes, a single one, or one per invocation.
+#[test]
+fn an_image_run_recovery_reports_the_audio_picked_main_title() {
+    #[derive(Default)]
+    struct Sizes(std::sync::Mutex<Vec<Option<u64>>>);
+    impl crate::Sink for Sizes {
+        fn event(&self, e: &crate::Event<'_>) {
+            if let crate::Event::Pass(p) = e {
+                self.0.lock().unwrap().push(p.main_title_size_bytes);
+            }
+        }
+    }
+    let fx = crate::test_fixtures::branch_image();
+    let german = Some(fx.disc.titles[1].size_bytes);
+    assert_ne!(german, Some(fx.disc.titles[0].size_bytes));
+    let dir = tempfile::tempdir().unwrap();
+    let src = fx.write(dir.path(), "src.iso");
+    let multipass = crate::MultipassOpts {
+        max_passes: 2,
+        ..Default::default()
+    };
+    for (n, passes) in [Some(multipass), Some(Default::default()), None]
+        .into_iter()
+        .enumerate()
+    {
+        let dst = dir.path().join(format!("{n}.iso"));
+        let p = Plan {
+            streams: StreamChoice {
+                audio: crate::StreamFilter::Langs(vec!["de".into()]),
+                ..StreamChoice::default()
+            },
+            multipass: true,
+            ..plan(
+                &format!("iso://{}", src.display()),
+                &format!("iso://{}", dst.display()),
+            )
+        };
+        let with = RunWith {
+            passes,
+            ..with(factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default()))
+        };
+        let sink = Sizes::default();
+        run_with(&p, with, &sink).expect("the image copies");
+        let sizes = sink.0.into_inner().unwrap();
+        assert!(!sizes.is_empty(), "{passes:?}");
+        assert!(sizes.iter().all(|&z| z == german), "{passes:?}: {sizes:?}");
+    }
+}

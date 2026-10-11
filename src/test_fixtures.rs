@@ -30,28 +30,44 @@ pub(crate) const TITLE_SECS: u32 = 120;
 // A one-PlayItem MPLS on `clip` whose STN lists the LPCM stream (KS-10 aside, one CPS
 // unit per clip here). In/out times in 45 kHz ticks from 1 s.
 fn one_item_mpls(clip: &[u8; 5]) -> Vec<u8> {
-    let mut item = clip.to_vec();
-    item.extend_from_slice(b"M2TS");
-    item.extend_from_slice(&[0u8; 3]);
-    item.extend_from_slice(&45_000u32.to_be_bytes());
-    item.extend_from_slice(&(45_000u32 * (1 + TITLE_SECS)).to_be_bytes());
-    item.extend_from_slice(&[0u8; 12]);
-    let mut stn = vec![0u8, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    stn.extend_from_slice(&[3, 0x01]);
-    stn.extend_from_slice(&AUDIO_PID.to_be_bytes());
-    stn.extend_from_slice(&[5, 0x80, 0x31]);
-    stn.extend_from_slice(b"eng");
-    item.extend_from_slice(&stn);
+    mpls(&[(*clip, TITLE_SECS)], b"eng")
+}
+
+// A sequential MPLS playing `items` in order, `(clip, seconds)` each from 1 s into the clip;
+// the first item's STN lists the LPCM stream in `language`, a later item's lists nothing.
+fn mpls(items: &[([u8; 5], u32)], language: &[u8; 3]) -> Vec<u8> {
     let mut pl = vec![0u8; 6];
-    pl.extend_from_slice(&1u16.to_be_bytes());
+    pl.extend_from_slice(&(items.len() as u16).to_be_bytes());
     pl.extend_from_slice(&[0u8; 2]);
-    pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
-    pl.extend_from_slice(&item);
+    for (i, (clip, secs)) in items.iter().enumerate() {
+        let mut item = clip.to_vec();
+        item.extend_from_slice(b"M2TS");
+        item.extend_from_slice(&[0u8; 3]);
+        item.extend_from_slice(&45_000u32.to_be_bytes());
+        item.extend_from_slice(&(45_000u32 * (1 + secs)).to_be_bytes());
+        item.extend_from_slice(&[0u8; 12]);
+        let audio = u8::from(i == 0);
+        let mut stn = vec![0u8, 0, 0, 0, 0, audio, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        if i == 0 {
+            stn.extend_from_slice(&[3, 0x01]);
+            stn.extend_from_slice(&AUDIO_PID.to_be_bytes());
+            stn.extend_from_slice(&[5, 0x80, 0x31]);
+            stn.extend_from_slice(language);
+        }
+        item.extend_from_slice(&stn);
+        pl.extend_from_slice(&(item.len() as u16).to_be_bytes());
+        pl.extend_from_slice(&item);
+    }
     let pl_len = (pl.len() - 4) as u32;
     pl[0..4].copy_from_slice(&pl_len.to_be_bytes());
     let mut buf = b"MPLS0200".to_vec();
-    buf.extend_from_slice(&40u32.to_be_bytes());
+    buf.extend_from_slice(&58u32.to_be_bytes());
     buf.extend_from_slice(&[0u8; 28]);
+    // AppInfoPlayList: length 14, reserved, PlayList_playback_type 1 (sequential), as real
+    // discs declare, so the scan describes each title by segments.
+    buf.extend_from_slice(&14u32.to_be_bytes());
+    buf.extend_from_slice(&[0, 1]);
+    buf.extend_from_slice(&[0u8; 12]);
     buf.extend_from_slice(&pl);
     buf
 }
@@ -154,15 +170,46 @@ pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
 
 /// [`bd_image`] with each clip's length in units (a larger title's piece is asked first).
 pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize) -> Fx {
+    let playlists = (0..sized.len())
+        .map(|i| one_item_mpls(&clip_id(i)))
+        .collect();
+    bd_image_playlists(sized, declared, playlists)
+}
+
+/// Two cuts of one programme, a branch variant: title 0 the English cut (clip 0, then 10 s of
+/// clip 1), title 1 the German cut (clip 0, then 5 s of the smaller clip 2). Clips 0 and 1
+/// are keyed K1, clip 2 K2.
+pub(crate) fn branch_image() -> Fx {
+    let sized = [
+        (Some(K1), CLIP_UNITS),
+        (Some(K1), CLIP_UNITS),
+        (Some(K2), 8),
+    ];
+    let english = mpls(&[(clip_id(0), TITLE_SECS), (clip_id(1), 10)], b"eng");
+    let german = mpls(&[(clip_id(0), TITLE_SECS), (clip_id(2), 5)], b"deu");
+    bd_image_playlists(&sized, 2, vec![english, german])
+}
+
+fn clip_id(i: usize) -> [u8; 5] {
+    format!("{i:05}").as_bytes().try_into().unwrap()
+}
+
+// A BD image of the clips `sized` (as [`bd_image_sized`]) whose playlists are `playlists`,
+// one title each.
+fn bd_image_playlists(
+    sized: &[(Option<[u8; 16]>, u32)],
+    declared: usize,
+    playlists: Vec<Vec<u8>>,
+) -> Fx {
     let clips: Vec<Option<[u8; 16]>> = sized.iter().map(|c| c.0).collect();
     let uk_ro = libfreemkv::test_util::unit_key_ro(
         AacsVersion::V10,
         &vec![[0xEE; 16]; declared],
         &vec![1u16; clips.len()],
     );
-    let n = clips.len();
+    let (n, p) = (clips.len(), playlists.len());
     let mut files = vec![BdFile::new("BDMV/index.bdmv", 1, None)];
-    for i in 0..n {
+    for i in 0..p {
         files.push(BdFile::new(format!("BDMV/PLAYLIST/{i:05}.mpls"), 1, None));
     }
     for i in 0..n {
@@ -177,7 +224,7 @@ pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize)
     }
     let mut img = encrypted_bd_image(&files, &uk_ro);
     for (i, key) in clips.iter().enumerate() {
-        let (start, _) = img.files[1 + 2 * n + i];
+        let (start, _) = img.files[1 + p + n + i];
         let n_packets = sized[i].1 * 32;
         for u in 0..sized[i].1 {
             let mut unit: Vec<u8> = (0..32)
@@ -191,26 +238,27 @@ pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize)
             img.image[at..at + unit.len()].copy_from_slice(&unit);
         }
     }
-    for (i, &(_, units)) in sized.iter().enumerate() {
-        let clip = format!("{i:05}");
-        let clip: [u8; 5] = clip.as_bytes().try_into().unwrap();
-        for (f, bytes) in [
-            (1 + i, one_item_mpls(&clip)),
-            (1 + n + i, minimal_clpi(units * 32)),
-        ] {
-            let at = img.files[f].0 as usize * 2048;
-            img.image[at..at + bytes.len()].copy_from_slice(&bytes);
-        }
+    let clpis = sized
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, units))| (1 + p + i, minimal_clpi(units * 32)));
+    let mpls = playlists
+        .into_iter()
+        .enumerate()
+        .map(|(i, bytes)| (1 + i, bytes));
+    for (f, bytes) in mpls.chain(clpis) {
+        let at = img.files[f].0 as usize * 2048;
+        img.image[at..at + bytes.len()].copy_from_slice(&bytes);
     }
     let mut src = MemSource::new(img.image.clone());
     let cap = src.capacity_sectors();
     let disc = Disc::scan_image(&mut src, cap, &libfreemkv::ScanOptions::default()).unwrap();
     assert_eq!(
         disc.titles.len(),
-        n,
-        "the fixture scans to one title per clip"
+        p,
+        "the fixture scans to one title per playlist"
     );
-    let mut metadata: Vec<(u32, u32)> = img.files[1..=n].to_vec();
+    let mut metadata: Vec<(u32, u32)> = img.files[1..=p].to_vec();
     metadata.push(uk_ro_extent(&img));
     Fx {
         img,

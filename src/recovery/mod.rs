@@ -136,6 +136,19 @@ pub(crate) fn copy_in(
     opts: &CopyOptions,
     halt: &EngineHalt<'_>,
 ) -> Result<CopyResult> {
+    copy_titled(disc, reader, path, opts, halt, None)
+}
+
+// `copy_in` reporting `main_title` (an index into `disc.titles`; `None`: title 0) as the main
+// title in its sweep's or patch's progress.
+pub(crate) fn copy_titled(
+    disc: &libfreemkv::Disc,
+    reader: &mut dyn SectorSource,
+    path: &std::path::Path,
+    opts: &CopyOptions,
+    halt: &EngineHalt<'_>,
+    main_title: Option<usize>,
+) -> Result<CopyResult> {
     // Pre-flight decrypt gate: without it, a decrypting copy of an encrypted disc
     // with no usable key would silently write ciphertext to the ISO and still
     // return Ok at exit 0. `--raw` (opts.decrypt == false) makes this a no-op.
@@ -157,7 +170,7 @@ pub(crate) fn copy_in(
             Ok(map) => map,
             Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                 tracing::info!("copy dispatch: → sweep (mapfile is corrupt/unparseable)");
-                return sweep_internal(disc, reader, path, opts, false, halt);
+                return sweep_internal(disc, reader, path, opts, false, halt, main_title);
             }
             Err(e) => return Err(Error::from(e)),
         };
@@ -167,7 +180,7 @@ pub(crate) fn copy_in(
             && no_image(path)?
         {
             tracing::info!("copy dispatch: → sweep (another disc's mapfile has no image)");
-            return sweep_internal(disc, reader, path, opts, false, halt);
+            return sweep_internal(disc, reader, path, opts, false, halt, main_title);
         }
         // A scoped (MKV-staging) image resumed as iso://: the gate above proved every
         // stream file is now located, so widen it and let the dispatch fill the rest.
@@ -183,7 +196,7 @@ pub(crate) fn copy_in(
         if map.raw().is_some_and(|raw| raw == opts.decrypt) {
             // An image of the other raw/decrypt mode: resuming or patching it would mix the two.
             tracing::warn!("copy dispatch: image is in the other raw/decrypt mode; overwriting it");
-            return sweep_internal(disc, reader, path, opts, false, halt);
+            return sweep_internal(disc, reader, path, opts, false, halt, main_title);
         }
         let stats = map.stats();
         let disc_size = disc.capacity_bytes;
@@ -220,7 +233,7 @@ pub(crate) fn copy_in(
                 iso_len,
                 disc_size,
             );
-            return sweep_internal(disc, reader, path, opts, false, halt);
+            return sweep_internal(disc, reader, path, opts, false, halt, main_title);
         }
         // `bytes_nontried == 0` is implied by `bad_bytes == 0` (subset), so inverting it is an
         // equivalent mutant — don't chase it.
@@ -246,7 +259,7 @@ pub(crate) fn copy_in(
                 map.total_size(),
                 disc_size,
             );
-            return sweep_internal(disc, reader, path, opts, false, halt);
+            return sweep_internal(disc, reader, path, opts, false, halt, main_title);
         }
         // NonTried bytes mean a prior sweep was halted (Ctrl-C/crash) mid-way — route
         // to resume sweep FIRST, even with retryable bytes present, since patch only
@@ -258,7 +271,7 @@ pub(crate) fn copy_in(
                 stats.bytes_nontried,
                 stats.bytes_retryable,
             );
-            return sweep_internal(disc, reader, path, opts, true, halt);
+            return sweep_internal(disc, reader, path, opts, true, halt, main_title);
         }
         // From here covers_disc=true and nontried=0: the whole disc was
         // attempted. Only the retry/patch decision differs by mode.
@@ -268,7 +281,7 @@ pub(crate) fn copy_in(
                     "copy dispatch: → patch (retryable={})",
                     stats.bytes_retryable,
                 );
-                return patch_internal(disc, reader, path, opts, halt);
+                return patch_internal(disc, reader, path, opts, halt, main_title);
             }
             // Fallthrough: nontried=0, retryable=0 — all sectors attempted, remaining
             // bad bytes are already Unreadable. Resume sweep/patch would both be
@@ -302,7 +315,7 @@ pub(crate) fn copy_in(
             false,
         ));
     }
-    sweep_internal(disc, reader, path, opts, false, halt)
+    sweep_internal(disc, reader, path, opts, false, halt, main_title)
 }
 
 // What goes in the mapfile's `# Rescue Logfile. Created by …` header — must name the crate that
@@ -570,6 +583,7 @@ fn sweep_internal(
     opts: &CopyOptions,
     resume: bool,
     halt: &EngineHalt<'_>,
+    main_title: Option<usize>,
 ) -> Result<CopyResult> {
     let sweep_opts = SweepOptions {
         decrypt: opts.decrypt,
@@ -580,7 +594,7 @@ fn sweep_internal(
         halt: opts.halt.clone(),
         keys: opts.keys.clone(),
     };
-    sweep_in(disc, reader, path, &sweep_opts, None, halt)
+    sweep_titled(disc, reader, path, &sweep_opts, None, halt, main_title)
 }
 
 fn patch_internal(
@@ -589,12 +603,13 @@ fn patch_internal(
     path: &std::path::Path,
     opts: &CopyOptions,
     halt: &EngineHalt<'_>,
+    main_title: Option<usize>,
 ) -> Result<CopyResult> {
     let patch_opts = PatchOptions {
         keys: opts.keys.clone(),
         ..PatchOptions::for_patch_pass(opts.decrypt, opts.progress, opts.halt.clone())
     };
-    let pr = patch::patch_titled(disc, reader, path, &patch_opts, halt, None)?;
+    let pr = patch::patch_titled(disc, reader, path, &patch_opts, halt, main_title)?;
     tracing::info!(
         target: "freemkv::disc",
         phase = "patch_done",

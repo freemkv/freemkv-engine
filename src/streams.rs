@@ -341,6 +341,11 @@ impl AudioPreference {
         Self(wanted)
     }
 
+    // No language wanted: every title scores 0, so its tags need no resolving.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     // Count requested languages, not tracks: duplicate tracks add no coverage. `languages` are
     // a title's tags already resolved by [`stream_lang`], once per title.
     pub(crate) fn score_languages(&self, languages: &[Option<Language>]) -> usize {
@@ -433,10 +438,18 @@ fn resolve_subtitles(
 /// a language identity, case-insensitively. `None` if unrecognized.
 // A stream's language: an untagged one is `und` (undetermined), as the refusal reports it.
 pub(crate) fn stream_lang(tag: &str) -> Option<Language> {
+    #[cfg(test)]
+    LANG_LOOKUPS.with(|n| n.set(n.get() + 1));
     match tag.trim().is_empty() {
         true => Some(Language::Und),
         false => normalize_lang(tag),
     }
+}
+
+// Stream tags resolved on this thread, so a test can see which paths resolve none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LANG_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether selection understands `tag` as a language (an ISO 639 code or an English
