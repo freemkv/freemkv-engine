@@ -769,7 +769,9 @@ fn url_source(
     })?;
     let idx = match explicit {
         Some(idx) => idx,
-        None => title_index(plan, Some(probed.disc()))?,
+        None => title_index(plan, Some(probed.disc())).inspect_err(|_| {
+            keys_event(&Default::default(), None);
+        })?,
     };
     let scope = match need_keys {
         true => libfreemkv::keys::KeyScope::Titles(vec![idx]),

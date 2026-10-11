@@ -697,7 +697,11 @@ fn the_main_title_is_the_default_and_a_missing_title_is_range_error() {
         Some(libfreemkv::Error::DiscTitleRange { index: 5, count: 2 }.code())
     );
     disc.titles.clear();
-    assert!(pick_title(&disc, None, &StreamFilter::All).is_err());
+    for title in [None, Some(0)] {
+        let e = pick_title(&disc, title, &StreamFilter::All).unwrap_err();
+        let code = libfreemkv::error::E_NO_STREAMS;
+        assert_eq!(crate::error_code(&e), Some(code), "{title:?}: {e}");
+    }
 }
 
 #[test]
@@ -889,8 +893,8 @@ impl RemuxIo for NoPublishIo {
 }
 
 // A target filesystem that cannot publish without replacing fails the remux with a coded
-// error, after the work is verified: the verified output is kept beside the target (never
-// deleted) for a manual publish, the target is not created, and the lock is released.
+// error naming the verified output it keeps as `<target>.verified` (never a `.partial`, which
+// a retry sweeps): a retry that fails again leaves it. The target is not created.
 #[test]
 fn an_unsupported_no_replace_publish_keeps_the_verified_output() {
     let dir = tempfile::tempdir().unwrap();
@@ -901,27 +905,48 @@ fn an_unsupported_no_replace_publish_keeps_the_verified_output() {
         let sink = Events::default();
         let token = Halt::new();
         let halt = EngineHalt::new(&token, None).with_sink(&sink);
-        let e = land_verified(
-            &job(target.clone(), false),
-            0,
-            &title(600.0),
-            &sink,
-            &halt,
-            &NoPublishIo,
-            staged.then_some(local.as_path()),
-            writes(new.clone(), true),
-        )
-        .unwrap_err();
+        let remux = |mux: &dyn Fn(&str) -> io::Result<libfreemkv::MuxOutcome>| {
+            let j = job(target.clone(), false);
+            let stage = staged.then_some(local.as_path());
+            land_verified(&j, 0, &title(600.0), &sink, &halt, &NoPublishIo, stage, mux)
+        };
+        let e = remux(&|dest| writes(new.clone(), true)(dest)).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
         let code = libfreemkv::error::E_IO_ERROR;
         assert_eq!(crate::error_code(&e), Some(code), "staged {staged}: {e}");
+        let kept = verified_path(&target);
+        assert_eq!(RemuxUnpublished::of(&e).map(|u| &u.kept), Some(&kept));
         assert!(!target.exists(), "staged {staged}: nothing published");
-        let kept = partial_path(&target);
         assert_eq!(std::fs::read(&kept).unwrap(), new, "staged {staged}");
-        assert!(!local.exists(), "staged {staged}: the local stage is spent");
+        assert!(
+            !partial_path(&target).exists() && !local.exists(),
+            "staged {staged}"
+        );
         let lock = dir.path().join(format!("Movie-{staged}.mkv.lock"));
         assert!(!lock.exists(), "staged {staged}: the lock is released");
+        // A retry whose mux fails sweeps its own partial, never the kept copy.
+        let fail = |dest: &str| {
+            std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half")?;
+            Err(io::Error::other("E6000: 12"))
+        };
+        assert!(remux(&fail).is_err());
+        assert_eq!(std::fs::read(&kept).unwrap(), new, "staged {staged}: retry");
     }
+}
+
+// With `replace` the publication is a plain rename: its failure is coded (E5000, its own
+// kind) and keeps nothing, an Unsupported one included.
+#[test]
+fn a_failed_replacing_rename_is_coded_and_keeps_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("missing-folder").join("Movie.mkv");
+    let landing = dir.path().join("Movie.mkv.partial");
+    std::fs::write(&landing, b"new").unwrap();
+    let e = super::land(&landing, &job(target.clone(), true), &NoPublishIo).unwrap_err();
+    assert_eq!(e.kind(), io::ErrorKind::NotFound, "{e}");
+    let code = libfreemkv::error::E_IO_ERROR;
+    assert_eq!(crate::error_code(&e), Some(code), "{e}");
+    assert!(RemuxUnpublished::of(&e).is_none());
 }
 
 // A stat that fails at title start (ESTALE on a flaky share) is no evidence the output was
@@ -1007,9 +1032,10 @@ fn a_remux_keys_the_audio_picked_cut_alone() {
     let report = remux_opening(&job, opts, &sink, &Halt::new(), None).expect("remuxes");
     assert!(report.outcome.completed);
     assert!(sink.0.lock().unwrap().contains(&"start:1".to_string()));
-    // Resolving from sources: one resolve, over the picked title.
+    // Resolving from sources: one request, and for title 1 alone (only its key K2 is held,
+    // so a resolve over title 0 would be refused).
     let calls = Calls::default();
-    let f = factory(&[(Answer::Online, &[K1, K2])], &calls);
+    let f = factory(&[(Answer::Online, &[K2])], &calls);
     let opts = OpenImageOptions {
         disc: Some(disc),
         ..OpenImageOptions::resolve(f)
@@ -1022,4 +1048,53 @@ fn a_remux_keys_the_audio_picked_cut_alone() {
         "one request, for title 1: {:?}",
         calls.all()
     );
+}
+
+// Only a file sink's path is ever removed after a failed title: a network or stdio sink
+// names no file (`network://host:port` must never become `remove_file("host:port")`), and a
+// folder sink is left alone.
+#[test]
+fn only_a_file_sink_names_an_output_file() {
+    for dest in [
+        "mkv:///o/a.mkv",
+        "m2ts:///o/a.m2ts",
+        "mp4:///o/a.mp4",
+        "mpg:///o/a.mpg",
+    ] {
+        let path = dest.split_once("://").unwrap().1;
+        assert_eq!(output_file(dest), Some(PathBuf::from(path)), "{dest}");
+    }
+    for dest in [
+        "network://127.0.0.1:9000",
+        "stdio://",
+        "null://",
+        "mkv:///o/dir/",
+    ] {
+        assert_eq!(output_file(dest), None, "{dest}");
+    }
+}
+
+// A real mux of an image title reports its output opening to the title's `OpenedWatch`,
+// the evidence a failed title uses to remove what it wrote.
+#[test]
+fn a_real_mux_reports_its_output_opening_to_the_watch() {
+    use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let set = resolve(
+        &fx,
+        KeyScope::Titles(vec![0]),
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    );
+    let opened = crate::open_image_with(&iso, OpenImageOptions::known(set.unwrap())).unwrap();
+    let watch = OpenedWatch::new(&crate::NoopSink);
+    assert!(!watch.opened());
+    let dest = format!("mkv://{}", dir.path().join("t.mkv").display());
+    let selection = libfreemkv::StreamSelection::default();
+    let mux = mux_options(false);
+    let r = mux_opened_title(&opened, &opened.keys, 0, selection, &dest, &mux, &watch);
+    assert!(r.unwrap().completed);
+    assert!(watch.opened(), "OutputOpened reached the watch");
 }

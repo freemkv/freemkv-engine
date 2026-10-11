@@ -327,14 +327,16 @@ fn an_image_title_run_resolves_its_selection_after_the_scan() {
 }
 
 // How a title run over an image is keyed: from the key sources, or raw / with the keys
-// held, each with a stream filter (so the run opens the image for its title), or raw
-// keeping every stream (so nothing is opened but a non-explicit selection's scan).
+// held, with a stream filter (so the run opens the image for its title) or keeping every
+// stream (so nothing is opened but a selection's scan).
 #[derive(Clone, Copy, Debug)]
 enum Keying {
     Resolve,
     RawFilter,
     HeldFilter,
     RawAll,
+    // Keys held, every stream kept: like `RawAll`, nothing to open for keys or streams.
+    HeldAll,
 }
 
 const KEYINGS: [Keying; 4] = [
@@ -380,12 +382,13 @@ fn image_title_run(
         titles,
         raw,
         streams: match keying {
-            Keying::RawAll => Default::default(),
+            Keying::RawAll | Keying::HeldAll => Default::default(),
             _ => filtered,
         },
         ..plan(source, &format!("{scheme}://{}", out.display()))
     };
-    let keys = matches!(keying, Keying::HeldFilter).then(|| held_keys(fx, source));
+    let keys =
+        matches!(keying, Keying::HeldFilter | Keying::HeldAll).then(|| held_keys(fx, source));
     let with = RunWith {
         keys,
         halt,
@@ -628,7 +631,7 @@ fn an_image_title_run_scans_the_image_once() {
         format!("iso://{}", iso.display()),
         format!("dir://{}", folder.display()),
     ] {
-        for keying in KEYINGS {
+        for keying in KEYINGS.into_iter().chain([Keying::HeldAll]) {
             for titles in [
                 Selection::MainMovie,
                 Selection::Longest,
@@ -638,7 +641,10 @@ fn an_image_title_run_scans_the_image_once() {
                 let (r, _) = image_title_run(&fx, &source, &out, titles.clone(), keying, None);
                 assert_eq!(verdict(r), sound(keying), "{source} {titles:?} {keying:?}");
                 let want = match (&titles, keying) {
-                    (Selection::Titles(_) | Selection::MainMovie, Keying::RawAll) => 0,
+                    (
+                        Selection::Titles(_) | Selection::MainMovie,
+                        Keying::RawAll | Keying::HeldAll,
+                    ) => 0,
                     _ => 1,
                 };
                 assert_eq!(scans.get(), want, "{source} {titles:?} {keying:?}");
@@ -838,6 +844,12 @@ fn a_title_run_reports_its_key_acquisition() {
         run(&title(&bad, false), with(keyed())),
         (false, vec![false])
     );
+    // A selection the probed disc refuses (review) is a refusal before any key, too.
+    let review = Plan {
+        titles: Selection::Episodes,
+        ..title(&source, false)
+    };
+    assert_eq!(run(&review, with(keyed())), (false, vec![false]));
     // A loose clip of an encrypted disc folder: its folder's keys.
     let clip = fx.write_folder(&dir.path().join("folder"));
     let m2ts = format!("m2ts://{}", clip.display());

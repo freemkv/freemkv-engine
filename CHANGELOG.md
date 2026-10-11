@@ -14,6 +14,7 @@ project follows semantic versioning.
 - `MultipassOpts` carries the recovery policy as data: `max_sweep_attempts`, `resume_sweep`, `on_patch_failure` and `after_wedge`, with the enums `OnPatchFailure` and `AfterWedge` and `impl Default`.
 - `RecoveryEvent::PatchFailed`, reported when a failed patch pass ends the passes under `OnPatchFailure::Finish`.
 - `keys::covers_scope` (a key set for this disc that covers a scope, AACS where the scope reads an AACS disc) and `keys::drive_credentials` (host certificates from a keydb).
+- `RemuxUnpublished` (`of(&io::Error)`, field `kept`): the verified output a remux kept when its target filesystem could not publish without replacing.
 
 ### Changed
 
@@ -33,13 +34,14 @@ project follows semantic versioning.
 - An incomplete image mux is no longer counted as written (Halted after a Stop, else E9078).
 - A single subtitle list (normal and forced equal) is checked once in preflight over every subtitle (detail `subtitle`).
 - The staged copy's speed and ETA come from `SpeedEstimator`.
-- A failed or stopped image title no longer deletes an earlier file at its destination when the file's state could not be read before the title (EIO, ESTALE, EACCES): only a file the title's mux opened, or one that appeared where the path was proven absent, is removed.
+- A failed or stopped image title removes the file at its destination only when the title made it: its mux opened the output, or a stat before the title proved the path absent (and a file is there now) or found a file whose length or mtime has since changed. A stat that failed for any reason but not-found (EIO, ESTALE, EACCES) proves nothing, so an earlier rip there is kept. Only file sinks (`mkv://`, `m2ts://`, `mp4://`, `mpg://`, `fvi://`, `chapters://`, `json://`) are ever removed; a network, stdio, null or folder sink never is.
 - A remux with no title keys the title it picks with the job's audio (one resolve over that cut); a held key set covering only that cut no longer refuses E7022 for title 0.
-- A remux whose target filesystem can neither hard-link nor rename without replacing fails with a coded I/O error (E5000, kind `Unsupported`) and keeps the verified output at `<target>.partial` for a manual publish, instead of an uncoded error that deleted it.
+- A remux whose target filesystem can neither hard-link nor rename without replacing fails with a coded I/O error (E5000, kind `Unsupported`, payload `RemuxUnpublished { kept }`) and keeps the verified output as `<target>.verified` for a manual publish, instead of an uncoded error that deleted it; a retry never sweeps it. Every other publish failure, a replacing rename's included, is coded E5000 with its own kind.
 - A remux reports `TitleDone` with the title's verdict: an incomplete or stopped mux is `TitleDone(Err)`, as for image titles.
-- A title run over a source with no titles is E_NO_STREAMS (as the mux reports it), not an invalid destination URL.
+- A title run or remux over a source with no titles is E_NO_STREAMS (as the mux reports it), not an invalid destination URL or a title range error.
 - A Stop wins over the error of an image scan it interrupted (`Halted`), and a loose clip's disc-folder scan runs under the run's Stop.
 - A raw or key-holding title run keeping every stream muxes `MainMovie` (title 0) with no image scan, as 1.8.3 did.
+- A keyed image title run whose selection the probed disc refuses (e.g. E9086) reports `Event::Keys` without a ring, as a refused open does.
 
 ### Removed
 

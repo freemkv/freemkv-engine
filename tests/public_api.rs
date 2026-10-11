@@ -34,6 +34,10 @@ fn returned_types_are_nameable() {
     fn _holds_reasons(_: &[freemkv_engine::Reason]) {}
     fn _holds_opened(_: freemkv_engine::OpenedImage) {}
     fn _holds_remux(_: freemkv_engine::RemuxReport) {}
+    // A remux error's kept output: a front end shows `kept`.
+    fn _holds_unpublished(e: &std::io::Error) -> Option<&std::path::Path> {
+        freemkv_engine::RemuxUnpublished::of(e).map(|u| u.kept.as_path())
+    }
     fn _holds_event(_: freemkv_engine::Event<'_>) {}
 }
 
