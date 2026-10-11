@@ -81,8 +81,10 @@ pub struct OpenImageOptions {
     /// (J14); a raw reader is opened and checked for capacity and disc hash. A `dir://`
     /// folder is always scanned, so a disc given with one is refused (E7013, caller bug).
     pub disc: Option<libfreemkv::Disc>,
-    /// What the rip decrypts; `None` = `Titles([main])`, or the main title's review
-    /// candidates when it needs review (the title is authorized later, not here).
+    /// What the rip decrypts; `None` = `Titles([0])` (the MainMovie pick with every audio
+    /// kept, which is always title 0; nothing on a disc with no titles). A caller that picks
+    /// another title (e.g. by audio language) names it here, or a later mux of it asks the
+    /// key sources again.
     pub scope: Option<KeyScope>,
     /// An in-memory VID from a drive scan (KU §4.2), checked against the sidecar `vidfp`.
     pub vid: Option<[u8; 16]>,
@@ -184,7 +186,7 @@ pub fn scan_image(
 }
 
 // [`scan_image`] stopped by `halt`: a Stop raised before, during or by the end of the scan
-// ends it `Halted`.
+// ends it `Halted`, whatever error the stopped scan returned (Stop wins).
 pub(crate) fn scan_image_halted(
     src: &ImageSource,
     halt: Option<&libfreemkv::Halt>,
@@ -199,7 +201,11 @@ pub(crate) fn scan_image_halted(
     let scanned = match src {
         ImageSource::Iso(p) => libfreemkv::scan_iso(p, opts),
         ImageSource::Dir(p) => libfreemkv::scan_dir(p, opts),
-    }?;
+    }
+    .map_err(|e| match halt.is_some_and(libfreemkv::Halt::is_cancelled) {
+        true => Error::Halted,
+        false => e,
+    })?;
     #[cfg(test)]
     scan_hook::fire(scan_hook::At::Done);
     halt.map_or(Ok(()), libfreemkv::Halt::check)?;
@@ -678,6 +684,8 @@ fn check_prescanned(
         });
     }
     let norm = |h: &str| libfreemkv::hex::strip_hex_prefix(h).to_ascii_lowercase();
+    // The AACS disc hash: a disc with no AACS state (DVD, clear BD) has none, and is not
+    // compared on a key file it does not have.
     let disc_hash = disc.intrinsic_id().map(norm);
     // One UDF parse serves both reads. An OS error reading the image is that error, never
     // "a different disc"; a key file the image does not hold (or zeroed metadata) is.

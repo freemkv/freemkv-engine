@@ -746,8 +746,13 @@ fn url_source(
         _ => None,
     };
     if !need_keys && !need_title {
+        // MainMovie keeping every audio is always title 0 (never a review): a run needing
+        // neither keys nor a title's streams knows it without a scan, as 1.8.3 did.
+        let main_all = matches!(plan.titles, crate::Selection::MainMovie)
+            && plan.streams.audio == crate::StreamFilter::All;
         let idx = match explicit {
             Some(idx) => idx,
+            None if main_all => title_index(plan, None)?,
             None => {
                 let (disc, _) = crate::image::scan_image_halted(&src, Some(&halt))?;
                 title_index(plan, Some(&disc))?
@@ -764,7 +769,9 @@ fn url_source(
     })?;
     let idx = match explicit {
         Some(idx) => idx,
-        None => title_index(plan, Some(probed.disc()))?,
+        None => title_index(plan, Some(probed.disc())).inspect_err(|_| {
+            keys_event(&Default::default(), None);
+        })?,
     };
     let scope = match need_keys {
         true => libfreemkv::keys::KeyScope::Titles(vec![idx]),
@@ -777,13 +784,18 @@ fn url_source(
     Ok((idx, need_keys.then_some(opened.keys), title))
 }
 
-// The one title a title run muxes: `Titles([i])` is title `i`; another selection resolves
-// against the scanned disc (review is E9086). With no disc, `MainMovie` is title 0. Anything
-// naming several titles is not a title run.
+// The one title a title run muxes: `Titles([i])`, else the selection on the scanned disc
+// (review E9086; no titles E_NO_STREAMS, as the mux reports it). With no disc, `MainMovie`
+// is title 0. Anything naming several titles is not a title run.
 fn title_index(plan: &Plan, disc: Option<&libfreemkv::Disc>) -> crate::Result<usize> {
     match (&plan.titles, disc) {
         (crate::Selection::Titles(t), _) if t.len() == 1 => Ok(t[0]),
         (crate::Selection::MainMovie, None) => Ok(0),
+        (sel, Some(disc))
+            if !matches!(sel, crate::Selection::Titles(_)) && disc.titles.is_empty() =>
+        {
+            Err(libfreemkv::Error::NoStreams)
+        }
         (sel, Some(disc)) if !matches!(sel, crate::Selection::Titles(_)) => {
             match crate::resolve_selection(disc, sel, &plan.streams.audio, None)?.as_slice() {
                 [one] => Ok(*one),

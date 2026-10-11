@@ -8,6 +8,7 @@
 
 use super::tests::{Events, job, mkv, outcome, title, writes};
 use super::*;
+use crate::image::open_image_with;
 use libfreemkv::halt::Liveness as Counter;
 use libfreemkv::io::artifact_lock::lock_path as sidecar_for;
 use std::sync::Mutex;

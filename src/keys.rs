@@ -104,8 +104,10 @@ pub enum RipOutput {
 }
 
 /// The [`KeyScope`] a rip of `titles` (indices into `disc.titles`) to `output` resolves
-/// (KU §2.5): `Titles(selected)`, or `Titles([main])` for a plain rip with no selection;
-/// `WholeDisc` for a decrypted image; `None` for a raw copy, which makes no key call.
+/// (KU §2.5): `Titles(selected)`; for a plain rip with no selection `Titles([0])`, the
+/// MainMovie pick with every audio kept (always title 0; `Titles([])` on a disc with no
+/// titles), so a rip that prefers another cut by audio language passes that title in
+/// `titles`; `WholeDisc` for a decrypted image; `None` for a raw copy, which makes no key call.
 pub fn rip_scope(disc: &libfreemkv::Disc, titles: &[usize], output: RipOutput) -> KeyScope {
     match output {
         RipOutput::RawImage => KeyScope::None,
@@ -115,7 +117,8 @@ pub fn rip_scope(disc: &libfreemkv::Disc, titles: &[usize], output: RipOutput) -
     }
 }
 
-// The titles a key scope covers for the main title (none on an empty disc).
+// The titles a key scope covers for the main title with every audio kept: title 0 (none on
+// an empty disc).
 pub(crate) fn main_scope(disc: &libfreemkv::Disc) -> Vec<usize> {
     crate::SelectionModel::from_titles(&disc.titles)
         .main_title(&crate::StreamFilter::All, None)
@@ -189,13 +192,16 @@ pub fn resolve_loose_clip(
         return (Ok(None), ResolutionTrace::new());
     };
     // A folder that is not a readable disc looks up nothing: a clear clip still opens, an
-    // encrypted one refuses E7022 in `input()`. An OS read error (EIO, EACCES) surfaces.
-    let scanned = match crate::image::scan_image(&crate::ImageSource::Dir(root.clone())) {
+    // encrypted one refuses E7022 in `input()`. An OS read error (EIO, EACCES) surfaces, as
+    // does a Stop: the scan runs under the run's halt.
+    let src = crate::ImageSource::Dir(root.clone());
+    let scanned = match crate::image::scan_image_halted(&src, halt) {
         Ok((disc, _)) if !disc.needs_key_lookup() => return (Ok(None), ResolutionTrace::new()),
         r => r,
     };
     let (disc, mut reader) = match scanned {
         Ok(d) => d,
+        Err(e @ libfreemkv::Error::Halted) => return (Err(e), ResolutionTrace::new()),
         Err(e @ libfreemkv::Error::IoError { .. }) if !is_not_found(&e) => {
             return (Err(e), ResolutionTrace::new());
         }

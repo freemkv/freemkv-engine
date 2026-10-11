@@ -14,6 +14,7 @@ project follows semantic versioning.
 - `MultipassOpts` carries the recovery policy as data: `max_sweep_attempts`, `resume_sweep`, `on_patch_failure` and `after_wedge`, with the enums `OnPatchFailure` and `AfterWedge` and `impl Default`.
 - `RecoveryEvent::PatchFailed`, reported when a failed patch pass ends the passes under `OnPatchFailure::Finish`.
 - `keys::covers_scope` (a key set for this disc that covers a scope, AACS where the scope reads an AACS disc) and `keys::drive_credentials` (host certificates from a keydb).
+- `RemuxUnpublished` (`of(&io::Error)`, field `kept`): the verified output a remux kept when its target filesystem could not publish without replacing.
 
 ### Changed
 
@@ -24,7 +25,7 @@ project follows semantic versioning.
 - **MainMovie** stays title 0 unless another cut of it carries more of the wanted languages (`presentation_language`, else the audio filter's languages). A cut qualifies when the content it shares with title 0 is in the same order in both and is more than half of each, compared on libfreemkv's format-neutral `selection_evidence.segments`, with one rule for DVD, Blu-ray, UHD and HD DVD. Exact aliases and seamless-branching extended cuts qualify; logo-sharing extras, reordered decoys and separate full copies do not. An episode of a play-all qualifies only if it is itself more than half of the play-all's content, so one of three or more comparable episodes does not. Remux's default title uses the same pick.
 - MainMovie never holds for review: an invalid or unmatched language keeps title 0. E9086 is for episode-roster reasons only.
 - **Recovery hosts**: `PassHost` loses its `resume_sweep`, `sweep_attempt`, `patch_failed` and `continue_after_wedge` hooks (breaking for hosts that implemented them); their policy is in `MultipassOpts`. `MultipassOpts` gains four public fields, so struct literals need `..Default::default()`. A zero `max_sweep_attempts` counts as 1.
-- An image opened without an explicit key scope scopes its keys to the main title's pick (or, when the main title needs review, its candidates).
+- An image opened without an explicit key scope scopes its keys to title 0, the MainMovie pick with every audio kept (`rip_scope` with no titles likewise). MainMovie never needs review.
 - `OpenImageOptions::halt` also stops the image scan, not only the key resolve, and an open whose halt is already raised now returns `Halted`, even with held keys or a pre-scanned disc.
 
 ### Fixed
@@ -35,6 +36,14 @@ project follows semantic versioning.
 - An incomplete image mux is no longer counted as written (Halted after a Stop, else E9078).
 - A single subtitle list (normal and forced equal) is checked once in preflight over every subtitle (detail `subtitle`).
 - The staged copy's speed and ETA come from `SpeedEstimator`.
+- A failed or stopped image title removes the file at its destination only when the title made it: its mux opened the output, or a stat before the title proved the path absent (and a file is there now) or found a file whose length or mtime has since changed. A stat that failed for any reason but not-found (EIO, ESTALE, EACCES) proves nothing, so an earlier rip there is kept. Only file sinks (`mkv://`, `m2ts://`, `mp4://`, `mpg://`, `fvi://`, `chapters://`, `json://`) are ever removed; a network, stdio, null or folder sink never is.
+- A remux with no title keys the title it picks with the job's audio (one resolve over that cut); a held key set covering only that cut no longer refuses E7022 for title 0.
+- A remux whose target filesystem can neither hard-link nor rename without replacing fails with a coded I/O error (E5000, kind `Unsupported`, payload `RemuxUnpublished { kept }`) and keeps the verified output as `<target>.verified` for a manual publish, instead of an uncoded error that deleted it; a retry never sweeps it. Every other publish failure, a replacing rename's included, is coded E5000 with its own kind.
+- A remux reports `TitleDone` with the title's verdict: an incomplete or stopped mux is `TitleDone(Err)`, as for image titles.
+- A title run or remux over a source with no titles is E_NO_STREAMS (as the mux reports it), not an invalid destination URL or a title range error.
+- A Stop wins over the error of an image scan it interrupted (`Halted`), and a loose clip's disc-folder scan runs under the run's Stop.
+- A raw or key-holding title run keeping every stream muxes `MainMovie` (title 0) with no image scan, as 1.8.3 did.
+- A keyed image title run whose selection the probed disc refuses (e.g. E9086) reports `Event::Keys` without a ring, as a refused open does.
 
 ### Removed
 

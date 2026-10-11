@@ -327,14 +327,16 @@ fn an_image_title_run_resolves_its_selection_after_the_scan() {
 }
 
 // How a title run over an image is keyed: from the key sources, or raw / with the keys
-// held, each with a stream filter (so the run opens the image for its title), or raw
-// keeping every stream (so nothing is opened but a non-explicit selection's scan).
+// held, with a stream filter (so the run opens the image for its title) or keeping every
+// stream (so nothing is opened but a selection's scan).
 #[derive(Clone, Copy, Debug)]
 enum Keying {
     Resolve,
     RawFilter,
     HeldFilter,
     RawAll,
+    // Keys held, every stream kept: like `RawAll`, nothing to open for keys or streams.
+    HeldAll,
 }
 
 const KEYINGS: [Keying; 4] = [
@@ -380,12 +382,13 @@ fn image_title_run(
         titles,
         raw,
         streams: match keying {
-            Keying::RawAll => Default::default(),
+            Keying::RawAll | Keying::HeldAll => Default::default(),
             _ => filtered,
         },
         ..plan(source, &format!("{scheme}://{}", out.display()))
     };
-    let keys = matches!(keying, Keying::HeldFilter).then(|| held_keys(fx, source));
+    let keys =
+        matches!(keying, Keying::HeldFilter | Keying::HeldAll).then(|| held_keys(fx, source));
     let with = RunWith {
         keys,
         halt,
@@ -606,8 +609,9 @@ fn an_image_title_run_selection_does_not_change_its_checks() {
     }
 }
 
-// A title run on an image scans it once for a non-explicit selection (MainMovie, Longest),
-// whatever it is keyed by, and an explicit title scans no more than before.
+// A title run on an image scans it once for a non-explicit selection, whatever it is keyed
+// by; an explicit title, or MainMovie keeping every audio (title 0), with neither keys nor a
+// title's streams needed (raw, every stream) scans nothing.
 #[test]
 fn an_image_title_run_scans_the_image_once() {
     let fx = bd_image(&[Some(K1), Some(K2)], 2);
@@ -627,7 +631,7 @@ fn an_image_title_run_scans_the_image_once() {
         format!("iso://{}", iso.display()),
         format!("dir://{}", folder.display()),
     ] {
-        for keying in KEYINGS {
+        for keying in KEYINGS.into_iter().chain([Keying::HeldAll]) {
             for titles in [
                 Selection::MainMovie,
                 Selection::Longest,
@@ -637,7 +641,10 @@ fn an_image_title_run_scans_the_image_once() {
                 let (r, _) = image_title_run(&fx, &source, &out, titles.clone(), keying, None);
                 assert_eq!(verdict(r), sound(keying), "{source} {titles:?} {keying:?}");
                 let want = match (&titles, keying) {
-                    (Selection::Titles(_), Keying::RawAll) => 0,
+                    (
+                        Selection::Titles(_) | Selection::MainMovie,
+                        Keying::RawAll | Keying::HeldAll,
+                    ) => 0,
                     _ => 1,
                 };
                 assert_eq!(scans.get(), want, "{source} {titles:?} {keying:?}");
@@ -671,11 +678,16 @@ fn a_stop_around_the_image_scan_halts_the_title_run() {
         format!("dir://{}", folder.display()),
     ] {
         for keying in [Keying::Resolve, Keying::RawAll] {
-            for titles in [
-                Selection::MainMovie,
-                Selection::Longest,
-                Selection::Episodes,
-            ] {
+            // A raw MainMovie run keeping every stream is title 0 with no scan to stop.
+            let selections = match keying {
+                Keying::RawAll => vec![Selection::Longest, Selection::Episodes],
+                _ => vec![
+                    Selection::MainMovie,
+                    Selection::Longest,
+                    Selection::Episodes,
+                ],
+            };
+            for titles in selections {
                 for when in [When::BeforeScan, When::AtScanStart, When::AtScanEnd] {
                     let halt = libfreemkv::Halt::new();
                     if when == When::BeforeScan {
@@ -757,4 +769,119 @@ fn hddvd_folder(root: &std::path::Path) {
     write("AACS/MKBROM.AACS", &[0u8; 2048]);
     // libfreemkv lays out a BD or DVD tree only; the scan reads HVDVD_TS before VIDEO_TS.
     std::fs::create_dir_all(root.join("VIDEO_TS")).unwrap();
+}
+
+// A title run over a source whose scan found no titles is the source's refusal (E_NO_STREAMS,
+// as libfreemkv's mux of an empty title list), never an invalid destination URL.
+#[test]
+fn a_title_run_over_a_disc_with_no_titles_is_no_streams() {
+    let empty = crate::test_fixtures::disc_of(Vec::new());
+    for titles in [
+        Selection::MainMovie,
+        Selection::Longest,
+        Selection::Episodes,
+    ] {
+        let p = Plan {
+            titles: titles.clone(),
+            ..plan("iso:///in.iso", "mkv:///o/a.mkv")
+        };
+        let err = title_index(&p, Some(&empty)).expect_err("no titles");
+        assert!(
+            matches!(err, libfreemkv::Error::NoStreams),
+            "{titles:?}: {err:?}"
+        );
+    }
+}
+
+// A Sink recording each `Event::Keys`: whether it carried a ring.
+#[derive(Default)]
+struct KeysSeen(std::sync::Mutex<Vec<bool>>);
+
+impl crate::Sink for KeysSeen {
+    fn event(&self, e: &crate::Event<'_>) {
+        if let crate::Event::Keys { ring, .. } = e {
+            self.0.lock().unwrap().push(ring.is_some());
+        }
+    }
+}
+
+// A title run that acquires its keys reports the walk as one `Event::Keys`: with the ring on
+// success, without it on a refusal (of the resolve, or of the open before it) and for a loose
+// clip's folder lookup. A run that acquires nothing (raw, or keys held) reports none.
+#[test]
+fn a_title_run_reports_its_key_acquisition() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "src.iso");
+    let source = format!("iso://{}", iso.display());
+    let out = dir.path().join("t.mkv");
+    let run = |p: &Plan, with: RunWith<'_>| {
+        let sink = KeysSeen::default();
+        let r = run_with(p, with, &sink);
+        let _ = std::fs::remove_file(&out);
+        (r.is_ok(), sink.0.into_inner().unwrap())
+    };
+    let title = |source: &str, raw: bool| Plan {
+        titles: Selection::Titles(vec![1]),
+        raw,
+        ..plan(source, &format!("mkv://{}", out.display()))
+    };
+    let keyed = || factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
+    assert_eq!(
+        run(&title(&source, false), with(keyed())),
+        (true, vec![true])
+    );
+    let none = factory(&[(Answer::Keydb, &[])], &Calls::default());
+    assert_eq!(
+        run(&title(&source, false), with(none)),
+        (false, vec![false])
+    );
+    // A sidecar that does not load refuses the open before any key is asked.
+    let garbage = fx.write(dir.path(), "garbage.iso");
+    std::fs::write(crate::mapfile_path_for(&garbage), "not a mapfile\n").unwrap();
+    let bad = format!("iso://{}", garbage.display());
+    assert_eq!(
+        run(&title(&bad, false), with(keyed())),
+        (false, vec![false])
+    );
+    // A selection the probed disc refuses (review) is a refusal before any key, too.
+    let review = Plan {
+        titles: Selection::Episodes,
+        ..title(&source, false)
+    };
+    assert_eq!(run(&review, with(keyed())), (false, vec![false]));
+    // A loose clip of an encrypted disc folder: its folder's keys.
+    let clip = fx.write_folder(&dir.path().join("folder"));
+    let m2ts = format!("m2ts://{}", clip.display());
+    let (_, seen) = run(&title(&m2ts, false), with(keyed()));
+    assert_eq!(seen, vec![true]);
+    // Raw, or with the keys held: nothing acquired, nothing reported.
+    assert_eq!(
+        run(&title(&source, true), with(keyed())).1,
+        Vec::<bool>::new()
+    );
+    let held = RunWith {
+        keys: Some(held_keys(&fx, &source)),
+        ..with(keyed())
+    };
+    assert_eq!(run(&title(&source, false), held), (true, Vec::new()));
+}
+
+// A MainMovie title run prefers the cut carrying the plan's audio: on a disc whose two
+// titles are cuts of one programme, German audio picks the German cut, every audio title 0.
+#[test]
+fn a_main_movie_title_run_picks_the_audio_preferred_cut() {
+    let disc = crate::test_fixtures::disc_of(crate::test_fixtures::branch_titles());
+    let movie = |audio| Plan {
+        titles: Selection::MainMovie,
+        streams: StreamChoice {
+            audio,
+            ..StreamChoice::default()
+        },
+        ..plan("iso:///in.iso", "mkv:///o/a.mkv")
+    };
+    let de = crate::StreamFilter::Langs(vec!["de".into()]);
+    assert_eq!(title_index(&movie(de), Some(&disc)).ok(), Some(1));
+    let all = crate::StreamFilter::All;
+    assert_eq!(title_index(&movie(all), Some(&disc)).ok(), Some(0));
 }

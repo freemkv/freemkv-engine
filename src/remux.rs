@@ -7,7 +7,7 @@
 //! real progress as `Sink::progress` passes `"sync"` / `"verify"` (§4.5, T12b, T30).
 
 use crate::engine_halt::{EngineHalt, HaltSink};
-use crate::image::{ImageSource, OpenImageOptions, OpenedImage, open_image_with};
+use crate::image::{ImageSource, OpenImageOptions, OpenedImage, probe_image};
 use crate::job::{StreamChoice, StreamFilter};
 use crate::keys::{KeyParams, key_source_factory};
 use crate::mux::{
@@ -69,9 +69,9 @@ impl MuxPlan {
 
 /// Mux `plan.titles` out of `opened`, title `idx` into the sink URL `dest(idx)`,
 /// under the [`run_titles`] loop policy. Each title is bracketed by
-/// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails into a
-/// file sink has its partial file removed, unless the title never touched the file (a
-/// directory sink, ending in `/`, is left alone).
+/// [`Event::TitleStart`] / [`Event::TitleDone`]. A title that fails or stops into a file
+/// sink removes its partial file only if it made it (its mux opened the output, or the path
+/// was proven absent or different before); a directory sink (ending in `/`) is left alone.
 ///
 /// Keys (KU §3.2): `opened.keys`, or ONE resolve over the plan's titles seeded with it
 /// before any output. Each title is `opened.disc.titles[idx]`, muxed from the image
@@ -107,12 +107,16 @@ pub fn mux_image_titles_with(
         let dest = dest(idx);
         sink.event(&Event::TitleStart { idx, dest: &dest });
         let selection = plan.selection_for(idx);
-        let out_path = libfreemkv::parse_url(&dest).path_str().to_string();
-        let before = output_stamp(&out_path);
-        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, sink)
-            .and_then(|outcome| finished(outcome, idx, &halt));
-        if result.is_err() && !dest.ends_with('/') {
-            remove_failed_output(&out_path, before);
+        let out_file = output_file(&dest);
+        let before = out_file
+            .as_deref()
+            .map(|p| Before::of(std::fs::metadata(p)));
+        let watch = OpenedWatch::new(sink);
+        let result = mux_opened_title(opened, &keys, idx, selection, &dest, &plan.mux, &watch);
+        let opened_output = watch.opened() || result.as_ref().is_ok_and(|o| o.output_opened);
+        let result = result.and_then(|outcome| finished(outcome, idx, &halt));
+        if let (Err(_), Some(path), Some(before)) = (&result, &out_file, before) {
+            remove_failed_output(path, before, opened_output);
         }
         sink.event(&Event::TitleDone {
             idx,
@@ -139,17 +143,107 @@ fn finished(
     })
 }
 
-// Length and mtime of the file at `path`; `None` when absent.
-fn output_stamp(path: &str) -> Option<(u64, Option<std::time::SystemTime>)> {
-    let m = std::fs::metadata(path).ok()?;
-    Some((m.len(), m.modified().ok()))
+// The file a title's sink URL writes: a file sink's path; none for a network, stdio or null
+// sink, or a folder (ending in `/`).
+fn output_file(dest: &str) -> Option<PathBuf> {
+    use libfreemkv::StreamUrl as U;
+    match libfreemkv::parse_url(dest) {
+        _ if dest.ends_with('/') => None,
+        U::Mkv { path }
+        | U::M2ts { path }
+        | U::Mp4 { path }
+        | U::Mpg { path }
+        | U::Fvi { path }
+        | U::Chapters { path }
+        | U::Json { path } => Some(path),
+        _ => None,
+    }
 }
 
-// Remove the file a failed mux left at `path`, unless it is the one `before` saw: an error
-// before the output opened must not delete an earlier rip.
-fn remove_failed_output(path: &str, before: Option<(u64, Option<std::time::SystemTime>)>) {
-    if output_stamp(path) != before {
+// Length and mtime of a file.
+type Stamp = (u64, Option<std::time::SystemTime>);
+
+fn stamp_of(m: &std::fs::Metadata) -> Stamp {
+    (m.len(), m.modified().ok())
+}
+
+// What a title's output path held before its mux. Only NotFound is `Absent`: a stat that
+// failed otherwise (EIO, ESTALE, EACCES on a flaky share) is `Unknown`, never "absent".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Before {
+    Absent,
+    Present(Stamp),
+    Unknown,
+}
+
+impl Before {
+    fn of(stat: io::Result<std::fs::Metadata>) -> Self {
+        match stat {
+            Ok(m) => Before::Present(stamp_of(&m)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Before::Absent,
+            Err(_) => Before::Unknown,
+        }
+    }
+}
+
+// Remove the file a failed mux left at `path` only when this run made it: the mux opened its
+// output (`opened`), or `before` proved the path absent or of another stamp. An unknown
+// `before` with no opened output never deletes an earlier rip.
+fn remove_failed_output(path: impl AsRef<Path>, before: Before, opened: bool) {
+    let path = path.as_ref();
+    let now = std::fs::metadata(path).map(|m| stamp_of(&m));
+    let created = match (before, now) {
+        (_, Err(_)) => false,
+        (Before::Absent, Ok(_)) => true,
+        (Before::Present(was), Ok(now)) => now != was,
+        (Before::Unknown, Ok(_)) => false,
+    };
+    if opened || created {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+// A title's sink that notes whether the mux opened its output (`Event::OutputOpened`): the
+// run's own evidence that the file at the destination is this title's.
+struct OpenedWatch<'a> {
+    inner: &'a dyn Sink,
+    opened: std::sync::OnceLock<()>,
+}
+
+impl<'a> OpenedWatch<'a> {
+    fn new(inner: &'a dyn Sink) -> Self {
+        OpenedWatch {
+            inner,
+            opened: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn opened(&self) -> bool {
+        self.opened.get().is_some()
+    }
+}
+
+impl Sink for OpenedWatch<'_> {
+    fn log(&self, level: Level, msg: &str) {
+        self.inner.log(level, msg)
+    }
+    fn title_opened(&self, title: &libfreemkv::DiscTitle) {
+        self.inner.title_opened(title)
+    }
+    fn progress(&self, p: &crate::sink::Progress) {
+        self.inner.progress(p)
+    }
+    fn completed(&self, outcome: &crate::Outcome) {
+        self.inner.completed(outcome)
+    }
+    fn event(&self, e: &Event<'_>) {
+        if matches!(e, Event::OutputOpened { .. }) {
+            let _ = self.opened.set(());
+        }
+        self.inner.event(e)
+    }
+    fn should_cancel(&self) -> bool {
+        self.inner.should_cancel()
     }
 }
 
@@ -336,8 +430,9 @@ pub struct RemuxReport {
 /// Remux one title of `job.iso` to `job.target`: take `<target>.lock`, mux into
 /// `<target>.partial`, fsync, [`verify_mkv`], then rename over the target and fsync its
 /// folder. On any failure or cancel the partial file and the lock are removed and an
-/// existing target is left exactly as it was. The chosen title goes to
-/// [`Sink::title_opened`]; phases and the title's mux are reported as [`Event`]s.
+/// existing target is left exactly as it was; a filesystem that cannot publish without
+/// replacing keeps the verified output as `<target>.verified` ([`RemuxUnpublished`]). The
+/// chosen title goes to [`Sink::title_opened`]; phases and the mux are reported as [`Event`]s.
 pub fn remux_iso(job: &RemuxJob, keys: &KeyParams, sink: &dyn Sink) -> io::Result<RemuxReport> {
     remux_iso_with(job, keys, sink, &Halt::new())
 }
@@ -356,7 +451,8 @@ pub fn remux_iso_with(
 
 /// Remux to a local partial file, then copy a verified result to a partial
 /// beside the target before the atomic replacement. The caller owns the
-/// staging location; the engine removes both partial files on every exit.
+/// staging location; the engine removes both partial files on every exit but the
+/// unsupported publish [`remux_iso`] describes, which keeps the verified one beside the target.
 pub fn remux_iso_staged(
     job: &RemuxJob,
     keys: &KeyParams,
@@ -390,6 +486,18 @@ fn remux_iso_sources_at(
     halt: &Halt,
     staged_partial: Option<&Path>,
 ) -> io::Result<RemuxReport> {
+    let opts = OpenImageOptions::resolve(sources);
+    remux_opening(job, opts, sink, halt, staged_partial)
+}
+
+// The remux of `job` over an image opened with `base` (its keys and, in a test, a disc).
+fn remux_opening(
+    job: &RemuxJob,
+    base: OpenImageOptions,
+    sink: &dyn Sink,
+    halt: &Halt,
+    staged_partial: Option<&Path>,
+) -> io::Result<RemuxReport> {
     // §4.2: "cancellation is `EngineHalt::is_cancelled() = op.is_cancelled() || extra ||
     // sink.should_cancel()`".
     let halt = EngineHalt::new(halt, None).with_sink(sink);
@@ -400,15 +508,17 @@ fn remux_iso_sources_at(
     refuse_existing(job)?;
     utf8_source(&job.iso)?;
     sink.event(&Event::Phase { name: "open" });
-    // The open, its title and its key top-up all run under one halt (KU §2.3 step 13).
+    // The open, its title and its keys all run under one halt (KU §2.3 step 13). The title
+    // is picked on the probed disc with the job's audio before any key is asked, so the one
+    // resolve covers the title muxed (an audio-preferred cut, not the All-audio main title).
     let open = |h: &Halt| -> io::Result<_> {
         let opts = OpenImageOptions {
-            scope: job.title.map(|i| KeyScope::Titles(vec![i])),
             halt: Some(h.clone()),
-            ..OpenImageOptions::resolve(sources)
+            ..base
         };
-        let opened = open_image_with(&job.iso, opts)?;
-        let idx = pick_title(&opened.disc, job.title, &job.streams.audio)?;
+        let probed = probe_image(&job.iso, opts)?;
+        let idx = pick_title(probed.disc(), job.title, &job.streams.audio)?;
+        let opened = probed.key_traced(KeyScope::Titles(vec![idx])).0?;
         let keys = opened.keys_for(&[idx], Some(h))?;
         Ok((opened, idx, keys))
     };
@@ -457,16 +567,78 @@ fn refuse_existing(job: &RemuxJob) -> io::Result<()> {
     Ok(())
 }
 
-// Publish atomically without overwriting unless replacement was requested.
-// Unsupported no-replace operations fail closed; a target found there is E9084.
-fn land(landing: &Path, job: &RemuxJob) -> io::Result<()> {
-    if job.replace {
-        return std::fs::rename(landing, &job.target);
-    }
-    libfreemkv::io::publish::no_replace(landing, &job.target).map_err(|e| match e.kind() {
-        io::ErrorKind::AlreadyExists => target_exists(&job.target),
-        _ => e,
+// Publish atomically without overwriting unless replacement was requested. A failure is a
+// coded I/O error (E5000) of its own kind, but a target found there, which is E9084.
+fn land(landing: &Path, job: &RemuxJob, rio: &dyn RemuxIo) -> io::Result<()> {
+    let published = match job.replace {
+        true => std::fs::rename(landing, &job.target),
+        false => rio.publish(landing, &job.target),
+    };
+    published.map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists if !job.replace => target_exists(&job.target),
+        _ => coded_io(e),
     })
+}
+
+// An OS error as a typed `Error::IoError` payload (so it has a code), keeping its kind.
+fn coded_io(e: io::Error) -> io::Error {
+    match libfreemkv::error_code(&e) {
+        Some(_) => e,
+        None => io::Error::new(e.kind(), libfreemkv::Error::from(e)),
+    }
+}
+
+/// The error of a remux whose target filesystem can neither rename without replacing nor
+/// hard-link: the verified output is kept at `kept` (`<target>.verified`) for a manual
+/// publish. Its code and text are the I/O error's (E5000); its kind is `Unsupported`.
+#[derive(Debug)]
+pub struct RemuxUnpublished {
+    pub kept: PathBuf,
+    source: io::Error,
+}
+
+impl RemuxUnpublished {
+    /// The kept output named by a remux error, if it is this one.
+    pub fn of(e: &io::Error) -> Option<&Self> {
+        e.get_ref()?.downcast_ref()
+    }
+}
+
+impl std::fmt::Display for RemuxUnpublished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl std::error::Error for RemuxUnpublished {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+// Where an unpublished verified output is kept: beside the target, outside the `.partial`
+// a retry sweeps, and not an `.mkv` a library lists.
+fn verified_path(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".verified");
+    target.with_file_name(name)
+}
+
+// Keep the verified `landing` as `<target>.verified` (it stays at `landing` if even that
+// rename fails), and name it in the error.
+fn keep_unpublished(landing: &Path, target: &Path, e: io::Error, sink: &dyn Sink) -> io::Error {
+    let verified = verified_path(target);
+    let kept = match std::fs::rename(landing, &verified) {
+        Ok(()) => verified,
+        Err(_) => landing.to_path_buf(),
+    };
+    let shown = crate::mux::log_safe(&kept.display().to_string());
+    sink.log(
+        Level::Warn,
+        &format!("publish unsupported; verified remux kept at {shown}"),
+    );
+    let kind = e.kind();
+    io::Error::new(kind, RemuxUnpublished { kept, source: e })
 }
 
 fn target_exists(target: &Path) -> io::Error {
@@ -480,6 +652,10 @@ fn pick_title(
     title: Option<usize>,
     audio: &StreamFilter,
 ) -> io::Result<usize> {
+    if disc.titles.is_empty() {
+        // As a title run and libfreemkv's mux report a source with no titles.
+        return Err(libfreemkv::Error::NoStreams.into());
+    }
     let picked = match title {
         Some(index) => (index < disc.titles.len()).then_some(index),
         None => crate::SelectionModel::from_titles(&disc.titles).main_title(audio, None),
@@ -578,6 +754,10 @@ pub(crate) trait RemuxIo: Sync {
     /// Create `path` for the staged copy; an existing file is refused, never truncated.
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>>;
     fn timing(&self) -> RemuxTiming;
+    /// Move `landing` to `target` only if `target` is absent.
+    fn publish(&self, landing: &Path, target: &Path) -> io::Result<()> {
+        libfreemkv::io::publish::no_replace(landing, target)
+    }
 }
 
 /// The production primitives: libfreemkv's durable sync and plain file reads.
@@ -648,13 +828,14 @@ fn land_verified(
     sink.event(&Event::Phase { name: "mux" });
     let dest = format!("mkv://{partial_str}");
     sink.event(&Event::TitleStart { idx, dest: &dest });
-    let result = mux(&dest);
+    // The title's verdict, as `mux_image_titles_with` reports it: incomplete is an Err.
+    let result = mux(&dest).and_then(|outcome| finished(outcome, idx, halt));
     sink.event(&Event::TitleDone {
         idx,
         dest: &dest,
         result: result.as_ref(),
     });
-    let outcome = finished(result?, idx, halt)?;
+    let outcome = result?;
     durable_sync(rio, partial, halt, sink, timing)?;
 
     // Each verify (the local file, then a staged NAS copy) is its own phase and verdict.
@@ -698,7 +879,15 @@ fn land_verified(
     if halt.is_cancelled() {
         return Err(libfreemkv::Error::Halted.into());
     }
-    land(landing, job)?;
+    if let Err(e) = land(landing, job, rio) {
+        // No publication without replacing: a retry would fail the same way after the whole
+        // mux again, so the verified output is kept for a manual publish.
+        if !job.replace && e.kind() == io::ErrorKind::Unsupported {
+            remote_guard.as_mut().unwrap_or(&mut guard).disarm();
+            return Err(keep_unpublished(landing, &job.target, e, sink));
+        }
+        return Err(e);
+    }
     remote_guard.as_mut().unwrap_or(&mut guard).disarm();
     // The rename committed: a Stop or a failure during the folder sync cuts only the sync
     // short (§2.6, §4.4), and the caller is still told the target was replaced.

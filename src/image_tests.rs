@@ -175,3 +175,40 @@ fn a_kept_io_refusal_keeps_its_os_error() {
         assert_eq!((back.kind(), back.raw_os_error()), want);
     }
 }
+
+// A Stop raised while an image scan runs wins over the error that scan then returns: the
+// caller is told `Halted`, never the scan's own failure.
+#[test]
+fn a_scan_that_fails_after_a_stop_is_halted() {
+    let halt = libfreemkv::Halt::new();
+    let stop = halt.clone();
+    scan_hook::set(move |at| {
+        if at == scan_hook::At::Start {
+            stop.cancel();
+        }
+    });
+    let src = ImageSource::Iso("/nonexistent/freemkv/stopped.iso".into());
+    let r = scan_image_halted(&src, Some(&halt)).map(|_| ());
+    scan_hook::clear();
+    assert!(matches!(r, Err(Error::Halted)), "{r:?}");
+    // With no Stop the same scan is its own error.
+    let r = scan_image_halted(&src, Some(&libfreemkv::Halt::new())).map(|_| ());
+    assert!(matches!(r, Err(Error::IoError { .. })), "{r:?}");
+}
+
+// `intrinsic_id` is the AACS disc hash alone: a non-AACS disc (DVD/CSS, clear BD) has none,
+// so its image, with no `/AACS/Unit_Key_RO.inf`, is not refused as another disc.
+#[test]
+fn a_prescanned_non_aacs_disc_matches_its_image_without_a_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    crate::test_fixtures::clear_folder(dir.path());
+    let (mut disc, mut reader) = libfreemkv::scan_dir(dir.path(), Default::default()).unwrap();
+    for format in [libfreemkv::DiscFormat::BluRay, libfreemkv::DiscFormat::Dvd] {
+        disc.format = format;
+        assert!(disc.aacs.is_none() && disc.intrinsic_id().is_none());
+        check_prescanned(&disc, reader.as_mut(), None, None, &[]).expect("its own image");
+    }
+    let fx = bd_image(&[Some(K1)], 1);
+    let hash = fx.disc.aacs.as_ref().map(|a| a.disc_hash.as_str());
+    assert_eq!(fx.disc.intrinsic_id(), hash, "the AACS disc hash");
+}
