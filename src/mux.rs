@@ -8,7 +8,7 @@
 //! main-title default (via [`Selection`]) so an obfuscated disc doesn't rip
 //! everything by accident.
 
-use crate::job::{Job, Selection, StreamFilter};
+use crate::job::{Selection, StreamFilter};
 use crate::sink::{Level, Sink};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,39 +45,17 @@ pub(crate) fn log_safe(s: &str) -> String {
     out
 }
 
-/// Resolve a [`Selection`] to concrete 0-based title indices against a scanned disc.
-/// Out-of-range explicit indices are dropped (preflight blocks them first). `MainMovie` is
-/// title 0 or another cut of it in a wanted language ([`crate::SelectionModel`]);
-/// `Episodes` needs an authored roster; `Longest` is the max-duration title.
-/// `Err` is a selection that needs review: it never becomes an empty list, which only an
-/// explicit `Titles([])` yields.
+/// Resolve a [`Selection`] to 0-based title indices against a scanned disc
+/// ([`crate::SelectionModel::select`]): `audio`, or an explicit `presentation` language,
+/// ranks equivalent cuts. Out-of-range explicit indices are dropped (preflight blocks them).
+/// `Err` is a selection that needs review (only `Episodes`): never an empty list.
 pub fn resolve_selection(
-    disc: &libfreemkv::Disc,
-    sel: &Selection,
-) -> Result<Vec<usize>, crate::SelectionReview> {
-    resolve_selection_with_audio(disc, sel, &StreamFilter::All)
-}
-
-/// Resolve a job's selection, ranking equivalent main or episode presentations
-/// by requested audio-language coverage. Ties retain the first presentation.
-/// Explicit titles, All and Longest retain their selection semantics.
-pub fn resolve_job_selection(
-    disc: &libfreemkv::Disc,
-    job: &Job,
-) -> Result<Vec<usize>, crate::SelectionReview> {
-    resolve_selection_with_audio(disc, &job.selection, &job.streams.audio)
-}
-
-/// Like [`resolve_selection`], but ranks equivalent main/episode presentations
-/// by requested audio-language coverage. Missing identity never equates titles.
-pub fn resolve_selection_with_audio(
     disc: &libfreemkv::Disc,
     selection: &Selection,
     audio: &StreamFilter,
+    presentation: Option<&str>,
 ) -> Result<Vec<usize>, crate::SelectionReview> {
-    crate::SelectionModel::from_disc(disc)
-        .select(selection, audio)
-        .into_result()
+    crate::SelectionModel::from_titles(&disc.titles).select(selection, audio, presentation)
 }
 
 /// The result of muxing one title, from the loop's point of view.

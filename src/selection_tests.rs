@@ -38,10 +38,11 @@ fn roster(titles: &mut [DiscTitle], members: &[usize]) {
     }
 }
 
-fn select(titles: &[DiscTitle]) -> SelectionReport {
+fn select(titles: &[DiscTitle]) -> Result<Vec<usize>, SelectionReview> {
     SelectionModel::from_titles(titles).select(
         &Selection::Episodes,
         &StreamFilter::Langs(vec!["de".into()]),
+        None,
     )
 }
 
@@ -60,7 +61,7 @@ fn authored_partition_order_survives_scan_order_and_audio_alternates() {
             *order = Some(ordinal);
         }
     }
-    assert_eq!(select(&titles).indices, vec![1, 2]);
+    assert_eq!(select(&titles), Ok(vec![1, 2]));
     for (index, ordinal) in [(0, Some(0)), (0, Some(2)), (1, Some(4))] {
         let mut invalid = titles.clone();
         if let EpisodeEvidence::Authored { ordinal: order, .. } =
@@ -68,7 +69,7 @@ fn authored_partition_order_survives_scan_order_and_audio_alternates() {
         {
             *order = ordinal;
         }
-        assert!(select(&invalid).requires_review());
+        assert!(select(&invalid).is_err());
     }
 }
 
@@ -94,17 +95,15 @@ fn reported_planet_earth_order_and_vpc_intervals_never_use_size_order_or_fuzzy_i
         clip(167, "00059", 524_280, 139_681_423, "deu"),
     ];
     roster(&mut titles, &[1, 5, 3]);
-    let report = select(&titles);
-    assert_eq!(report.indices, vec![1, 5, 3]);
+    let report = select(&titles).unwrap();
+    assert_eq!(report, vec![1, 5, 3]);
     assert_eq!(
         report
-            .indices
             .iter()
             .map(|&i| titles[i].playlist_id)
             .collect::<Vec<_>>(),
         vec![147, 148, 149]
     );
-    assert!(!report.requires_review());
     for (vpc, order) in [(2, 0), (6, 1)] {
         let mut conflicting = titles.clone();
         if let EpisodeEvidence::Authored { ordinal, .. } =
@@ -112,11 +111,9 @@ fn reported_planet_earth_order_and_vpc_intervals_never_use_size_order_or_fuzzy_i
         {
             *ordinal = Some(order);
         }
-        let held = select(&conflicting);
-        assert!(held.indices.is_empty());
         assert_eq!(
-            held.review_reason,
-            Some(SelectionReviewReason::InvalidEpisodeRoster)
+            select(&conflicting).map_err(|review| review.reason),
+            Err(SelectionReviewReason::InvalidEpisodeRoster)
         );
     }
 }
@@ -164,10 +161,10 @@ fn observed_seventeen_title_authored_roster_selects_three_exact_programs() {
             }
             scanned.rotate_left(shift);
             let report = SelectionModel::from_titles(&scanned)
-                .select(&Selection::Episodes, &StreamFilter::All);
-            assert!(!report.requires_review(), "{reversed}/{shift}: {report:?}");
-            assert_eq!(report.indices.len(), 3, "{reversed}/{shift}: {report:?}");
-            let selected: Vec<_> = report.indices.iter().map(|&i| &scanned[i]).collect();
+                .select(&Selection::Episodes, &StreamFilter::All, None)
+                .unwrap();
+            assert_eq!(report.len(), 3, "{reversed}/{shift}: {report:?}");
+            let selected: Vec<_> = report.iter().map(|&i| &scanned[i]).collect();
             assert_eq!(selected[0].playlist_id, 166);
             assert_eq!(selected[1].playlist_id, 167);
             assert!(matches!(selected[2].playlist_id, 149 | 168));
@@ -208,10 +205,8 @@ fn authored_order_is_required_and_unknown_identity_cannot_share_a_slot() {
                 }
             }
         }
-        let report = select(&titles);
-        assert!(report.requires_review(), "case {case}");
-        assert!(report.indices.is_empty(), "case {case}");
-        assert!(!report.candidates.is_empty());
+        let review = select(&titles).unwrap_err();
+        assert!(!review.candidates.is_empty(), "case {case}");
     }
 }
 
@@ -225,26 +220,19 @@ fn authored_six_alternates_keep_three_uneven_short_episodes_and_reject_distinct_
     }
     titles.push(title(6, "fake", 2100.0, "deu"));
     roster(&mut titles, &[0, 1, 2, 3, 4, 5]);
-    let report = select(&titles);
-    assert_eq!(report.indices, vec![1, 3, 5]);
-    assert!(!report.requires_review());
-    assert!(matches!(
-        report.basis,
-        SelectionBasis::AuthoredEpisodes { .. }
-    ));
+    assert_eq!(select(&titles), Ok(vec![1, 3, 5]));
 }
 
 #[test]
 fn unknown_is_a_review_hold_not_runtime_proof() {
     let titles = vec![title(0, "a", 90.0, "eng"), title(1, "b", 2400.0, "deu")];
-    let report = select(&titles);
-    assert!(report.indices.is_empty());
-    assert_eq!(report.candidates, vec![0, 1]);
     assert_eq!(
-        report.review_reason,
-        Some(SelectionReviewReason::MissingEpisodeRoster)
+        select(&titles),
+        Err(SelectionReview {
+            reason: SelectionReviewReason::MissingEpisodeRoster,
+            candidates: vec![0, 1],
+        })
     );
-    assert_eq!(report.basis, SelectionBasis::UncertainReview);
 }
 
 #[test]
@@ -283,9 +271,11 @@ fn partial_conflicting_invalid_and_sliced_rosters_fail_closed() {
                 SelectionReviewReason::InvalidEpisodeRoster
             }
         };
-        let report = select(&titles);
-        assert!(report.indices.is_empty(), "case {case}");
-        assert_eq!(report.review_reason, Some(expected), "case {case}");
+        assert_eq!(
+            select(&titles).map_err(|review| review.reason),
+            Err(expected),
+            "case {case}"
+        );
     }
 }
 
@@ -304,14 +294,14 @@ fn exact_intervals_and_unknown_identity_remain_conservative_under_authored_roste
     d.playlist_id = 3;
     let mut titles = vec![a, b, c, d];
     roster(&mut titles, &[0, 1, 2, 3]);
-    assert_eq!(select(&titles).indices, vec![0, 1, 2, 3]);
+    assert_eq!(select(&titles), Ok(vec![0, 1, 2, 3]));
 }
 
 #[test]
 fn excluded_equivalent_cannot_supply_audio_to_an_authored_episode() {
     let mut titles = vec![title(0, "a", 100.0, "eng"), title(1, "a", 100.0, "deu")];
     roster(&mut titles, &[0]);
-    assert_eq!(select(&titles).indices, vec![0]);
+    assert_eq!(select(&titles), Ok(vec![0]));
 }
 
 #[test]
@@ -320,16 +310,16 @@ fn owned_model_preserves_audio_and_explicit_choices() {
     let model = SelectionModel::from_titles(&titles);
     drop(titles);
     let audio = StreamFilter::Langs(vec!["de".into()]);
-    let movie = model.select(&Selection::MainMovie, &audio);
-    assert_eq!(movie.indices, vec![1]);
-    assert_eq!(movie.basis, SelectionBasis::Movie);
+    assert_eq!(
+        model.select(&Selection::MainMovie, &audio, None),
+        Ok(vec![1])
+    );
+    assert_eq!(model.main_title(&audio, None), Some(1));
     for (selection, expected) in [
         (Selection::Titles(vec![1, 0, 1, 99]), vec![1, 0]),
         (Selection::All, vec![0, 1]),
         (Selection::Longest, vec![1]),
     ] {
-        let report = model.select(&selection, &audio);
-        assert_eq!(report.indices, expected);
-        assert!(!report.requires_review());
+        assert_eq!(model.select(&selection, &audio, None), Ok(expected));
     }
 }

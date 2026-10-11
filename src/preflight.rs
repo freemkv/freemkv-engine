@@ -110,14 +110,16 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     // Does the selection resolve to a title? Ask the ONE function that decides
     // it (pure) rather than restate the policy here: `Longest` can resolve to
     // NOTHING (all-NaN durations), which a prior duplicated assumption missed.
-    let report = crate::SelectionModel::from_disc(disc).select(&job.selection, &job.streams.audio);
-    if let Some(reason) = report.review_reason {
-        reasons.push(Reason::with_detail(
-            "selection-review-required",
-            reason.key(),
-        ));
-    }
-    let resolved = report.indices;
+    let resolved = match crate::resolve_selection(disc, &job.selection, &job.streams.audio, None) {
+        Ok(indices) => indices,
+        Err(review) => {
+            reasons.push(Reason::with_detail(
+                "selection-review-required",
+                review.reason.key(),
+            ));
+            Vec::new()
+        }
+    };
     if reasons.is_empty() && resolved.is_empty() {
         reasons.push(Reason::new("empty-selection"));
     }

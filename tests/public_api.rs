@@ -173,14 +173,17 @@ fn vid_fingerprint_is_public_and_pinned() {
 }
 
 /// A selection that needs review is a typed error with its candidates, never an empty list.
+/// One resolver (and the model's `select`) answers it; the main title never needs review.
 #[test]
 fn selection_resolvers_return_the_review() {
-    use freemkv_engine::{Job, Selection, SelectionReview, StreamFilter};
+    use freemkv_engine::{Selection, SelectionModel, SelectionReview, StreamFilter};
     type Resolved = Result<Vec<usize>, SelectionReview>;
-    let _: fn(&libfreemkv::Disc, &Selection) -> Resolved = freemkv_engine::resolve_selection;
-    let _: fn(&libfreemkv::Disc, &Job) -> Resolved = freemkv_engine::resolve_job_selection;
-    let _: fn(&libfreemkv::Disc, &Selection, &StreamFilter) -> Resolved =
-        freemkv_engine::resolve_selection_with_audio;
+    let _: fn(&libfreemkv::Disc, &Selection, &StreamFilter, Option<&str>) -> Resolved =
+        freemkv_engine::resolve_selection;
+    let _: fn(&SelectionModel, &Selection, &StreamFilter, Option<&str>) -> Resolved =
+        SelectionModel::select;
+    let _: fn(&SelectionModel, &StreamFilter, Option<&str>) -> Option<usize> =
+        SelectionModel::main_title;
     let _: fn(SelectionReview) -> libfreemkv::Error = libfreemkv::Error::from;
 }
 

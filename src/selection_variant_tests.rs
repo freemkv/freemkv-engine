@@ -115,15 +115,8 @@ fn movie(
     titles: &[DiscTitle],
     presentation: Option<&str>,
     audio: &StreamFilter,
-) -> SelectionReport {
-    let preferences = SelectionPreferences {
-        presentation_language: presentation.map(Into::into),
-    };
-    SelectionModel::from_titles(titles).select_with_preferences(
-        &Selection::MainMovie,
-        audio,
-        &preferences,
-    )
+) -> Result<Vec<usize>, SelectionReview> {
+    SelectionModel::from_titles(titles).select(&Selection::MainMovie, audio, presentation)
 }
 
 fn picks(
@@ -132,9 +125,8 @@ fn picks(
     presentation: Option<&str>,
     audio: &StreamFilter,
 ) -> Vec<usize> {
-    let report = movie(&titles(shape, layout), presentation, audio);
-    assert_eq!(report.review_reason, None, "{shape:?} {layout:?}");
-    report.indices
+    movie(&titles(shape, layout), presentation, audio)
+        .unwrap_or_else(|review| panic!("{shape:?} {layout:?}: {review:?}"))
 }
 
 // Shared cells/clips around per-language parts; an extended cut is accepted (documented).
@@ -215,12 +207,9 @@ fn main_movie_never_reviews_and_decides_the_same_for_dvd_and_bd_shapes() {
     for layout in ALL {
         for (presentation, audio) in &requests {
             let decide = |shape| {
-                let report = movie(&titles(shape, layout), *presentation, audio);
-                assert_eq!(
-                    report.review_reason, None,
-                    "{layout:?} {presentation:?} {audio:?}"
-                );
-                report.indices
+                movie(&titles(shape, layout), *presentation, audio).unwrap_or_else(|review| {
+                    panic!("{layout:?} {presentation:?} {audio:?}: {review:?}")
+                })
             };
             assert_eq!(
                 decide(Shape::Dvd),
