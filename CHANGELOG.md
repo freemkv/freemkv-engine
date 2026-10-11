@@ -4,6 +4,18 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [Unreleased]
+
+### Changed
+
+- MainMovie stays title 0 unless another cut of it carries more of the wanted languages (`presentation_language`, else the audio filter's languages). A cut qualifies when the content it shares with title 0 is in the same order in both and is more than half of each, compared on libfreemkv's format-neutral `selection_evidence.segments`, with one rule for DVD, Blu-ray, UHD and HD DVD. Exact aliases still qualify, and so do seamless-branching extended cuts. Logo-sharing extras, play-all episodes, reordered decoys and separate full copies do not. A DVD whose German and English versions share cells now gives German for `-a de` or presentation language `de`, as the 1.8.3 GUI did.
+- MainMovie never holds for review. An invalid or unmatched language keeps title 0, so front ends validate language tags at input with the new `is_language_tag`. E9086 is now for episode-roster reasons only.
+
+### Removed
+
+- DVD authored-launch selection: `SelectionBasis::AuthoredLaunch`, the review reasons `incomplete-launch-proof`, `invalid-launch-proof`, `missing-presentation-language`, `invalid-presentation-language`, `unmatched-presentation-language` and `ambiguous-presentation-language`, and `SelectionTitle::audio_by_pid`. On untraceable DVDs (most of them) it held every main-movie pick for review whenever an audio language was set.
+- `PresentationIdentity` is an opaque list of content segments rather than an enum of clip and DVD-cell variants.
+
 ## [1.8.3] — 2026-10-08
 
 ### Changed

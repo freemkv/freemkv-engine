@@ -1,5 +1,5 @@
 use super::*;
-use libfreemkv::disc::Extent;
+use libfreemkv::disc::{ContentSegment, Extent};
 
 fn title(dur_secs: f64, start_lba: u32) -> DiscTitle {
     let mut t = DiscTitle::empty();
@@ -34,6 +34,7 @@ fn spans(dur: f64, spans: &[(u32, u32)]) -> DiscTitle {
             sector_count,
         })
         .collect();
+    t.selection_evidence.segments = ContentSegment::from_cell_extents(&t.extents);
     t
 }
 
@@ -162,6 +163,7 @@ fn alternate_playlists_for_one_program_are_selected_once() {
                 source_packets: 0,
                 feed_span: None,
             }];
+            t.selection_evidence.segments = ContentSegment::from_clips(&t.clips);
             titles.push(t);
         }
     }
@@ -207,6 +209,7 @@ fn distinct_programs_with_shared_intro_are_not_collapsed() {
                 feed_span: None,
             },
         ];
+        t.selection_evidence.segments = ContentSegment::from_clips(&t.clips);
         t
     };
     let titles = vec![

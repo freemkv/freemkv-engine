@@ -6,6 +6,7 @@
 
 use libfreemkv::aacs::mkb::AacsVersion;
 use libfreemkv::aacs::types::UnitKey;
+use libfreemkv::disc::ContentSegment;
 use libfreemkv::keysource::ResolveCtx;
 use libfreemkv::test_util::{BdFile, EncryptedBdImage, MemSource, encrypted_bd_image};
 use libfreemkv::{Disc, KeySource, KeySourceFactory, SectorSource};
@@ -691,6 +692,7 @@ pub(crate) fn clip_title(
         source_packets: 0,
         feed_span: None,
     }];
+    title.selection_evidence.segments = ContentSegment::from_clips(&title.clips);
     title
         .streams
         .push(libfreemkv::Stream::Audio(libfreemkv::AudioStream {
@@ -706,39 +708,25 @@ pub(crate) fn clip_title(
     title
 }
 
-/// Two DVD titles with complete authored launch proof: MainMovie needs a presentation
-/// language (`MissingPresentationLanguage`, candidates [0, 1] with audio All).
-pub(crate) fn launch_titles() -> Vec<libfreemkv::DiscTitle> {
-    use libfreemkv::disc::{DvdLaunchEvidence, DvdLaunchRoute, DvdLaunchStep};
-    let mut titles = vec![
-        clip_title(2, "en", 101.0, "eng"),
-        clip_title(1, "de", 100.0, "deu"),
-    ];
-    for title in &mut titles {
-        let audio_language = title.audio_streams().next().unwrap().language.clone();
-        title.selection_evidence.dvd_launch = DvdLaunchEvidence::VerifiedRoot {
-            vts: 1,
-            pgcn: 1,
-            title_count: 2,
-            routes: vec![DvdLaunchRoute {
-                button: title.playlist_id as u8,
-                display_masks: vec![1, 4],
-                target_vts: 1,
-                target_title: title.playlist_id as u8,
-                target_part: 1,
-                audio_stream: title.playlist_id as u8 - 1,
-                audio_pid: 0x1100,
-                audio_language,
-                traces: vec![vec![DvdLaunchStep {
-                    vts: 1,
-                    menu_vob: true,
-                    byte_offset: 197,
-                    command: [0x30, 5, 0, 1, 0, title.playlist_id as u8, 0, 0],
-                }]],
-            }],
-        };
-    }
-    titles
+/// Two cuts of one programme: shared clips "a" and "c" around a per-language "b-<lang>".
+/// MainMovie is title 0 (eng) unless German is wanted, then title 1 (deu).
+pub(crate) fn branch_titles() -> Vec<libfreemkv::DiscTitle> {
+    ["eng", "deu"]
+        .into_iter()
+        .enumerate()
+        .map(|(id, language)| {
+            let mut title = clip_title(id as u16, "a", 300.0, language);
+            title.clips = ["a", &format!("b-{language}"), "c"]
+                .into_iter()
+                .map(|clip| libfreemkv::Clip {
+                    clip_id: clip.into(),
+                    ..title.clips[0].clone()
+                })
+                .collect();
+            title.selection_evidence.segments = ContentSegment::from_clips(&title.clips);
+            title
+        })
+        .collect()
 }
 
 /// A clear disc of `titles`.

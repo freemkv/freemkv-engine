@@ -2613,12 +2613,15 @@ fn measured_titles_follow_the_selection_and_never_come_back_empty() {
     );
 }
 
-// A whole-disc image's MainMovie that needs review still measures its damage, over the
-// review candidates: measuring never authorizes or refuses anything.
+// A whole-disc image's selection that needs review (Episodes without a roster) still
+// measures its damage, over the review candidates: measuring never authorizes or refuses.
 #[test]
 fn measured_titles_of_a_selection_needing_review_are_its_candidates() {
     let empty = libfreemkv::DiscTitle::empty();
-    let mut titles = crate::test_fixtures::launch_titles();
+    let mut titles = vec![
+        crate::test_fixtures::clip_title(1, "a", 100.0, "eng"),
+        crate::test_fixtures::clip_title(2, "b", 100.0, "deu"),
+    ];
     for (i, t) in titles.iter_mut().enumerate() {
         t.extents = vec![libfreemkv::disc::Extent {
             start_lba: 100 * i as u32,
@@ -2626,7 +2629,7 @@ fn measured_titles_of_a_selection_needing_review_are_its_candidates() {
         }];
     }
     let disc = crate::test_fixtures::disc_of(titles);
-    let job = raw_job(std::path::Path::new("x.iso")).with_selection(crate::Selection::MainMovie);
+    let job = raw_job(std::path::Path::new("x.iso")).with_selection(crate::Selection::Episodes);
     let got = measured_titles(&disc, &job, &empty);
     let starts: Vec<u32> = got.iter().map(|t| t.extents[0].start_lba).collect();
     assert_eq!(starts, vec![0, 100]);

@@ -51,9 +51,8 @@ pub struct Reason {
     ///                          carries (detail = audio|subtitle|subtitle_forced)
     /// "unknown-language"       a requested tag names no language (detail = tag)
     /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
-    /// "selection-review-required" the evidence proves no automatic choice: episode
-    ///                          roster, launch proof or presentation language
-    ///                          (detail = SelectionReviewReason::key())
+    /// "selection-review-required" the evidence proves no automatic choice: an
+    ///                          episode roster (detail = SelectionReviewReason::key())
     /// ```
     pub key: String,
     /// Optional machine detail for the message (e.g. the offending index).

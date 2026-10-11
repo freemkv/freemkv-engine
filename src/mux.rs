@@ -47,8 +47,8 @@ pub(crate) fn log_safe(s: &str) -> String {
 
 /// Resolve a [`Selection`] to concrete 0-based title indices against a scanned disc.
 /// Out-of-range explicit indices are dropped (preflight blocks them first). `MainMovie` is
-/// the canonical presentation the [`crate::SelectionModel`] proves (authored launch, else
-/// title 0); `Episodes` needs an authored roster; `Longest` is the max-duration title.
+/// title 0 or another cut of it in a wanted language ([`crate::SelectionModel`]);
+/// `Episodes` needs an authored roster; `Longest` is the max-duration title.
 /// `Err` is a selection that needs review: it never becomes an empty list, which only an
 /// explicit `Titles([])` yields.
 pub fn resolve_selection(

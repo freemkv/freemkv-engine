@@ -1,41 +1,41 @@
 //! Conservative identities for alternate presentations within one scanned disc.
 
-use libfreemkv::{ContentFormat, DiscTitle};
+use libfreemkv::DiscTitle;
+use libfreemkv::disc::ContentSegment;
+use std::collections::HashSet;
 
-/// Exact ordered authored playback intervals, never duration/size similarity.
+/// Exact ordered authored content segments, never duration/size similarity. Format-neutral:
+/// the scanner describes every format's titles as segments.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum PresentationIdentity {
-    Clips(ContentFormat, Vec<(String, u32, u32)>),
-    DvdCells(Vec<(u32, u32)>),
+pub struct PresentationIdentity(Vec<ContentSegment>);
+
+pub(crate) fn identity(title: &DiscTitle) -> Option<PresentationIdentity> {
+    let segments = &title.selection_evidence.segments;
+    (!segments.is_empty()).then(|| PresentationIdentity(segments.clone()))
 }
 
-// Stream-file extents are not playback intervals. Only DVD extents carry
-// authored cell ranges; other formats require valid ordered clip intervals.
-pub(crate) fn identity(title: &DiscTitle) -> Option<PresentationIdentity> {
-    if !title.clips.is_empty() {
-        return title
-            .clips
-            .iter()
-            .map(|clip| {
-                (!clip.clip_id.trim().is_empty() && clip.in_time < clip.out_time).then_some((
-                    clip.clip_id.clone(),
-                    clip.in_time,
-                    clip.out_time,
-                ))
-            })
-            .collect::<Option<Vec<_>>>()
-            .map(|clips| PresentationIdentity::Clips(title.content_format, clips));
+impl PresentationIdentity {
+    // Another cut of the same programme: the content both share appears in the same order
+    // in each and is more than half of each. Exact aliases share everything.
+    pub(crate) fn branch_variant(&self, other: &Self) -> bool {
+        let (mine, theirs) = (shared(&self.0, &other.0), shared(&other.0, &self.0));
+        let common = weight(mine.iter().copied());
+        mine == theirs
+            && common.saturating_mul(2) > weight(self.0.iter())
+            && common.saturating_mul(2) > weight(other.0.iter())
     }
-    if title.content_format != ContentFormat::DvdPs || title.extents.is_empty() {
-        return None;
-    }
-    title
-        .extents
-        .iter()
-        .map(|extent| {
-            let last = extent.sector_count.checked_sub(1)?;
-            Some((extent.start_lba, extent.start_lba.checked_add(last)?))
-        })
-        .collect::<Option<Vec<_>>>()
-        .map(PresentationIdentity::DvdCells)
+}
+
+// `a`'s segments that also occur in `b`, in `a`'s order.
+fn shared<'a>(a: &'a [ContentSegment], b: &[ContentSegment]) -> Vec<&'a ContentSegment> {
+    let present: HashSet<_> = b.iter().collect();
+    a.iter()
+        .filter(|segment| present.contains(segment))
+        .collect()
+}
+
+fn weight<'a>(segments: impl Iterator<Item = &'a ContentSegment>) -> u64 {
+    segments.fold(0, |sum, s| {
+        sum.saturating_add(s.end.saturating_sub(s.start))
+    })
 }

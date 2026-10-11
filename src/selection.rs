@@ -5,10 +5,9 @@ use libfreemkv::DiscTitle;
 use libfreemkv::disc::{EpisodeEvidence, MovieSelectionBasis, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
 
-#[path = "selection_launch.rs"]
-mod launch;
-
-/// Content-presentation preference, independent of which streams are retained.
+/// Content-presentation preference, independent of which streams are retained. Soft:
+/// MainMovie switches from title 0 only to another cut of it carrying the language
+/// (see [`SelectionModel::select_with_preferences`]) and never holds for review.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SelectionPreferences {
     pub presentation_language: Option<String>,
@@ -23,7 +22,6 @@ pub struct SelectionTitle {
     pub duration_secs: f64,
     pub presentation: Option<PresentationIdentity>,
     pub audio_languages: Vec<String>,
-    pub audio_by_pid: Vec<(u16, String)>,
     pub evidence: TitleSelectionEvidence,
 }
 
@@ -38,7 +36,6 @@ pub enum SelectionBasis {
     All,
     Longest,
     Movie(MovieSelectionBasis),
-    AuthoredLaunch,
     AuthoredEpisodes { roster: String },
     UncertainReview,
 }
@@ -49,12 +46,6 @@ pub enum SelectionReviewReason {
     IncompleteEpisodeRoster,
     ConflictingEpisodeRoster,
     InvalidEpisodeRoster,
-    IncompleteLaunchProof,
-    InvalidLaunchProof,
-    MissingPresentationLanguage,
-    InvalidPresentationLanguage,
-    UnmatchedPresentationLanguage,
-    AmbiguousPresentationLanguage,
 }
 
 impl SelectionReviewReason {
@@ -64,12 +55,6 @@ impl SelectionReviewReason {
             Self::IncompleteEpisodeRoster => "incomplete-episode-roster",
             Self::ConflictingEpisodeRoster => "conflicting-episode-roster",
             Self::InvalidEpisodeRoster => "invalid-episode-roster",
-            Self::IncompleteLaunchProof => "incomplete-launch-proof",
-            Self::InvalidLaunchProof => "invalid-launch-proof",
-            Self::MissingPresentationLanguage => "missing-presentation-language",
-            Self::InvalidPresentationLanguage => "invalid-presentation-language",
-            Self::UnmatchedPresentationLanguage => "unmatched-presentation-language",
-            Self::AmbiguousPresentationLanguage => "ambiguous-presentation-language",
         }
     }
 }
@@ -137,10 +122,6 @@ impl SelectionModel {
                             _ => None,
                         })
                         .collect(),
-                    audio_by_pid: title
-                        .audio_streams()
-                        .map(|audio| (audio.pid, audio.language.clone()))
-                        .collect(),
                     evidence: title.selection_evidence.clone(),
                 })
                 .collect(),
@@ -165,11 +146,6 @@ impl SelectionModel {
         audio: &StreamFilter,
         preferences: &SelectionPreferences,
     ) -> SelectionReport {
-        if matches!(selection, Selection::MainMovie)
-            && let Some(report) = self.launch_selection(audio, preferences)
-        {
-            return report;
-        }
         let presentation_audio = preferences
             .presentation_language
             .as_ref()
@@ -205,11 +181,15 @@ impl SelectionModel {
                         review_reason: None,
                     };
                 };
+                // Title 0 unless another cut of it carries more of the wanted languages.
                 let mut best = 0;
                 if let Some(identity) = &main.presentation {
                     for (index, title) in self.titles.iter().enumerate().skip(1) {
-                        if title.presentation.as_ref() == Some(identity)
-                            && scores[index] > scores[best]
+                        if scores[index] > scores[best]
+                            && title
+                                .presentation
+                                .as_ref()
+                                .is_some_and(|other| other.branch_variant(identity))
                         {
                             best = index;
                         }
@@ -337,3 +317,6 @@ impl SelectionModel {
 #[cfg(test)]
 #[path = "selection_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "selection_variant_tests.rs"]
+mod variant_tests;

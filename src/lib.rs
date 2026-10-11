@@ -88,7 +88,7 @@ pub use run::recover_to_iso;
 pub use sink::{Event, Level, NoopSink, Progress, RecoveryEvent, Sink};
 pub use speed::SpeedEstimator;
 pub use streams::{
-    StreamSelError, SubtitleFilter, UnmatchedClass, resolve_stream_selection,
+    StreamSelError, SubtitleFilter, UnmatchedClass, is_language_tag, resolve_stream_selection,
     resolve_stream_selection_forced,
 };
 
