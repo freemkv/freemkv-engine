@@ -214,16 +214,18 @@ fn iso_dvd_source_muxes_to_mpg_through_the_engine() {
     let source_url = format!("iso://{}", iso_path.display());
     let dest_url = format!("mpg://{}", mpg_path.display());
     let mux_opts = freemkv_engine::mux_options(false);
-    // D4: the output opening reaches the front end's Sink, where both shells print the note.
+    // D4: the output opening reaches the front end's Sink, where both shells print the note,
+    // with the identity of the file the mux opened.
+    type Seen = (String, usize, Option<(u64, u64)>);
     #[derive(Default)]
-    struct Opened(std::sync::Mutex<Vec<(String, usize)>>);
+    struct Opened(std::sync::Mutex<Vec<Seen>>);
     impl freemkv_engine::Sink for Opened {
         fn event(&self, e: &freemkv_engine::Event<'_>) {
-            if let freemkv_engine::Event::OutputOpened { dest, title } = e {
+            if let freemkv_engine::Event::OutputOpened { dest, title, file } = e {
                 self.0
                     .lock()
                     .unwrap()
-                    .push((dest.to_string(), title.streams.len()));
+                    .push((dest.to_string(), title.streams.len(), *file));
             }
         }
     }
@@ -237,9 +239,11 @@ fn iso_dvd_source_muxes_to_mpg_through_the_engine() {
         &sink,
     )
     .unwrap_or_else(|e| panic!("iso:// -> mpg:// mux must succeed, got {e}"));
+    let file = libfreemkv::io::artifact_lock::file_identity(&mpg_path).ok();
+    assert!(file.is_some());
     assert_eq!(
         *sink.0.lock().unwrap(),
-        vec![(dest_url.clone(), 2)],
+        vec![(dest_url.clone(), 2, file)],
         "one OutputOpened, with the dest and the title as written"
     );
 

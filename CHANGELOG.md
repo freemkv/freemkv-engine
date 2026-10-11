@@ -26,6 +26,7 @@ project follows semantic versioning.
 - MainMovie never holds for review: an invalid or unmatched language keeps title 0. E9086 is for episode-roster reasons only.
 - **Recovery hosts**: `PassHost` loses its `resume_sweep`, `sweep_attempt`, `patch_failed` and `continue_after_wedge` hooks (breaking for hosts that implemented them); their policy is in `MultipassOpts`. `MultipassOpts` gains four public fields, so struct literals need `..Default::default()`. A zero `max_sweep_attempts` counts as 1.
 - An image opened without an explicit key scope scopes its keys to title 0, the MainMovie pick with every audio kept (`rip_scope` with no titles likewise). MainMovie never needs review.
+- **`Event::OutputOpened`** gains `file: Option<(u64, u64)>`: the opened file's identity (device and inode, or volume serial and file index), which libfreemkv reads from the mux's own handle; `None` for a non-file sink or when it could not be read. A pattern that names the variant's fields without `..` must add it.
 - `OpenImageOptions::halt` also stops the image scan, not only the key resolve, and an open whose halt is already raised now returns `Halted`, even with held keys or a pre-scanned disc.
 
 ### Fixed

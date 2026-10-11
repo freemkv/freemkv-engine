@@ -101,10 +101,12 @@ fn a_title_that_opened_its_output_and_then_failed_or_stopped_removes_it() {
     let dest = |_: usize| format!("mkv://{}", out.display());
     let plan = MuxPlan::new(vec![0]);
     let opens = |dest: &str, sink: &dyn Sink| {
-        std::fs::write(dest.strip_prefix("mkv://").unwrap(), b"half a title").unwrap();
+        let path = Path::new(dest.strip_prefix("mkv://").unwrap());
+        std::fs::write(path, b"half a title").unwrap();
         sink.event(&Event::OutputOpened {
             dest,
             title: &libfreemkv::DiscTitle::empty(),
+            file: file_id(path),
         });
     };
     let (token, sink) = (Halt::new(), Events::default());
@@ -147,6 +149,7 @@ fn a_file_replaced_after_the_open_is_never_removed() {
         sink.event(&Event::OutputOpened {
             dest,
             title: &title,
+            file: file_id(Path::new(path)),
         });
         let other = dir.path().join("other.mkv");
         std::fs::write(&other, b"another rip").unwrap();

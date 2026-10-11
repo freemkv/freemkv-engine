@@ -471,14 +471,14 @@ pub(crate) fn with_mux_watcher_for<T>(
         halt.cancel();
     }
     let (tx, rx) = mpsc::channel::<(u64, u64)>();
-    let (opened_tx, opened_rx) = mpsc::channel::<libfreemkv::DiscTitle>();
+    let (opened_tx, opened_rx) = mpsc::channel::<(libfreemkv::DiscTitle, Option<(u64, u64)>)>();
     let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
     // Forwards write progress, the output opening and flush progress over channels.
     // Owned + 'static (holds only Senders), so it fits the `Ctx`'s `Arc<dyn Events>`.
     struct ChannelEvents {
         tx: mpsc::Sender<(u64, u64)>,
-        opened: mpsc::Sender<libfreemkv::DiscTitle>,
+        opened: mpsc::Sender<(libfreemkv::DiscTitle, Option<(u64, u64)>)>,
         flush: mpsc::Sender<(u64, u64)>,
         extra: Option<Arc<dyn libfreemkv::Events>>,
     }
@@ -491,8 +491,8 @@ pub(crate) fn with_mux_watcher_for<T>(
                 libfreemkv::Event::BytesWritten { bytes, total } => {
                     let _ = self.tx.send((bytes, total));
                 }
-                libfreemkv::Event::OutputOpened { title } => {
-                    let _ = self.opened.send(title.clone());
+                libfreemkv::Event::OutputOpened { title, file } => {
+                    let _ = self.opened.send((title.clone(), file));
                 }
                 // Stop design v5 §4.5: flush progress becomes `Sink::progress(pass: "sync")`,
                 // one call per event.
@@ -503,8 +503,8 @@ pub(crate) fn with_mux_watcher_for<T>(
             }
         }
     }
-    let opened = |title: &libfreemkv::DiscTitle| {
-        sink.event(&crate::sink::Event::OutputOpened { dest, title });
+    let opened = |title: &libfreemkv::DiscTitle, file| {
+        sink.event(&crate::sink::Event::OutputOpened { dest, title, file });
     };
 
     let done = Arc::new(AtomicBool::new(false));
@@ -524,8 +524,8 @@ pub(crate) fn with_mux_watcher_for<T>(
                 // it reads true, the drain below sees every send, and the loop ends after it.
                 let finished = watcher_done.load(Ordering::Acquire);
                 // The opening first: it precedes every write-progress tick.
-                while let Ok(title) = opened_rx.try_recv() {
-                    opened(&title);
+                while let Ok((title, file)) = opened_rx.try_recv() {
+                    opened(&title, file);
                 }
                 // Coalesce queued progress ticks to the LATEST, sample ONCE:
                 // sampling per-message would measure `dt` in microseconds
