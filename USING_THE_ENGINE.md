@@ -63,9 +63,9 @@ same rule for every format). Ties go to the earlier title. Exact aliases qualify
 does an extended cut built by seamless branching. Logo-sharing extras, reordered decoys
 and separate full copies do not. An episode of a play-all qualifies only when it is
 itself more than half of the play-all's content (one episode of three or more
-comparable ones is not); the rule is about shared weight, not about what the title is. MainMovie never holds
-for review on language: an unknown or unmatched language keeps title 0, so front ends
-validate language tags at input.
+comparable ones is not); the rule is about shared weight, not about what the title is.
+MainMovie never holds for review on language: an unknown or unmatched language keeps
+title 0, so front ends validate language tags at input.
 
 `select` returns the executable indices, or `Err(SelectionReview)` whose `candidates`
 are review/display only: ask for explicit title choices before starting.

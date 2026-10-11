@@ -75,7 +75,7 @@ impl SelectionModel {
                         .iter()
                         .filter_map(|stream| match stream {
                             libfreemkv::Stream::Audio(audio) => {
-                                Some(crate::streams::audio_language(&audio.language))
+                                Some(crate::streams::stream_lang(&audio.language))
                             }
                             _ => None,
                         })

@@ -90,7 +90,7 @@ pub(super) struct SharedPatchState {
 }
 
 impl SharedPatchState {
-    /// `title` is the main feature (`PatchOptions::main_title`, else title 0); `None` on a disc
+    /// `title` is the main feature (`patch_titled`'s `main_title`, else title 0); `None` on a disc
     /// with no titles, where there is nothing to locate damage against.
     fn from_map(map: &Mapfile, title: Option<&libfreemkv::DiscTitle>) -> Self {
         let bad_ranges = map.ranges_with(&mapfile::damage_sector_statuses());

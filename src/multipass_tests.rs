@@ -3090,3 +3090,38 @@ fn resume_sweep_overrides_whether_the_sweep_rereads_a_finished_image() {
     assert!(reads_in_second_run(Some(false), true, "resume-false") > 1000);
     assert!(reads_in_second_run(Some(true), false, "resume-true-nomap") > 1000);
 }
+
+// A selection that resolves to nothing has no main title: progress reports none, not title 0.
+#[test]
+fn an_empty_selection_has_no_main_title_in_progress() {
+    let disc = variant_disc();
+    for selection in [
+        crate::Selection::Titles(vec![]),
+        crate::Selection::Titles(vec![9]),
+    ] {
+        let (_dir, iso) = scratch_iso("empty-selection");
+        let job = raw_job(&iso).with_selection(selection);
+        let mut reader = MultiSpotReader {
+            capacity: 4096,
+            spots: vec![],
+        };
+        let log = EventLog::default();
+        multipass_rip(
+            &disc,
+            &mut reader,
+            &iso,
+            &job,
+            &MultipassOpts {
+                max_passes: 2,
+                ..Default::default()
+            },
+            &log,
+        )
+        .expect("a result");
+        let sizes = log.sizes.lock().unwrap();
+        assert!(
+            !sizes.is_empty() && sizes.iter().all(|z| z.is_none()),
+            "{sizes:?}"
+        );
+    }
+}

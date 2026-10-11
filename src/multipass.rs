@@ -546,13 +546,15 @@ pub(crate) fn end_of_recovery_lost_ms(
     (main_title_lost_ms(title, main_bad_bytes), None)
 }
 
-// The title live progress reports as the main one: the first title this rip delivers, so the
-// progress figures and `MultipassResult::main_lost_ms` describe the same title.
+// The first title this rip delivers (for `MainMovie`, the one measured_titles measures). A
+// selection resolving to nothing has none: `usize::MAX` is no index, so progress reports no
+// main title rather than title 0.
 fn progress_main_title(disc: &libfreemkv::Disc, job: &Job) -> Option<usize> {
     crate::resolve_selection(disc, &job.selection, &job.streams.audio, None)
         .unwrap_or_else(|review| review.candidates)
         .into_iter()
         .find(|&i| i < disc.titles.len())
+        .or(Some(usize::MAX))
 }
 
 // The titles this rip delivers (`Job::selection`; a selection needing review: its candidates),
@@ -929,6 +931,7 @@ pub(crate) fn recover(
     }
     let empty_title = libfreemkv::DiscTitle::empty();
     let titles = measured_titles(disc, job, &empty_title);
+    let main_title = progress_main_title(disc, job);
     if !plan.multipass {
         return single_pass(disc, host.reader(), iso_path, job, scope, sink, halt);
     }
@@ -954,7 +957,6 @@ pub(crate) fn recover(
             },
         );
         let scope = scope.map(crate::recovery::sector_scope_to_bytes);
-        let main_title = progress_main_title(disc, job);
         let mut attempt = 0u32;
         let mut last_err = None;
         let sr = loop {
