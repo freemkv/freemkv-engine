@@ -31,6 +31,7 @@ project follows semantic versioning.
 
 ### Fixed
 
+- The locked rustls is 0.23.46, for RUSTSEC-2026-0346, -0347, -0348 and -0349 (TLS secrets in `Debug`, ECH, certificate decompression, key-exchange downgrade).
 - Image and folder title runs resolve their selection against the scanned disc; `MainMovie`, `Longest` and `Episodes` were taken as title 0 without a scan.
 - Such a run opens the image once (one engine scan, under the run's Stop) and resolves its selection on that open, so a non-explicit selection gets the sidecar and identity checks, and errors, of the explicit title. libfreemkv's mux still probes the image itself.
 - A remux target that appears before publication is the typed E9084 refusal; on a filesystem without hard links the old fallback rename could overwrite it.
