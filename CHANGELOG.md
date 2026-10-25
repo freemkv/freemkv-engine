@@ -4,6 +4,12 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [Unreleased] — 2026-10-25
+
+### Fixed
+
+- CLI, GUI and server: folder backups consume the same prepared disc reader as ISO backups, preserving clear navigation files and all source directories.
+
 ## [1.8.5] — 2026-10-19
 
 ### Changed

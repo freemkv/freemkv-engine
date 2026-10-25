@@ -563,12 +563,25 @@ fn tree(
                 Reading::Reader(r) => &mut **r,
                 Reading::Host(h) => h.reader(),
             };
-            disc.extract_into(reader, &mut out, keys.as_ref(), &ctx)?
+            let mut prepared = crate::recovery::whole_disc_decrypting_reader(
+                disc,
+                reader,
+                true,
+                Some(halt),
+                keys.as_ref(),
+            )?;
+            disc.extract_into(&mut prepared, &mut out, &ctx)?
         }
         Source::Opened(o) => {
             let keys = keys.as_ref().unwrap_or(&o.keys);
-            o.disc
-                .extract_into(o.reader.as_mut(), &mut out, Some(keys), &ctx)?
+            let mut prepared = crate::recovery::whole_disc_decrypting_reader(
+                &o.disc,
+                o.reader.as_mut(),
+                true,
+                Some(halt),
+                Some(keys),
+            )?;
+            o.disc.extract_into(&mut prepared, &mut out, &ctx)?
         }
     };
     Ok(Report::Tree { extract })

@@ -20,6 +20,12 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     halt: Option<&libfreemkv::halt::Halt>,
     keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> Result<WholeDiscReader<'r>> {
+    libfreemkv::keys::check_decryptable(
+        disc,
+        !decrypt,
+        keys,
+        &libfreemkv::keys::KeyScope::WholeDisc,
+    )?;
     if !decrypt {
         return Ok(libfreemkv::whole_disc::raw_whole_disc_reader(reader));
     }

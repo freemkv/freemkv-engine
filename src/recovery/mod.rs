@@ -1628,6 +1628,7 @@ mod read_error;
 mod section_recover;
 mod sweep;
 mod whole_disc;
+pub(crate) use whole_disc::whole_disc_decrypting_reader;
 
 // The mapfile-backed main-title bad-byte reader, used by the multipass
 // abort-on-loss gate. `pub` so the engine can re-export it: a front-end reads
