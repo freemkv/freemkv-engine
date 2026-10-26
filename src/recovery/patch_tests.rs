@@ -227,6 +227,60 @@ impl libfreemkv::SectorSource for NoWorkSource {
 }
 
 #[test]
+fn patch_no_work_precancelled_stops_before_source_reads() {
+    let mut missed = Vec::new();
+    for (decrypt, with_keys) in [(true, true), (true, false), (false, true), (false, false)] {
+        for entry in ["op", "extra", "legacy"] {
+            let dir = tempfile::tempdir().unwrap();
+            let iso = dir.path().join("disc.iso");
+            let disc = guard_disc(4096);
+            let full = disc.capacity_bytes;
+            let map_path = disc.mapfile_for(&iso);
+            let mut map = mapfile::Mapfile::create(&map_path, full, "vTEST").unwrap();
+            map.record(0, full, mapfile::SectorStatus::Finished)
+                .unwrap();
+            map.flush().unwrap();
+            let image = vec![0xA5; full as usize];
+            std::fs::write(&iso, &image).unwrap();
+            let before = std::fs::read(&map_path).unwrap();
+            let op = libfreemkv::Halt::new();
+            let mut opts = PatchOptions::for_patch_pass(decrypt, None, None);
+            opts.keys = with_keys.then(libfreemkv::keys::KeyRing::none);
+            if entry == "op" {
+                op.cancel();
+            } else {
+                opts.halt = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    true,
+                )));
+            }
+            let mut source = NoWorkSource { reads: 0 };
+            if entry == "legacy" {
+                let result = patch(&disc, &mut source, &iso, &opts);
+                if !matches!(result, Err(Error::Halted)) {
+                    missed.push(format!(
+                        "{entry}, decrypt={decrypt}, keys={with_keys}: {result:?}"
+                    ));
+                }
+            } else {
+                let result = super::patch_with(&op, &disc, &mut source, &iso, &opts);
+                if !matches!(result, crate::EngineOutcome::Stopped(None)) {
+                    missed.push(format!(
+                        "{entry}, decrypt={decrypt}, keys={with_keys}: {result:?}"
+                    ));
+                }
+            }
+            assert_eq!(source.reads, 0, "{entry}");
+            assert_eq!(std::fs::read(&iso).unwrap(), image, "{entry}");
+            assert_eq!(std::fs::read(&map_path).unwrap(), before, "{entry}");
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "pre-cancelled patch must stop: {missed:#?}"
+    );
+}
+
+#[test]
 fn patch_no_work_still_refuses_invalid_inputs_before_source_reads() {
     for gate in ["truncated", "coverage", "identity", "no-key"] {
         let dir = tempfile::tempdir().unwrap();
@@ -272,6 +326,17 @@ fn patch_no_work_still_refuses_invalid_inputs_before_source_reads() {
         let mut source = NoWorkSource { reads: 0 };
         let err = patch(&disc, &mut source, &iso, &opts).unwrap_err();
         assert_eq!(source.reads, 0, "{gate}: {err:?}");
+        let op = libfreemkv::Halt::new();
+        op.cancel();
+        match super::patch_with(&op, &disc, &mut source, &iso, &opts) {
+            crate::EngineOutcome::Failed(cancelled_err) => assert_eq!(
+                cancelled_err.code(),
+                err.code(),
+                "{gate}: existing gate wins over Stop"
+            ),
+            other => panic!("{gate}: expected the same validation failure, got {other:?}"),
+        }
+        assert_eq!(source.reads, 0, "{gate}: cancelled validation");
         match gate {
             "truncated" => assert!(matches!(err, Error::ImageTruncated { .. }), "{err:?}"),
             "coverage" => assert!(
