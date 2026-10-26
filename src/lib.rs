@@ -16,6 +16,7 @@ mod extract;
 mod image;
 mod job;
 pub mod keys;
+pub mod metadata;
 mod multipass;
 mod mux;
 mod outcome;

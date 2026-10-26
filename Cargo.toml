@@ -19,6 +19,8 @@ anyhow = "1"
 libfreemkv = "1.8"
 freemkv-keysources = "1.8"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
 tracing = "0.1"
 # Language-tag normalization for stream selection (name / 639-1 / 639-2/3 →
 # language identity). `lowercase_names` enables case-insensitive name matching
@@ -29,6 +31,7 @@ isolang = { version = "2", features = ["lowercase_names"] }
 sha2 = "0.11"
 
 [dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # Temp dirs / files for the relocated recovery regression suites (mirrors
 # libfreemkv's dev-dependency).
 tempfile = "3"
