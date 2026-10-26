@@ -124,6 +124,10 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
             Ok(json) => Some(json),
             Err(e) => {
                 tracing::warn!(query = %query, error = %e, "tmdb: response was not valid JSON");
+                sink.log(
+                    crate::Level::Warn,
+                    "TMDB: response could not be read or parsed",
+                );
                 None
             }
         },
@@ -133,6 +137,10 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
         }
         Err(ureq::Error::StatusCode(code)) => {
             tracing::warn!(query = %query, status = code, "tmdb: HTTP error status");
+            sink.log(
+                crate::Level::Warn,
+                &format!("TMDB: HTTP error status {code}"),
+            );
             None
         }
         Err(e) => {
@@ -141,6 +149,10 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
             // so masking stays even though ureq 3 is URL-free elsewhere.
             let error_kind = super::transport_error_kind(&e);
             tracing::warn!(query = %query, error_kind = %error_kind, "tmdb: request failed (network/transport)");
+            sink.log(
+                crate::Level::Warn,
+                &format!("TMDB: request failed (network/transport: {error_kind})"),
+            );
             None
         }
     }
@@ -220,6 +232,7 @@ fn lookup_using(
             continue;
         };
         let Some(results) = resp["results"].as_array() else {
+            failed = true;
             continue;
         };
         if let Some(best) = pick_best(&variant, results, prefer_tv) {
@@ -774,24 +787,9 @@ fn season_episodes_with(
         "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}?api_key={}",
         urlencoded(api_key)
     );
-    match AGENT.get(&url).call() {
-        Ok(resp) => match read_capped_json(resp) {
-            Ok(json) => parse_episodes(&json),
-            Err(e) => {
-                tracing::warn!(tv_id, season, error = %e, "tmdb: season response was not valid JSON");
-                Vec::new()
-            }
-        },
-        Err(ureq::Error::StatusCode(401)) => {
-            warn_bad_key_throttled(sink);
-            Vec::new()
-        }
-        Err(e) => {
-            let error_kind = super::transport_error_kind(&e);
-            tracing::warn!(tv_id, season, error_kind = %error_kind, "tmdb: season fetch failed");
-            Vec::new()
-        }
-    }
+    fetch_url(&url, &format!("TV {tv_id} season {season}"), sink)
+        .map(|json| parse_episodes(&json))
+        .unwrap_or_default()
 }
 
 /// Parse the `episodes` array of a `/tv/{id}/season/{n}` response.
@@ -871,29 +869,37 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
     if count == 0 || episodes.is_empty() {
         return fallback;
     }
-    // The disc has to fit inside the season's episode numbering, or there is no
-    // honest position to align to.
+    let Ok(count) = u16::try_from(count) else {
+        return fallback;
+    };
+    // The disc must fit inside the season's episode numbering.
     let min_ep = episodes.iter().map(|e| e.number).min().unwrap_or(1).max(1);
     let max_ep = episodes.iter().map(|e| e.number).max().unwrap_or(0);
-    let Some(last_start) = max_ep.checked_sub(count as u16 - 1) else {
+    let Some(last_start) = max_ep.checked_sub(count - 1) else {
         return fallback;
     };
     if last_start < min_ep {
         return fallback;
     }
-    let runtime_of = |n: u16| {
-        episodes
-            .iter()
-            .find(|e| e.number == n)
-            .map(|e| e.runtime_min)
+    let mut runtimes = std::collections::HashMap::with_capacity(episodes.len());
+    for episode in episodes {
+        #[cfg(test)]
+        low_metadata_tests::count_runtime_probe();
+        runtimes
+            .entry(episode.number)
+            .or_insert(episode.runtime_min);
+    }
+    let runtime_of = |number: u16| {
+        #[cfg(test)]
+        low_metadata_tests::count_runtime_probe();
+        runtimes.get(&number).copied()
     };
 
-    // Best = smallest average runtime distance over comparable pairs; ties
-    // break toward `fallback`. An offset with no comparable pair is skipped,
-    // so a season with no runtime data leaves `best_signal == 0` → `fallback`.
+    // Require a unique minimum over comparable pairs; unknown runtimes add no signal.
     let mut best_start = fallback;
     let mut best_avg = f64::INFINITY;
     let mut best_signal = 0u32;
+    let mut best_tied = false;
     let mut fallback_avg: Option<f64> = None;
     for start in min_ep..=last_start {
         let mut dist = 0.0f64;
@@ -916,17 +922,16 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
         if start == fallback {
             fallback_avg = Some(avg);
         }
-        let closer =
-            (start as i32 - fallback as i32).abs() < (best_start as i32 - fallback as i32).abs();
-        let better =
-            best_signal == 0 || avg < best_avg - 1e-9 || ((avg - best_avg).abs() <= 1e-9 && closer);
-        if better {
+        if best_signal == 0 || avg < best_avg - 1e-9 {
             best_start = start;
             best_avg = avg;
             best_signal = signal;
+            best_tied = false;
+        } else if (avg - best_avg).abs() <= 1e-9 {
+            best_tied = true;
         }
     }
-    if best_signal == 0 {
+    if best_signal == 0 || best_tied {
         return fallback;
     }
     if fallback_avg.is_some_and(|fa| fa - best_avg < ALIGN_MIN_GAIN_MIN) {
@@ -938,3 +943,7 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
 #[cfg(test)]
 #[path = "tmdb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "low_metadata_tests.rs"]
+mod low_metadata_tests;
