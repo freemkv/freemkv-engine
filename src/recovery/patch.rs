@@ -1330,6 +1330,7 @@ fn patch_linked(
         "begin"
     );
     let bytes_good_before = initial_stats.bytes_good;
+    lib.check()?;
 
     // As in sweep, AACS reads widen to file unit grids; raw copies retain ciphertext.
     // The validated work list is immutable: when empty, the raw wrapper is never consumed.
