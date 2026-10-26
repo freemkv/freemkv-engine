@@ -1333,10 +1333,12 @@ fn patch_linked(
 
     // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim); AACS
     // reads widen onto each file's unit grid. Bad sectors = PHYSICAL read failure.
+    // The validated work list is immutable and an empty run consumes no reader.
+    // Avoid naming metadata reads in that case, retaining the normal sink/settle path.
     let mut reader = super::whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
-        opts.decrypt,
+        opts.decrypt && !bad_ranges.is_empty(),
         halt.is_wired().then_some(lib),
         opts.keys.as_ref(),
     )?;

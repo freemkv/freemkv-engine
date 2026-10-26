@@ -2356,13 +2356,38 @@ fn a_finished_raw_image_rerun_as_a_decrypted_copy_is_read_again() {
     let sink = HookSink::new("", false, Box::new(|| {}));
     let second = multipass_rip(&disc, &mut r2, &iso, &job, &opts, &sink).expect("run 2");
     assert!(second.complete, "{second:?}");
-    assert_eq!(
-        reads.lock().unwrap().len(),
-        4096,
-        "every sector must be read again"
-    );
+    // Decrypted naming may also probe LBA 256. Check payload coverage rather
+    // than an aggregate count that duplicates can satisfy with a missing sector.
+    assert_source_lba_coverage(&reads.lock().unwrap(), 4096);
     assert_eq!(marker_at(&iso, 4095), 0xB2);
     assert!(sink.logged(Level::Warn, "other raw/decrypt mode"));
+}
+
+fn assert_source_lba_coverage(reads: &[u32], sectors: u32) {
+    let observed: std::collections::BTreeSet<_> = reads.iter().copied().collect();
+    assert_eq!(observed.first(), Some(&0), "first source LBA");
+    assert_eq!(observed.last(), Some(&(sectors - 1)), "last source LBA");
+    for lba in 0..sectors {
+        assert!(
+            observed.contains(&lba),
+            "source read coverage missing LBA {lba}"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "source read coverage missing LBA 2000")]
+fn source_lba_coverage_rejects_a_missing_middle_sector_despite_duplicate_probes() {
+    let reads: Vec<_> = (0..4096)
+        .filter(|&lba| lba != 2000)
+        .chain([256, 256])
+        .collect();
+    assert_eq!(
+        reads.len(),
+        4097,
+        "same count as the legitimate full copy plus probe"
+    );
+    assert_source_lba_coverage(&reads, 4096);
 }
 
 // Pass 1's "only a map proven raw" rule alone: a decrypted partial whose map predates the

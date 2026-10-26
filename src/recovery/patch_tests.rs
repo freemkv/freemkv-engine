@@ -29,7 +29,7 @@ impl libfreemkv::sector::SectorSource for NoReader {
         _buf: &mut [u8],
         _decrypt: bool,
     ) -> std::result::Result<usize, libfreemkv::Error> {
-        panic!("the image-length gate must refuse BEFORE any sector is read");
+        panic!("patch must not read this source");
     }
 }
 
@@ -149,6 +149,193 @@ fn patch_accepts_an_image_of_the_length_the_mapfile_describes() {
 
     let _ = std::fs::remove_file(&mapfile_path);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Real-sized no-work passes must not probe even optional naming metadata. They
+// still use the normal sink lifecycle and preserve map/image bytes and accounting.
+#[test]
+fn patch_no_work_on_large_media_never_reads_source() {
+    use mapfile::SectorStatus::*;
+    for mode in ["finished", "scoped", "nontried"] {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        let disc = guard_disc(4096);
+        let full = disc.capacity_bytes;
+        let map_path = disc.mapfile_for(&iso);
+        let mut map = mapfile::Mapfile::create(&map_path, full, "vTEST").unwrap();
+        map.record(0, full, Finished).unwrap();
+        let (good, pending, unreadable) = match mode {
+            "scoped" => {
+                map.record(2048, 2048, Unreadable).unwrap();
+                map.set_scope(vec![(0, 2048)]);
+                (full - 2048, 0, 2048)
+            }
+            "nontried" => {
+                map.record(0, full, NonTried).unwrap();
+                (0, full, 0)
+            }
+            _ => (full, 0, 0),
+        };
+        map.flush().unwrap();
+        let image = vec![0xA5; full as usize];
+        std::fs::write(&iso, &image).unwrap();
+        let before = std::fs::read(&map_path).unwrap();
+        let mut source = NoWorkSource { reads: 0 };
+        let out = patch(
+            &disc,
+            &mut source,
+            &iso,
+            &PatchOptions::for_patch_pass(true, None, None),
+        )
+        .unwrap();
+        assert_eq!(source.reads, 0, "{mode}: no metadata or payload read");
+        assert_eq!(
+            (out.bytes_total, out.bytes_good, out.bytes_pending),
+            (full, good, pending)
+        );
+        assert_eq!(
+            (out.bytes_recovered_this_pass, out.bytes_unreadable),
+            (0, unreadable)
+        );
+        assert!(!out.halted && !out.wedged_exit);
+        assert_eq!(std::fs::read(&iso).unwrap(), image, "{mode}");
+        assert_eq!(std::fs::read(&map_path).unwrap(), before, "{mode}");
+    }
+}
+
+struct NoWorkSource {
+    reads: usize,
+}
+impl libfreemkv::SectorSource for NoWorkSource {
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        _count: u16,
+        _buf: &mut [u8],
+        _recovery: bool,
+    ) -> libfreemkv::Result<usize> {
+        self.reads += 1;
+        Err(libfreemkv::Error::DiscRead {
+            sector: lba as u64,
+            status: None,
+            sense: None,
+        })
+    }
+    fn capacity_sectors(&self) -> u32 {
+        4096
+    }
+}
+
+#[test]
+fn patch_no_work_still_refuses_invalid_inputs_before_source_reads() {
+    for gate in ["truncated", "coverage", "identity", "no-key"] {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("disc.iso");
+        let mut disc = guard_disc(4096);
+        let mut opts = PatchOptions::for_patch_pass(true, None, None);
+        if gate == "identity" {
+            use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
+            let fx = bd_image(&[Some(K1)], 1);
+            opts.keys = Some(
+                resolve(
+                    &fx,
+                    libfreemkv::keys::KeyScope::WholeDisc,
+                    &[(Answer::Keydb, &[K1])],
+                    &Calls::default(),
+                )
+                .unwrap(),
+            );
+            disc = fx.disc;
+        }
+        if gate == "no-key" {
+            disc.aacs = Some(
+                libfreemkv::test_util::aacs_state()
+                    .disc_hash("1111111111111111111111111111111111111111")
+                    .build(),
+            );
+        }
+        disc.encrypted = gate == "no-key";
+        let full = disc.capacity_bytes;
+        let total = if gate == "coverage" { full / 2 } else { full };
+        let mut map = mapfile::Mapfile::create(&disc.mapfile_for(&iso), total, "vTEST").unwrap();
+        map.record(0, total, mapfile::SectorStatus::Finished)
+            .unwrap();
+        if gate == "identity" {
+            map.set_disc_hash("2222222222222222222222222222222222222222");
+        }
+        map.flush().unwrap();
+        std::fs::write(
+            &iso,
+            vec![0; if gate == "truncated" { full / 2 } else { full } as usize],
+        )
+        .unwrap();
+        let mut source = NoWorkSource { reads: 0 };
+        let err = patch(&disc, &mut source, &iso, &opts).unwrap_err();
+        assert_eq!(source.reads, 0, "{gate}: {err:?}");
+        match gate {
+            "truncated" => assert!(matches!(err, Error::ImageTruncated { .. }), "{err:?}"),
+            "coverage" => assert!(
+                matches!(err, Error::MapfileInvalid { kind: "coverage" }),
+                "{err:?}"
+            ),
+            "identity" => assert!(
+                matches!(
+                    err,
+                    Error::MapfileInvalid {
+                        kind: "disc-mismatch"
+                    }
+                ),
+                "{err:?}"
+            ),
+            _ => assert_eq!(err.code(), libfreemkv::error::E_NO_DISC_KEY, "{err:?}"),
+        }
+    }
+}
+
+#[test]
+fn patch_nonempty_decrypted_work_still_prepares_names_and_plaintext() {
+    use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
+    let fx = bd_image(&[Some(K1)], 1);
+    let keys = resolve(
+        &fx,
+        libfreemkv::keys::KeyScope::WholeDisc,
+        &[(Answer::Keydb, &[K1])],
+        &Calls::default(),
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = fx.write(dir.path(), "disc.iso");
+    let full = fx.disc.capacity_bytes;
+    let mut map = mapfile::Mapfile::create(&fx.disc.mapfile_for(&iso), full, "vTEST").unwrap();
+    map.record(0, full, mapfile::SectorStatus::NonTrimmed)
+        .unwrap();
+    map.flush().unwrap();
+    let mut opts = PatchOptions::for_patch_pass(true, None, None);
+    opts.keys = Some(keys);
+    let out = patch(&fx.disc, &mut fx.source(), &iso, &opts).unwrap();
+    assert_eq!(
+        (out.bytes_good, out.bytes_recovered_this_pass),
+        (full, full)
+    );
+    let got = std::fs::read(&iso).unwrap();
+    let (start, sectors) = fx.clip(0);
+    let range = start as usize * 2048..(start + sectors) as usize * 2048;
+    let mask = |bytes: &[u8]| {
+        let mut bytes = bytes.to_vec();
+        bytes.chunks_mut(192).for_each(|packet| packet[0] &= 0x3F);
+        bytes
+    };
+    assert_eq!(mask(&got[range.clone()]), mask(&fx.img.plain[range]));
+    let mut source = libfreemkv::test_util::MemSource::new(got);
+    let fs = libfreemkv::read_filesystem(&mut source).unwrap();
+    assert!(
+        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.bak")
+            .is_ok()
+    );
+    assert!(
+        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.inf")
+            .is_err()
+    );
 }
 
 // A NON-REGULAR destination is exempt from the truncation gate: a
