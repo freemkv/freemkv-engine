@@ -709,6 +709,13 @@ fn numbered_episode_names_ignores_tmdb_runtime_and_count() {
 }
 
 #[test]
+fn tv_disc_label_with_season_and_disc_resolves_to_show_name() {
+    assert!(is_confident_match("KUNG_FU_SEASON1_D3", "Kung Fu", 1972));
+    assert_eq!(season_from_label("KUNG_FU_SEASON1_D3"), Some(1));
+    assert_eq!(disc_from_label("KUNG_FU_SEASON1_D3"), Some(3));
+}
+
+#[test]
 fn runtime_plausible_tolerates_broadcast_drift_but_rejects_gross() {
     assert!(runtime_plausible(89.0 * 60.0, 89)); // exact
     assert!(runtime_plausible(46.0 * 60.0, 45)); // within tolerance
