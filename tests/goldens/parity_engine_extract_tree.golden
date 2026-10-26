@@ -1,6 +1,6 @@
 one-key whole-disc resolve = KeySetStatus { proven: 1, declared: Some(2), keyed: 1, clear: 0, lazy: 1, forensic: None, origin: Some("keydb"), best_effort: false, requests: 1 }
 keyed result = good=153792 unreadable=0 complete=true halted=false files=8
-keyed AACS/Unit_Key_RO.inf = 192 bytes sha256:1a2b1aa0f1f194269c4a55992d31b361
+keyed AACS/Unit_Key_RO.bak = 192 bytes sha256:1a2b1aa0f1f194269c4a55992d31b361
 keyed BDMV/CLIPINF/00000.clpi = 6144 bytes sha256:67d55e7fa83aad726c96b991fba41f30
 keyed BDMV/CLIPINF/00001.clpi = 6144 bytes sha256:9ce174343681ae36185784ec9eedc3c6
 keyed BDMV/PLAYLIST/00000.mpls = 6144 bytes sha256:73f787177a7729a8c4149702ff4a919e
@@ -18,7 +18,7 @@ no-set BDMV/STREAM/00000.m2ts = 61440 bytes sha256:3b6ee1ecb9e3cebe582147703404a
 no-set BDMV/STREAM/00001.m2ts = 61440 bytes sha256:2e4b12075a0b1331bab9a50d6225487f
 no-set BDMV/index.bdmv = 6144 bytes sha256:3a25ec8e4276a359fbd2da7b70b74436
 one-key result = good=92352 unreadable=61440 complete=false halted=false files=8
-one-key AACS/Unit_Key_RO.inf = 192 bytes sha256:1a2b1aa0f1f194269c4a55992d31b361
+one-key AACS/Unit_Key_RO.bak = 192 bytes sha256:1a2b1aa0f1f194269c4a55992d31b361
 one-key BDMV/CLIPINF/00000.clpi = 6144 bytes sha256:67d55e7fa83aad726c96b991fba41f30
 one-key BDMV/CLIPINF/00001.clpi = 6144 bytes sha256:9ce174343681ae36185784ec9eedc3c6
 one-key BDMV/PLAYLIST/00000.mpls = 6144 bytes sha256:73f787177a7729a8c4149702ff4a919e

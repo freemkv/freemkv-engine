@@ -1,5 +1,5 @@
 decrypt result = CopyResult { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, recovered_this_pass: 0, complete: true, halted: false }
-decrypt iso = 8546304 bytes sha256:4a4ea533b2e47a272d537338b2094c16
+decrypt iso = 8546304 bytes sha256:0cab6daa39bf1118098c14c00b1a66d3
 raw result = CopyResult { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, recovered_this_pass: 0, complete: true, halted: false }
 raw iso = 8546304 bytes sha256:399335c89a889d24d870a765c6de7681
 decrypt-no-set refused = E7022
