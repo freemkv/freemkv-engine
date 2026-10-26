@@ -125,6 +125,21 @@ impl SelectionModel {
         })
     }
 
+    /// Prefer proven authored episodes; without episode evidence use the main film.
+    /// Partial or contradictory evidence still requires review.
+    pub fn main_or_episodes(
+        &self,
+        audio: &StreamFilter,
+        presentation: Option<&str>,
+    ) -> Result<Vec<usize>, SelectionReview> {
+        match self.select(&Selection::Episodes, audio, presentation) {
+            Err(review) if review.reason == SelectionReviewReason::MissingEpisodeRoster => {
+                self.select(&Selection::MainMovie, audio, presentation)
+            }
+            answer => answer,
+        }
+    }
+
     /// The main title, which never needs review: title 0 unless another cut of it carries
     /// more of the wanted languages (as [`select`](Self::select)). `None`: no titles.
     pub fn main_title(&self, audio: &StreamFilter, presentation: Option<&str>) -> Option<usize> {

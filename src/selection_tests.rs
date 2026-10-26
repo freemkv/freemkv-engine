@@ -346,3 +346,19 @@ fn owned_model_preserves_audio_and_explicit_choices() {
         assert_eq!(model.select(&selection, &audio, None), Ok(expected));
     }
 }
+
+#[test]
+fn combined_preset_uses_authored_episodes_and_never_guesses_from_duration() {
+    let mut titles = vec![title(1, "a", 7503.0, "eng"), title(2, "b", 1500.0, "eng")];
+    let auto = |titles: &[DiscTitle]| {
+        SelectionModel::from_titles(titles).main_or_episodes(&StreamFilter::All, None)
+    };
+    assert_eq!(auto(&titles), Ok(vec![0]));
+    roster(&mut titles, &[1, 0]);
+    assert_eq!(auto(&titles), Ok(vec![1, 0]));
+    titles[1].selection_evidence.episodes = EpisodeEvidence::Unknown;
+    assert_eq!(
+        auto(&titles).unwrap_err().reason,
+        SelectionReviewReason::IncompleteEpisodeRoster
+    );
+}
