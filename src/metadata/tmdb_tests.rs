@@ -50,24 +50,24 @@ fn clean_title_keeps_bare_year_in_title() {
 #[test]
 fn strip_paren_year_boundaries() {
     // Exactly "(dddd)" is removed.
-    assert_eq!(strip_paren_year("Drive (2011)"), "Drive ");
-    assert_eq!(strip_paren_year("(2011)"), "");
+    assert_eq!(strip_paren_year("Drive (2011)").0, "Drive ");
+    assert_eq!(strip_paren_year("(2011)").0, "");
     // Near-miss digit counts are NOT a year group → kept verbatim.
-    assert_eq!(strip_paren_year("(201)"), "(201)");
-    assert_eq!(strip_paren_year("(20111)"), "(20111)");
-    assert_eq!(strip_paren_year("(20)"), "(20)");
+    assert_eq!(strip_paren_year("(201)").0, "(201)");
+    assert_eq!(strip_paren_year("(20111)").0, "(20111)");
+    assert_eq!(strip_paren_year("(20)").0, "(20)");
     // Non-digit contents kept.
-    assert_eq!(strip_paren_year("(abcd)"), "(abcd)");
-    assert_eq!(strip_paren_year("(20a1)"), "(20a1)");
+    assert_eq!(strip_paren_year("(abcd)").0, "(abcd)");
+    assert_eq!(strip_paren_year("(20a1)").0, "(20a1)");
     // Malformed / unbalanced parens kept (no crash, no partial strip).
-    assert_eq!(strip_paren_year("(2011"), "(2011");
-    assert_eq!(strip_paren_year("2011)"), "2011)");
+    assert_eq!(strip_paren_year("(2011").0, "(2011");
+    assert_eq!(strip_paren_year("2011)").0, "2011)");
     // Multiple year groups all removed.
-    assert_eq!(strip_paren_year("(2001) x (2002)"), " x ");
+    assert_eq!(strip_paren_year("(2001) x (2002)").0, " x ");
     // Multibyte input must not panic and must strip correctly.
-    assert_eq!(strip_paren_year("Amélie (2001)"), "Amélie ");
+    assert_eq!(strip_paren_year("Amélie (2001)").0, "Amélie ");
     // A 4-digit group adjacent to the end.
-    assert_eq!(strip_paren_year("Se7en (1995)"), "Se7en ");
+    assert_eq!(strip_paren_year("Se7en (1995)").0, "Se7en ");
 }
 
 #[test]
@@ -178,7 +178,7 @@ fn pick_best_skips_dateless_collection_ranked_first() {
         {"media_type": "movie", "title": "Wraithline: Part Two",
          "release_date": "2024-02-27", "popularity": 120.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).expect("must pick the film");
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).expect("must pick the film");
     assert_eq!(r.title, "Wraithline: Part Two");
     assert_eq!(r.year, 2024);
 }
@@ -193,7 +193,7 @@ fn pick_best_prefers_dated_even_at_lower_popularity() {
         {"media_type": "movie", "title": "Wraithline: Part Two",
          "release_date": "2024-02-27", "popularity": 10.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.year, 2024);
 }
 
@@ -203,7 +203,7 @@ fn pick_best_breaks_dated_ties_on_popularity() {
         {"media_type": "movie", "title": "Low", "release_date": "2010-01-01", "popularity": 5.0},
         {"media_type": "movie", "title": "High", "release_date": "2011-01-01", "popularity": 99.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.title, "High");
 }
 
@@ -218,12 +218,12 @@ fn pick_best_prefers_tv_over_a_more_popular_film_namesake_when_flagged() {
         {"media_type": "tv", "name": "Longacre",
          "first_air_date": "2012-01-08", "popularity": 30.0}
     ]);
-    let r = pick_best("Longacre", results.as_array().unwrap(), true).unwrap();
+    let r = pick_best("Longacre", results.as_array().unwrap(), true, &[]).unwrap();
     assert_eq!(r.media_type, "tv");
     assert_eq!(r.year, 2012);
     // Without the flag, popularity wins (the film) — proving the flag, not
     // some incidental ordering, is what selects the series.
-    let r2 = pick_best("Longacre", results.as_array().unwrap(), false).unwrap();
+    let r2 = pick_best("Longacre", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r2.media_type, "movie");
 }
 
@@ -237,7 +237,7 @@ fn pick_best_prefer_tv_does_not_override_an_exact_film_over_a_fuzzy_series() {
          "release_date": "1995-12-15", "popularity": 40.0},
         {"media_type": "tv", "name": "Heat", "first_air_date": "", "popularity": 90.0}
     ]);
-    let r = pick_best("Heat", results.as_array().unwrap(), true).unwrap();
+    let r = pick_best("Heat", results.as_array().unwrap(), true, &[]).unwrap();
     assert_eq!(r.media_type, "movie");
     assert_eq!(r.year, 1995);
 }
@@ -248,7 +248,7 @@ fn pick_best_skips_person_results() {
         {"media_type": "person", "name": "Denis Villeneuve", "popularity": 80.0},
         {"media_type": "movie", "title": "Arrival", "release_date": "2016-11-11", "popularity": 40.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.title, "Arrival");
 }
 
@@ -258,7 +258,7 @@ fn pick_best_none_when_no_movie_or_tv() {
         {"media_type": "person", "name": "Someone", "popularity": 80.0},
         {"media_type": "collection", "name": "Some Collection", "popularity": 50.0}
     ]);
-    assert!(pick_best("", results.as_array().unwrap(), false).is_none());
+    assert!(pick_best("", results.as_array().unwrap(), false, &[]).is_none());
 }
 
 #[test]
@@ -266,7 +266,7 @@ fn pick_best_tv_uses_name_and_first_air_date() {
     let results = serde_json::json!([
         {"media_type": "tv", "name": "Severance", "first_air_date": "2022-02-18", "popularity": 60.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.title, "Severance");
     assert_eq!(r.year, 2022);
     assert_eq!(r.media_type, "tv");
@@ -282,7 +282,7 @@ fn pick_best_exact_title_beats_more_popular() {
         {"media_type": "movie", "title": "Undertow",
          "release_date": "2024-04-10", "popularity": 30.0}
     ]);
-    let r = pick_best("Undertow", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("Undertow", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.title, "Undertow");
     assert_eq!(r.year, 2024);
 }
@@ -297,7 +297,7 @@ fn pick_best_exact_match_ignores_punctuation_and_case() {
         {"media_type": "movie", "title": "Skyburner: Ace",
          "release_date": "2022-05-24", "popularity": 50.0}
     ]);
-    let r = pick_best("Skyburner Ace", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("Skyburner Ace", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(r.title, "Skyburner: Ace");
     assert_eq!(r.year, 2022);
 }
@@ -313,7 +313,7 @@ fn pick_best_exact_dated_first_survives_a_more_popular_non_exact_later() {
         {"media_type": "movie", "title": "Captain Nova: Undertow",
          "release_date": "2016-04-27", "popularity": 200.0}
     ]);
-    let r = pick_best("Undertow", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("Undertow", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(
         r.title, "Undertow",
         "an already-exact, dated best must not be displaced by a later, \
@@ -333,7 +333,7 @@ fn pick_best_dated_first_survives_a_more_popular_undated_later() {
         {"media_type": "movie", "title": "Wraithline Part Two",
          "release_date": "", "popularity": 500.0}
     ]);
-    let r = pick_best("", results.as_array().unwrap(), false).unwrap();
+    let r = pick_best("", results.as_array().unwrap(), false, &[]).unwrap();
     assert_eq!(
         r.year, 2024,
         "a dated best found first must not be displaced by a later, \

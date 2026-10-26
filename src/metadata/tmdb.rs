@@ -209,6 +209,7 @@ fn lookup_using(
     // than firing `query=&...` (TMDB answers HTTP 422). A season marker
     // ("… Season 5") means TV — bias the pick so it can't be outranked.
     let prefer_tv = season_from_label(label).is_some();
+    let (_, years) = strip_paren_year(label);
     let mut fallback: Option<TmdbResult> = None;
     let mut failed = false;
     for variant in query_variants(label) {
@@ -222,9 +223,9 @@ fn lookup_using(
         let Some(results) = resp["results"].as_array() else {
             continue;
         };
-        if let Some(best) = pick_best(&variant, results, prefer_tv) {
-            // Confident = exact normalized title match on THIS variant + a year.
-            if best.year > 0 && norm(&best.title) == norm(&variant) {
+        if let Some(best) = pick_best(&variant, results, prefer_tv, &years) {
+            // Confidence also requires every explicit label year to agree.
+            if year_matches(best.year, &years) && norm(&best.title) == norm(&variant) {
                 return Ok(Some(best));
             }
             if fallback.is_none() {
@@ -261,13 +262,17 @@ fn norm(s: &str) -> String {
 
 /// Is the resolved `title`/`year` a CONFIDENT match for the disc `label`?
 ///
-/// Confident = the title carries a year AND exactly matches (normalized) the cleaned label OR
-/// any of the same progressively-trimmed variants that [`lookup`] searches. Takes the RAW label
-/// (cleaning happens inside), matching `lookup`. Rips whose match is NOT confident (or that
-/// would overwrite an existing file) are held for operator review rather than auto-filed under
-/// a guessed name.
+/// Requires a nonzero year agreeing with every parenthesized four-digit year in the RAW label,
+/// and an exact normalized title match to its cleaned label or a progressively-trimmed variant
+/// that [`lookup`] searches. Conflicting explicit years are never confident. Non-confident
+/// matches (or those overwriting an existing file) are held for operator review.
 pub fn is_confident_match(label: &str, title: &str, year: u16) -> bool {
-    year > 0 && query_variants(label).iter().any(|v| norm(v) == norm(title))
+    let (_, years) = strip_paren_year(label);
+    year_matches(year, &years) && query_variants(label).iter().any(|v| norm(v) == norm(title))
+}
+
+fn year_matches(year: u16, explicit_years: &[u16]) -> bool {
+    year > 0 && explicit_years.iter().all(|&explicit| explicit == year)
 }
 
 /// The one result a typed name names: exactly one of `kind` whose title is `name` (as
@@ -332,21 +337,25 @@ fn rank_search_results(
 
 // Choose the best entry from a TMDB `search/multi` response: keep only movie/TV entries, prefer
 // ones with a release year, break ties on popularity.
-fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Option<TmdbResult> {
+fn pick_best(
+    query: &str,
+    results: &[serde_json::Value],
+    prefer_tv: bool,
+    years: &[u16],
+) -> Option<TmdbResult> {
     let want = norm(query);
-    // Ranking key, lexicographic, highest wins: (exact, dated, tv_preferred,
-    // popularity). `exact` beats popularity (else generic "Undertow" matches
-    // the more popular 2016 film); `tv_preferred` only breaks equal ties.
+    // Rank exact title with the requested year first, then the original
+    // (exact, dated, tv_preferred, popularity) order for best-effort guesses.
     let key = |cand: &TmdbResult, pop: f64| {
         let exact = cand.year > 0 && !want.is_empty() && norm(&cand.title) == want;
         (
-            exact,
+            u8::from(exact) + u8::from(exact && year_matches(cand.year, years)),
             cand.year > 0,
             prefer_tv && cand.media_type.is_tv(),
             pop,
         )
     };
-    let mut best: Option<(TmdbResult, (bool, bool, bool, f64))> = None;
+    let mut best: Option<(TmdbResult, (u8, bool, bool, f64))> = None;
     for v in results {
         let Some((cand, popularity)) = parse_result(v) else {
             continue;
@@ -362,9 +371,9 @@ fn pick_best(query: &str, results: &[serde_json::Value], prefer_tv: bool) -> Opt
 
 /// Lexicographic "is `a` a better rank than `b`" for [`pick_best`]'s key. Hand
 /// rolled because the key ends in an `f64` (popularity), which is not `Ord`.
-fn key_gt(a: (bool, bool, bool, f64), b: (bool, bool, bool, f64)) -> bool {
+fn key_gt(a: (u8, bool, bool, f64), b: (u8, bool, bool, f64)) -> bool {
     if a.0 != b.0 {
-        return a.0;
+        return a.0 > b.0;
     }
     if a.1 != b.1 {
         return a.1;
@@ -425,11 +434,12 @@ fn parse_result(v: &serde_json::Value) -> Option<(TmdbResult, f64)> {
     ))
 }
 
-// Remove a parenthesized 4-digit release year, e.g. "Drive (2011)" -> "Drive ". A BARE year is
-// left untouched ("Blade Runner 2049"). Char-based so a multibyte label never panics.
-fn strip_paren_year(s: &str) -> String {
+// Strip and retain all parenthesized four-digit years; bare title numbers stay.
+// Char-based so a multibyte label never panics.
+fn strip_paren_year(s: &str) -> (String, Vec<u16>) {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
+    let mut years = Vec::new();
     let mut i = 0;
     while i < chars.len() {
         // Match "(dddd)" exactly: '(' then 4 ASCII digits then ')'.
@@ -438,13 +448,18 @@ fn strip_paren_year(s: &str) -> String {
             && chars[i + 5] == ')'
             && chars[i + 1..i + 5].iter().all(|c| c.is_ascii_digit())
         {
+            years.push(
+                chars[i + 1..i + 5]
+                    .iter()
+                    .fold(0, |year, c| year * 10 + (*c as u16 - u16::from(b'0'))),
+            );
             i += 6; // skip the whole "(dddd)" group
         } else {
             out.push(chars[i]);
             i += 1;
         }
     }
-    out
+    (out, years)
 }
 
 /// Clean a disc label for TMDB search: "AURORA_DRIFT_TWO" -> "Aurora Drift Two"
@@ -452,7 +467,7 @@ fn strip_paren_year(s: &str) -> String {
 /// a parenthesized release year (see `strip_paren_year`).
 pub fn clean_title(label: &str) -> String {
     let s = label.replace(['_', '-'], " ");
-    let s = strip_paren_year(&s);
+    let s = strip_paren_year(&s).0;
 
     // Strip common disc format suffixes (case-insensitive)
     let suffixes = [
@@ -688,7 +703,7 @@ fn query_variants(label: &str) -> Vec<String> {
     // Same separator/year normalization clean_title applies, but WITHOUT the
     // case folding, so junk detection keeps the label's original casing.
     let base = label.replace(['_', '-'], " ");
-    let base = strip_paren_year(&base);
+    let base = strip_paren_year(&base).0;
     let toks: Vec<&str> = base.split_whitespace().collect();
     let mut variants: Vec<String> = Vec::new();
     let mut end = toks.len();
@@ -938,3 +953,7 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
 #[cfg(test)]
 #[path = "tmdb_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "year_identity_tests.rs"]
+mod year_identity_tests;
