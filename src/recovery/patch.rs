@@ -1331,10 +1331,9 @@ fn patch_linked(
     );
     let bytes_good_before = initial_stats.bytes_good;
 
-    // Decrypt-aware read, identical to `sweep` (`--raw` copies ciphertext verbatim); AACS
-    // reads widen onto each file's unit grid. Bad sectors = PHYSICAL read failure.
-    // The validated work list is immutable and an empty run consumes no reader.
-    // Avoid naming metadata reads in that case, retaining the normal sink/settle path.
+    // As in sweep, AACS reads widen to file unit grids; raw copies retain ciphertext.
+    // The validated work list is immutable: when empty, the raw wrapper is never consumed.
+    // Skip naming reads then, retaining normal sink/settle and physical-read failure behavior.
     let mut reader = super::whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
