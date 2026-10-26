@@ -694,6 +694,21 @@ fn map_episodes_degrades_to_sequential_without_tmdb_data() {
 }
 
 #[test]
+fn numbered_episode_names_ignores_tmdb_runtime_and_count() {
+    let episodes = vec![Episode {
+        number: 4,
+        name: "Fourth".into(),
+        runtime_min: 180,
+    }];
+    let got = numbered_episode_names(3, &episodes, 3);
+    assert_eq!(got.iter().map(|a| a.episode).collect::<Vec<_>>(), [3, 4, 5]);
+    assert_eq!(
+        got.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+        ["", "Fourth", ""]
+    );
+}
+
+#[test]
 fn runtime_plausible_tolerates_broadcast_drift_but_rejects_gross() {
     assert!(runtime_plausible(89.0 * 60.0, 89)); // exact
     assert!(runtime_plausible(46.0 * 60.0, 45)); // within tolerance

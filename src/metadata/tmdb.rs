@@ -735,6 +735,26 @@ pub struct EpisodeAssignment {
     pub name: String,
 }
 
+/// Attach TMDB names to disc-ordered episodes without using TMDB runtime or
+/// episode count to select titles or infer where this disc begins.
+pub fn numbered_episode_names(
+    count: usize,
+    episodes: &[Episode],
+    start: u16,
+) -> Vec<EpisodeAssignment> {
+    (0..count)
+        .map(|i| {
+            let episode = start.saturating_add(u16::try_from(i).unwrap_or(u16::MAX));
+            let name = episodes
+                .iter()
+                .find(|candidate| candidate.number == episode)
+                .map(|candidate| candidate.name.clone())
+                .unwrap_or_default();
+            EpisodeAssignment { episode, name }
+        })
+        .collect()
+}
+
 /// Fetch a TV season's episode list from TMDB (`GET /3/tv/{id}/season/{n}`).
 ///
 /// Uses the same shared timeout-bounded `AGENT`, size-capped JSON read, and
