@@ -13,7 +13,7 @@ fn explicit_year_selects_the_remake_identity_in_both_response_orders() {
         vec![movie("Dune", 2021, 1000.0), movie("Dune", 1984, 1.0)],
         vec![movie("Dune", 1984, 1.0), movie("Dune", 2021, 1000.0)],
     ] {
-        let found = lookup_using("Dune (1984)", |_| Some(json!({"results": results})))
+        let found = lookup_using("Dune (1984)", |_| Ok(json!({"results": results})))
             .unwrap()
             .unwrap();
         years.push(found.year);
@@ -25,7 +25,7 @@ fn explicit_year_selects_the_remake_identity_in_both_response_orders() {
 #[test]
 fn only_the_wrong_year_remains_a_nonconfident_best_effort_guess() {
     let found = lookup_using("Dune (1984)", |_| {
-        Some(json!({"results": [movie("Dune", 2021, 1000.0)]}))
+        Ok(json!({"results": [movie("Dune", 2021, 1000.0)]}))
     })
     .unwrap()
     .unwrap();
@@ -40,8 +40,8 @@ fn wrong_year_exact_variant_does_not_return_before_the_correct_trimmed_match() {
     let found = lookup_using("DUNE_(1984)_UE", |query| {
         seen.borrow_mut().push(query.to_string());
         match query {
-            "Dune Ue" => Some(json!({"results": [movie("Dune UE", 2021, 1000.0)]})),
-            "Dune" => Some(json!({"results": [movie("Dune", 1984, 1.0)]})),
+            "Dune Ue" => Ok(json!({"results": [movie("Dune UE", 2021, 1000.0)]})),
+            "Dune" => Ok(json!({"results": [movie("Dune", 1984, 1.0)]})),
             _ => panic!("unexpected query {query}"),
         }
     })
@@ -54,8 +54,8 @@ fn wrong_year_exact_variant_does_not_return_before_the_correct_trimmed_match() {
 #[test]
 fn failed_packaging_variant_still_finds_the_correct_year() {
     let found = lookup_using("Dune (1984) UE", |query| match query {
-        "Dune Ue" => Some(json!({})), // malformed: a failure, loop continues
-        "Dune" => Some(json!({"results": [
+        "Dune Ue" => Ok(json!({})), // malformed: a failure, loop continues
+        "Dune" => Ok(json!({"results": [
             movie("Dune", 2021, 1000.0), movie("Dune", 1984, 1.0)
         ]})),
         _ => panic!("unexpected query {query}"),
@@ -73,8 +73,8 @@ fn failed_packaging_variant_still_finds_the_correct_year() {
 #[test]
 fn failed_variant_and_wrong_year_guess_preserve_lookup_failure() {
     let found = lookup_using("DUNE_(1984)_UE", |query| match query {
-        "Dune Ue" => Some(json!({})), // malformed: a failure, loop continues
-        "Dune" => Some(json!({"results": [movie("Dune", 2021, 1000.0)]})),
+        "Dune Ue" => Ok(json!({})), // malformed: a failure, loop continues
+        "Dune" => Ok(json!({"results": [movie("Dune", 2021, 1000.0)]})),
         _ => panic!("unexpected query {query}"),
     });
     let failed = found.expect_err("wrong-year guess must not override a failed query");
@@ -89,9 +89,9 @@ fn conflicting_explicit_years_never_become_confident() {
         }
         let failed = lookup_using(&format!("{label} UE"), |query| {
             if query.ends_with("Ue") {
-                Some(json!({}))
+                Ok(json!({}))
             } else {
-                Some(json!({"results": [movie("Dune", 1984, 1.0)]}))
+                Ok(json!({"results": [movie("Dune", 1984, 1.0)]}))
             }
         });
         assert!(failed.is_err());
@@ -104,7 +104,7 @@ fn no_explicit_year_keeps_popularity_and_tv_preferences() {
     let results = json!({"results": [
         movie("Dune", 1984, 1.0), movie("Dune", 2021, 1000.0)
     ]});
-    let found = lookup_using("Dune", |_| Some(results.clone()))
+    let found = lookup_using("Dune", |_| Ok(results.clone()))
         .unwrap()
         .unwrap();
     assert_eq!(found.year, 2021);
@@ -115,11 +115,11 @@ fn no_explicit_year_keeps_popularity_and_tv_preferences() {
         {"media_type": "tv", "name": "Dune", "first_air_date": "2000-01-01",
             "popularity": 1.0}
     ]});
-    let tv = lookup_using("Dune Season 1", |_| Some(results.clone()))
+    let tv = lookup_using("Dune Season 1", |_| Ok(results.clone()))
         .unwrap()
         .unwrap();
     assert!(tv.media_type.is_tv());
-    let film = lookup_using("Dune", |_| Some(results.clone()))
+    let film = lookup_using("Dune", |_| Ok(results.clone()))
         .unwrap()
         .unwrap();
     assert!(!film.media_type.is_tv());
@@ -133,7 +133,7 @@ fn explicit_year_identity_precedes_tv_preference_and_keeps_tv_tiebreaks() {
             {"media_type": "tv", "name": "Dune",
                 "first_air_date": format!("{tv_year}-01-01"), "popularity": 1.0}
         ]});
-        let found = lookup_using("Dune (1984) Season 1", |_| Some(results.clone()))
+        let found = lookup_using("Dune (1984) Season 1", |_| Ok(results.clone()))
             .unwrap()
             .unwrap();
         assert_eq!(found.year, 1984);

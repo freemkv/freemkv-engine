@@ -73,8 +73,8 @@ fn build_agent(recv_body: std::time::Duration) -> ureq::Agent {
 
 // API origin. Tests point it at a loopback server (per thread).
 #[cfg(not(test))]
-fn api_base() -> String {
-    "https://api.themoviedb.org".to_string()
+fn api_base() -> &'static str {
+    "https://api.themoviedb.org"
 }
 #[cfg(test)]
 thread_local! {
@@ -132,26 +132,49 @@ fn read_capped_json(resp: ureq::http::Response<ureq::Body>) -> std::io::Result<s
 // Run a `search/multi` request via the shared timeout-bounded AGENT. Splits
 // out 401 (bad key, throttled warning) from other status/transport errors
 // instead of collapsing every failure to "no results", hiding the cause.
-fn fetch_multi(query: &str, api_key: &str, sink: &dyn crate::Sink) -> Option<serde_json::Value> {
-    fetch_url(&search_multi_url(query, api_key), query, sink)
+fn fetch_multi(query: &str, api_key: &str, sink: &dyn crate::Sink) -> Fetched {
+    fetch_url_checked(&search_multi_url(query, api_key), query, sink)
+}
+
+/// Why a fetch failed, as far as the query-variant loop cares.
+#[derive(Debug, PartialEq)]
+enum Failure {
+    /// No other query can fix it (transport, 401, 429, 5xx): stop asking.
+    Stop,
+    /// Specific to this query (other 4xx, unreadable body): a peeled one may match.
+    Next,
+}
+
+type Fetched = Result<serde_json::Value, Failure>;
+
+fn status_failure(code: u16) -> Failure {
+    if matches!(code, 401 | 429 | 500..=599) {
+        Failure::Stop
+    } else {
+        Failure::Next
+    }
 }
 
 fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_json::Value> {
+    fetch_url_checked(url, query, sink).ok()
+}
+
+fn fetch_url_checked(url: &str, query: &str, sink: &dyn crate::Sink) -> Fetched {
     match AGENT.get(url).call() {
         Ok(resp) => match read_capped_json(resp) {
-            Ok(json) => Some(json),
+            Ok(json) => Ok(json),
             Err(e) => {
                 tracing::warn!(query = %query, error = %e, "tmdb: response was not valid JSON");
                 sink.log(
                     crate::Level::Warn,
                     "TMDB: response could not be read or parsed",
                 );
-                None
+                Err(Failure::Next)
             }
         },
         Err(ureq::Error::StatusCode(401)) => {
             warn_bad_key_throttled(sink);
-            None
+            Err(Failure::Stop)
         }
         Err(ureq::Error::StatusCode(code)) => {
             tracing::warn!(query = %query, status = code, "tmdb: HTTP error status");
@@ -159,7 +182,7 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
                 crate::Level::Warn,
                 &format!("TMDB: HTTP error status {code}"),
             );
-            None
+            Err(status_failure(code))
         }
         Err(e) => {
             // Do NOT log `e` directly: the URL has the api_key in its query
@@ -171,7 +194,7 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
                 crate::Level::Warn,
                 &format!("TMDB: request failed (network/transport: {error_kind})"),
             );
-            None
+            Err(Failure::Stop)
         }
     }
 }
@@ -250,7 +273,7 @@ pub fn best_effort(found: Result<Option<TmdbResult>, LookupFailed>) -> Option<Tm
 // `lookup`'s variant loop over any `search/multi` source.
 fn lookup_using(
     label: &str,
-    fetch: impl Fn(&str) -> Option<serde_json::Value>,
+    fetch: impl Fn(&str) -> Fetched,
 ) -> Result<Option<TmdbResult>, LookupFailed> {
     // A separator-only label yields no query variants; short-circuit rather
     // than firing `query=&...` (TMDB answers HTTP 422). A season marker
@@ -263,11 +286,16 @@ fn lookup_using(
         if variant.trim().is_empty() {
             continue;
         }
-        // A failed fetch (transport, 401, other status, unreadable body) ends the
-        // loop: the next variant would wait out its own timeout or resend a bad key.
-        let Some(resp) = fetch(&variant) else {
-            failed = true;
-            break;
+        let resp = match fetch(&variant) {
+            Ok(resp) => resp,
+            Err(Failure::Stop) => {
+                failed = true;
+                break;
+            }
+            Err(Failure::Next) => {
+                failed = true;
+                continue;
+            }
         };
         let Some(results) = resp["results"].as_array() else {
             failed = true;
@@ -352,7 +380,7 @@ fn search_with(
     if api_key.is_empty() || query.trim().is_empty() {
         return Vec::new();
     }
-    let Some(json) = fetch_multi(query, api_key, sink) else {
+    let Ok(json) = fetch_multi(query, api_key, sink) else {
         return Vec::new();
     };
     let Some(results) = json["results"].as_array() else {

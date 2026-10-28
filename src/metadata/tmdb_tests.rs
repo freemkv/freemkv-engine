@@ -906,24 +906,24 @@ fn lookup_returns_the_first_confident_variant_else_the_first_fallback() {
     // "Heat UE" peels to "Heat". The full label finds a loose, undated guess; the
     // peeled variant finds the exact dated film, which must win.
     let found = lookup_using("HEAT_UE", |q| match q {
-        "Heat Ue" => Some(results_for("Heat Wave", "", "movie")),
-        "Heat" => Some(results_for("Heat", "1995-12-15", "movie")),
-        _ => None,
+        "Heat Ue" => Ok(results_for("Heat Wave", "", "movie")),
+        "Heat" => Ok(results_for("Heat", "1995-12-15", "movie")),
+        _ => Err(Failure::Stop),
     })
     .unwrap()
     .unwrap();
     assert_eq!((found.title.as_str(), found.year), ("Heat", 1995));
     // No variant is confident: the first variant's guess is kept, not a later one.
     let guess = lookup_using("HEAT_UE", |q| match q {
-        "Heat Ue" => Some(results_for("Heat Wave", "2001-01-01", "movie")),
-        "Heat" => Some(results_for("Heated", "2002-02-02", "movie")),
-        _ => None,
+        "Heat Ue" => Ok(results_for("Heat Wave", "2001-01-01", "movie")),
+        "Heat" => Ok(results_for("Heated", "2002-02-02", "movie")),
+        _ => Err(Failure::Stop),
     })
     .unwrap()
     .unwrap();
     assert_eq!(guess.title, "Heat Wave");
     // An exact title with no year is not confident either.
-    let undated = lookup_using("HEAT", |_| Some(results_for("Heat", "", "movie")));
+    let undated = lookup_using("HEAT", |_| Ok(results_for("Heat", "", "movie")));
     assert_eq!(undated.unwrap().unwrap().year, 0);
 }
 
@@ -934,11 +934,11 @@ fn lookup_prefers_the_series_for_a_season_marked_label() {
              "popularity": 500.0},
             {"media_type": "tv", "name": "Longacre", "first_air_date": "2012-01-08",
              "popularity": 30.0}]});
-    let tv = lookup_using("Longacre Season 5", |_| Some(both.clone()))
+    let tv = lookup_using("Longacre Season 5", |_| Ok(both.clone()))
         .unwrap()
         .unwrap();
     assert_eq!(tv.media_type, "tv");
-    let film = lookup_using("Longacre", |_| Some(both.clone()))
+    let film = lookup_using("Longacre", |_| Ok(both.clone()))
         .unwrap()
         .unwrap();
     assert_eq!(film.media_type, "movie");
@@ -946,23 +946,23 @@ fn lookup_prefers_the_series_for_a_season_marked_label() {
 
 #[test]
 fn checked_lookup_reports_a_failed_query_unless_another_is_confident() {
-    assert!(lookup_using("HEAT_UE", |_| None).is_err());
+    assert!(lookup_using("HEAT_UE", |_| Err(Failure::Stop)).is_err());
     let empty = serde_json::json!({"results": []});
     assert!(matches!(
-        lookup_using("HEAT_UE", |_| Some(empty.clone())),
+        lookup_using("HEAT_UE", |_| Ok(empty.clone())),
         Ok(None)
     ));
     let found = lookup_using("HEAT_UE", |q| match q {
-        "Heat" => Some(results_for("Heat", "1995-12-15", "movie")),
-        _ => Some(serde_json::json!({})),
+        "Heat" => Ok(results_for("Heat", "1995-12-15", "movie")),
+        _ => Ok(serde_json::json!({})),
     })
     .unwrap()
     .unwrap();
     assert_eq!(found.year, 1995);
     // A guess that is not confident is no answer while a query failed.
     let guess = lookup_using("HEAT_UE", |q| match q {
-        "Heat Ue" => Some(results_for("Heat Wave", "2001-01-01", "movie")),
-        _ => None,
+        "Heat Ue" => Ok(results_for("Heat Wave", "2001-01-01", "movie")),
+        _ => Err(Failure::Stop),
     });
     assert!(guess.is_err());
 }
@@ -996,13 +996,13 @@ fn old_tmdb_result_json_reads_media_type_leniently() {
 fn a_failed_variant_still_hands_the_rip_the_best_guess() {
     // The first query guesses a TV show (not confident); the peeled query fails.
     let answer = lookup_using("HEAT_UE", |q| match q {
-        "Heat Ue" => Some(results_for("Heat Wave", "2001-01-01", "tv")),
-        _ => None,
+        "Heat Ue" => Ok(results_for("Heat Wave", "2001-01-01", "tv")),
+        _ => Err(Failure::Stop),
     });
     assert!(answer.is_err(), "the worker still sees the failure");
     let guess = best_effort(answer).unwrap();
     assert_eq!(guess.media_type, crate::metadata::MediaKind::Tv);
-    assert!(best_effort(lookup_using("HEAT_UE", |_| None)).is_none());
+    assert!(best_effort(lookup_using("HEAT_UE", |_| Err(Failure::Stop))).is_none());
 }
 
 // A season whose episodes each run `mins[i]` minutes, numbered from 1.
@@ -1144,7 +1144,7 @@ fn a_failed_fetch_stops_the_variant_loop() {
     let calls = std::cell::Cell::new(0);
     let answer = lookup_using("HEAT_UE_BD3", |_| {
         calls.set(calls.get() + 1);
-        None
+        Err(Failure::Stop)
     });
     assert_eq!(calls.get(), 1, "one failure must not trigger more requests");
     assert!(matches!(answer, Err(LookupFailed(None))));

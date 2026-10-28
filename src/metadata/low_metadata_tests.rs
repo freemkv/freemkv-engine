@@ -107,14 +107,14 @@ fn low_lookup_malformed_results_is_response_failure() {
     ] {
         assert!(
             matches!(
-                lookup_using("HEAT_UE", |_| Some(response.clone())),
+                lookup_using("HEAT_UE", |_| Ok(response.clone())),
                 Err(LookupFailed(None))
             ),
             "response: {response}"
         );
     }
     assert!(matches!(
-        lookup_using("HEAT_UE", |_| Some(serde_json::json!({"results": []}))),
+        lookup_using("HEAT_UE", |_| Ok(serde_json::json!({"results": []}))),
         Ok(None)
     ));
 }
@@ -124,18 +124,18 @@ fn low_lookup_malformed_results_retains_guess_and_later_confident_match() {
     let guess = || serde_json::json!({"results": [{"media_type": "movie", "title": "Heat", "release_date": "", "id": 1}]});
     let found = lookup_using("HEAT_UE", |query| {
         if query == "Heat Ue" {
-            Some(guess())
+            Ok(guess())
         } else {
-            Some(serde_json::json!({}))
+            Ok(serde_json::json!({}))
         }
     });
     assert!(matches!(&found, Err(LookupFailed(Some(candidate))) if candidate.tmdb_id == 1));
     assert_eq!(best_effort(found).unwrap().tmdb_id, 1);
     let found = lookup_using("HEAT_UE", |query| {
         if query == "Heat Ue" {
-            Some(serde_json::json!({"results": null}))
+            Ok(serde_json::json!({"results": null}))
         } else {
-            Some(
+            Ok(
                 serde_json::json!({"results": [{"media_type": "movie", "title": "Heat", "release_date": "1995-01-01", "id": 2}]}),
             )
         }
@@ -248,4 +248,102 @@ fn low_sink_keeps_no_key_quiet_and_401_throttled() {
     let logs = sink.0.lock().unwrap();
     assert_eq!(logs.len(), 1, "one 401 warning, no generic one: {logs:?}");
     assert!(logs[0].contains("API key rejected (HTTP 401)"), "{logs:?}");
+}
+
+// Serve `responses` in order (the last repeats) until `done` is set; returns the
+// accepted-request counter. Lets a test count how many requests a lookup sent.
+fn serve_counting(
+    responses: Vec<Vec<u8>>,
+) -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    super::TEST_API_BASE.with(|b| *b.borrow_mut() = Some(format!("http://{addr}")));
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (c, d) = (count.clone(), done.clone());
+    let handle = std::thread::spawn(move || {
+        while !d.load(SeqCst) {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            let n = c.fetch_add(1, SeqCst);
+            let mut request = [0; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(&responses[n.min(responses.len() - 1)]);
+        }
+    });
+    (count, done, handle)
+}
+
+fn status_response(status: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes()
+}
+
+// Requests `Client::lookup("HEAT_UE")` (two query variants) sends for `responses`.
+fn lookup_requests(responses: Vec<Vec<u8>>) -> (usize, Result<Option<TmdbResult>, LookupFailed>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (count, done, server) = serve_counting(responses);
+    let sink = RecordingSink::default();
+    let found = Client::new("KEY", &sink).lookup("HEAT_UE");
+    done.store(true, SeqCst);
+    server.join().unwrap();
+    (count.load(SeqCst), found)
+}
+
+#[test]
+fn low_lookup_stops_on_errors_another_query_cannot_fix() {
+    for status in [
+        "401 Unauthorized",
+        "429 Too Many Requests",
+        "503 Unavailable",
+    ] {
+        let (requests, found) = lookup_requests(vec![status_response(status)]);
+        assert_eq!(requests, 1, "{status}");
+        assert!(matches!(found, Err(LookupFailed(None))), "{status}");
+    }
+}
+
+#[test]
+fn low_lookup_stops_on_transport_failure() {
+    let calls = Cell::new(0);
+    let found = lookup_using("HEAT_UE", |_| {
+        calls.set(calls.get() + 1);
+        Err(Failure::Stop)
+    });
+    assert_eq!(calls.get(), 1);
+    assert!(matches!(found, Err(LookupFailed(None))));
+    let sink = RecordingSink::default();
+    super::TEST_API_BASE.with(|b| *b.borrow_mut() = Some("api_key".to_string()));
+    assert!(matches!(
+        fetch_multi("Heat", "KEY", &sink),
+        Err(Failure::Stop)
+    ));
+}
+
+#[test]
+fn low_lookup_continues_past_a_query_specific_status() {
+    let hit = br#"{"results":[{"media_type":"movie","title":"Heat","release_date":"1995-12-15","id":9}]}"#;
+    let mut ok = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        hit.len()
+    )
+    .into_bytes();
+    ok.extend_from_slice(hit);
+    for status in [
+        "422 Unprocessable Entity",
+        "404 Not Found",
+        "400 Bad Request",
+    ] {
+        let (requests, found) = lookup_requests(vec![status_response(status), ok.clone()]);
+        assert_eq!(requests, 2, "{status}");
+        assert_eq!(found.unwrap().unwrap().tmdb_id, 9, "{status}");
+    }
 }
