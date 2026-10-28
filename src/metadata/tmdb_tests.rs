@@ -950,7 +950,7 @@ fn checked_lookup_reports_a_failed_query_unless_another_is_confident() {
     ));
     let found = lookup_using("HEAT_UE", |q| match q {
         "Heat" => Some(results_for("Heat", "1995-12-15", "movie")),
-        _ => None,
+        _ => Some(serde_json::json!({})),
     })
     .unwrap()
     .unwrap();
@@ -1133,4 +1133,15 @@ fn query_variants_peel_past_a_spaced_disc_suffix() {
             query_variants(label)
         );
     }
+}
+
+#[test]
+fn a_failed_fetch_stops_the_variant_loop() {
+    let calls = std::cell::Cell::new(0);
+    let answer = lookup_using("HEAT_UE_BD3", |_| {
+        calls.set(calls.get() + 1);
+        None
+    });
+    assert_eq!(calls.get(), 1, "one failure must not trigger more requests");
+    assert!(matches!(answer, Err(LookupFailed(None))));
 }

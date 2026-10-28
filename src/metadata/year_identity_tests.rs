@@ -54,7 +54,7 @@ fn wrong_year_exact_variant_does_not_return_before_the_correct_trimmed_match() {
 #[test]
 fn failed_packaging_variant_still_finds_the_correct_year() {
     let found = lookup_using("Dune (1984) UE", |query| match query {
-        "Dune Ue" => None,
+        "Dune Ue" => Some(json!({})), // malformed: a failure, loop continues
         "Dune" => Some(json!({"results": [
             movie("Dune", 2021, 1000.0), movie("Dune", 1984, 1.0)
         ]})),
@@ -73,7 +73,7 @@ fn failed_packaging_variant_still_finds_the_correct_year() {
 #[test]
 fn failed_variant_and_wrong_year_guess_preserve_lookup_failure() {
     let found = lookup_using("DUNE_(1984)_UE", |query| match query {
-        "Dune Ue" => None,
+        "Dune Ue" => Some(json!({})), // malformed: a failure, loop continues
         "Dune" => Some(json!({"results": [movie("Dune", 2021, 1000.0)]})),
         _ => panic!("unexpected query {query}"),
     });
@@ -89,7 +89,7 @@ fn conflicting_explicit_years_never_become_confident() {
         }
         let failed = lookup_using(&format!("{label} UE"), |query| {
             if query.ends_with("Ue") {
-                None
+                Some(json!({}))
             } else {
                 Some(json!({"results": [movie("Dune", 1984, 1.0)]}))
             }

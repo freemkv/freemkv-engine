@@ -228,9 +228,11 @@ fn lookup_using(
         if variant.trim().is_empty() {
             continue;
         }
+        // A failed fetch (transport, 401, other status, unreadable body) ends the
+        // loop: the next variant would wait out its own timeout or resend a bad key.
         let Some(resp) = fetch(&variant) else {
             failed = true;
-            continue;
+            break;
         };
         let Some(results) = resp["results"].as_array() else {
             failed = true;
