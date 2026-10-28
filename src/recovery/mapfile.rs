@@ -180,15 +180,29 @@ pub struct MapStats {
 // Revokes a `Mapfile`'s right to write its path, so an ABANDONED writer thread (see
 // `super::finish_bounded`) can't rewrite the file from a stale snapshot after a resume.
 #[derive(Clone)]
-pub(crate) struct MapfileDisown(Arc<AtomicBool>);
+pub(crate) struct MapfileDisown(Arc<AtomicBool>, PathBuf);
 
 impl MapfileDisown {
     /// Revoke the mapfile's right to write. Idempotent, and safe to call
     /// from a thread other than the one that owns the `Mapfile` — that is
-    /// the entire point.
+    /// the entire point. Its path stays listed while the abandoned `Mapfile` lives.
     pub(crate) fn disown(&self) {
         self.0.store(true, Ordering::Release);
+        let mut live = ABANDONED.lock().unwrap_or_else(PoisonError::into_inner);
+        live.retain(|(_, w)| w.strong_count() > 0);
+        live.push((self.1.clone(), Arc::downgrade(&self.0)));
     }
+}
+
+// Mapfiles disowned while their writer thread may still run, process-wide: a later run in
+// the same process must not rename an image such a writer can still touch.
+static ABANDONED: Mutex<Vec<(PathBuf, std::sync::Weak<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// Whether an abandoned writer of the mapfile at `path` is still alive (still holds it).
+pub(crate) fn abandoned_writer_alive(path: &Path) -> bool {
+    let mut live = ABANDONED.lock().unwrap_or_else(PoisonError::into_inner);
+    live.retain(|(_, w)| w.strong_count() > 0);
+    live.iter().any(|(p, _)| p == path)
 }
 
 /// Time-batched mapfile. `record()` keeps in-memory state up-to-date on
@@ -518,7 +532,7 @@ impl Mapfile {
     /// one BEFORE the mapfile moves into a consumer thread; see
     /// [`MapfileDisown`] and [`super::finish_bounded_disowning`].
     pub(crate) fn disown_handle(&self) -> MapfileDisown {
-        MapfileDisown(Arc::clone(&self.disowned))
+        MapfileDisown(Arc::clone(&self.disowned), self.path.clone())
     }
 
     /// Whether a [`MapfileDisown`] handle has revoked this mapfile: its owner was

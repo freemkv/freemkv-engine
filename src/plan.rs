@@ -597,9 +597,11 @@ fn tree(
     Ok(Report::Tree { extract })
 }
 
-// The decrypted image renamed once, after the last pass and under the lock. Never a stopped or
-// wedged copy. A pass whose consumer was disowned may still write the image, so it is left as
-// is; an AACS disc reports that as `Kept { Unexpected }`.
+/// The decrypted image renamed once, after the last pass and under the lock. Never a stopped
+/// copy, or one that ended on a wedge (its damage is still retryable). A recovery that went on
+/// past a wedge (`AfterWedge::Continue`) drained that pass's consumer and finished, so it is
+/// renamed. A disowned consumer still alive in this process may write the image: left as is,
+/// reported `Kept { Unexpected }` for an AACS disc.
 pub(crate) fn image_names(
     copy: &CopyResult,
     recovery: Option<&MultipassResult>,
@@ -608,11 +610,11 @@ pub(crate) fn image_names(
     disc: &libfreemkv::Disc,
 ) -> Option<libfreemkv::whole_disc::DecryptedNames> {
     use libfreemkv::whole_disc::{DecryptedNames, NamesKept};
-    let wedged = recovery.map_or(eh.wedged(), |r| r.wedged);
+    let wedged = recovery.map_or_else(|| eh.wedged(), |r| r.wedged);
     if copy.halted || recovery.is_some_and(|r| r.halted) || wedged {
         return None;
     }
-    if eh.abandoned() {
+    if crate::recovery::abandoned_writer_alive(&crate::mapfile_path_for(path)) {
         tracing::warn!(
             target: "freemkv::udf",
             "decrypted-name rename skipped; an abandoned pass may still write the image"

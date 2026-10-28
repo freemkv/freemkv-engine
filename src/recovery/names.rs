@@ -2,10 +2,11 @@
 //! sectors written by different passes never mix renamed and original metadata; the rename
 //! runs once after the last pass, reading and writing only the image and its mapfile.
 //!
-//! The rename never demotes the mapfile. `<iso>.names-undo` holds the original bytes of every
-//! sector it writes: pending until the written image is verified, then committed. A later run
-//! settles a leftover undo before any pass reads ([`settle_names_undo`]): a pending one is
-//! rolled back, a committed one has its rebuilt mirror sectors marked finished.
+//! `<iso>.names-undo` holds each touched sector's original bytes and mapfile status. It is
+//! written before the image; the rebuilt mirror sectors are marked finished only once the
+//! written image is verified, and the undo is then committed and dropped. A leftover pending
+//! undo rolls back bytes and statuses ([`settle_names_undo`]); a committed one is just dropped.
+//! Passes only rewrite unfinished sectors, so either state is safe to read around.
 
 use super::mapfile::{self, Mapfile, SectorStatus};
 use libfreemkv::whole_disc::{DecryptedNames, ImageNames, NamesKept};
@@ -13,11 +14,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SECTOR: u64 = 2048;
-const MAGIC: &[u8; 8] = b"FMKVUNDO";
-// Header: magic, state, image length, record count; then per record lba, fill flag, bytes.
-const STATE_AT: u64 = 8;
-const HEADER: usize = 8 + 1 + 8 + 4;
-const RECORD: usize = 4 + 1 + SECTOR as usize;
+const MAGIC: &[u8; 8] = b"FMKVUND2";
+// Header: magic, state, image length, record count, FNV-1a of all but the state byte; then
+// per record lba, fill flag, mapfile status at plan time, bytes.
+const STATE_AT: usize = 8;
+const HEADER: usize = 8 + 1 + 8 + 4 + 8;
+const RECORD: usize = 4 + 1 + 1 + SECTOR as usize;
 const PENDING: u8 = 0;
 const COMMITTED: u8 = 1;
 
@@ -33,6 +35,7 @@ pub(crate) fn names_undo_path(path: &Path) -> PathBuf {
 pub(super) enum At {
     Open,
     Write(u32),
+    Marked,
     Committed,
 }
 
@@ -50,9 +53,12 @@ fn finish_with(path: &Path, aacs: bool, hook: Hook<'_>) -> Option<DecryptedNames
     if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
         return None;
     }
+    // An earlier rename this run could not settle: leave the image as it is.
     if let Err(e) = settle_names_undo(path) {
         tracing::error!(target: "freemkv::udf", error = %e, "decrypted-name undo not settled");
-        return kept(NamesKept::Unexpected);
+        return Some(DecryptedNames::Kept {
+            cause: NamesKept::Unexpected,
+        });
     }
     let map = Mapfile::load(&mapfile::mapfile_path_for(path)).ok()?;
     match (map.raw(), map.scope()) {
@@ -65,7 +71,6 @@ fn finish_with(path: &Path, aacs: bool, hook: Hook<'_>) -> Option<DecryptedNames
         _ => return None,
     }
     let unreadable = unfinished(&map);
-    drop(map);
     let plan = match libfreemkv::whole_disc::plan_image_names(path, &unreadable) {
         Ok(Some(plan)) => plan,
         Ok(None) => return libfreemkv::whole_disc::check_image_names(path, &unreadable, aacs),
@@ -79,7 +84,13 @@ fn finish_with(path: &Path, aacs: bool, hook: Hook<'_>) -> Option<DecryptedNames
             return kept(NamesKept::from_plan_error(&e, &unreadable));
         }
     };
-    match apply(path, &plan, &unreadable, aacs, hook) {
+    let statuses: Vec<SectorStatus> = plan
+        .sectors
+        .iter()
+        .map(|&(lba, _)| status_at(&map, lba))
+        .collect();
+    drop(map);
+    match apply(path, &plan, &statuses, &unreadable, aacs, hook) {
         Ok(()) => Some(DecryptedNames::Renamed {
             mirror_sectors_restored: plan.restored.len() as u32,
         }),
@@ -92,11 +103,12 @@ fn finish_with(path: &Path, aacs: bool, hook: Hook<'_>) -> Option<DecryptedNames
     }
 }
 
-// Write the plan behind a pending undo, verify it, then commit and mark the rebuilt mirror
-// sectors finished. Any failure before the commit restores the originals.
+// Write the plan behind a pending undo, verify it, mark the rebuilt mirror sectors finished,
+// then commit and drop the undo. Any failure before the commit rolls back.
 fn apply(
     path: &Path,
     plan: &ImageNames,
+    statuses: &[SectorStatus],
     unreadable: &[(u32, u32)],
     aacs: bool,
     hook: Hook<'_>,
@@ -104,12 +116,17 @@ fn apply(
     let records: Vec<Record> = {
         let mut file = std::fs::File::open(path)?;
         let mut out = Vec::with_capacity(plan.sectors.len());
-        for &(lba, _) in &plan.sectors {
+        for (&(lba, _), &status) in plan.sectors.iter().zip(statuses) {
             let mut bytes = Box::new([0u8; SECTOR as usize]);
             file.seek(SeekFrom::Start(lba as u64 * SECTOR))?;
             file.read_exact(&mut bytes[..])?;
             let fill = plan.restored.contains(&lba);
-            out.push(Record { lba, fill, bytes });
+            out.push(Record {
+                lba,
+                fill,
+                status,
+                bytes,
+            });
         }
         out
     };
@@ -117,27 +134,23 @@ fn apply(
     let undo = names_undo_path(path);
     write_undo(&undo, image_len, &records)?;
     let opened = hook(At::Open).and_then(|_| std::fs::OpenOptions::new().write(true).open(path));
-    let mut file = match opened {
-        Ok(file) => file,
-        Err(e) => {
-            remove_undo(&undo)?;
-            return Err(e);
-        }
-    };
-    if let Err(e) = write_and_verify(&mut file, path, plan, unreadable, aacs, hook) {
-        restore(&mut file, &records, |_| true)?;
+    if let Err(e) = opened
+        .and_then(|mut file| write_and_verify(&mut file, path, plan, unreadable, aacs, hook))
+        .and_then(|_| mark_fills(path, &records))
+        .and_then(|_| hook(At::Marked))
+    {
+        // The undo stays if the rollback itself fails; the next run settles it.
+        rollback(path, &records)?;
         remove_undo(&undo)?;
         return Err(e);
     }
+    // Verified and marked: either undo state now settles to a consistent image (pending rolls
+    // back to the originals, committed is dropped), so a failed commit or delete is not a failure.
     let committed = commit_undo(&undo).and_then(|_| hook(At::Committed));
-    if let Err(e) = committed {
-        restore(&mut file, &records, |_| true)?;
-        remove_undo(&undo)?;
-        return Err(e);
+    if let Err(e) = committed.and_then(|_| remove_undo(&undo)) {
+        tracing::warn!(target: "freemkv::udf", error = %e, "decrypted-name undo left for the next run");
     }
-    // Committed: a failure from here leaves the undo for the next run to settle.
-    mark_fills(path, &records)?;
-    remove_undo(&undo)
+    Ok(())
 }
 
 fn write_and_verify(
@@ -171,36 +184,41 @@ fn write_and_verify(
     }
 }
 
-/// Settle a leftover `<iso>.names-undo` before anything reads the image: roll a pending one
-/// back (except mirror sectors a pass has since read), finish a committed one. An undo whose
-/// image or decrypted mapfile is gone is dropped.
+/// Settle a leftover `<iso>.names-undo`: roll a pending one back, drop a committed one or one
+/// whose image is gone or resized. A corrupt undo, or one that cannot be applied, is kept and
+/// reported: the image is then left as it is.
 pub(crate) fn settle_names_undo(path: &Path) -> io::Result<()> {
     let undo = names_undo_path(path);
     let bytes = match std::fs::read(&undo) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         r => r?,
     };
-    let map = Mapfile::load(&mapfile::mapfile_path_for(path))
-        .ok()
-        .filter(|m| m.raw() == Some(false));
-    let len = std::fs::metadata(path).ok().map(|m| m.len());
-    match (parse_undo(&bytes), map) {
-        (Some((state, image_len, records)), Some(map)) if len == Some(image_len) => {
-            if state == COMMITTED {
-                drop(map);
-                mark_fills(path, &records)?;
-            } else {
-                let finished = map.ranges_with(&[SectorStatus::Finished]);
-                let read_since = |r: &Record| r.fill && covered(&finished, r.lba);
-                let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
-                restore(&mut file, &records, |r| !read_since(r))?;
-            }
-        }
-        _ => {
-            tracing::warn!(target: "freemkv::udf", "dropping a decrypted-name undo whose image changed")
-        }
+    let Some((state, image_len, records)) = parse_undo(&bytes) else {
+        tracing::warn!(target: "freemkv::udf", "decrypted-name undo is corrupt; kept");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "corrupt decrypted-name undo",
+        ));
+    };
+    let len = match std::fs::metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        r => Some(r?.len()),
+    };
+    if len != Some(image_len) {
+        tracing::warn!(target: "freemkv::udf", "dropping a decrypted-name undo whose image changed");
+    } else if state == PENDING {
+        rollback(path, &records)?;
     }
     remove_undo(&undo)
+}
+
+/// [`settle_names_undo`] before a pass reads the image; a failure is logged, not fatal. Passes rewrite
+/// only unfinished sectors, which a pending rollback resets anyway, and the rename then leaves
+/// the image alone while the undo stays.
+pub(crate) fn settle_before_pass(path: &Path) {
+    if let Err(e) = settle_names_undo(path) {
+        tracing::warn!(target: "freemkv::udf", error = %e, "decrypted-name undo not settled");
+    }
 }
 
 /// Drop `<iso>.names-undo`: the image it describes is being replaced.
@@ -211,7 +229,19 @@ pub(crate) fn remove_names_undo(path: &Path) -> io::Result<()> {
 struct Record {
     lba: u32,
     fill: bool,
+    status: SectorStatus,
     bytes: Box<[u8; SECTOR as usize]>,
+}
+
+// FNV-1a 64 over the undo, its state byte excluded (the commit rewrites it in place).
+fn checksum(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != STATE_AT)
+        .fold(0xcbf2_9ce4_8422_2325, |h, (_, &b)| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        })
 }
 
 fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()> {
@@ -220,11 +250,15 @@ fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()>
     buf.push(PENDING);
     buf.extend_from_slice(&image_len.to_le_bytes());
     buf.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&[0; 8]);
     for r in records {
         buf.extend_from_slice(&r.lba.to_le_bytes());
         buf.push(u8::from(r.fill));
+        buf.push(r.status.to_char() as u8);
         buf.extend_from_slice(&r.bytes[..]);
     }
+    let sum = checksum(&buf);
+    buf[HEADER - 8..HEADER].copy_from_slice(&sum.to_le_bytes());
     let mut tmp = undo.as_os_str().to_os_string();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
@@ -249,28 +283,35 @@ fn parse_undo(bytes: &[u8]) -> Option<(u8, u64, Vec<Record>)> {
     if bytes.len() < HEADER || &bytes[..8] != MAGIC {
         return None;
     }
-    let state = bytes[8];
+    let state = bytes[STATE_AT];
     let image_len = u64::from_le_bytes(bytes[9..17].try_into().ok()?);
     let count = u32::from_le_bytes(bytes[17..21].try_into().ok()?) as usize;
-    if state > COMMITTED || bytes.len() != HEADER + count * RECORD {
+    let sum = u64::from_le_bytes(bytes[21..29].try_into().ok()?);
+    let mut zeroed = bytes.to_vec();
+    zeroed[HEADER - 8..HEADER].fill(0);
+    if state > COMMITTED
+        || bytes.len() != HEADER + count.checked_mul(RECORD)?
+        || checksum(&zeroed) != sum
+    {
         return None;
     }
-    let records = (0..count)
+    (0..count)
         .map(|i| {
             let r = &bytes[HEADER + i * RECORD..][..RECORD];
-            Record {
-                lba: u32::from_le_bytes(r[..4].try_into().unwrap()),
+            Some(Record {
+                lba: u32::from_le_bytes(r[..4].try_into().ok()?),
                 fill: r[4] != 0,
-                bytes: Box::new(r[5..].try_into().unwrap()),
-            }
+                status: SectorStatus::from_char(r[5] as char)?,
+                bytes: Box::new(r[6..].try_into().ok()?),
+            })
         })
-        .collect();
-    Some((state, image_len, records))
+        .collect::<Option<Vec<_>>>()
+        .map(|records| (state, image_len, records))
 }
 
 fn commit_undo(undo: &Path) -> io::Result<()> {
     let mut f = std::fs::OpenOptions::new().write(true).open(undo)?;
-    f.seek(SeekFrom::Start(STATE_AT))?;
+    f.seek(SeekFrom::Start(STATE_AT as u64))?;
     f.write_all(&[COMMITTED])?;
     f.sync_all()
 }
@@ -289,16 +330,30 @@ fn sync_parent(p: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn restore(
-    file: &mut std::fs::File,
-    records: &[Record],
-    keep: impl Fn(&Record) -> bool,
-) -> io::Result<()> {
-    for r in records.iter().filter(|r| keep(r)) {
+// Every touched sector back to its original bytes, and each rebuilt mirror sector back to
+// its plan-time status: a pass may have read it since, and it is unfinished again here.
+fn rollback(path: &Path, records: &[Record]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+    for r in records {
         file.seek(SeekFrom::Start(r.lba as u64 * SECTOR))?;
         file.write_all(&r.bytes[..])?;
     }
-    file.sync_all()
+    file.sync_all()?;
+    let reset: Vec<&Record> = records
+        .iter()
+        .filter(|r| r.fill && r.status != SectorStatus::Finished)
+        .collect();
+    if reset.is_empty() {
+        return Ok(());
+    }
+    let mut map = match Mapfile::load(&mapfile::mapfile_path_for(path)) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        r => r?,
+    };
+    for r in reset {
+        map.record(r.lba as u64 * SECTOR, SECTOR, r.status)?;
+    }
+    map.flush()
 }
 
 // The rebuilt mirror sectors are now confirmed: no pass reads them again.
@@ -311,6 +366,14 @@ fn mark_fills(path: &Path, records: &[Record]) -> io::Result<()> {
         map.record(r.lba as u64 * SECTOR, SECTOR, SectorStatus::Finished)?;
     }
     map.flush()
+}
+
+fn status_at(map: &Mapfile, lba: u32) -> SectorStatus {
+    let at = lba as u64 * SECTOR;
+    map.entries()
+        .iter()
+        .find(|e| e.pos <= at && at < e.pos + e.size)
+        .map_or(SectorStatus::NonTried, |e| e.status)
 }
 
 // `ranges` less the single sectors `lbas` (the rebuilt mirror sectors, now written).
@@ -336,11 +399,6 @@ fn without(ranges: &[(u32, u32)], lbas: &[u32]) -> Vec<(u32, u32)> {
         }
     }
     out
-}
-
-fn covered(ranges: &[(u64, u64)], lba: u32) -> bool {
-    let at = lba as u64 * SECTOR;
-    ranges.iter().any(|&(p, n)| p <= at && at < p + n)
 }
 
 // Every sector the mapfile does not mark finished, as `(start, count)`.

@@ -164,7 +164,7 @@ pub(crate) fn copy_titled(
     // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
-    names::settle_names_undo(path).map_err(Error::from)?;
+    names::settle_before_pass(path);
     if mf_path.exists() {
         // A corrupt map restarts clean, as the sweep's own resume does; an unreadable one fails.
         let mut map = match mapfile::Mapfile::load(&mf_path) {
@@ -964,7 +964,7 @@ fn sweep_linked(
         names::remove_names_undo(path).map_err(Error::from)?;
     } else {
         // An interrupted rename is settled before this pass reads around it.
-        names::settle_names_undo(path).map_err(Error::from)?;
+        names::settle_before_pass(path);
     }
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(Error::from)?;
@@ -1402,10 +1402,6 @@ fn sweep_linked(
     // `Pipeline::finish` would re-block on the stalled consumer, so Stop never returns.
     let consumer_failed = pipe.consumer_failed();
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
-    // Teardown failed and disowned the consumer: it may still write the image.
-    if summary.is_err() {
-        halt.mark_abandoned();
-    }
 
     // The producer's error wins, unless the consumer's apply failed first: then its write
     // error is the cause (see `pass_failure`).
@@ -1640,6 +1636,7 @@ mod read_error;
 mod section_recover;
 mod sweep;
 mod whole_disc;
+pub(crate) use mapfile::abandoned_writer_alive;
 pub(crate) use names::finish_image_names;
 pub(crate) use whole_disc::whole_disc_decrypting_reader;
 
