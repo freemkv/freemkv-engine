@@ -4,7 +4,16 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
-## [Unreleased] — 2026-10-25
+## [1.8.6] — UNRELEASED
+
+### Added
+
+- Shared TMDB identification and episode naming for the CLI, GUI and server (moved from the freemkv app), with disc-order episode names for TV disc labels and an optional private API key.
+- Combined film / episodes selection prefers authored episodes.
+
+### Changed
+
+- TMDB: a match is confident only when its year agrees with every year in the disc label; a response without results counts as a failed lookup, and lookup failures are logged with their cause.
 
 ### Fixed
 
