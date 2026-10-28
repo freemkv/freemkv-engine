@@ -1114,3 +1114,12 @@ fn exact_match_refuses_remakes_and_near_names() {
     let dated = exact_match(&results, "K For Kestrel", MediaKind::Movie, 2017);
     assert_eq!(dated.map(|r| r.tmdb_id), Some(2));
 }
+
+#[test]
+fn clean_title_strips_any_disc_number_disc_from_label_accepts() {
+    assert_eq!(clean_title("THE_OFFICE_SEASON_3_DISC_5"), "The Office");
+    assert_eq!(clean_title("THE_OFFICE_DISK_12"), "The Office");
+    assert_eq!(clean_title("Heat Disc 99"), "Heat");
+    assert_eq!(clean_title("Heat Disc 100"), "Heat Disc 100");
+    assert!(query_variants("THE_OFFICE_SEASON_3_DISC_5").contains(&"The Office".to_string()));
+}

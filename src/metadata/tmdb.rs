@@ -490,14 +490,6 @@ pub fn clean_title(label: &str) -> String {
         "blu ray",
         "bluray",
         "dvd",
-        "disc 1",
-        "disc 2",
-        "disc 3",
-        "disc 4",
-        "disk 1",
-        "disk 2",
-        "disk 3",
-        "disk 4",
     ];
     // Search AND slice the SAME (lowercased) string: `to_lowercase()` can
     // change byte length, so an offset in `lower` may not index into `s`.
@@ -522,7 +514,7 @@ pub fn clean_title(label: &str) -> String {
         // resolves to the base show title, only when no format suffix
         // matched this round — the two peels interleave across the loop.
         if next.is_none() {
-            next = strip_trailing_season(trimmed);
+            next = strip_trailing_season(trimmed).or_else(|| strip_trailing_disc(trimmed));
         }
         match next {
             Some(rest) => clipped = rest,
@@ -550,17 +542,35 @@ pub fn clean_title(label: &str) -> String {
 // Unambiguous TV season markers. A trailing "<word> <number>" of one of these is peeled by
 // `clean_title` so a series disc resolves to the base show title.
 const SEASON_WORDS: &[&str] = &["season", "series", "saison", "staffel", "seizoen"];
+const DISC_WORDS: &[&str] = &["disc", "disk"];
 
 // If `s` (lowercased, trailing-junk-trimmed) ends with a season marker like
 // "season 5", return `s` with that marker removed; else None. The number is
 // required — a bare trailing "season" is left alone (e.g. "Silly Season").
 fn strip_trailing_season(s: &str) -> Option<&str> {
+    strip_trailing_word_number(s, SEASON_WORDS, |_| true)
+}
+
+// Same for a trailing "disc N"/"disk N", N in the range `disc_from_label` accepts.
+fn strip_trailing_disc(s: &str) -> Option<&str> {
+    strip_trailing_word_number(s, DISC_WORDS, number_in_range)
+}
+
+fn number_in_range(digits: &str) -> bool {
+    digits.parse::<u16>().is_ok_and(|n| (1..=99).contains(&n))
+}
+
+fn strip_trailing_word_number<'a>(
+    s: &'a str,
+    words: &[&str],
+    number_ok: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
     let digits_start = s.trim_end_matches(|c: char| c.is_ascii_digit());
-    if digits_start.len() == s.len() {
-        return None; // no trailing digits
+    if digits_start.len() == s.len() || !number_ok(&s[digits_start.len()..]) {
+        return None; // no trailing digits, or out of range
     }
     let head = digits_start.trim_end(); // strip the space(s) before the number
-    for word in SEASON_WORDS {
+    for word in words {
         if let Some(pos) = head.rfind(word)
             && pos + word.len() == head.len()
             // Must be a whole word: start of string or a non-alphanumeric before it.
@@ -586,7 +596,7 @@ pub fn season_from_label(label: &str) -> Option<u16> {
 /// Parse a disc number from a `label`: "… Disc 2" → 2, "GOT_S3_D4" → 4,
 /// "BD1" → 1. Returns 1..=99, else `None`. Used to sequence a multi-disc set.
 pub fn disc_from_label(label: &str) -> Option<u16> {
-    number_after_word(label, &["disc", "disk"])
+    number_after_word(label, DISC_WORDS)
         .or_else(|| compact_token_number(label, &["disc", "disk", "bd", "d"]))
 }
 
