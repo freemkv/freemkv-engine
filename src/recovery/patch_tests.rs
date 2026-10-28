@@ -1105,3 +1105,40 @@ fn a_disowned_patch_sink_writes_nothing() {
     drop(sink);
     assert!(std::fs::read(&iso).unwrap().iter().all(|&b| b == 7));
 }
+
+// Sectors left out of a pass (an unsettled rename undo's) stay bad but are not its work: once
+// the rest is recovered the bar is full.
+#[test]
+fn skipped_damage_does_not_hold_the_bar_short() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("out.iso");
+    std::fs::write(&iso, vec![0u8; 8 * 2048]).unwrap();
+    let mut map = Mapfile::create(&dir.path().join("out.map"), 8 * 2048, "test").unwrap();
+    map.record(0, 8 * 2048, mapfile::SectorStatus::Finished)
+        .unwrap();
+    map.record(2048, 2048, mapfile::SectorStatus::NonTrimmed)
+        .unwrap();
+    let (sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
+    sink.publish_now();
+    let done = std::sync::Mutex::new(None);
+    let reporter = |e: &libfreemkv::Event<'_>| {
+        if let libfreemkv::Event::Pass(p) = e {
+            *done.lock().unwrap() = Some((p.work_done, p.work_total));
+        }
+    };
+    let opts = PatchOptions::for_patch_pass(true, Some(&reporter), None);
+    let state = PatchLoopState {
+        skipped: 2048,
+        ..PatchLoopState::new(0, 1, 3 * 2048)
+    };
+    let disc = guard_disc(8);
+    report_patch_progress(
+        disc.titles.first(),
+        &state,
+        &opts,
+        8 * 2048,
+        &shared,
+        &EngineHalt::legacy(None),
+    );
+    assert_eq!(*done.lock().unwrap(), Some((3 * 2048, 3 * 2048)));
+}

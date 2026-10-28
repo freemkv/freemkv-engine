@@ -15,12 +15,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SECTOR: u64 = 2048;
-const MAGIC: &[u8; 8] = b"FMKVUND3";
+const MAGIC: &[u8; 8] = b"FMKVUND4";
 // Header: magic, state, image length, record count, FNV-1a of all but the state byte; then
-// per record lba, fill flag, mapfile status at plan time, FNV-1a of the planned bytes, bytes.
+// per record lba, fill flag, mapfile status at plan time, planned bytes, original bytes.
 const STATE_AT: usize = 8;
 const HEADER: usize = 8 + 1 + 8 + 4 + 8;
-const RECORD: usize = 4 + 1 + 1 + 8 + SECTOR as usize;
+const RECORD: usize = 4 + 1 + 1 + 2 * SECTOR as usize;
 const PENDING: u8 = 0;
 const COMMITTED: u8 = 1;
 
@@ -126,7 +126,7 @@ fn apply(
                 lba,
                 fill,
                 status,
-                planned: 0,
+                planned: Box::new([0; SECTOR as usize]),
                 bytes,
             });
         }
@@ -136,7 +136,7 @@ fn apply(
         .into_iter()
         .zip(&plan.sectors)
         .map(|(r, (_, planned))| Record {
-            planned: fnv(&planned[..]),
+            planned: planned.clone(),
             ..r
         })
         .collect();
@@ -235,16 +235,21 @@ pub(crate) fn settle_names_undo(path: &Path) -> Settled {
     } else if state == PENDING {
         match ours(path, &records) {
             Err(_) => return lbas(),
-            Ok(false) => {
+            Ok(None) => {
                 tracing::warn!(target: "freemkv::udf", "dropping a decrypted-name undo the image no longer matches");
             }
-            Ok(true) => {
-                if restore(path, &records).is_err() {
+            Ok(Some(undo)) => {
+                let undo: Vec<&Record> = records
+                    .iter()
+                    .zip(undo)
+                    .filter_map(|(r, u)| u.then_some(r))
+                    .collect();
+                if restore(path, &undo).is_err() {
                     return lbas();
                 }
                 // The bytes are the originals now: a pass re-reading a mirror sector reads
                 // the disc's own copy, which matches the restored main.
-                if reset_fills(path, &records).is_err() {
+                if reset_fills(path, &undo).is_err() {
                     return Settled::StatusOwed;
                 }
             }
@@ -257,19 +262,23 @@ pub(crate) fn settle_names_undo(path: &Path) -> Settled {
     }
 }
 
-// Whether every sector still holds what the undo wrote there or what it replaced. Passes skip
-// an unsettled undo's sectors, so anything else is another image (or a fresh copy) by that name.
-fn ours(path: &Path, records: &[Record]) -> io::Result<bool> {
+// Records to roll back, `None` for another image: each main byte is what the undo wrote or
+// replaced (a torn write mixes them). A rebuilt mirror holding neither was read back from the
+// disc by a pass, which matches the restored main: it is left, with its status.
+fn ours(path: &Path, records: &[Record]) -> io::Result<Option<Vec<bool>>> {
     let mut file = std::fs::File::open(path)?;
     let mut got = [0u8; SECTOR as usize];
+    let mut undo = Vec::with_capacity(records.len());
     for r in records {
         file.seek(SeekFrom::Start(r.lba as u64 * SECTOR))?;
         file.read_exact(&mut got)?;
-        if got != *r.bytes && fnv(&got) != r.planned {
-            return Ok(false);
+        let mixed = (0..got.len()).all(|i| got[i] == r.bytes[i] || got[i] == r.planned[i]);
+        if !mixed && !r.fill {
+            return Ok(None);
         }
+        undo.push(mixed);
     }
-    Ok(true)
+    Ok(Some(undo))
 }
 
 /// [`settle_names_undo`] before a pass reads the image, never fatal: the byte ranges the pass
@@ -293,7 +302,7 @@ struct Record {
     lba: u32,
     fill: bool,
     status: SectorStatus,
-    planned: u64,
+    planned: Box<[u8; SECTOR as usize]>,
     bytes: Box<[u8; SECTOR as usize]>,
 }
 
@@ -321,7 +330,7 @@ fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()>
         buf.extend_from_slice(&r.lba.to_le_bytes());
         buf.push(u8::from(r.fill));
         buf.push(r.status.to_char() as u8);
-        buf.extend_from_slice(&r.planned.to_le_bytes());
+        buf.extend_from_slice(&r.planned[..]);
         buf.extend_from_slice(&r.bytes[..]);
     }
     let sum = checksum(&buf);
@@ -372,8 +381,8 @@ fn parse_undo(bytes: &[u8]) -> Option<(u8, u64, Vec<Record>)> {
                 lba: u32::from_le_bytes(r[..4].try_into().ok()?),
                 fill: r[4] != 0,
                 status: SectorStatus::from_char(r[5] as char)?,
-                planned: u64::from_le_bytes(r[6..14].try_into().ok()?),
-                bytes: Box::new(r[14..].try_into().ok()?),
+                planned: Box::new(r[6..6 + SECTOR as usize].try_into().ok()?),
+                bytes: Box::new(r[6 + SECTOR as usize..].try_into().ok()?),
             })
         })
         .collect::<Option<Vec<_>>>()
@@ -404,8 +413,9 @@ fn sync_parent(p: &Path) -> io::Result<()> {
 // Every touched sector back to its original bytes, and each rebuilt mirror sector back to
 // its plan-time status: a pass may have read it since, and it is unfinished again here.
 fn rollback(path: &Path, records: &[Record]) -> io::Result<()> {
-    restore(path, records)?;
-    reset_fills(path, records)
+    let all: Vec<&Record> = records.iter().collect();
+    restore(path, &all)?;
+    reset_fills(path, &all)
 }
 
 #[cfg(test)]
@@ -414,7 +424,7 @@ thread_local! {
     static FAIL_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn restore(path: &Path, records: &[Record]) -> io::Result<()> {
+fn restore(path: &Path, records: &[&Record]) -> io::Result<()> {
     #[cfg(test)]
     if FAIL_RESTORE.with(|f| f.get()) {
         return Err(io::Error::other("restore"));
@@ -427,9 +437,10 @@ fn restore(path: &Path, records: &[Record]) -> io::Result<()> {
     file.sync_all()
 }
 
-fn reset_fills(path: &Path, records: &[Record]) -> io::Result<()> {
+fn reset_fills(path: &Path, records: &[&Record]) -> io::Result<()> {
     let reset: Vec<&Record> = records
         .iter()
+        .copied()
         .filter(|r| r.fill && r.status != SectorStatus::Finished)
         .collect();
     if reset.is_empty() {

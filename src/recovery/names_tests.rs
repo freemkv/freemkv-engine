@@ -456,7 +456,7 @@ fn a_fresh_copy_drops_a_leftover_undo() {
         lba: layout.aacs_dir,
         fill: false,
         status: SectorStatus::Finished,
-        planned: 0,
+        planned: Box::new([0; 2048]),
         bytes: Box::new([0xAA; 2048]),
     };
     super::write_undo(&names_undo_path(&iso), len, &[stale]).unwrap();
@@ -792,7 +792,7 @@ fn an_undo_for_another_image_is_dropped_unapplied() {
         lba: layout.aacs_dir,
         fill: false,
         status: SectorStatus::Finished,
-        planned: super::fnv(&[0xBB; 2048]),
+        planned: Box::new([0xBB; 2048]),
         bytes: Box::new([0xAA; 2048]),
     };
     super::write_undo(&names_undo_path(&iso), len, &[other]).unwrap();
@@ -825,5 +825,57 @@ fn a_fresh_copy_runs_past_an_undo_it_cannot_delete() {
         None,
     );
     assert_eq!(names, UNEXPECTED);
+    assert!(lists(&iso, "Unit_Key_RO.inf"));
+}
+
+// An undo unread for one run, while a pass read the rebuilt mirror back from the disc, is
+// still applied once it reads again: main is rolled back to match that mirror, then renamed.
+#[test]
+fn an_undo_unread_for_a_run_is_still_applied_after_a_pass_reads_the_mirror() {
+    let (fx, layout, keys) = fixture();
+    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    torn_pending(&fx, &keys, &iso, mirror);
+    let undo = std::fs::read(names_undo_path(&iso)).unwrap();
+    corrupt_undo(&iso);
+    assert_eq!(rip(&fx, &keys, &iso, Damage::None, |_, _| {}), UNEXPECTED);
+    assert!(
+        sector(&iso, mirror) == source_sector(&fx, mirror),
+        "read back"
+    );
+    std::fs::write(names_undo_path(&iso), undo).unwrap();
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
+    assert!(sector(&iso, main) == sector(&iso, mirror));
+    assert_eq!(status(&iso, mirror), SectorStatus::Finished);
+    assert_eq!(finish_image_names(&iso, true), RENAMED);
+    assert!(sector(&iso, main) == sector(&iso, mirror));
+}
+
+// A write torn by power loss holds part of each version: still this image's, rolled back.
+#[test]
+fn a_torn_sector_write_is_rolled_back() {
+    let (fx, layout, keys) = fixture();
+    let main = layout.aacs_dir;
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    recovered(&fx, &keys, &iso, Damage::None);
+    let original = sector(&iso, main);
+    crash_at(&iso, At::Marked);
+    let mut torn = sector(&iso, main);
+    let at = torn
+        .iter()
+        .zip(&original)
+        .position(|(a, b)| a != b)
+        .unwrap()
+        + 1;
+    torn[at..].copy_from_slice(&original[at..]);
+    assert!(
+        torn != original && torn != sector(&iso, main),
+        "torn inside the change"
+    );
+    write_at(&iso, main, &torn);
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
+    assert!(sector(&iso, main) == original);
     assert!(lists(&iso, "Unit_Key_RO.inf"));
 }

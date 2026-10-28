@@ -554,6 +554,8 @@ pub(super) struct PatchLoopState {
     pub bytes_good_before: u64,
     pub initial_batch: u16,
     pub work_total: u64,
+    // Damage bytes left out of `work_total` (an unsettled rename undo's): still bad, not work.
+    pub skipped: u64,
 }
 
 impl PatchLoopState {
@@ -582,6 +584,7 @@ impl PatchLoopState {
             bytes_good_before,
             initial_batch,
             work_total,
+            skipped: 0,
         }
     }
 }
@@ -1143,7 +1146,9 @@ pub(super) fn report_patch_progress(
     // Progress = bytes RECOVERED, not a per-range counter, since breadth-first
     // tiers bring back readable bulk before any range "finishes". `still_bad_work` is the
     // damage inside the scope, as `work_total` is.
-    let recovered = state.work_total.saturating_sub(still_bad_work);
+    let recovered = state
+        .work_total
+        .saturating_sub(still_bad_work.saturating_sub(state.skipped));
     let pp = libfreemkv::progress::PassProgress {
         kind,
         work_done: recovered,
@@ -1289,12 +1294,12 @@ fn patch_linked(
         work_total,
         is_regular,
     } = compute_initial_state(path, &mapfile_path)?;
-    let (bad_ranges, work_total) = match skip.is_empty() {
-        true => (bad_ranges, work_total),
+    let (bad_ranges, work_total, skipped) = match skip.is_empty() {
+        true => (bad_ranges, work_total, 0),
         false => {
             let left = mapfile::subtract(&bad_ranges, &skip);
             let total = left.iter().map(|r| r.1).sum();
-            (left, total)
+            (left, total, work_total - total)
         }
     };
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
@@ -1429,7 +1434,10 @@ fn patch_linked(
         halt,
         lib,
         total_bytes,
-        state: PatchLoopState::new(bytes_good_before, initial_batch, work_total),
+        state: PatchLoopState {
+            skipped,
+            ..PatchLoopState::new(bytes_good_before, initial_batch, work_total)
+        },
         scoreboard: HandlerScoreboard::default(),
         wedge_streak: 0,
         drive_speed: None,
