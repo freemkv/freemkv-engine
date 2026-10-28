@@ -901,7 +901,7 @@ fn fire_write_hook(path: &Path, at: HookAt) {
 }
 
 // The directory holding `path`: `.` for a bare relative name, whose `parent()` is `""`.
-fn parent_dir(path: &Path) -> Option<&Path> {
+pub(crate) fn parent_dir(path: &Path) -> Option<&Path> {
     match path.parent() {
         Some(p) if p.as_os_str().is_empty() => Some(Path::new(".")),
         p => p,

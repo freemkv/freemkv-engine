@@ -19,7 +19,8 @@ project follows semantic versioning.
 
 - TMDB: disc labels with Disc 5 and higher, and spaced disc numbers after a season token (`SHOW_S1_DISC_2`), are matched like the rest of the set. A lookup stops at the first network failure, rejected key, rate limit or server error instead of trying every query variant, and still tries the next variant after a query-specific error.
 - CLI, GUI and server: folder backups consume the same prepared disc reader as ISO backups, preserving clear navigation files and all source directories.
-- Decrypted ISO copies rename `AACS/Unit_Key_RO.inf` once after the last pass, so a multi-pass or resumed copy never mixes renamed and original directory sectors; an unreadable metadata mirror sector is rebuilt from the main copy, and `Report::Image::names` reports the outcome. A stopped, wedged, raw or staged image is never touched.
+- Decrypted ISO copies rename `AACS/Unit_Key_RO.inf` once after the last pass, so a multi-pass or resumed copy never mixes renamed and original directory sectors; an unreadable metadata mirror sector is rebuilt from the main copy, and `Report::Image::names` reports the outcome. A stopped, wedged, raw or staged image, or one a disowned pass may still write, is never touched; an interrupted rename is rolled back (or finished) from `<iso>.names-undo` before the next run reads the image.
+- Direct engine APIs (`copy`, `sweep`, `patch`, `recover_to_iso`, `multipass_rip*`) now write decrypted ISOs with the disc's own names; only `run` / `run_with` rename `Unit_Key_RO.inf`. A disowned patch consumer no longer writes the image.
 
 ## [1.8.5] — 2026-10-19
 

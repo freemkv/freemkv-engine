@@ -521,13 +521,8 @@ fn image(
             (copied, None)
         }
     };
-    // Renamed once, after the last pass and under the lock. Never a stopped or wedged copy: a
-    // disowned consumer may still own the file.
     let names = match &copied {
-        Ok(c) if !plan.raw && !null && !c.halted => match &recovery {
-            Some(r) if r.halted || r.wedged => None,
-            _ => crate::recovery::finish_image_names(path, disc.aacs.is_some()),
-        },
+        Ok(c) if !plan.raw && !null => image_names(c, recovery.as_ref(), &eh, path, disc),
         _ => None,
     };
     let done = matches!(&copied, Ok(r) if r.bytes_good > 0 && !r.halted);
@@ -600,6 +595,33 @@ fn tree(
         }
     };
     Ok(Report::Tree { extract })
+}
+
+// The decrypted image renamed once, after the last pass and under the lock. Never a stopped or
+// wedged copy. A pass whose consumer was disowned may still write the image, so it is left as
+// is; an AACS disc reports that as `Kept { Unexpected }`.
+pub(crate) fn image_names(
+    copy: &CopyResult,
+    recovery: Option<&MultipassResult>,
+    eh: &crate::EngineHalt<'_>,
+    path: &std::path::Path,
+    disc: &libfreemkv::Disc,
+) -> Option<libfreemkv::whole_disc::DecryptedNames> {
+    use libfreemkv::whole_disc::{DecryptedNames, NamesKept};
+    let wedged = recovery.map_or(eh.wedged(), |r| r.wedged);
+    if copy.halted || recovery.is_some_and(|r| r.halted) || wedged {
+        return None;
+    }
+    if eh.abandoned() {
+        tracing::warn!(
+            target: "freemkv::udf",
+            "decrypted-name rename skipped; an abandoned pass may still write the image"
+        );
+        return disc.aacs.is_some().then_some(DecryptedNames::Kept {
+            cause: NamesKept::Unexpected,
+        });
+    }
+    crate::recovery::finish_image_names(path, disc.aacs.is_some())
 }
 
 // One title of `plan.source` muxed into `plan.dest`: off a held drive or title, or the

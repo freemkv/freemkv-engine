@@ -9,7 +9,7 @@
 use crate::sink::Sink;
 use libfreemkv::halt::{Halt, WAIT_SLICE};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// The op token, an optional narrower flag, and (remux) the Sink probe.
@@ -25,7 +25,14 @@ pub struct EngineHalt<'a> {
     pub(crate) sink: Option<&'a dyn Sink>,
     // A cancel once observed stays observed: a non-sticky `should_cancel` stays a Stop.
     seen: AtomicBool,
+    // What the run's passes left behind in the image: `ABANDONED` / `WEDGED` bits.
+    image: AtomicU8,
 }
+
+// A pass's consumer was disowned at teardown and may still write the image.
+const ABANDONED: u8 = 1;
+// A pass ended on a transport fault.
+const WEDGED: u8 = 2;
 
 impl std::fmt::Debug for EngineHalt<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +42,7 @@ impl std::fmt::Debug for EngineHalt<'_> {
             .field("extra", &self.extra)
             .field("sink", &self.sink.is_some())
             .field("seen", &self.seen)
+            .field("image", &self.image)
             .finish()
     }
 }
@@ -48,6 +56,7 @@ impl EngineHalt<'static> {
             extra,
             sink: None,
             seen: AtomicBool::new(false),
+            image: AtomicU8::new(0),
         }
     }
 
@@ -59,6 +68,7 @@ impl EngineHalt<'static> {
             extra,
             sink: None,
             seen: AtomicBool::new(false),
+            image: AtomicU8::new(0),
         }
     }
 }
@@ -75,6 +85,7 @@ impl<'a> EngineHalt<'a> {
             extra: self.extra,
             sink: Some(sink),
             seen: self.seen,
+            image: self.image,
         }
     }
 
@@ -93,6 +104,24 @@ impl<'a> EngineHalt<'a> {
             self.seen.store(true, Ordering::Release);
         }
         now
+    }
+
+    // A pass's consumer was disowned at teardown: the image may still take its writes.
+    pub(crate) fn mark_abandoned(&self) {
+        self.image.fetch_or(ABANDONED, Ordering::AcqRel);
+    }
+
+    pub(crate) fn abandoned(&self) -> bool {
+        self.image.load(Ordering::Acquire) & ABANDONED != 0
+    }
+
+    // A pass ended on a transport fault (a one-pass copy reports no `wedged` of its own).
+    pub(crate) fn mark_wedged(&self) {
+        self.image.fetch_or(WEDGED, Ordering::AcqRel);
+    }
+
+    pub(crate) fn wedged(&self) -> bool {
+        self.image.load(Ordering::Acquire) & WEDGED != 0
     }
 
     /// The caller's op token (a private, never-cancelled one for a legacy entry).

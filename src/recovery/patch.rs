@@ -235,6 +235,10 @@ impl Sink<PatchItem> for PatchSink {
     type Output = PatchSummary;
 
     fn apply(&mut self, item: PatchItem) -> std::result::Result<Flow, Error> {
+        // Abandoned by teardown: a resumed pass or the end-of-copy rename owns the image now.
+        if self.map.is_disowned() {
+            return Ok(Flow::Stop);
+        }
         match item {
             PatchItem::Recovered { pos, buf } => {
                 let len = buf.len() as u64;
@@ -1275,6 +1279,8 @@ fn patch_linked(
 
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
+    // An interrupted rename is settled before this pass reads around it.
+    super::names::settle_names_undo(path).map_err(Error::from)?;
     let InitialState {
         map,
         stats: initial_stats,
@@ -1432,6 +1438,10 @@ fn patch_linked(
     // `Pipeline::finish` once hung joining a wedged consumer and swallowed a halt.
     let consumer_failed = pipe.consumer_failed();
     let finish_result = super::finish_bounded_disowning(pipe, &finish_halt, &map_disown);
+    // Teardown failed and disowned the consumer: it may still write the image.
+    if finish_result.is_err() {
+        halt.mark_abandoned();
+    }
     let summary = settle(run_result, finish_result, consumer_failed)?;
 
     let outcome = build_outcome(
@@ -1442,6 +1452,9 @@ fn patch_linked(
         bad_ranges.len(),
         opts.wedged_threshold,
     );
+    if outcome.wedged_exit {
+        halt.mark_wedged();
+    }
     tracing::info!(
         target: "freemkv::scan",
         phase = "patch",

@@ -1082,3 +1082,26 @@ fn sync_failure_on_close_does_not_persist_finished_case() -> bool {
     );
     true
 }
+
+// A sink abandoned by teardown writes nothing more: a later owner (the end-of-copy rename)
+// may already have changed the image.
+#[test]
+fn a_disowned_patch_sink_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    std::fs::write(&iso, vec![7u8; 4 * 2048]).unwrap();
+    let map =
+        mapfile::Mapfile::create(&mapfile::mapfile_path_for(&iso), 4 * 2048, "vTEST").unwrap();
+    let disown = map.disown_handle();
+    let (mut sink, _) = PatchSink::new(&iso, map, true, None).unwrap();
+    disown.disown();
+    let flow = sink
+        .apply(PatchItem::Recovered {
+            pos: 2048,
+            buf: vec![1u8; 2048],
+        })
+        .unwrap();
+    assert!(matches!(flow, Flow::Stop));
+    drop(sink);
+    assert!(std::fs::read(&iso).unwrap().iter().all(|&b| b == 7));
+}

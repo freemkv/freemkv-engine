@@ -164,6 +164,7 @@ pub(crate) fn copy_titled(
     // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
+    names::settle_names_undo(path).map_err(Error::from)?;
     if mf_path.exists() {
         // A corrupt map restarts clean, as the sweep's own resume does; an unreadable one fails.
         let mut map = match mapfile::Mapfile::load(&mf_path) {
@@ -960,6 +961,10 @@ fn sweep_linked(
         // open_or_create loads it and the new disc inherits old Finished ranges →
         // silently zero-filled ISO. ENOENT is fine; any other error aborts.
         stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
+        names::remove_names_undo(path).map_err(Error::from)?;
+    } else {
+        // An interrupted rename is settled before this pass reads around it.
+        names::settle_names_undo(path).map_err(Error::from)?;
     }
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(Error::from)?;
@@ -1397,6 +1402,10 @@ fn sweep_linked(
     // `Pipeline::finish` would re-block on the stalled consumer, so Stop never returns.
     let consumer_failed = pipe.consumer_failed();
     let summary = finish_bounded_disowning(pipe, &send_halt, &map_disown);
+    // Teardown failed and disowned the consumer: it may still write the image.
+    if summary.is_err() {
+        halt.mark_abandoned();
+    }
 
     // The producer's error wins, unless the consumer's apply failed first: then its write
     // error is the cause (see `pass_failure`).
