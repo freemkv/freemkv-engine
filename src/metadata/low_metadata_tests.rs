@@ -152,29 +152,38 @@ impl crate::Sink for RecordingSink {
     }
 }
 
-fn local_fetch(
-    response: Vec<u8>,
-    path: &str,
-    context: &str,
-    sink: &RecordingSink,
-) -> Option<serde_json::Value> {
+// Serve one canned `response` on loopback and point the TMDB base at it for this thread.
+// Returns the server handle; joining it proves exactly one request arrived.
+fn serve_once(response: Vec<u8>) -> std::thread::JoinHandle<()> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let server = std::thread::spawn(move || {
+    super::TEST_API_BASE.with(|b| *b.borrow_mut() = Some(format!("http://{addr}")));
+    std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut request = [0; 2048];
         let count = stream.read(&mut request).unwrap();
         let request = String::from_utf8_lossy(&request[..count]);
         assert_eq!(request.matches("GET ").count(), 1);
         stream.write_all(&response).unwrap();
-    });
-    let got = fetch_url(
-        &format!("http://{addr}{path}?api_key=SECRETKEY123"),
-        context,
-        sink,
-    );
-    server.join().unwrap();
-    got
+    })
+}
+
+// Run each Client method against its own one-shot server answering `response`.
+// All three must come back empty/failed, forwarding their failure to the sink.
+fn assert_client_calls_fail(response: &[u8], expected: &str) {
+    type Call = fn(&Client) -> bool;
+    let calls: [(&str, Call); 3] = [
+        ("search", |c| c.search("Heat", 5).is_empty()),
+        ("lookup", |c| c.lookup("Heat").is_err()),
+        ("season_episodes", |c| c.season_episodes(7, 3).is_empty()),
+    ];
+    for (name, call) in calls {
+        let sink = RecordingSink::default();
+        let server = serve_once(response.to_vec());
+        assert!(call(&Client::new("SECRETKEY123", &sink)), "{name}");
+        server.join().unwrap();
+        assert_safe_warning(&sink, expected);
+    }
 }
 
 fn assert_safe_warning(sink: &RecordingSink, expected: &str) {
@@ -188,42 +197,33 @@ fn assert_safe_warning(sink: &RecordingSink, expected: &str) {
 
 #[test]
 fn low_sink_reports_search_and_season_http_failures() {
-    for path in ["/3/search/multi", "/3/tv/7/season/3"] {
-        let sink = RecordingSink::default();
-        assert!(
-            local_fetch(
-                b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_vec(),
-                path,
-                "season 3",
-                &sink
-            )
-            .is_none()
-        );
-        assert_safe_warning(&sink, "503");
-    }
+    assert_client_calls_fail(
+        b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        "503",
+    );
 }
 
 #[test]
 fn low_sink_reports_search_and_season_json_and_body_failures() {
-    for path in ["/3/search/multi", "/3/tv/7/season/3"] {
-        for response in [
-            b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nRAW_BODY_SECRET"
-                .to_vec(),
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{".to_vec(),
-        ] {
-            let sink = RecordingSink::default();
-            assert!(local_fetch(response, path, "season 3", &sink).is_none());
-            assert_safe_warning(&sink, "response");
-        }
+    for response in [
+        &b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\nRAW_BODY_SECRET"[..],
+        &b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{"[..],
+    ] {
+        assert_client_calls_fail(response, "response");
     }
 }
 
 #[test]
 fn low_sink_reports_search_and_season_transport_failures() {
-    for context in ["search", "season 3"] {
+    super::TEST_API_BASE.with(|b| *b.borrow_mut() = Some("api_key".to_string()));
+    for context in ["search", "lookup", "season_episodes"] {
         let sink = RecordingSink::default();
-        assert!(fetch_url("api_key=SECRETKEY123", context, &sink).is_none());
+        let client = Client::new("SECRETKEY123", &sink);
+        match context {
+            "search" => assert!(client.search("Heat", 5).is_empty()),
+            "lookup" => assert!(client.lookup("Heat").is_err()),
+            _ => assert!(client.season_episodes(7, 3).is_empty()),
+        }
         assert_safe_warning(&sink, "transport");
     }
 }
@@ -236,25 +236,16 @@ fn low_sink_keeps_no_key_quiet_and_401_throttled() {
     assert!(client.search("Heat", 5).is_empty());
     assert!(client.season_episodes(7, 3).is_empty());
     assert!(sink.0.lock().unwrap().is_empty());
+    let client = Client::new("SECRETKEY123", &sink);
     for _ in 0..2 {
-        assert!(
-            local_fetch(
-                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_vec(),
-                "/3/search/multi",
-                "Heat",
-                &sink
-            )
-            .is_none()
+        let server = serve_once(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
         );
+        assert!(client.search("Heat", 5).is_empty());
+        server.join().unwrap();
     }
+    // The throttle is per thread under test, so the first 401 always warns, the second never.
     let logs = sink.0.lock().unwrap();
-    assert!(
-        logs.len() <= 1,
-        "401 must not add a generic warning: {logs:?}"
-    );
-    assert!(
-        logs.iter()
-            .all(|message| message.contains("API key rejected (HTTP 401)"))
-    );
+    assert_eq!(logs.len(), 1, "one 401 warning, no generic one: {logs:?}");
+    assert!(logs[0].contains("API key rejected (HTTP 401)"), "{logs:?}");
 }

@@ -71,12 +71,30 @@ fn build_agent(recv_body: std::time::Duration) -> ureq::Agent {
     ureq::Agent::new_with_config(config)
 }
 
+// API origin. Tests point it at a loopback server (per thread).
+#[cfg(not(test))]
+fn api_base() -> String {
+    "https://api.themoviedb.org".to_string()
+}
+#[cfg(test)]
+thread_local! {
+    pub(super) static TEST_API_BASE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn api_base() -> String {
+    TEST_API_BASE
+        .with(|b| b.borrow().clone())
+        .unwrap_or_else(|| "https://api.themoviedb.org".to_string())
+}
+
 // Build the `search/multi` URL. Both `api_key` and `query` are percent-encoded:
 // a stray space/&/#/= in a copy-pasted key would otherwise yield a malformed
 // or silently-wrong URL, and `query` is untrusted disc-label content.
 fn search_multi_url(query: &str, api_key: &str) -> String {
     format!(
-        "https://api.themoviedb.org/3/search/multi?api_key={}&query={}&page=1",
+        "{}/3/search/multi?api_key={}&query={}&page=1",
+        api_base(),
         urlencoded(api_key),
         urlencoded(query)
     )
@@ -160,19 +178,7 @@ fn fetch_url(url: &str, query: &str, sink: &dyn crate::Sink) -> Option<serde_jso
 
 /// One-per-minute warning that the configured TMDB API key was rejected.
 fn warn_bad_key_throttled(sink: &dyn crate::Sink) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
-    if now.saturating_sub(last) >= 60
-        && LAST_WARN_SECS
-            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    {
+    if bad_key_warning_due() {
         tracing::warn!(
             "tmdb: API key rejected (HTTP 401) — check the TMDB API key in Settings; \
              titles will fall through to the needs-review queue until it is fixed"
@@ -181,6 +187,35 @@ fn warn_bad_key_throttled(sink: &dyn crate::Sink) {
             crate::Level::Warn,
             "TMDB API key rejected (HTTP 401) — check the TMDB API key in Settings",
         );
+    }
+}
+
+// True at most once a minute. Per thread under test, so each test starts fresh.
+fn bad_key_warning_due() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    fn due(last_warn: &AtomicU64) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = last_warn.load(Ordering::Relaxed);
+        now.saturating_sub(last) >= 60
+            && last_warn
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+    }
+    #[cfg(not(test))]
+    {
+        static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+        due(&LAST_WARN_SECS)
+    }
+    #[cfg(test)]
+    {
+        thread_local! {
+            static LAST_WARN_SECS: AtomicU64 = const { AtomicU64::new(0) };
+        }
+        LAST_WARN_SECS.with(due)
     }
 }
 
@@ -814,7 +849,8 @@ fn season_episodes_with(
         return Vec::new();
     }
     let url = format!(
-        "https://api.themoviedb.org/3/tv/{tv_id}/season/{season}?api_key={}",
+        "{}/3/tv/{tv_id}/season/{season}?api_key={}",
+        api_base(),
         urlencoded(api_key)
     );
     fetch_url(&url, &format!("TV {tv_id} season {season}"), sink)
