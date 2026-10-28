@@ -212,6 +212,7 @@ const NOT_A_HALT: [(&str, &str); 8] = [
     ("recovery/mapfile.rs", "disowned"),
     // Warning throttle timestamp, not a cancellation flag.
     ("metadata/tmdb.rs", "LAST_WARN_SECS"),
+    ("metadata/tmdb.rs", "last_warn"),
 ];
 
 // Files of the modules declared `#[cfg(test)] mod name;` anywhere under `src/`.
