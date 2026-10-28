@@ -17,6 +17,7 @@ project follows semantic versioning.
 
 ### Fixed
 
+- TMDB: disc labels with Disc 5 and higher, and spaced disc numbers after a season token (`SHOW_S1_DISC_2`), are matched like the rest of the set. A lookup stops at the first network failure, rejected key, rate limit or server error instead of trying every query variant, and still tries the next variant after a query-specific error.
 - CLI, GUI and server: folder backups consume the same prepared disc reader as ISO backups, preserving clear navigation files and all source directories.
 
 ## [1.8.5] — 2026-10-19
