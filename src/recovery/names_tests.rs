@@ -1,4 +1,4 @@
-use super::{At, finish_image_names, finish_with, names_undo_path};
+use super::{At, Settled, finish_image_names, finish_with, names_undo_path};
 use crate::recovery::mapfile::{Mapfile, SectorStatus, mapfile_path_for};
 use crate::test_fixtures::{Answer, Calls, Damage, Drive, Fx, K1, mirrored_bd_image, resolve};
 use crate::{Held, Job, MultipassOpts, PassHost, Plan, Report, RunWith};
@@ -417,8 +417,6 @@ fn a_crash_mid_write_is_rolled_back_by_the_next_rename() {
         "torn by the crash"
     );
 
-    // Corrupt main further: the undo, not the image, decides what main held.
-    write_at(&iso, main, &[0xAA; 2048]);
     assert_eq!(finish_image_names(&iso, true), RENAMED);
     assert!(sector(&iso, main) == sector(&iso, mirror));
     assert!(renamed(&iso));
@@ -458,6 +456,7 @@ fn a_fresh_copy_drops_a_leftover_undo() {
         lba: layout.aacs_dir,
         fill: false,
         status: SectorStatus::Finished,
+        planned: 0,
         bytes: Box::new([0xAA; 2048]),
     };
     super::write_undo(&names_undo_path(&iso), len, &[stale]).unwrap();
@@ -550,7 +549,16 @@ fn a_live_abandoned_consumer_blocks_the_rename() {
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
     let mf = mapfile_path_for(&iso);
-    let map = Mapfile::load(&mf).unwrap();
+    // The consumer names the mapfile through a symlinked folder; the rename by its real path.
+    #[cfg(unix)]
+    let named = {
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+        link.join(mf.file_name().unwrap())
+    };
+    #[cfg(not(unix))]
+    let named = mf.clone();
+    let map = Mapfile::load(&named).unwrap();
     let disown = map.disown_handle();
     let (gate, entered) = (Gate::shut(), Arc::new(Mutex::new(false)));
     let sink = Stalled {
@@ -643,7 +651,7 @@ fn a_pending_undo_rolls_back_with_an_unreadable_mapfile() {
     let original = sector(&iso, layout.aacs_dir);
     crash_at(&iso, At::Marked);
     let aside = break_mapfile(&iso);
-    super::settle_names_undo(&iso).unwrap();
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     mend_mapfile(&iso, &aside);
     assert!(sector(&iso, layout.aacs_dir) == original);
     assert!(lists(&iso, "Unit_Key_RO.inf"));
@@ -651,7 +659,7 @@ fn a_pending_undo_rolls_back_with_an_unreadable_mapfile() {
 }
 
 // A rebuilt mirror sector's status can only be reset through the mapfile: while it can't be
-// read the undo is kept, and once it can the sector is unfinished again.
+// read the bytes are back but the undo is kept, and once it can the sector is unfinished again.
 #[test]
 fn a_fill_rollback_waits_for_a_readable_mapfile() {
     let (fx, layout, keys) = fixture();
@@ -664,10 +672,11 @@ fn a_fill_rollback_waits_for_a_readable_mapfile() {
     crash_at(&iso, At::Marked);
     assert_eq!(status(&iso, mirror), SectorStatus::Finished, "marked");
     let aside = break_mapfile(&iso);
-    assert!(super::settle_names_undo(&iso).is_err());
+    assert_eq!(super::settle_names_undo(&iso), Settled::StatusOwed);
     assert!(names_undo_path(&iso).exists());
+    assert!(lists(&iso, "Unit_Key_RO.inf"), "bytes rolled back");
     mend_mapfile(&iso, &aside);
-    super::settle_names_undo(&iso).unwrap();
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     assert_eq!(status(&iso, mirror), was);
     assert!(lists(&iso, "Unit_Key_RO.inf"));
 }
@@ -692,6 +701,7 @@ fn a_corrupt_undo_is_kept_and_the_copy_still_runs() {
     corrupt_undo(&iso);
     let before = state(&iso);
     assert_eq!(finish_image_names(&iso, true), UNEXPECTED);
+    assert_eq!(finish_image_names(&iso, false), None);
     assert!(state(&iso) == before);
     assert_eq!(rip(&fx, &keys, &iso, Damage::None, |_, _| {}), UNEXPECTED);
     assert!(names_undo_path(&iso).exists());
@@ -711,7 +721,109 @@ fn a_failed_commit_still_reports_the_verified_rename() {
     });
     assert_eq!(names, RENAMED);
     assert!(names_undo_path(&iso).exists());
-    super::settle_names_undo(&iso).unwrap();
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     assert!(renamed(&iso));
     assert!(!names_undo_path(&iso).exists());
+}
+
+// The rename's last crash left a pending undo with the rebuilt mirror still unfinished.
+fn torn_pending(fx: &Fx, keys: &KeyRing, iso: &Path, mirror: u32) {
+    recovered(fx, keys, iso, Damage::Range(mirror, mirror + 1));
+    crash_at(iso, At::Marked);
+    let mut map = Mapfile::load(&mapfile_path_for(iso)).unwrap();
+    map.record(mirror as u64 * 2048, 2048, SectorStatus::NonTrimmed)
+        .unwrap();
+    map.flush().unwrap();
+}
+
+// An undo whose bytes could not be rolled back keeps its sectors out of the passes: no pass
+// reads the original mirror back under a renamed main. The next settle rolls it back.
+#[test]
+fn passes_skip_an_undo_they_could_not_roll_back() {
+    let (fx, layout, keys) = fixture();
+    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    torn_pending(&fx, &keys, &iso, mirror);
+    super::FAIL_RESTORE.with(|f| f.set(true));
+    let names = rip(&fx, &keys, &iso, Damage::None, |_, _| {});
+    super::FAIL_RESTORE.with(|f| f.set(false));
+    assert_eq!(names, UNEXPECTED);
+    assert!(sector(&iso, main) == sector(&iso, mirror), "never torn");
+    assert_eq!(
+        finish_image_names(&iso, true),
+        Some(DecryptedNames::Renamed {
+            mirror_sectors_restored: 1
+        })
+    );
+    assert!(sector(&iso, main) == sector(&iso, mirror));
+    assert!(renamed(&iso));
+}
+
+// An unreadable undo hides its sectors, so a pass may tear the image: the rename then never
+// claims it renamed, even once the undo is gone.
+#[test]
+fn a_torn_image_behind_a_corrupt_undo_is_never_reported_renamed() {
+    let (fx, layout, keys) = fixture();
+    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    torn_pending(&fx, &keys, &iso, mirror);
+    corrupt_undo(&iso);
+    assert_eq!(rip(&fx, &keys, &iso, Damage::None, |_, _| {}), UNEXPECTED);
+    assert!(
+        sector(&iso, main) != sector(&iso, mirror),
+        "the pass read the mirror back"
+    );
+    std::fs::remove_file(names_undo_path(&iso)).unwrap();
+    assert_eq!(finish_image_names(&iso, true), UNEXPECTED);
+}
+
+// An undo that matches neither what it replaced nor what it wrote is another image's: dropped,
+// never restored.
+#[test]
+fn an_undo_for_another_image_is_dropped_unapplied() {
+    let (fx, layout, keys) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    recovered(&fx, &keys, &iso, Damage::None);
+    let len = std::fs::metadata(&iso).unwrap().len();
+    let other = super::Record {
+        lba: layout.aacs_dir,
+        fill: false,
+        status: SectorStatus::Finished,
+        planned: super::fnv(&[0xBB; 2048]),
+        bytes: Box::new([0xAA; 2048]),
+    };
+    super::write_undo(&names_undo_path(&iso), len, &[other]).unwrap();
+    let before = state(&iso);
+    assert_eq!(super::settle_names_undo(&iso), Settled::Done);
+    assert!(state(&iso) == before);
+    assert!(!names_undo_path(&iso).exists());
+}
+
+// A fresh copy that cannot delete a stale undo still runs; the rename then leaves the image.
+#[test]
+fn a_fresh_copy_runs_past_an_undo_it_cannot_delete() {
+    let (fx, _, keys) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    let undo = names_undo_path(&iso);
+    std::fs::create_dir(&undo).unwrap();
+    std::fs::write(undo.join("x"), b"x").unwrap();
+    let names = rip_with(
+        &fx,
+        &keys,
+        &iso,
+        Damage::None,
+        |_, w| {
+            w.passes = Some(MultipassOpts {
+                resume_sweep: Some(false),
+                ..passes()
+            })
+        },
+        None,
+    );
+    assert_eq!(names, UNEXPECTED);
+    assert!(lists(&iso, "Unit_Key_RO.inf"));
 }

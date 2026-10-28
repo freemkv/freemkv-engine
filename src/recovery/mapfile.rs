@@ -190,19 +190,25 @@ impl MapfileDisown {
         self.0.store(true, Ordering::Release);
         let mut live = ABANDONED.lock().unwrap_or_else(PoisonError::into_inner);
         live.retain(|(_, w)| w.strong_count() > 0);
-        live.push((self.1.clone(), Arc::downgrade(&self.0)));
+        live.push((canonical(&self.1), Arc::downgrade(&self.0)));
     }
 }
 
 // Mapfiles disowned while their writer thread may still run, process-wide: a later run in
-// the same process must not rename an image such a writer can still touch.
+// the same process must not rename an image such a writer can still touch. Known limit: another
+// process sees only the artifact lock, released when this run ends.
 static ABANDONED: Mutex<Vec<(PathBuf, std::sync::Weak<AtomicBool>)>> = Mutex::new(Vec::new());
 
 /// Whether an abandoned writer of the mapfile at `path` is still alive (still holds it).
 pub(crate) fn abandoned_writer_alive(path: &Path) -> bool {
     let mut live = ABANDONED.lock().unwrap_or_else(PoisonError::into_inner);
     live.retain(|(_, w)| w.strong_count() > 0);
-    live.iter().any(|(p, _)| p == path)
+    let path = canonical(path);
+    live.iter().any(|(p, _)| *p == path)
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Time-batched mapfile. `record()` keeps in-memory state up-to-date on
@@ -1108,6 +1114,24 @@ pub(crate) fn intersect(ranges: &[(u64, u64)], scope: &[(u64, u64)]) -> Vec<(u64
         } else {
             j += 1;
         }
+    }
+    out
+}
+
+/// `ranges` less every byte range in `cut` (a short list: the sectors a pass must not read).
+pub(crate) fn subtract(ranges: &[(u64, u64)], cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out = ranges.to_vec();
+    for &(cp, cn) in cut {
+        let cend = cp.saturating_add(cn);
+        out = out
+            .into_iter()
+            .flat_map(|(p, n)| {
+                let end = p.saturating_add(n);
+                let head = (p < cp.min(end)).then(|| (p, cp.min(end) - p));
+                let tail = (cend.max(p) < end).then(|| (cend.max(p), end - cend.max(p)));
+                head.into_iter().chain(tail)
+            })
+            .collect();
     }
     out
 }

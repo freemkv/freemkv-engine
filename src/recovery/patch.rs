@@ -1280,7 +1280,7 @@ fn patch_linked(
     let patch_t0 = std::time::Instant::now();
     let mapfile_path = disc.mapfile_for(path);
     // An interrupted rename is settled before this pass reads around it.
-    super::names::settle_before_pass(path);
+    let skip = super::names::settle_before_pass(path);
     let InitialState {
         map,
         stats: initial_stats,
@@ -1289,6 +1289,14 @@ fn patch_linked(
         work_total,
         is_regular,
     } = compute_initial_state(path, &mapfile_path)?;
+    let (bad_ranges, work_total) = match skip.is_empty() {
+        true => (bad_ranges, work_total),
+        false => {
+            let left = mapfile::subtract(&bad_ranges, &skip);
+            let total = left.iter().map(|r| r.1).sum();
+            (left, total)
+        }
+    };
     // AACS BD Pre-recorded 0.953 §3.7 Note: "PC Host shall decrypt bus-encrypted Clip AV
     // stream file". A scoped (MKV-staging) map only re-reads its scope, where none is lost.
     if map.scope().is_none() {

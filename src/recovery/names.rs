@@ -6,7 +6,8 @@
 //! written before the image; the rebuilt mirror sectors are marked finished only once the
 //! written image is verified, and the undo is then committed and dropped. A leftover pending
 //! undo rolls back bytes and statuses ([`settle_names_undo`]); a committed one is just dropped.
-//! Passes only rewrite unfinished sectors, so either state is safe to read around.
+//! A pass skips the sectors of an undo it could not roll back; the rename skips while any undo
+//! is left.
 
 use super::mapfile::{self, Mapfile, SectorStatus};
 use libfreemkv::whole_disc::{DecryptedNames, ImageNames, NamesKept};
@@ -14,12 +15,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 const SECTOR: u64 = 2048;
-const MAGIC: &[u8; 8] = b"FMKVUND2";
+const MAGIC: &[u8; 8] = b"FMKVUND3";
 // Header: magic, state, image length, record count, FNV-1a of all but the state byte; then
-// per record lba, fill flag, mapfile status at plan time, bytes.
+// per record lba, fill flag, mapfile status at plan time, FNV-1a of the planned bytes, bytes.
 const STATE_AT: usize = 8;
 const HEADER: usize = 8 + 1 + 8 + 4 + 8;
-const RECORD: usize = 4 + 1 + 1 + SECTOR as usize;
+const RECORD: usize = 4 + 1 + 1 + 8 + SECTOR as usize;
 const PENDING: u8 = 0;
 const COMMITTED: u8 = 1;
 
@@ -53,12 +54,12 @@ fn finish_with(path: &Path, aacs: bool, hook: Hook<'_>) -> Option<DecryptedNames
     if !std::fs::metadata(path).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    // An earlier rename this run could not settle: leave the image as it is.
-    if let Err(e) = settle_names_undo(path) {
-        tracing::error!(target: "freemkv::udf", error = %e, "decrypted-name undo not settled");
-        return Some(DecryptedNames::Kept {
-            cause: NamesKept::Unexpected,
-        });
+    // An undo that is still there could not be settled: leave the image as it is.
+    let settled = settle_names_undo(path);
+    let undo = names_undo_path(path);
+    if settled != Settled::Done || undo.exists() {
+        tracing::error!(target: "freemkv::udf", undo = %undo.display(), ?settled, "decrypted-name undo not settled; rename skipped");
+        return kept(NamesKept::Unexpected);
     }
     let map = Mapfile::load(&mapfile::mapfile_path_for(path)).ok()?;
     match (map.raw(), map.scope()) {
@@ -125,11 +126,20 @@ fn apply(
                 lba,
                 fill,
                 status,
+                planned: 0,
                 bytes,
             });
         }
         out
     };
+    let records: Vec<Record> = records
+        .into_iter()
+        .zip(&plan.sectors)
+        .map(|(r, (_, planned))| Record {
+            planned: fnv(&planned[..]),
+            ..r
+        })
+        .collect();
     let image_len = std::fs::metadata(path)?.len();
     let undo = names_undo_path(path);
     write_undo(&undo, image_len, &records)?;
@@ -184,40 +194,93 @@ fn write_and_verify(
     }
 }
 
+/// How far [`settle_names_undo`] got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Settled {
+    /// No undo left to act on.
+    Done,
+    /// The original bytes are back; a mirror sector's status reset is still owed (undo kept).
+    StatusOwed,
+    /// The undo is kept with these sectors not rolled back.
+    Unrestored(Vec<u32>),
+    /// The undo is kept and cannot be read: its sectors are unknown.
+    Unknown,
+}
+
 /// Settle a leftover `<iso>.names-undo`: roll a pending one back, drop a committed one or one
-/// whose image is gone or resized. A corrupt undo, or one that cannot be applied, is kept and
-/// reported: the image is then left as it is.
-pub(crate) fn settle_names_undo(path: &Path) -> io::Result<()> {
+/// whose image is gone, resized or no longer holds what it wrote. Anything it cannot finish
+/// keeps the undo for the next run.
+pub(crate) fn settle_names_undo(path: &Path) -> Settled {
     let undo = names_undo_path(path);
     let bytes = match std::fs::read(&undo) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        r => r?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Settled::Done,
+        Err(e) => {
+            tracing::error!(target: "freemkv::udf", undo = %undo.display(), error = %e, "decrypted-name undo unreadable; kept");
+            return Settled::Unknown;
+        }
+        Ok(bytes) => bytes,
     };
     let Some((state, image_len, records)) = parse_undo(&bytes) else {
-        tracing::warn!(target: "freemkv::udf", "decrypted-name undo is corrupt; kept");
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "corrupt decrypted-name undo",
-        ));
+        tracing::error!(target: "freemkv::udf", undo = %undo.display(), "decrypted-name undo is corrupt; kept");
+        return Settled::Unknown;
     };
+    let lbas = || Settled::Unrestored(records.iter().map(|r| r.lba).collect());
     let len = match std::fs::metadata(path) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        r => Some(r?.len()),
+        Err(_) => return lbas(),
+        Ok(m) => Some(m.len()),
     };
     if len != Some(image_len) {
         tracing::warn!(target: "freemkv::udf", "dropping a decrypted-name undo whose image changed");
     } else if state == PENDING {
-        rollback(path, &records)?;
+        match ours(path, &records) {
+            Err(_) => return lbas(),
+            Ok(false) => {
+                tracing::warn!(target: "freemkv::udf", "dropping a decrypted-name undo the image no longer matches");
+            }
+            Ok(true) => {
+                if restore(path, &records).is_err() {
+                    return lbas();
+                }
+                // The bytes are the originals now: a pass re-reading a mirror sector reads
+                // the disc's own copy, which matches the restored main.
+                if reset_fills(path, &records).is_err() {
+                    return Settled::StatusOwed;
+                }
+            }
+        }
     }
-    remove_undo(&undo)
+    match remove_undo(&undo) {
+        Ok(()) => Settled::Done,
+        Err(_) if state == PENDING => Settled::StatusOwed,
+        Err(_) => Settled::Done,
+    }
 }
 
-/// [`settle_names_undo`] before a pass reads the image; a failure is logged, not fatal. Passes rewrite
-/// only unfinished sectors, which a pending rollback resets anyway, and the rename then leaves
-/// the image alone while the undo stays.
-pub(crate) fn settle_before_pass(path: &Path) {
-    if let Err(e) = settle_names_undo(path) {
-        tracing::warn!(target: "freemkv::udf", error = %e, "decrypted-name undo not settled");
+// Whether every sector still holds what the undo wrote there or what it replaced. Passes skip
+// an unsettled undo's sectors, so anything else is another image (or a fresh copy) by that name.
+fn ours(path: &Path, records: &[Record]) -> io::Result<bool> {
+    let mut file = std::fs::File::open(path)?;
+    let mut got = [0u8; SECTOR as usize];
+    for r in records {
+        file.seek(SeekFrom::Start(r.lba as u64 * SECTOR))?;
+        file.read_exact(&mut got)?;
+        if got != *r.bytes && fnv(&got) != r.planned {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// [`settle_names_undo`] before a pass reads the image, never fatal: the byte ranges the pass
+/// must not read this run (an undo's sectors it could not roll back).
+pub(crate) fn settle_before_pass(path: &Path) -> Vec<(u64, u64)> {
+    match settle_names_undo(path) {
+        Settled::Unrestored(lbas) => lbas
+            .into_iter()
+            .map(|lba| (lba as u64 * SECTOR, SECTOR))
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -230,18 +293,21 @@ struct Record {
     lba: u32,
     fill: bool,
     status: SectorStatus,
+    planned: u64,
     bytes: Box<[u8; SECTOR as usize]>,
+}
+
+fn fnv(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, &b| {
+        (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 // FNV-1a 64 over the undo, its state byte excluded (the commit rewrites it in place).
 fn checksum(bytes: &[u8]) -> u64 {
-    bytes
-        .iter()
-        .enumerate()
-        .filter(|&(i, _)| i != STATE_AT)
-        .fold(0xcbf2_9ce4_8422_2325, |h, (_, &b)| {
-            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
-        })
+    let mut b = bytes.to_vec();
+    b[STATE_AT] = 0;
+    fnv(&b)
 }
 
 fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()> {
@@ -255,6 +321,7 @@ fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()>
         buf.extend_from_slice(&r.lba.to_le_bytes());
         buf.push(u8::from(r.fill));
         buf.push(r.status.to_char() as u8);
+        buf.extend_from_slice(&r.planned.to_le_bytes());
         buf.extend_from_slice(&r.bytes[..]);
     }
     let sum = checksum(&buf);
@@ -276,7 +343,10 @@ fn write_undo(undo: &Path, image_len: u64, records: &[Record]) -> io::Result<()>
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    sync_parent(undo)
+    match mapfile::parent_dir(undo) {
+        Some(parent) => libfreemkv::io::fsync::dir_checked(parent),
+        None => Ok(()),
+    }
 }
 
 fn parse_undo(bytes: &[u8]) -> Option<(u8, u64, Vec<Record>)> {
@@ -302,7 +372,8 @@ fn parse_undo(bytes: &[u8]) -> Option<(u8, u64, Vec<Record>)> {
                 lba: u32::from_le_bytes(r[..4].try_into().ok()?),
                 fill: r[4] != 0,
                 status: SectorStatus::from_char(r[5] as char)?,
-                bytes: Box::new(r[6..].try_into().ok()?),
+                planned: u64::from_le_bytes(r[6..14].try_into().ok()?),
+                bytes: Box::new(r[14..].try_into().ok()?),
             })
         })
         .collect::<Option<Vec<_>>>()
@@ -333,12 +404,30 @@ fn sync_parent(p: &Path) -> io::Result<()> {
 // Every touched sector back to its original bytes, and each rebuilt mirror sector back to
 // its plan-time status: a pass may have read it since, and it is unfinished again here.
 fn rollback(path: &Path, records: &[Record]) -> io::Result<()> {
+    restore(path, records)?;
+    reset_fills(path, records)
+}
+
+#[cfg(test)]
+thread_local! {
+    // Fails `restore` on this thread.
+    static FAIL_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn restore(path: &Path, records: &[Record]) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_RESTORE.with(|f| f.get()) {
+        return Err(io::Error::other("restore"));
+    }
     let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
     for r in records {
         file.seek(SeekFrom::Start(r.lba as u64 * SECTOR))?;
         file.write_all(&r.bytes[..])?;
     }
-    file.sync_all()?;
+    file.sync_all()
+}
+
+fn reset_fills(path: &Path, records: &[Record]) -> io::Result<()> {
     let reset: Vec<&Record> = records
         .iter()
         .filter(|r| r.fill && r.status != SectorStatus::Finished)

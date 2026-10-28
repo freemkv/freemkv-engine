@@ -164,6 +164,7 @@ pub(crate) fn copy_titled(
     // interrupted run leaves a crash-safe mapfile, so re-issuing must resume, not
     // re-sweep from 0. Multipass also dispatches to patch on retryable bytes.
     let mf_path = disc.mapfile_for(path);
+    // The pass it dispatches to settles again and skips what this could not settle.
     names::settle_before_pass(path);
     if mf_path.exists() {
         // A corrupt map restarts clean, as the sweep's own resume does; an unreadable one fails.
@@ -956,16 +957,20 @@ fn sweep_linked(
             Err(e) => return Err(Error::from(e)),
         }
     }
-    if !resume {
+    let skip = if !resume {
         // A fresh sweep MUST start from an empty mapfile: if the stale file survives,
         // open_or_create loads it and the new disc inherits old Finished ranges →
         // silently zero-filled ISO. ENOENT is fine; any other error aborts.
         stale_mapfile_removed(std::fs::remove_file(&mapfile_path))?;
-        names::remove_names_undo(path).map_err(Error::from)?;
+        // A stale undo left behind no longer matches the new image, and settling drops it.
+        if let Err(e) = names::remove_names_undo(path) {
+            tracing::warn!(target: "freemkv::udf", error = %e, "stale decrypted-name undo not removed");
+        }
+        Vec::new()
     } else {
         // An interrupted rename is settled before this pass reads around it.
-        names::settle_before_pass(path);
-    }
+        names::settle_before_pass(path)
+    };
     let mut map = mapfile::Mapfile::open_or_create(&mapfile_path, total_bytes, MAPFILE_CREATOR)
         .map_err(Error::from)?;
 
@@ -1028,6 +1033,7 @@ fn sweep_linked(
     if let Some(scope) = &pass_scope {
         regions = mapfile::intersect(&regions, scope);
     }
+    regions = mapfile::subtract(&regions, &skip);
     let domain = match &pass_scope {
         Some(scope) => mapfile::intersect(&[(0, total_bytes)], scope)
             .iter()
