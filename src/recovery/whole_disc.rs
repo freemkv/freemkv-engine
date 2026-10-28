@@ -12,7 +12,7 @@ pub(crate) type WholeDiscReader<'r> =
 /// Whole-disc reader. `--raw`: the raw reader, which never decrypts. Decrypting with the
 /// rip's key set (KU §3.2), the set's reader: its keyed pieces, and the on-arrival proof
 /// for the rest, with no lookup. Decrypting without one: CSS / clear discs through an empty
-/// set; the decrypt gate has already refused an AACS disc (KU-X1).
+/// set. `check_decryptable` runs first and refuses an undecryptable disc (KU-X1).
 pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
     reader: &'r mut dyn SectorSource,

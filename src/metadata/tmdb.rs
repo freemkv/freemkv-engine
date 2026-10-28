@@ -514,7 +514,8 @@ fn strip_paren_year(s: &str) -> (String, Vec<u16>) {
 
 /// Clean a disc label for TMDB search: "AURORA_DRIFT_TWO" -> "Aurora Drift Two"
 /// Strips common disc suffixes like "4K Ultra HD", "Blu-ray", "DVD", etc., and
-/// a parenthesized release year (see `strip_paren_year`).
+/// a parenthesized release year (see `strip_paren_year`), and peels a trailing
+/// season marker ("Season 5") so a series disc resolves to the show title.
 pub fn clean_title(label: &str) -> String {
     let s = label.replace(['_', '-'], " ");
     let s = strip_paren_year(&s).0;
