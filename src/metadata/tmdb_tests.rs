@@ -1123,3 +1123,14 @@ fn clean_title_strips_any_disc_number_disc_from_label_accepts() {
     assert_eq!(clean_title("Heat Disc 100"), "Heat Disc 100");
     assert!(query_variants("THE_OFFICE_SEASON_3_DISC_5").contains(&"The Office".to_string()));
 }
+
+#[test]
+fn query_variants_peel_past_a_spaced_disc_suffix() {
+    for label in ["SHOW_S1_DISC_2", "SHOW_S1_DISC2"] {
+        assert!(
+            query_variants(label).contains(&"Show".to_string()),
+            "{label}: {:?}",
+            query_variants(label)
+        );
+    }
+}

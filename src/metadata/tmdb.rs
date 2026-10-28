@@ -732,13 +732,16 @@ fn query_variants(label: &str) -> Vec<String> {
     let mut end = toks.len();
     loop {
         let q = clean_title(&toks[..end].join(" "));
+        // Decide from the tokens clean_title kept, not the raw last one it may
+        // have already stripped (e.g. "disc 2").
+        let kept = q.split_whitespace().count().min(end);
         if !q.is_empty() && !variants.iter().any(|v| v == &q) {
             variants.push(q);
         }
-        if variants.len() >= MAX_QUERY_VARIANTS || end <= 1 || !is_trailing_junk(toks[end - 1]) {
+        if variants.len() >= MAX_QUERY_VARIANTS || kept <= 1 || !is_trailing_junk(toks[kept - 1]) {
             break;
         }
-        end -= 1;
+        end = kept - 1;
     }
     variants
 }
