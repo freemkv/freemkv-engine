@@ -12,11 +12,14 @@ pub(crate) type WholeDiscReader<'r> =
 /// Whole-disc reader. `--raw`: the raw reader, which never decrypts. Decrypting with the
 /// rip's key set (KU §3.2), the set's reader: its keyed pieces, and the on-arrival proof
 /// for the rest, with no lookup. Decrypting without one: CSS / clear discs through an empty
-/// set. `check_decryptable` runs first and refuses an undecryptable disc (KU-X1).
+/// set. `check_decryptable` runs first and refuses an undecryptable disc (KU-X1). `names`:
+/// rename the decrypted names in the read view; rescue passes keep them (an ISO renames once
+/// at the end, [`super::names`]).
 pub(crate) fn whole_disc_decrypting_reader<'r>(
     disc: &libfreemkv::Disc,
     reader: &'r mut dyn SectorSource,
     decrypt: bool,
+    names: bool,
     halt: Option<&libfreemkv::halt::Halt>,
     keys: Option<&libfreemkv::keys::KeyRing>,
 ) -> Result<WholeDiscReader<'r>> {
@@ -29,10 +32,16 @@ pub(crate) fn whole_disc_decrypting_reader<'r>(
     if !decrypt {
         return Ok(libfreemkv::whole_disc::raw_whole_disc_reader(reader));
     }
-    match keys {
-        Some(set) => set.whole_disc_reader(disc, reader, halt),
-        // No halt: like the pre-KU-X2 reader, a stop is the pass's to observe (it ends halted,
-        // not Err(Halted) at construction); the empty set's non-AACS arm reads it nowhere else.
-        None => libfreemkv::keys::KeyRing::none().whole_disc_reader(disc, reader, None),
+    // No halt without a set: like the pre-KU-X2 reader, a stop is the pass's to observe (it
+    // ends halted, not Err(Halted) at construction); the empty set's non-AACS arm reads it nowhere else.
+    let none = libfreemkv::keys::KeyRing::none();
+    let (set, halt) = match keys {
+        Some(set) => (set, halt),
+        None => (&none, None),
+    };
+    if names {
+        set.whole_disc_reader(disc, reader, halt)
+    } else {
+        set.whole_disc_reader_keeping_names(disc, reader, halt)
     }
 }

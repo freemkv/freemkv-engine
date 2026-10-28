@@ -1,7 +1,7 @@
 decrypt sweep = CopyResult { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, recovered_this_pass: 0, complete: true, halted: false }
 decrypt damaged map = MapStats { bytes_total: 8546304, bytes_good: 8534016, bytes_unreadable: 0, bytes_pending: 12288, bytes_nontried: 0, bytes_retryable: 12288, num_bad_ranges: 0, main_lost_ms: 0.0 }
 decrypt patch = PatchOutcome { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, bytes_recovered_this_pass: 12288, halted: false, wedged_exit: false, wedged_threshold: 50 }
-decrypt iso = 8546304 bytes sha256:0cab6daa39bf1118098c14c00b1a66d3
+decrypt iso = 8546304 bytes sha256:4a4ea533b2e47a272d537338b2094c16
 raw sweep = CopyResult { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, recovered_this_pass: 0, complete: true, halted: false }
 raw damaged map = MapStats { bytes_total: 8546304, bytes_good: 8534016, bytes_unreadable: 0, bytes_pending: 12288, bytes_nontried: 0, bytes_retryable: 12288, num_bad_ranges: 0, main_lost_ms: 0.0 }
 raw patch = PatchOutcome { bytes_total: 8546304, bytes_good: 8546304, bytes_unreadable: 0, bytes_pending: 0, bytes_recovered_this_pass: 12288, halted: false, wedged_exit: false, wedged_threshold: 50 }

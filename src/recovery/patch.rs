@@ -1332,13 +1332,14 @@ fn patch_linked(
     let bytes_good_before = initial_stats.bytes_good;
     lib.check()?;
 
-    // As in sweep, AACS reads widen to file unit grids; raw copies retain ciphertext.
-    // The validated work list is immutable: when empty, the raw wrapper is never consumed.
-    // Skip naming reads then, retaining normal sink/settle and physical-read failure behavior.
+    // As in sweep: AACS reads widen to file unit grids, raw copies retain ciphertext, names
+    // stay as read. An empty work list never consumes the reader: skip its setup reads,
+    // retaining normal sink/settle and physical-read failure behavior.
     let mut reader = super::whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
         opts.decrypt && !bad_ranges.is_empty(),
+        false,
         halt.is_wired().then_some(lib),
         opts.keys.as_ref(),
     )?;

@@ -136,6 +136,9 @@ pub enum Report {
         recovery: Option<MultipassResult>,
         disc: Option<Box<libfreemkv::Disc>>,
         path: PathBuf,
+        /// What the decrypted image did with `AACS/Unit_Key_RO.inf`; `None` for a raw, null,
+        /// stopped, wedged or staged copy, or a disc without one.
+        names: Option<libfreemkv::whole_disc::DecryptedNames>,
     },
     /// A file tree: per-file accounting.
     Tree { extract: libfreemkv::ExtractResult },
@@ -518,6 +521,15 @@ fn image(
             (copied, None)
         }
     };
+    // Renamed once, after the last pass and under the lock. Never a stopped or wedged copy: a
+    // disowned consumer may still own the file.
+    let names = match &copied {
+        Ok(c) if !plan.raw && !null && !c.halted => match &recovery {
+            Some(r) if r.halted || r.wedged => None,
+            _ => crate::recovery::finish_image_names(path, disc.aacs.is_some()),
+        },
+        _ => None,
+    };
     let done = matches!(&copied, Ok(r) if r.bytes_good > 0 && !r.halted);
     if let Some(lock) = lock
         && done
@@ -535,6 +547,7 @@ fn image(
         recovery,
         disc,
         path: path.to_path_buf(),
+        names,
     })
 }
 
@@ -567,6 +580,7 @@ fn tree(
                 disc,
                 reader,
                 true,
+                true,
                 Some(halt),
                 keys.as_ref(),
             )?;
@@ -577,6 +591,7 @@ fn tree(
             let mut prepared = crate::recovery::whole_disc_decrypting_reader(
                 &o.disc,
                 o.reader.as_mut(),
+                true,
                 true,
                 Some(halt),
                 Some(keys),

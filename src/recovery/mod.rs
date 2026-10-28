@@ -877,10 +877,12 @@ fn sweep_linked(
     let total_bytes = disc.image_read_sectors()? as u64 * 2048;
     // Decrypt-aware read (`--raw`: pass-through); AACS reads widen onto each content
     // file's unit grid inside it. Bad sectors = physical read failure, not decrypt.
+    // Names stay as read; an ISO renames once, after its last pass.
     let mut reader = whole_disc::whole_disc_decrypting_reader(
         disc,
         reader,
         opts.decrypt,
+        false,
         halt.is_wired().then_some(lib),
         opts.keys.as_ref(),
     )?;
@@ -1623,11 +1625,13 @@ const DEFAULT_BATCH_SECTORS_OPTICAL: u16 = 60;
 #[cfg(test)]
 mod ku_tests;
 pub(crate) mod mapfile;
+mod names;
 mod patch;
 mod read_error;
 mod section_recover;
 mod sweep;
 mod whole_disc;
+pub(crate) use names::finish_image_names;
 pub(crate) use whole_disc::whole_disc_decrypting_reader;
 
 // The mapfile-backed main-title bad-byte reader, used by the multipass

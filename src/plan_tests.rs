@@ -42,7 +42,8 @@ fn with(f: libfreemkv::KeySourceFactory) -> RunWith<'static> {
 }
 
 // iso:// → iso:// through `run`: the decrypted image equals the engine's decrypting
-// copy of the same image, with a mapfile beside it (read errors are recorded, not fatal).
+// copy of the same image, with a mapfile beside it (read errors are recorded, not fatal),
+// renamed once at the end.
 #[test]
 fn an_image_plan_copies_the_image_decrypted() {
     let fx = bd_image(&[Some(K1), Some(K2)], 2);
@@ -55,10 +56,20 @@ fn an_image_plan_copies_the_image_decrypted() {
     );
     let f = factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default());
     let report = run_with(&p, with(f), &crate::NoopSink).expect("the image copies");
-    let Report::Image { copy, .. } = report else {
+    let Report::Image { copy, names, .. } = report else {
         panic!("an image report")
     };
     assert!(copy.complete, "{copy:?}");
+    assert_eq!(
+        names,
+        Some(libfreemkv::whole_disc::DecryptedNames::Renamed {
+            mirror_sectors_restored: 0
+        })
+    );
+    let mut out = libfreemkv::FileSectorSource::open(&dst).unwrap();
+    let fs = libfreemkv::read_filesystem(&mut out).unwrap();
+    assert!(fs.file_extents(&mut out, "/AACS/Unit_Key_RO.bak").is_ok());
+    assert!(fs.file_extents(&mut out, "/AACS/Unit_Key_RO.inf").is_err());
     assert_eq!(
         std::fs::metadata(&dst).unwrap().len(),
         fx.img.image.len() as u64

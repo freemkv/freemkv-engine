@@ -168,6 +168,19 @@ pub(crate) fn bd_image(clips: &[Option<[u8; 16]>], declared: usize) -> Fx {
     bd_image_sized(&sized, declared)
 }
 
+/// [`bd_image`] with a duplicated UDF metadata mirror appended, rescanned.
+pub(crate) fn mirrored_bd_image(
+    clips: &[Option<[u8; 16]>],
+    declared: usize,
+) -> (Fx, libfreemkv::test_util::MetadataMirrorLayout) {
+    let mut fx = bd_image(clips, declared);
+    let layout = libfreemkv::test_util::add_metadata_mirror(&mut fx.img);
+    let mut src = fx.source();
+    let cap = src.capacity_sectors();
+    fx.disc = Disc::scan_image(&mut src, cap, &libfreemkv::ScanOptions::default()).unwrap();
+    (fx, layout)
+}
+
 /// [`bd_image`] with each clip's length in units (a larger title's piece is asked first).
 pub(crate) fn bd_image_sized(sized: &[(Option<[u8; 16]>, u32)], declared: usize) -> Fx {
     let playlists = (0..sized.len())
@@ -502,6 +515,8 @@ pub(crate) enum Damage {
     /// Every read of 9+ sectors touching `[s, e)`: the on-arrival side reads (up to 32
     /// units), never a pass's own read of one widened unit (KU §2.4).
     LongReads(u32, u32),
+    /// Every read touching `[s, e)` fails as a dead bus (a transport fault).
+    Transport(u32, u32),
 }
 
 /// A random-access fake drive over an image, with switchable [`Damage`].
@@ -541,6 +556,16 @@ impl SectorSource for Drive {
             Damage::Range(s, e) => touches(s, e),
             Damage::RangeExcept(s, e, os, oe) => touches(s, e) && !(os <= lba && end <= oe),
             Damage::LongReads(s, e) => count >= 9 && touches(s, e),
+            Damage::Transport(s, e) => {
+                if touches(s, e) {
+                    return Err(libfreemkv::Error::DiscRead {
+                        sector: lba as u64,
+                        status: Some(libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE),
+                        sense: None,
+                    });
+                }
+                false
+            }
         };
         if dead {
             return Err(libfreemkv::Error::DiscRead {

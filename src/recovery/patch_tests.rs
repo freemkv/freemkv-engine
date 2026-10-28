@@ -357,8 +357,10 @@ fn patch_no_work_still_refuses_invalid_inputs_before_source_reads() {
     }
 }
 
+// A patch pass writes plaintext but keeps the disc's names: an ISO renames once, after its
+// last pass (`plan::image`).
 #[test]
-fn patch_nonempty_decrypted_work_still_prepares_names_and_plaintext() {
+fn patch_nonempty_decrypted_work_keeps_names_and_writes_plaintext() {
     use crate::test_fixtures::{Answer, Calls, K1, bd_image, resolve};
     let fx = bd_image(&[Some(K1)], 1);
     let keys = resolve(
@@ -394,11 +396,11 @@ fn patch_nonempty_decrypted_work_still_prepares_names_and_plaintext() {
     let mut source = libfreemkv::test_util::MemSource::new(got);
     let fs = libfreemkv::read_filesystem(&mut source).unwrap();
     assert!(
-        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.bak")
+        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.inf")
             .is_ok()
     );
     assert!(
-        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.inf")
+        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.bak")
             .is_err()
     );
 }
