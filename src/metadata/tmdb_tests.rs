@@ -371,6 +371,10 @@ impl std::io::Write for LogBuf {
 #[test]
 fn a_transport_failure_never_logs_the_api_key() {
     use tracing_subscriber::layer::SubscriberExt as _;
+    // With one dispatcher registered, tracing caches a callsite's interest from whichever
+    // thread hits it first: a parallel test with no subscriber caches `never` and this
+    // test's event is dropped. A second live dispatcher makes interest cover all of them.
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
     let buf = LogBuf::default();
     let sink = buf.clone();
     let subscriber = tracing_subscriber::registry().with(
