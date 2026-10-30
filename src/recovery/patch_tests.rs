@@ -399,10 +399,7 @@ fn patch_nonempty_decrypted_work_keeps_names_and_writes_plaintext() {
         fs.file_extents(&mut source, "/AACS/Unit_Key_RO.inf")
             .is_ok()
     );
-    assert!(
-        fs.file_extents(&mut source, "/AACS/Unit_Key_RO.bak")
-            .is_err()
-    );
+    assert!(fs.find_dir("/SCAA").is_none());
 }
 
 // A NON-REGULAR destination is exempt from the truncation gate: a

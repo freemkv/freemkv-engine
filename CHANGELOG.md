@@ -4,6 +4,12 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [1.8.7] — UNRELEASED
+
+### Changed
+
+- Decrypted ISO copies rename the root `AACS` folder to `SCAA` once after the last pass, instead of renaming `AACS/Unit_Key_RO.inf` to `Unit_Key_RO.bak`; every AACS file stays as the disc has it, and `Report::Image::names` reports the folder. An image a 1.8.6 run renamed gets the folder rename and keeps its `.bak`; a `<iso>.names-undo` a 1.8.6 run left is rolled back as before (same format).
+
 ## [1.8.6] — 2026-10-29
 
 ### Added

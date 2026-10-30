@@ -143,14 +143,20 @@ fn source_sector(fx: &Fx, lba: u32) -> &[u8] {
     &fx.img.image[lba as usize * 2048..(lba as usize + 1) * 2048]
 }
 
+// Whether the image's root lists folder `name`.
 fn lists(iso: &Path, name: &str) -> bool {
     let mut src = libfreemkv::FileSectorSource::open(iso).unwrap();
     let fs = libfreemkv::read_filesystem(&mut src).unwrap();
-    fs.file_extents(&mut src, &format!("/AACS/{name}")).is_ok()
+    fs.find_dir(&format!("/{name}")).is_some()
 }
 
+// The AACS folder is `SCAA` now, its key file still `Unit_Key_RO.inf`.
 fn renamed(iso: &Path) -> bool {
-    lists(iso, "Unit_Key_RO.bak") && !lists(iso, "Unit_Key_RO.inf")
+    let mut src = libfreemkv::FileSectorSource::open(iso).unwrap();
+    let fs = libfreemkv::read_filesystem(&mut src).unwrap();
+    lists(iso, "SCAA")
+        && !lists(iso, "AACS")
+        && fs.file_extents(&mut src, "/SCAA/Unit_Key_RO.inf").is_ok()
 }
 
 fn status(iso: &Path, lba: u32) -> SectorStatus {
@@ -167,12 +173,12 @@ const RENAMED: Option<DecryptedNames> = Some(DecryptedNames::Renamed {
     mirror_sectors_restored: 0,
 });
 
-// F1: the sweep cannot read the mirror's /AACS sector, the patch pass can. Renaming per pass
-// wrote main with `.inf` and the mirror with `.bak`; one rename at the end keeps them equal.
+// F1: the sweep cannot read the mirror's root sector, the patch pass can. Renaming per pass
+// wrote main with `AACS` and the mirror with `SCAA`; one rename at the end keeps them equal.
 #[test]
 fn a_mirror_recovered_by_a_later_pass_matches_main() {
     let (fx, layout, keys) = fixture();
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     let names = rip(
@@ -182,7 +188,7 @@ fn a_mirror_recovered_by_a_later_pass_matches_main() {
         Damage::Range(mirror, mirror + 1),
         |d, _| d.set(Damage::None),
     );
-    assert!(sector(&iso, layout.aacs_dir) == sector(&iso, mirror));
+    assert!(sector(&iso, layout.root_dir) == sector(&iso, mirror));
     assert!(renamed(&iso));
     assert_eq!(names, RENAMED);
 }
@@ -191,7 +197,7 @@ fn a_mirror_recovered_by_a_later_pass_matches_main() {
 #[test]
 fn a_mirror_lost_in_every_pass_is_restored_from_main() {
     let (fx, layout, keys) = fixture();
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     let names = rip(
@@ -207,17 +213,17 @@ fn a_mirror_lost_in_every_pass_is_restored_from_main() {
             mirror_sectors_restored: 1
         })
     );
-    assert!(sector(&iso, layout.aacs_dir) == sector(&iso, mirror));
+    assert!(sector(&iso, layout.root_dir) == sector(&iso, mirror));
     assert!(renamed(&iso));
     assert_eq!(status(&iso, mirror), SectorStatus::Finished);
 }
 
-// An unreadable main /AACS directory keeps the names and writes nothing; a resume that
+// An unreadable main root directory keeps the names and writes nothing; a resume that
 // reads it renames.
 #[test]
 fn a_damaged_main_directory_keeps_the_names_until_a_resume_reads_it() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     let names = rip(&fx, &keys, &iso, Damage::Range(main, main + 1), |_, _| {});
@@ -257,7 +263,7 @@ fn a_wedged_recovery_is_not_renamed() {
 
 fn stopped_at_the_patch_pass(wedge: bool) {
     let (fx, layout, keys) = fixture();
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     let halt = libfreemkv::Halt::new();
@@ -282,7 +288,7 @@ fn stopped_at_the_patch_pass(wedge: bool) {
         std::fs::read(&iso).unwrap() == *seen.lock().unwrap(),
         "wedge={wedge}"
     );
-    assert!(lists(&iso, "Unit_Key_RO.inf"), "wedge={wedge}");
+    assert!(lists(&iso, "AACS"), "wedge={wedge}");
 }
 
 // A raw copy and a scoped staging image keep the disc's own names.
@@ -299,7 +305,7 @@ fn raw_and_scoped_copies_are_not_renamed() {
     let all = [(0, fx.disc.image_read_sectors().unwrap())];
     let names = rip_with(&fx, &keys, &staged, Damage::None, |_, _| {}, Some(&all));
     assert_eq!(names, None);
-    assert!(sector(&staged, layout.aacs_dir) == source_sector(&fx, layout.aacs_dir));
+    assert!(sector(&staged, layout.root_dir) == source_sector(&fx, layout.root_dir));
     assert!(
         Mapfile::load(&mapfile_path_for(&staged))
             .unwrap()
@@ -323,7 +329,7 @@ fn recovered(fx: &Fx, keys: &KeyRing, iso: &Path, damage: Damage) {
         &crate::NoopSink,
     )
     .unwrap();
-    assert!(lists(iso, "Unit_Key_RO.inf"));
+    assert!(lists(iso, "AACS"));
 }
 
 const UNEXPECTED: Option<DecryptedNames> = Some(DecryptedNames::Kept {
@@ -370,7 +376,7 @@ fn a_failed_write_restores_the_originals() {
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
     let before = state(&iso);
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let names = finish_with(&iso, true, &mut |at| match at {
         At::Write(lba) if lba == mirror => Err(std::io::Error::other("EIO")),
         _ => Ok(true),
@@ -388,19 +394,19 @@ fn a_lost_mirror_write_is_detected_and_rolled_back() {
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
     let before = state(&iso);
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let names = finish_with(&iso, true, &mut |at| Ok(at != At::Write(mirror)));
     assert_eq!(names, UNEXPECTED);
     assert!(state(&iso) == before);
-    assert!(sector(&iso, layout.aacs_dir) == sector(&iso, mirror));
-    assert!(lists(&iso, "Unit_Key_RO.inf"));
+    assert!(sector(&iso, layout.root_dir) == sector(&iso, mirror));
+    assert!(lists(&iso, "AACS"));
 }
 
 // A crash part way through the writes leaves the undo; the next rename rolls it back first.
 #[test]
 fn a_crash_mid_write_is_rolled_back_by_the_next_rename() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
@@ -428,7 +434,7 @@ fn a_crash_mid_write_is_rolled_back_by_the_next_rename() {
 #[test]
 fn a_committed_rename_survives_a_crash_and_the_next_passes() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::Range(mirror, mirror + 1));
@@ -453,7 +459,7 @@ fn a_fresh_copy_drops_a_leftover_undo() {
     recovered(&fx, &keys, &iso, Damage::None);
     let len = std::fs::metadata(&iso).unwrap().len();
     let stale = super::Record {
-        lba: layout.aacs_dir,
+        lba: layout.root_dir,
         fill: false,
         status: SectorStatus::Finished,
         planned: Box::new([0; 2048]),
@@ -505,7 +511,7 @@ fn a_one_pass_copy_that_wedges_is_not_renamed() {
         None,
     );
     assert_eq!(stopped.unwrap(), None);
-    assert_eq!(status(&iso, layout.aacs_dir), SectorStatus::Finished);
+    assert_eq!(status(&iso, layout.root_dir), SectorStatus::Finished);
     let one_pass = |p: &mut Plan, w: &mut RunWith<'_>| {
         p.multipass = true;
         w.passes = None;
@@ -519,7 +525,7 @@ fn a_one_pass_copy_that_wedges_is_not_renamed() {
         None,
     );
     assert_eq!(names, None);
-    assert!(lists(&iso, "Unit_Key_RO.inf"), "never renamed");
+    assert!(lists(&iso, "AACS"), "never renamed");
 }
 
 // A stalled consumer abandoned at a real teardown (`finish_bounded_disowning`, as sweep and
@@ -610,7 +616,7 @@ fn crash_at(iso: &Path, at: At) {
 #[test]
 fn a_crash_before_commit_rolls_back_a_blank_finished_mirror() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
@@ -648,13 +654,13 @@ fn a_pending_undo_rolls_back_with_an_unreadable_mapfile() {
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
-    let original = sector(&iso, layout.aacs_dir);
+    let original = sector(&iso, layout.root_dir);
     crash_at(&iso, At::Marked);
     let aside = break_mapfile(&iso);
     assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     mend_mapfile(&iso, &aside);
-    assert!(sector(&iso, layout.aacs_dir) == original);
-    assert!(lists(&iso, "Unit_Key_RO.inf"));
+    assert!(sector(&iso, layout.root_dir) == original);
+    assert!(lists(&iso, "AACS"));
     assert!(!names_undo_path(&iso).exists());
 }
 
@@ -663,7 +669,7 @@ fn a_pending_undo_rolls_back_with_an_unreadable_mapfile() {
 #[test]
 fn a_fill_rollback_waits_for_a_readable_mapfile() {
     let (fx, layout, keys) = fixture();
-    let mirror = layout.mirror_of(layout.aacs_dir);
+    let mirror = layout.mirror_of(layout.root_dir);
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::Range(mirror, mirror + 1));
@@ -674,11 +680,11 @@ fn a_fill_rollback_waits_for_a_readable_mapfile() {
     let aside = break_mapfile(&iso);
     assert_eq!(super::settle_names_undo(&iso), Settled::StatusOwed);
     assert!(names_undo_path(&iso).exists());
-    assert!(lists(&iso, "Unit_Key_RO.inf"), "bytes rolled back");
+    assert!(lists(&iso, "AACS"), "bytes rolled back");
     mend_mapfile(&iso, &aside);
     assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     assert_eq!(status(&iso, mirror), was);
-    assert!(lists(&iso, "Unit_Key_RO.inf"));
+    assert!(lists(&iso, "AACS"));
 }
 
 fn corrupt_undo(iso: &Path) {
@@ -741,7 +747,7 @@ fn torn_pending(fx: &Fx, keys: &KeyRing, iso: &Path, mirror: u32) {
 #[test]
 fn passes_skip_an_undo_they_could_not_roll_back() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     torn_pending(&fx, &keys, &iso, mirror);
@@ -765,7 +771,7 @@ fn passes_skip_an_undo_they_could_not_roll_back() {
 #[test]
 fn a_torn_image_behind_a_corrupt_undo_is_never_reported_renamed() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     torn_pending(&fx, &keys, &iso, mirror);
@@ -789,7 +795,7 @@ fn an_undo_for_another_image_is_dropped_unapplied() {
     recovered(&fx, &keys, &iso, Damage::None);
     let len = std::fs::metadata(&iso).unwrap().len();
     let other = super::Record {
-        lba: layout.aacs_dir,
+        lba: layout.root_dir,
         fill: false,
         status: SectorStatus::Finished,
         planned: Box::new([0xBB; 2048]),
@@ -825,7 +831,7 @@ fn a_fresh_copy_runs_past_an_undo_it_cannot_delete() {
         None,
     );
     assert_eq!(names, UNEXPECTED);
-    assert!(lists(&iso, "Unit_Key_RO.inf"));
+    assert!(lists(&iso, "AACS"));
 }
 
 // An undo unread for one run, while a pass read the rebuilt mirror back from the disc, is
@@ -833,7 +839,7 @@ fn a_fresh_copy_runs_past_an_undo_it_cannot_delete() {
 #[test]
 fn an_undo_unread_for_a_run_is_still_applied_after_a_pass_reads_the_mirror() {
     let (fx, layout, keys) = fixture();
-    let (main, mirror) = (layout.aacs_dir, layout.mirror_of(layout.aacs_dir));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     torn_pending(&fx, &keys, &iso, mirror);
@@ -856,7 +862,7 @@ fn an_undo_unread_for_a_run_is_still_applied_after_a_pass_reads_the_mirror() {
 #[test]
 fn a_torn_sector_write_is_rolled_back() {
     let (fx, layout, keys) = fixture();
-    let main = layout.aacs_dir;
+    let main = layout.root_dir;
     let dir = tempfile::tempdir().unwrap();
     let iso = dir.path().join("d.iso");
     recovered(&fx, &keys, &iso, Damage::None);
@@ -877,5 +883,67 @@ fn a_torn_sector_write_is_rolled_back() {
     write_at(&iso, main, &torn);
     assert_eq!(super::settle_names_undo(&iso), Settled::Done);
     assert!(sector(&iso, main) == original);
-    assert!(lists(&iso, "Unit_Key_RO.inf"));
+    assert!(lists(&iso, "AACS"));
+}
+
+fn has_file(iso: &Path, path: &str) -> bool {
+    let mut src = libfreemkv::FileSectorSource::open(iso).unwrap();
+    let fs = libfreemkv::read_filesystem(&mut src).unwrap();
+    fs.file_extents(&mut src, path).is_ok()
+}
+
+// An image a 1.8.6 run renamed (`AACS/Unit_Key_RO.bak`), run again: the folder is renamed,
+// the `.bak` left as it is.
+#[test]
+fn a_1_8_6_renamed_image_run_again_gets_the_folder_rename() {
+    let (fx, layout, keys) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    recovered(&fx, &keys, &iso, Damage::None);
+    let mut bytes = std::fs::read(&iso).unwrap();
+    libfreemkv::test_util::rename_key_file_like_1_8_6(&mut bytes);
+    std::fs::write(&iso, &bytes).unwrap();
+    assert!(has_file(&iso, "/AACS/Unit_Key_RO.bak"));
+
+    let names = rip(&fx, &keys, &iso, Damage::None, |_, _| {});
+    assert_eq!(names, RENAMED);
+    assert!(lists(&iso, "SCAA") && !lists(&iso, "AACS"));
+    assert!(has_file(&iso, "/SCAA/Unit_Key_RO.bak"));
+    assert!(!has_file(&iso, "/SCAA/Unit_Key_RO.inf"));
+    let (main, mirror) = (layout.root_dir, layout.mirror_of(layout.root_dir));
+    assert!(sector(&iso, main) == sector(&iso, mirror));
+}
+
+// A pending undo a 1.8.6 rename left (same format; it recorded the key file's sector) is
+// rolled back first, then the folder is renamed over the disc's own names.
+#[test]
+fn a_1_8_6_pending_undo_is_rolled_back_before_the_folder_rename() {
+    let (fx, layout, keys) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    recovered(&fx, &keys, &iso, Damage::None);
+    let aacs = layout.aacs_dir;
+    let original = sector(&iso, aacs);
+    let mut old = std::fs::read(&iso).unwrap();
+    libfreemkv::test_util::rename_key_file_like_1_8_6(&mut old);
+    let planned = old[aacs as usize * 2048..][..2048].to_vec();
+    assert!(planned != original);
+    let len = std::fs::metadata(&iso).unwrap().len();
+    let record = super::Record {
+        lba: aacs,
+        fill: false,
+        status: SectorStatus::Finished,
+        planned: Box::new(planned.clone().try_into().unwrap()),
+        bytes: Box::new(original.clone().try_into().unwrap()),
+    };
+    super::write_undo(&names_undo_path(&iso), len, &[record]).unwrap();
+    // The 1.8.6 run crashed after writing main, before its commit.
+    write_at(&iso, aacs, &planned);
+    assert!(has_file(&iso, "/AACS/Unit_Key_RO.bak"));
+
+    assert_eq!(finish_image_names(&iso, true), RENAMED);
+    assert!(!names_undo_path(&iso).exists());
+    assert!(sector(&iso, aacs) == original);
+    assert!(renamed(&iso));
+    assert!(!has_file(&iso, "/SCAA/Unit_Key_RO.bak"));
 }

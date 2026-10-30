@@ -1,8 +1,10 @@
-//! The decrypted-name rename of a finished ISO. Rescue passes copy the disc's own names, so
-//! sectors written by different passes never mix renamed and original metadata; the rename
-//! runs once after the last pass, reading and writing only the image and its mapfile.
+//! The decrypted-name rename (root folder `AACS` → `SCAA`) of a finished ISO. Rescue passes
+//! copy the disc's own names, so sectors written by different passes never mix renamed and
+//! original metadata; the rename runs once after the last pass, reading and writing only the
+//! image and its mapfile.
 //!
-//! `<iso>.names-undo` holds each touched sector's original bytes and mapfile status. It is
+//! `<iso>.names-undo` holds each touched sector's original bytes and mapfile status, whatever
+//! the rename (a 1.8.6 undo of the key-file rename settles the same way). It is
 //! written before the image; the rebuilt mirror sectors are marked finished only once the
 //! written image is verified, and the undo is then committed and dropped. A leftover pending
 //! undo rolls back bytes and statuses ([`settle_names_undo`]); a committed one is just dropped.
@@ -43,8 +45,9 @@ pub(super) enum At {
 // `Ok(false)` skips the write at `At::Write`.
 type Hook<'a> = &'a mut dyn FnMut(At) -> io::Result<bool>;
 
-/// Rename `AACS/Unit_Key_RO.inf` in the decrypted ISO at `path`. `None` when the image has
-/// no such name, or is not one to touch: not a regular file, raw, scoped, or without a mapfile.
+/// Rename the root `AACS` folder to `SCAA` in the decrypted ISO at `path`; the AACS files are
+/// not changed. `None` when the image has no such folder, or is not one to touch: not a
+/// regular file, raw, scoped, or without a mapfile.
 pub(crate) fn finish_image_names(path: &Path, aacs: bool) -> Option<DecryptedNames> {
     finish_with(path, aacs, &mut |_| Ok(true))
 }

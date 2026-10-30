@@ -136,8 +136,8 @@ pub enum Report {
         recovery: Option<MultipassResult>,
         disc: Option<Box<libfreemkv::Disc>>,
         path: PathBuf,
-        /// What the decrypted image did with `AACS/Unit_Key_RO.inf`; `None` for a raw, null,
-        /// stopped, wedged or staged copy, or a disc without one.
+        /// What the decrypted image did with its root `AACS` folder (renamed `SCAA`, or kept);
+        /// `None` for a raw, null, stopped, wedged or staged copy, or a disc without one.
         names: Option<libfreemkv::whole_disc::DecryptedNames>,
     },
     /// A file tree: per-file accounting.

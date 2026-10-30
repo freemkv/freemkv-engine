@@ -68,8 +68,8 @@ fn an_image_plan_copies_the_image_decrypted() {
     );
     let mut out = libfreemkv::FileSectorSource::open(&dst).unwrap();
     let fs = libfreemkv::read_filesystem(&mut out).unwrap();
-    assert!(fs.file_extents(&mut out, "/AACS/Unit_Key_RO.bak").is_ok());
-    assert!(fs.file_extents(&mut out, "/AACS/Unit_Key_RO.inf").is_err());
+    assert!(fs.file_extents(&mut out, "/SCAA/Unit_Key_RO.inf").is_ok());
+    assert!(fs.find_dir("/AACS").is_none());
     assert_eq!(
         std::fs::metadata(&dst).unwrap().len(),
         fx.img.image.len() as u64
