@@ -1,6 +1,6 @@
 [package]
 name = "freemkv-engine"
-version = "1.8.6"
+version = "1.8.7"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -49,9 +49,9 @@ codegen-units = 1
 # on bump. Local dev overrides it with a path patch via the gitignored
 # .cargo/config.toml.
 [patch.crates-io]
-libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.8.6" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.8.6" }
-freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.6" }
+libfreemkv = { git = "https://github.com/freemkv/libfreemkv", tag = "v1.8.7" }
+freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.8.7" }
+freemkv-unlock = { git = "https://github.com/freemkv/freemkv-unlock", tag = "v1.8.7" }
 
 [lints.clippy]
 uninlined_format_args = "allow"
