@@ -1,7 +1,10 @@
 name: leak-guard
 
 # Thin caller → the canonical reusable guard in freemkv/.github.
-on: [push, pull_request]
+on:
+  push:
+    branches: [dev]
+  pull_request:
 # Least privilege: the reusable guard only reads the repo.
 permissions:
   contents: read

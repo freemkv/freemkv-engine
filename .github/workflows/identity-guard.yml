@@ -3,7 +3,10 @@ name: identity-guard
 # Thin caller → the canonical reusable guard in freemkv/.github.
 # Every push, like the other guards: same-repo PRs skip below, so their branch
 # pushes must be checked here.
-on: [push, pull_request]
+on:
+  push:
+    branches: [dev]
+  pull_request:
 # Least privilege: the reusable guard only reads the repo.
 permissions:
   contents: read

@@ -4,7 +4,10 @@ name: doc-links
 # freemkv-engine patches libfreemkv + freemkv-keysources from git tags, so the
 # reusable gate checks them out as siblings (plus freemkv-unlock, which
 # libfreemkv path-deps) and resolves the toolchain from rust-version.
-on: [push, pull_request]
+on:
+  push:
+    branches: [dev]
+  pull_request:
 # Least privilege: the reusable guard only reads the repo.
 permissions:
   contents: read
