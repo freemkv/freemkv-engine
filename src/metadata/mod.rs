@@ -75,17 +75,22 @@ pub struct MediaMetadata {
 
 impl MediaMetadata {
     /// Each field from the first source that has it: `operator` > `tmdb` > `labels` > none.
-    /// Kind is TV when a label names a season; season and disc read the first label that
-    /// names one, only for TV. A Movie (from either source) carries no season, disc or first
+    /// Kind is the operator's; else TV when TMDB says TV or any label names a season (a TV
+    /// disc TMDB mismatched to a film stays TV); else TMDB's; else none. Season and disc read
+    /// the first label that names one, only for TV. A Movie carries no season, disc or first
     /// episode, so an operator Movie overrides a season-marked label. Title and year never
     /// come from labels. Pass `tmdb: None` when there is no match.
     pub fn resolve(operator: &Self, tmdb: Option<&Self>, labels: &[&str]) -> Self {
         let matched = tmdb.cloned().unwrap_or_default();
         let label = |read: fn(&str) -> Option<u16>| labels.iter().find_map(|label| read(label));
-        let kind = operator
-            .kind
-            .or(matched.kind)
-            .or_else(|| label(tmdb::season_from_label).map(|_| MediaKind::Tv));
+        let label_tv = label(tmdb::season_from_label).is_some();
+        let kind = operator.kind.or_else(|| {
+            if matched.kind == Some(MediaKind::Tv) || label_tv {
+                Some(MediaKind::Tv)
+            } else {
+                matched.kind
+            }
+        });
         let tv = kind == Some(MediaKind::Tv);
         let movie = kind == Some(MediaKind::Movie);
         let title = match operator.title.trim().is_empty() {

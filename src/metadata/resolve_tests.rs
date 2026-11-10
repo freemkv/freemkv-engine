@@ -71,10 +71,30 @@ fn an_operator_movie_overrides_a_season_label() {
             (None, None, None)
         );
     }
-    // TMDB outranks the label the same way; pass `None` when nothing matched.
+    // A TMDB Movie alone stays a movie; pass `None` when nothing matched.
     let movie = meta("Film", 2001, Some(MediaKind::Movie));
-    let got = MediaMetadata::resolve(&MediaMetadata::default(), Some(&movie), &["X_S2"]);
+    let got = MediaMetadata::resolve(&MediaMetadata::default(), Some(&movie), &["FILM"]);
     assert_eq!((got.kind, got.season), (Some(MediaKind::Movie), None));
+}
+
+// A TV disc TMDB mismatched to a film stays TV: the season label outranks a TMDB Movie.
+#[test]
+fn a_season_label_outranks_a_tmdb_movie() {
+    let movie = meta("Film", 2001, Some(MediaKind::Movie));
+    let got = MediaMetadata::resolve(&MediaMetadata::default(), Some(&movie), &["X_S2_D3"]);
+    assert_eq!(got.kind, Some(MediaKind::Tv));
+    assert_eq!((got.season, got.disc), (Some(2), Some(3)));
+    assert_eq!((got.title.as_str(), got.year), ("Film", 2001));
+    // TMDB TV with no season label is TV; an operator Movie still beats both.
+    let show = meta("Show", 2001, Some(MediaKind::Tv));
+    let got = MediaMetadata::resolve(&MediaMetadata::default(), Some(&show), &["SHOW"]);
+    assert_eq!((got.kind, got.season), (Some(MediaKind::Tv), None));
+    let operator = meta("", 0, Some(MediaKind::Movie));
+    let got = MediaMetadata::resolve(&operator, Some(&movie), &["X_S2_D3"]);
+    assert_eq!(
+        (got.kind, got.season, got.disc),
+        (Some(MediaKind::Movie), None, None)
+    );
 }
 
 #[test]
