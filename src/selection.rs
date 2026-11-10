@@ -6,6 +6,10 @@ use libfreemkv::DiscTitle;
 use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
 use std::collections::{HashMap, HashSet};
 
+#[path = "selection_suggest.rs"]
+mod suggest;
+pub use suggest::{Alternate, Suggestion};
+
 /// Lightweight title data; indices refer to the original canonical scan order.
 #[derive(Debug, Clone, PartialEq)]
 struct SelectionTitle {
@@ -16,6 +20,37 @@ struct SelectionTitle {
     // Raw tags: resolved only when a language preference scores them.
     audio_tags: Vec<String>,
     evidence: TitleSelectionEvidence,
+    // DVD titles are compared and ordered by sector extents, others by segments.
+    dvd: bool,
+    // Sector ranges `[start, end)` in play order.
+    extents: Vec<(u64, u64)>,
+    video: Option<VideoSignature>,
+    // Raw tag of the first non-secondary audio stream, resolved only when suggesting.
+    primary_audio: Option<String>,
+}
+
+/// The primary video stream's shape, one half of an episode set's signature.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VideoSignature {
+    codec: libfreemkv::Codec,
+    resolution: libfreemkv::Resolution,
+    frame_rate: libfreemkv::FrameRate,
+}
+
+/// How an episode-intended pick resolves. `Run` may proceed; `Confirm` holds for the
+/// operator, who confirms `suggested` (empty when none or several `clusters` qualify).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    Run {
+        titles: Vec<usize>,
+        episodes: bool,
+    },
+    Confirm {
+        suggested: Vec<usize>,
+        clusters: Vec<Vec<usize>>,
+        alternates: Vec<Alternate>,
+        reason: SelectionReviewReason,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -75,6 +110,24 @@ impl SelectionModel {
                         .map(|audio| audio.language.clone())
                         .collect(),
                     evidence: title.selection_evidence.clone(),
+                    dvd: title.content_format == libfreemkv::ContentFormat::DvdPs,
+                    extents: (title.extents.iter())
+                        .filter(|extent| extent.sector_count > 0)
+                        .map(|extent| {
+                            let start = u64::from(extent.start_lba);
+                            (start, start + u64::from(extent.sector_count))
+                        })
+                        .collect(),
+                    video: (title.video_streams())
+                        .find(|video| !video.secondary)
+                        .map(|video| VideoSignature {
+                            codec: video.codec,
+                            resolution: video.resolution,
+                            frame_rate: video.frame_rate,
+                        }),
+                    primary_audio: (title.audio_streams())
+                        .find(|audio| !audio.secondary)
+                        .map(|audio| audio.language.clone()),
                 })
                 .collect(),
         }
@@ -162,6 +215,63 @@ impl SelectionModel {
             }
         }
         Some(best)
+    }
+
+    /// Server/desktop entry point for an episode-intended pick. A proven roster of 2+ runs as
+    /// episodes; one that collapses to fewer runs the main title; a disc of one title runs it.
+    /// Without a proven roster the operator confirms a [`suggest_episodes`](Self::suggest_episodes)
+    /// suggestion of titles of at least `min_secs`.
+    pub fn resolve_episodes(
+        &self,
+        audio: &StreamFilter,
+        presentation: Option<&str>,
+        min_secs: f64,
+    ) -> Resolved {
+        if self.titles.len() <= 1 {
+            return Resolved::Run {
+                titles: (0..self.titles.len()).collect(),
+                episodes: false,
+            };
+        }
+        match self.episode_roster() {
+            Ok(members) => {
+                let roster = self.representatives(members, &self.scores(audio, presentation));
+                match roster.len() {
+                    0 | 1 => Resolved::Run {
+                        titles: self.main_title(audio, presentation).into_iter().collect(),
+                        episodes: false,
+                    },
+                    _ => Resolved::Run {
+                        titles: roster,
+                        episodes: true,
+                    },
+                }
+            }
+            Err(reason) => {
+                let suggestion = self.suggest_episodes(audio, presentation, min_secs);
+                Resolved::Confirm {
+                    suggested: suggestion.suggested,
+                    clusters: suggestion.clusters,
+                    alternates: suggestion.alternates,
+                    reason,
+                }
+            }
+        }
+    }
+
+    /// Operator choice, in the operator's order: always `Run`. Out-of-range and repeated
+    /// indices are dropped; with `episodes`, exact-identity aliases collapse to the first.
+    pub fn resolve_explicit(&self, titles: &[usize], episodes: bool) -> Resolved {
+        let mut seen = HashSet::new();
+        let mut identities = HashSet::new();
+        let titles = (titles.iter().copied())
+            .filter(|&index| index < self.titles.len() && seen.insert(index))
+            .filter(|&index| match &self.titles[index].presentation {
+                Some(identity) if episodes => identities.insert(identity),
+                _ => true,
+            })
+            .collect();
+        Resolved::Run { titles, episodes }
     }
 
     // Each title's coverage of the wanted languages: the presentation language, else `audio`.
@@ -268,6 +378,9 @@ impl SelectionModel {
 #[cfg(test)]
 #[path = "selection_episode_tests.rs"]
 mod episode_tests;
+#[cfg(test)]
+#[path = "selection_suggest_tests.rs"]
+mod suggest_tests;
 #[cfg(test)]
 #[path = "selection_tests.rs"]
 mod tests;

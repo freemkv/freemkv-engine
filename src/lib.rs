@@ -24,7 +24,9 @@ mod plan;
 mod preflight;
 mod presentation;
 mod selection;
-pub use selection::{SelectionModel, SelectionReview, SelectionReviewReason};
+pub use selection::{
+    Alternate, Resolved, SelectionModel, SelectionReview, SelectionReviewReason, Suggestion,
+};
 // The recovery strategy (sweep/patch/mapfile/read_error/section_recover).
 mod recovery;
 
