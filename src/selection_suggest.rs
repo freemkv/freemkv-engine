@@ -1,5 +1,5 @@
 //! Suggested episode sets for discs without a proven roster. A suggestion is never proof:
-//! the operator confirms it (docs/playlist-selection.md).
+//! the operator confirms it before anything is ripped.
 
 use super::{SelectionModel, SelectionTitle, VideoSignature};
 use crate::StreamFilter;
