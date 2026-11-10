@@ -123,6 +123,7 @@ fn disc_with(n: usize, encrypted: bool, has_aacs_key: bool) -> libfreemkv::Disc 
         encrypted,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     }
 }

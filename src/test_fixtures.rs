@@ -680,6 +680,7 @@ fn manual_disc(img: &EncryptedBdImage, uk_ro: &[u8], titles: &[&[usize]]) -> Dis
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     }
 }
@@ -819,6 +820,7 @@ pub(crate) fn disc_of(titles: Vec<libfreemkv::DiscTitle>) -> Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::DvdPs,
     }
 }

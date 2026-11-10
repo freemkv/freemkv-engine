@@ -897,6 +897,7 @@ fn the_main_title_is_the_default_and_a_missing_title_is_range_error() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     };
     assert_eq!(pick_title(&disc, None, &StreamFilter::All).unwrap(), 0);
@@ -954,6 +955,7 @@ fn remux_main_title_honors_an_equivalent_audio_language_presentation() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     };
     assert_eq!(

@@ -18,6 +18,7 @@ fn agrees_with_libfreemkv_disc_mapfile_for() {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     };
     for p in [

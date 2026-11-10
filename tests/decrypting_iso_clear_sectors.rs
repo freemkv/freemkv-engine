@@ -285,6 +285,7 @@ fn disc(fx: &Fixture) -> Disc {
         encrypted: true,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: ContentFormat::BdTs,
     }
 }

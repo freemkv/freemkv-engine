@@ -146,6 +146,7 @@ fn synthetic_disc_with_one_file(contents: &[u8]) -> (libfreemkv::Disc, MemDisc) 
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     };
     (disc, m)

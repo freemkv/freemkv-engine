@@ -16,6 +16,7 @@ fn guard_disc(sectors: u32) -> libfreemkv::Disc {
         encrypted: false,
         aacs_error: None,
         css_error: None,
+        layer_map: None,
         content_format: libfreemkv::ContentFormat::BdTs,
     }
 }
