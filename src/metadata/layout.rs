@@ -16,7 +16,7 @@ pub fn title_with_year(meta: &MediaMetadata) -> String {
 /// Where `leaf` goes under its kind's root:
 /// - TV: `Show (Year)/Season NN/leaf` (season 1 when unknown);
 /// - Movie, or kind unknown: `Title (Year)/Title (Year).ext`, keeping `leaf`'s extension
-///   (`mkv` when it has none);
+///   when it is plain ASCII letters and digits (`mkv` otherwise);
 /// - no title: `leaf` alone.
 ///
 /// Every segment is [`sanitize_display`]ed, so the result never leaves the root.
@@ -36,6 +36,7 @@ pub fn relative_path(meta: &MediaMetadata, leaf: &str) -> PathBuf {
             let ext = Path::new(leaf)
                 .extension()
                 .and_then(|ext| ext.to_str())
+                .filter(|ext| !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()))
                 .unwrap_or("mkv");
             path.push(format!("{folder}.{ext}"));
         }

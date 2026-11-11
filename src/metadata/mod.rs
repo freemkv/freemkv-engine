@@ -194,14 +194,14 @@ const SAFE_FALLBACK: &str = "untitled";
 const MAX_SEGMENT_LEN: usize = 200;
 
 /// One visible path segment: keeps ASCII letters, digits, space and `-_.'`, trimmed, at most
-/// 200 bytes, without leading dots; never empty, `.` or `..` (those become `untitled`).
+/// 200 bytes, without leading dots or spaces; never empty, `.` or `..` (those become `untitled`).
 pub fn sanitize_display(name: &str) -> String {
     let filtered: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.' | '\''))
         .collect();
-    let stripped = filtered.trim().trim_start_matches('.');
-    let stripped = &stripped[..stripped.len().min(MAX_SEGMENT_LEN)];
+    let stripped = filtered.trim_start_matches(['.', ' ']);
+    let stripped = stripped[..stripped.len().min(MAX_SEGMENT_LEN)].trim_end();
     if stripped.is_empty() || stripped.chars().all(|c| c == '.') {
         return SAFE_FALLBACK.to_string();
     }
