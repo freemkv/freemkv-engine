@@ -4,6 +4,20 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [1.8.9] — UNRELEASED
+
+### Added
+
+- `SelectionModel::resolve_episodes` and `resolve_explicit`, the one title policy for the CLI, GUI and server: a proven roster runs as episodes, and an episode-intended pick without one returns `Resolved::Confirm` with a suggestion for the operator to confirm. `suggest_episodes` drops play-alls, folds partial-overlap variants into alternates and clusters by video, primary audio language and 15% duration gaps. An operator pick runs in the operator's order, with out-of-range and repeated indices dropped and exact aliases collapsed for episodes. `select` and `main_or_episodes` are unchanged.
+- `MediaMetadata::resolve` (operator, then TMDB, then disc label), `episode_numbers`, `episode_leaf` and `layout::relative_path`, the shared episode numbering, naming and library folder layout (`Show (Year)/Season NN/Show S01E01 - Name.mkv`, `Title (Year)/Title (Year).mkv`).
+
+### Fixed
+
+- A season label or a TMDB TV match outranks a TMDB movie match for the kind; the operator's kind still wins, and an operator Movie drops the season, disc and first episode.
+- An alias of a play-all is a play-all, not an alternate of a title in no set, and durations exactly 15% apart split into separate episode clusters instead of folding on float rounding.
+- `sanitize_display` trims after stripping dots and truncating, so a name never ends in a space that Windows and SMB drop; `relative_path` keeps only a plain ASCII alphanumeric extension (else `mkv`), so `x.` and `x.mkv:evil` no longer give a trailing dot or an NTFS stream name.
+- A non-finite title duration is skipped when aligning a disc to TMDB runtimes; one such title made every offset's average meaningless.
+
 ## [1.8.8] — 2026-11-01
 
 ### Changed
