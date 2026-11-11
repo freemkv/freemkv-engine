@@ -1082,6 +1082,10 @@ fn align_keeps_the_fallback_unless_another_offset_is_clearly_better() {
     let eps = season(&[22, 23, 22, 22]);
     let disc2 = [22.8 * 60.0, 22.8 * 60.0];
     assert_eq!(align_disc_offset(&disc2, &eps, 3), 3);
+    // A unique best offset (E02, 0.4 min off) that beats the fallback (E01, 0.6) by under a
+    // minute is still noise.
+    let eps = season(&[22, 23, 24]);
+    assert_eq!(align_disc_offset(&[22.6 * 60.0], &eps, 1), 1);
 }
 
 fn result(title: &str, year: u16, kind: MediaKind, id: u64) -> TmdbResult {

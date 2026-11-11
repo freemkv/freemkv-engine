@@ -910,6 +910,23 @@ fn intersect_keeps_only_the_overlap() {
     assert_eq!(merge_byte_ranges(&mut [(5, 5), (0, 5), (20, 0)]), [(0, 10)]);
 }
 
+#[test]
+fn subtract_keeps_the_head_and_tail_around_each_cut() {
+    // A cut inside a range keeps both sides.
+    assert_eq!(subtract(&[(0, 100)], &[(40, 10)]), [(0, 40), (50, 50)]);
+    // Cuts overlapping either end, and one covering a whole range.
+    assert_eq!(
+        subtract(&[(10, 20), (50, 20), (100, 10)], &[(0, 15), (65, 10), (90, 30)]),
+        [(15, 15), (50, 15)]
+    );
+    // Several cuts in one range; a cut touching no range changes nothing.
+    assert_eq!(
+        subtract(&[(0, 100)], &[(10, 10), (30, 10), (200, 5)]),
+        [(0, 10), (20, 10), (40, 60)]
+    );
+    assert_eq!(subtract(&[(0, 10)], &[]), [(0, 10)]);
+}
+
 // Many ranges against many scope runs, both directions of overlap, against a brute force.
 #[test]
 fn intersect_matches_every_pair_overlap() {
