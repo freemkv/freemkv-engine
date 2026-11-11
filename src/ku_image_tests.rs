@@ -896,7 +896,7 @@ fn the_front_doors_return_the_trace_on_a_refusal() {
         ..OpenImageOptions::resolve(f.clone())
     };
     let (r, trace) = crate::open_image_with_traced(&src, opts);
-    assert!(r.is_err());
+    assert_eq!(r.map(|_| ()).unwrap_err().code(), E_NO_DISC_KEY);
     assert_eq!(trace.keys.len(), 2, "{trace:?}");
     let (r, trace) = crate::open_image_with_traced(&src, OpenImageOptions::resolve(f));
     assert_eq!(r.unwrap().trace, trace);

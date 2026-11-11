@@ -69,7 +69,11 @@ fn authored_partition_order_survives_scan_order_and_audio_alternates() {
         {
             *order = ordinal;
         }
-        assert!(select(&invalid).is_err());
+        assert_eq!(
+            select(&invalid).map_err(|review| review.reason),
+            Err(SelectionReviewReason::InvalidEpisodeRoster),
+            "title {index} ordinal {ordinal:?}"
+        );
     }
 }
 
