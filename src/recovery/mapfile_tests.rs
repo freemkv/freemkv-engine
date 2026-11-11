@@ -916,7 +916,10 @@ fn subtract_keeps_the_head_and_tail_around_each_cut() {
     assert_eq!(subtract(&[(0, 100)], &[(40, 10)]), [(0, 40), (50, 50)]);
     // Cuts overlapping either end, and one covering a whole range.
     assert_eq!(
-        subtract(&[(10, 20), (50, 20), (100, 10)], &[(0, 15), (65, 10), (90, 30)]),
+        subtract(
+            &[(10, 20), (50, 20), (100, 10)],
+            &[(0, 15), (65, 10), (90, 30)]
+        ),
         [(15, 15), (50, 15)]
     );
     // Several cuts in one range; a cut touching no range changes nothing.
