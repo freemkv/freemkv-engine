@@ -445,3 +445,263 @@ fn capturing_suggestion_data_resolves_no_tags() {
     let _ = model(&[bd(0, 44.0, &[("00001", 0, 44)], "eng")]);
     assert_eq!(LANG_LOOKUPS.with(|n| n.get()), 0);
 }
+
+fn secondary(mut stream: Stream) -> Stream {
+    match &mut stream {
+        Stream::Video(video) => video.secondary = true,
+        Stream::Audio(audio) => audio.secondary = true,
+        _ => {}
+    }
+    stream
+}
+
+// Another cut of a play-all (here a dub) is a play-all too, not an alternate of one.
+#[test]
+fn an_alias_of_a_play_all_is_a_play_all() {
+    let (e1, e2) = (("00001", 0, 30), ("00002", 0, 30));
+    let titles = vec![
+        bd(1, 30.0, &[e1], "eng"),
+        bd(2, 30.0, &[e2], "eng"),
+        bd(3, 60.0, &[e1, e2], "eng"),
+        bd(4, 60.0, &[e1, e2], "deu"),
+    ];
+    for presentation in [None, Some("de")] {
+        let suggestion =
+            model(&titles).suggest_episodes(&StreamFilter::All, presentation, MIN_SECS);
+        assert_eq!(suggestion.play_alls, vec![2, 3], "{presentation:?}");
+        assert!(suggestion.alternates.is_empty(), "{presentation:?}");
+        assert_eq!(suggestion.suggested, vec![0, 1], "{presentation:?}");
+    }
+}
+
+#[test]
+fn an_alias_of_a_folded_variant_names_the_kept_title() {
+    let recap = [("00030", 0, 2), ("00011", 0, 44)];
+    let titles = vec![
+        bd(1, 44.0, &[("00011", 0, 44)], "eng"),
+        bd(2, 46.0, &recap, "eng"),
+        bd(3, 46.0, &recap, "deu"),
+        bd(4, 44.0, &[("00012", 0, 44)], "eng"),
+    ];
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.suggested, vec![0, 3]);
+    assert_eq!(
+        suggestion.alternates,
+        vec![Alternate { index: 1, of: 0 }, Alternate { index: 2, of: 0 }]
+    );
+}
+
+// Variants fold when they share at least half of the shorter one's content.
+#[test]
+fn variants_fold_from_exactly_half_shared() {
+    let half = vec![
+        bd(1, 40.0, &[("00001", 0, 40)], "eng"),
+        bd(2, 40.0, &[("00001", 0, 20), ("00002", 0, 20)], "eng"),
+    ];
+    let suggestion = suggest(&half);
+    assert_eq!(suggestion.alternates, vec![Alternate { index: 1, of: 0 }]);
+    assert!(suggestion.clusters.is_empty());
+    let under = vec![
+        bd(1, 40.0, &[("00001", 0, 40)], "eng"),
+        bd(2, 40.0, &[("00001", 0, 19), ("00002", 0, 21)], "eng"),
+    ];
+    let suggestion = suggest(&under);
+    assert!(suggestion.alternates.is_empty());
+    assert_eq!(suggestion.suggested, vec![0, 1]);
+}
+
+// Exactly 15% longer stays in the set; only more than 15% starts a new one.
+#[test]
+fn the_cluster_gap_is_more_than_fifteen_percent() {
+    let pair = |longer: f64| {
+        vec![
+            bd(1, 40.0, &[("00001", 0, 40)], "eng"),
+            bd(2, longer, &[("00002", 0, 46)], "eng"),
+        ]
+    };
+    assert_eq!(suggest(&pair(46.0)).suggested, vec![0, 1]);
+    assert!(suggest(&pair(46.1)).clusters.is_empty());
+    for (short, long) in [(20.0, 23.0), (100.0, 115.0)] {
+        let titles = vec![
+            bd(1, short, &[("00001", 0, 1)], "eng"),
+            bd(2, long, &[("00002", 0, 1)], "eng"),
+        ];
+        let got = model(&titles).suggest_episodes(&StreamFilter::All, None, 0.0);
+        assert_eq!(got.suggested, vec![0, 1], "{short} {long}");
+    }
+}
+
+// Described titles come first, then the first non-empty extent, then none.
+#[test]
+fn described_titles_order_before_undescribed_ones() {
+    let mut titles = vec![
+        bd(1, 44.0, &[("00009", 0, 44)], "eng"),
+        bd(2, 44.0, &[("00005", 0, 44)], "eng"),
+        bd(3, 44.0, &[("00007", 0, 44)], "eng"),
+        bd(4, 44.0, &[("00008", 0, 44)], "eng"),
+    ];
+    let extent = |start_lba, sector_count| Extent {
+        start_lba,
+        sector_count,
+    };
+    for (n, extents) in [
+        (0, vec![extent(0, 0), extent(900, 100)]),
+        (2, vec![extent(500, 100)]),
+        (3, vec![]),
+    ] {
+        titles[n].selection_evidence.segments.clear();
+        titles[n].extents = extents;
+    }
+    assert_eq!(suggest(&titles).suggested, vec![1, 2, 0, 3]);
+}
+
+// DVD order is the title number, whatever the sectors say.
+#[test]
+fn dvd_order_is_the_title_number_not_the_sector() {
+    let titles = vec![
+        dvd(1, 44.0, &[(30_000, 5_000)], "eng"),
+        dvd(2, 44.0, &[(10_000, 5_000)], "eng"),
+        dvd(3, 44.0, &[(20_000, 5_000)], "eng"),
+    ];
+    assert_eq!(suggest(&titles).suggested, vec![0, 1, 2]);
+}
+
+// A DVD play-all is found by its extents even without segments; a BD one that repeats a
+// clip still plays each episode once.
+#[test]
+fn play_alls_by_dvd_extents_and_repeated_clips() {
+    let mut titles = vec![
+        dvd(1, 44.0, &[(1_000, 5_000)], "eng"),
+        dvd(2, 44.0, &[(6_000, 5_000)], "eng"),
+        dvd(3, 44.0, &[(11_000, 5_000)], "eng"),
+        dvd(
+            4,
+            132.0,
+            &[(1_000, 5_000), (6_000, 5_000), (11_000, 5_000)],
+            "eng",
+        ),
+    ];
+    for t in &mut titles {
+        t.selection_evidence.segments.clear();
+    }
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.play_alls, vec![3]);
+    assert_eq!(suggestion.suggested, vec![0, 1, 2]);
+
+    let (e1, e2) = (("00001", 0, 30), ("00002", 0, 30));
+    let titles = vec![
+        bd(1, 30.0, &[e1], "eng"),
+        bd(2, 30.0, &[e2], "eng"),
+        bd(3, 90.0, &[e1, e1, e2], "eng"),
+    ];
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.play_alls, vec![2]);
+    assert_eq!(suggestion.suggested, vec![0, 1]);
+}
+
+// The signature is the first primary video and audio: secondary (PiP, commentary) streams
+// listed first do not split the set.
+#[test]
+fn secondary_streams_do_not_sign_a_title() {
+    let mut titles = vec![
+        bd(1, 44.0, &[("00001", 0, 44)], "eng"),
+        bd(2, 44.0, &[("00002", 0, 44)], "eng"),
+        bd(3, 44.0, &[("00003", 0, 44)], "eng"),
+    ];
+    let pip = video(Codec::Mpeg2, Resolution::R480i, FrameRate::F29_97);
+    titles[1].streams.insert(0, secondary(pip));
+    titles[2].streams.insert(1, secondary(audio("jpn")));
+    assert_eq!(suggest(&titles).suggested, vec![0, 1, 2]);
+}
+
+// Unrecognised language tags compare trimmed and case-insensitively.
+#[test]
+fn unknown_language_tags_compare_by_spelling() {
+    let mut titles = vec![
+        bd(1, 44.0, &[("00001", 0, 44)], "zz-custom"),
+        bd(2, 44.0, &[("00002", 0, 44)], " ZZ-Custom "),
+        bd(3, 44.0, &[("00003", 0, 44)], "qq-other"),
+    ];
+    assert_eq!(suggest(&titles).suggested, vec![0, 1]);
+    titles[2].streams[1] = audio("ZZ-CUSTOM");
+    assert_eq!(suggest(&titles).suggested, vec![0, 1, 2]);
+}
+
+#[test]
+fn min_secs_is_inclusive() {
+    let titles = vec![
+        bd(1, 10.0, &[("00001", 0, 10)], "eng"),
+        bd(2, 10.0, &[("00002", 0, 10)], "eng"),
+    ];
+    assert_eq!(suggest(&titles).suggested, vec![0, 1]);
+    let got = model(&titles).suggest_episodes(&StreamFilter::All, None, MIN_SECS + 0.001);
+    assert_eq!(got, Suggestion::default());
+}
+
+// resolve_episodes suggests with the caller's language and minimum length.
+#[test]
+fn resolve_episodes_passes_its_language_and_minimum_through() {
+    let mut titles = vec![
+        bd(1, 44.0, &[("00011", 0, 44)], "eng"),
+        bd(2, 46.0, &[("00030", 0, 2), ("00011", 0, 44)], "eng"),
+        bd(3, 44.5, &[("00012", 0, 40), ("00013", 0, 4)], "eng"),
+        bd(4, 44.5, &[("00012", 0, 40), ("00014", 0, 4)], "eng"),
+        bd(5, 5.0, &[("00040", 0, 5)], "eng"),
+        bd(6, 5.0, &[("00041", 0, 5)], "eng"),
+    ];
+    titles[3].streams.push(audio("deu"));
+    let got = model(&titles).resolve_episodes(&StreamFilter::All, Some("de"), MIN_SECS);
+    let alternates = vec![Alternate { index: 2, of: 3 }, Alternate { index: 1, of: 0 }];
+    assert_eq!(got, confirm(vec![0, 3], vec![vec![0, 3]], alternates));
+    let german = StreamFilter::Langs(vec!["deu".into()]);
+    let got = model(&titles).resolve_episodes(&german, None, MIN_SECS);
+    assert!(matches!(got, Resolved::Confirm { suggested, .. } if suggested == vec![0, 3]));
+}
+
+// A roster whose episodes are all one programme (dub playlists) runs that programme once.
+#[test]
+fn a_roster_of_aliases_runs_the_main_title() {
+    let mut titles = vec![
+        bd(0, 44.0, &[("00001", 0, 44)], "eng"),
+        bd(1, 44.0, &[("00001", 0, 44)], "deu"),
+        bd(2, 5.0, &[("00003", 0, 5)], "eng"),
+    ];
+    crate::test_fixtures::authored_episodes(&mut titles, &[0, 1]);
+    let model = model(&titles);
+    for (presentation, main) in [(None, 0), (Some("de"), 1)] {
+        assert_eq!(
+            model.resolve_episodes(&StreamFilter::All, presentation, MIN_SECS),
+            Resolved::Run {
+                titles: vec![main],
+                episodes: false
+            },
+            "{presentation:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_picks_never_collapse_undescribed_titles() {
+    let mut titles = vec![
+        bd(0, 44.0, &[("00001", 0, 44)], "eng"),
+        bd(1, 44.0, &[("00001", 0, 44)], "eng"),
+    ];
+    for t in &mut titles {
+        t.selection_evidence.segments.clear();
+    }
+    let model = model(&titles);
+    assert_eq!(
+        model.resolve_explicit(&[1, 0], true),
+        Resolved::Run {
+            titles: vec![1, 0],
+            episodes: true
+        }
+    );
+    assert_eq!(
+        model.resolve_explicit(&[], true),
+        Resolved::Run {
+            titles: vec![],
+            episodes: true
+        }
+    );
+}

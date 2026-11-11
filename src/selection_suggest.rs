@@ -21,12 +21,12 @@ pub struct Suggestion {
     /// Every cluster of 2+ like titles, ordered by their first title.
     pub clusters: Vec<Vec<usize>>,
     pub alternates: Vec<Alternate>,
-    /// Candidates that play 2+ other, pairwise disjoint candidates.
+    /// Candidates that play 2+ other, pairwise disjoint candidates, and their aliases.
     pub play_alls: Vec<usize>,
 }
 
 // A new cluster starts where the next title runs more than 15% longer than the previous one.
-const CLUSTER_GAP: f64 = 1.15;
+const CLUSTER_GAP_PERCENT: f64 = 115.0;
 
 // A title's content as merged `[start, end)` spans per unit; never empty.
 struct Coverage<'a> {
@@ -120,6 +120,14 @@ impl SelectionModel {
             live.retain(|index| !found.contains(index));
             play_alls.extend(found);
         }
+        // Another cut of a play-all is a play-all too.
+        alternates.retain(|alternate| {
+            let of_play_all = play_alls.contains(&alternate.of);
+            if of_play_all {
+                play_alls.push(alternate.index);
+            }
+            !of_play_all
+        });
         self.sort_play_order(&mut play_alls);
 
         // Fold variants sharing at least half of the shorter one's content.
@@ -208,8 +216,8 @@ impl SelectionModel {
             let mut cluster: Vec<usize> = Vec::new();
             for index in members {
                 if let Some(&previous) = cluster.last()
-                    && self.titles[index].duration_secs
-                        > self.titles[previous].duration_secs * CLUSTER_GAP
+                    && self.titles[index].duration_secs * 100.0
+                        > self.titles[previous].duration_secs * CLUSTER_GAP_PERCENT
                 {
                     clusters.push(std::mem::take(&mut cluster));
                 }
