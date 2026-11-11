@@ -30,6 +30,18 @@ fn low_align_tied_minimum_keeps_fallback() {
 }
 
 #[test]
+fn low_align_non_finite_duration_adds_no_signal() {
+    // Equal runtimes everywhere tie, so only a poisoned score could move off the fallback.
+    for bad in [f64::NAN, f64::INFINITY] {
+        assert_eq!(
+            align_disc_offset(&[bad, 1800.0], &episodes(&[30; 6]), 3),
+            3,
+            "{bad}"
+        );
+    }
+}
+
+#[test]
 fn low_align_oversized_count_is_checked_before_arithmetic() {
     for count in [65_536, 65_537] {
         let actual = std::panic::catch_unwind(|| {

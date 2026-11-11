@@ -1000,7 +1000,8 @@ pub fn align_disc_offset(title_secs: &[f64], episodes: &[Episode], fallback: u16
         let mut dist = 0.0f64;
         let mut signal = 0u32;
         for (i, &secs) in title_secs.iter().enumerate() {
-            if secs <= 0.0 {
+            // A non-finite duration poisons every offset's average: no signal.
+            if !secs.is_finite() || secs <= 0.0 {
                 continue;
             }
             if let Some(ep_min) = runtime_of(start + i as u16)
