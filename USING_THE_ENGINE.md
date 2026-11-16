@@ -219,6 +219,7 @@ match preflight(&disc, &job) {
             //   "no-titles" | "empty-selection" | "title-out-of-range"
             //   | "language-unmatched" | "unknown-language" | "encrypted-no-key"
             //   | "selection-review-required"
+            // "stream-index-out-of-range": detail is one-based title:class:requested:count;
             // "unknown-language": a requested tag names no language;
             // r.detail is the tag as given.
             // "language-unmatched": a language-filtered stream class the job

@@ -107,6 +107,8 @@ pub enum StreamFilter {
     /// input — a name (`"English"`), 639-1 (`"en"`), or 639-2/3 (`"eng"`) —
     /// normalized by language identity at resolve time (case-insensitive).
     Langs(Vec<String>),
+    /// One-based positions in the complete class list, in source order.
+    Indices(Vec<usize>),
 }
 
 impl Job {

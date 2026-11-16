@@ -663,3 +663,46 @@ fn a_single_subtitle_list_is_checked_once_over_every_subtitle() {
     assert_eq!(miss[0].available, vec!["deu", "eng"]);
     assert_eq!(one("fr").unmatched_everywhere([&t]), vec!["subtitle"]);
 }
+
+#[test]
+fn indices_select_source_order_and_include_forced_positions() {
+    let sel = resolve_stream_selection(
+        &forced_title(),
+        &StreamFilter::Indices(vec![3, 1, 1]),
+        &StreamFilter::Indices(vec![5, 2, 2]),
+    )
+    .unwrap();
+    assert_eq!(sel.audio, PidFilter::Only(vec![0x1100, 0x1102]));
+    assert_eq!(sel.subtitle, PidFilter::Only(vec![0x1201, 0x1211]));
+    assert!(AudioPreference::new(&StreamFilter::Indices(vec![2])).is_empty());
+}
+
+#[test]
+fn indices_refuse_partial_matches_and_empty_classes() {
+    for requested in [0, 99, usize::MAX] {
+        assert_eq!(
+            resolve_stream_selection(
+                &title(),
+                &StreamFilter::Indices(vec![1, requested]),
+                &StreamFilter::All
+            ),
+            Err(StreamSelError::IndexOutOfRange {
+                class: "audio",
+                requested,
+                count: 4
+            })
+        );
+    }
+    assert_eq!(
+        resolve_stream_selection(
+            &libfreemkv::DiscTitle::empty(),
+            &StreamFilter::All,
+            &StreamFilter::Indices(vec![1])
+        ),
+        Err(StreamSelError::IndexOutOfRange {
+            class: "subtitle",
+            requested: 1,
+            count: 0
+        })
+    );
+}

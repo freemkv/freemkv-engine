@@ -253,12 +253,27 @@ pub enum StreamSelError {
     /// A requested tag resolves to no known language — a typo (`"Klingonish"`),
     /// not a disc property. Hard error.
     UnknownLanguage { tag: String },
+    /// An index outside the complete audio or subtitle list.
+    IndexOutOfRange {
+        class: &'static str,
+        requested: usize,
+        count: usize,
+    },
 }
 
 /// The coded form (E9083) for callers that surface a selection error as an I/O error.
 impl From<StreamSelError> for libfreemkv::Error {
     fn from(e: StreamSelError) -> Self {
         match e {
+            StreamSelError::IndexOutOfRange {
+                class,
+                requested,
+                count,
+            } => libfreemkv::Error::StreamIndexOutOfRange {
+                class: class.into(),
+                requested,
+                count,
+            },
             StreamSelError::UnknownLanguage { tag } => {
                 libfreemkv::Error::StreamLanguageUnknown { tag }
             }
@@ -327,6 +342,7 @@ enum Wanted {
     All,
     None,
     Langs(Vec<Language>),
+    Indices(Vec<usize>),
 }
 
 pub(crate) struct AudioPreference(Vec<Language>);
@@ -361,6 +377,7 @@ impl Wanted {
         Ok(match sel {
             StreamFilter::All => Wanted::All,
             StreamFilter::None => Wanted::None,
+            StreamFilter::Indices(indices) => Wanted::Indices(indices.clone()),
             StreamFilter::Langs(tags) => Wanted::Langs(
                 tags.iter()
                     .map(|t| {
@@ -374,10 +391,11 @@ impl Wanted {
 
     /// Does this side keep a stream tagged `lang`? An untagged stream is `und`; an
     /// unresolvable tag can only be kept by `All`.
-    fn keeps(&self, lang: &str) -> bool {
+    fn keeps(&self, lang: &str, index: usize) -> bool {
         match self {
             Wanted::All => true,
             Wanted::None => false,
+            Wanted::Indices(indices) => indices.contains(&index),
             Wanted::Langs(langs) => stream_lang(lang).is_some_and(|l| langs.contains(&l)),
         }
     }
@@ -392,14 +410,16 @@ fn resolve_audio(
     if matches!(sel, StreamFilter::All) {
         return Ok(PidFilter::All);
     }
+    validate_indices(sel, "audio", title.audio_streams().count())?;
     let wanted = Wanted::compile(sel)?;
     // A SET, not a fallback chain: every audio stream matching ANY listed
     // language is kept, so "German & Spanish audio" keeps both.
     Ok(PidFilter::Only(
         title
             .audio_streams()
-            .filter(|a| wanted.keeps(&a.language))
-            .map(|a| a.pid)
+            .enumerate()
+            .filter(|(i, a)| wanted.keeps(&a.language, i + 1))
+            .map(|(_, a)| a.pid)
             .collect(),
     ))
 }
@@ -417,19 +437,23 @@ fn resolve_subtitles(
     }
     // Compile both sides up front: a typo on the forced side is an error even
     // when the disc carries no forced subtitle at all.
+    let count = title.subtitle_streams().count();
+    validate_indices(&sel.normal, "subtitle", count)?;
+    validate_indices(&sel.forced, "subtitle", count)?;
     let normal = Wanted::compile(&sel.normal)?;
     let forced = Wanted::compile(&sel.forced)?;
     Ok(PidFilter::Only(
         title
             .subtitle_streams()
-            .filter(|s| {
+            .enumerate()
+            .filter(|(i, s)| {
                 if s.forced {
-                    forced.keeps(&s.language)
+                    forced.keeps(&s.language, i + 1)
                 } else {
-                    normal.keeps(&s.language)
+                    normal.keeps(&s.language, i + 1)
                 }
             })
-            .map(|s| s.pid)
+            .map(|(_, s)| s.pid)
             .collect(),
     ))
 }
@@ -505,3 +529,22 @@ fn bib_to_terminologic(code: &str) -> Option<&'static str> {
 #[cfg(test)]
 #[path = "streams_tests.rs"]
 mod tests;
+
+fn validate_indices(
+    sel: &StreamFilter,
+    class: &'static str,
+    count: usize,
+) -> Result<(), StreamSelError> {
+    if let StreamFilter::Indices(indices) = sel {
+        for &requested in indices {
+            if requested == 0 || requested > count {
+                return Err(StreamSelError::IndexOutOfRange {
+                    class,
+                    requested,
+                    count,
+                });
+            }
+        }
+    }
+    Ok(())
+}

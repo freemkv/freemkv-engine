@@ -910,11 +910,15 @@ fn a_keyed_main_movie_title_run_muxes_the_audio_preferred_cut() {
     );
     let dir = tempfile::tempdir().unwrap();
     let iso = fx.write(dir.path(), "src.iso");
-    for (audio, language) in [
+    for (case, (audio, language)) in [
         (crate::StreamFilter::Langs(vec!["de".into()]), "deu"),
         (crate::StreamFilter::All, "eng"),
-    ] {
-        let out = dir.path().join(format!("{language}.mkv"));
+        (crate::StreamFilter::Indices(vec![1]), "eng"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = dir.path().join(format!("{case}-{language}.mkv"));
         let p = Plan {
             titles: Selection::MainMovie,
             streams: StreamChoice {

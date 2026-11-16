@@ -499,3 +499,22 @@ fn blocks_empty_explicit_selection() {
     let pf = preflight(&d, &j);
     assert!(pf.reasons().iter().any(|r| r.key == "empty-selection"));
 }
+
+#[test]
+fn numeric_batch_refuses_a_later_title_with_fewer_tracks() {
+    let disc = disc_with_titles(vec![
+        title_with_audio(&["eng", "fra"]),
+        title_with_audio(&["eng"]),
+    ]);
+    let mut job = Job::new("iso://x.iso", "/out").with_audio(StreamFilter::Indices(vec![1, 2]));
+    job.selection = Selection::All;
+    assert_eq!(
+        preflight(&disc, &job).reasons(),
+        &[Reason::with_detail(
+            "stream-index-out-of-range",
+            "2:audio:2:1"
+        )]
+    );
+    job.selection = Selection::Titles(vec![0]);
+    assert!(preflight(&disc, &job).is_ready());
+}

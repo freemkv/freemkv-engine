@@ -49,6 +49,7 @@ pub struct Reason {
     /// "title-out-of-range"     an index past the last title (detail = index)
     /// "language-unmatched"     a language-filtered class no selected title
     ///                          carries (detail = audio|subtitle|subtitle_forced)
+    /// "stream-index-out-of-range" one-based title:class:requested:count
     /// "unknown-language"       a requested tag names no language (detail = tag)
     /// "encrypted-no-key"       an encrypted disc, not raw, with no usable key
     /// "selection-review-required" the evidence proves no automatic choice: an
@@ -129,6 +130,24 @@ pub fn preflight(disc: &libfreemkv::Disc, job: &Job) -> Preflight {
     if reasons.is_empty() {
         for tag in job.streams.unknown_language_tags() {
             reasons.push(Reason::with_detail("unknown-language", tag));
+        }
+    }
+
+    // Numeric choices must be valid on every selected title, before any media is written.
+    if reasons.is_empty() {
+        for &i in &resolved {
+            if let Some(title) = disc.titles.get(i)
+                && let Err(crate::StreamSelError::IndexOutOfRange {
+                    class,
+                    requested,
+                    count,
+                }) = job.streams.resolve(title)
+            {
+                reasons.push(Reason::with_detail(
+                    "stream-index-out-of-range",
+                    format!("{}:{class}:{requested}:{count}", i + 1),
+                ));
+            }
         }
     }
 
