@@ -1820,10 +1820,10 @@ fn a_replacing_publish_that_hits_an_existing_name_is_a_plain_io_error() {
     }
     let target = PathBuf::from("/nowhere/Movie.mkv");
     let landing = PathBuf::from("/nowhere/Movie.mkv.partial");
-    let replacing = land(&landing, &job(target.clone(), true), &Racy).unwrap_err();
+    let replacing = super::land(&landing, &job(target.clone(), true), &Racy).unwrap_err();
     assert_eq!(replacing.kind(), io::ErrorKind::AlreadyExists);
     assert!(!replacing.to_string().starts_with("E9084"), "{replacing}");
-    let publishing = land(&landing, &job(target, false), &Racy).unwrap_err();
+    let publishing = super::land(&landing, &job(target, false), &Racy).unwrap_err();
     assert!(publishing.to_string().starts_with("E9084"), "{publishing}");
 }
 

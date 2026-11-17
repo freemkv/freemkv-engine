@@ -1606,13 +1606,18 @@ fn a_span_is_handed_to_the_sink_only_when_committed_and_whole() {
     let (h, mut disc) = Harness::build(&[], None, Duration::from_millis(1));
     let mut sink = RecordSink::default();
     let now = h.now_fn();
-    let mut ctx = ctx!(disc, sink, now);
     let mut buf = [0u8; SECTOR as usize * 2];
-    let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), false);
-    assert!(matches!(hit, ReadHit::Good));
+    {
+        let mut ctx = ctx!(disc, sink, now);
+        let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), false);
+        assert!(matches!(hit, ReadHit::Good));
+    }
     assert!(sink.got.is_empty(), "an uncommitted read writes nothing");
-    let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), true);
-    assert!(matches!(hit, ReadHit::Good));
+    {
+        let mut ctx = ctx!(disc, sink, now);
+        let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), true);
+        assert!(matches!(hit, ReadHit::Good));
+    }
     assert_eq!(sink.got.get(&0), Some(&(2 * SECTOR as usize)));
 }
 
