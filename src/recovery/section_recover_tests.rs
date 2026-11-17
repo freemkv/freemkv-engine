@@ -1568,3 +1568,145 @@ fn the_wedge_fast_fail_gate_is_strictly_below_500_ms() {
     }
     assert_eq!(WEDGE_FASTFAIL_MS, 500);
 }
+
+#[test]
+fn timed_out_ignores_the_stall_streak_and_follows_the_deadline() {
+    let (h, mut disc) = Harness::build(&[], None, Duration::from_millis(1));
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let ctx = ctx!(disc, sink, now);
+    let t0 = (ctx.now)();
+    assert!(ctx.timed_out(t0), "at the deadline");
+    assert!(!ctx.timed_out(t0 + Duration::from_secs(1)), "before it");
+}
+
+#[test]
+fn handler_names_carry_their_kind_and_read_params() {
+    let p = ReadParams::fast();
+    assert_eq!(Jump { params: p }.name(), format!("jump:{}", p.tag()));
+    assert_eq!(
+        SpeedSweep { params: p }.name(),
+        format!("speedsweep:{}", p.tag())
+    );
+    assert_eq!(
+        CachePrime { params: p }.name(),
+        format!("cacheprime:{}", p.tag())
+    );
+}
+
+#[test]
+fn scorecard_samples_are_bytes_per_second() {
+    let mut sb = HandlerScoreboard::default();
+    sb.record("h", 1000, Duration::from_secs(2));
+    assert_eq!(sb.rank("h"), 500);
+}
+
+#[test]
+fn a_span_is_handed_to_the_sink_only_when_committed_and_whole() {
+    let (h, mut disc) = Harness::build(&[], None, Duration::from_millis(1));
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let mut ctx = ctx!(disc, sink, now);
+    let mut buf = [0u8; SECTOR as usize * 2];
+    let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), false);
+    assert!(matches!(hit, ReadHit::Good));
+    assert!(sink.got.is_empty(), "an uncommitted read writes nothing");
+    let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), true);
+    assert!(matches!(hit, ReadHit::Good));
+    assert_eq!(sink.got.get(&0), Some(&(2 * SECTOR as usize)));
+}
+
+// A source that always transfers one sector less than asked.
+struct Short;
+impl SectorSource for Short {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        _recovery: bool,
+    ) -> Result<usize> {
+        let n = (count as usize - 1) * SECTOR as usize;
+        buf[..n].fill(7);
+        Ok(n)
+    }
+    fn capacity_sectors(&self) -> u32 {
+        0
+    }
+}
+
+#[test]
+fn a_short_transfer_is_a_failed_read_that_is_never_committed() {
+    let (h, _) = Harness::build(&[], None, Duration::from_millis(1));
+    let mut disc = Short;
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let mut ctx = ctx!(disc, sink, now);
+    let mut buf = [0u8; SECTOR as usize * 2];
+    for commit in [false, true] {
+        let hit = read_span_as(&mut ctx, &mut buf, 0, 2, ReadParams::fast(), commit);
+        assert!(matches!(hit, ReadHit::Bad), "commit={commit}");
+    }
+    assert!(sink.got.is_empty());
+}
+
+fn bisect_remaining(sectors: u64, dead: &[u32]) -> u64 {
+    let (h, mut disc) = Harness::build(dead, None, Duration::from_millis(1));
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let mut ctx = ctx!(disc, sink, now);
+    let mut bad = SubRanges::from_section(0, sectors * SECTOR);
+    let deadline = (ctx.now)() + Duration::from_secs(60);
+    let out = Bisect {
+        params: ReadParams::fast(),
+    }
+    .recover(&mut ctx, &mut bad, deadline);
+    assert_eq!(out, HandlerOutcome::Remaining);
+    bad.total_len()
+}
+
+#[test]
+fn bisect_searches_both_halves_around_a_dead_middle() {
+    assert_eq!(bisect_remaining(9, &[4]), SECTOR);
+}
+
+#[test]
+fn bisect_re_bisects_the_span_left_of_a_dead_edge_it_found_going_backward() {
+    assert_eq!(bisect_remaining(21, &[5]), SECTOR);
+}
+
+#[test]
+fn cache_prime_reads_an_island_in_whole_batches_inside_the_island() {
+    let (h, mut disc) = Harness::build(&[], None, Duration::from_millis(1));
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let mut ctx = ctx!(disc, sink, now);
+    let mut bad = SubRanges::from_section(0, 4 * SECTOR);
+    let deadline = (ctx.now)() + Duration::from_secs(10);
+    let out = CachePrime {
+        params: ReadParams::fast(),
+    }
+    .recover(&mut ctx, &mut bad, deadline);
+    assert_eq!(out, HandlerOutcome::Complete);
+    assert_eq!(h.read_count(), 1, "one read for the 4-sector island");
+}
+
+#[test]
+fn cache_prime_never_reads_past_a_multi_batch_island() {
+    let island = BATCH_SECTORS + 10;
+    let (h, mut disc) = Harness::build(&[], None, Duration::from_millis(1));
+    disc.capacity = island as u32;
+    let past_end = disc.past_end.clone();
+    let mut sink = RecordSink::default();
+    let now = h.now_fn();
+    let mut ctx = ctx!(disc, sink, now);
+    let mut bad = SubRanges::from_section(0, island * SECTOR);
+    let deadline = (ctx.now)() + Duration::from_secs(10);
+    let out = CachePrime {
+        params: ReadParams::fast(),
+    }
+    .recover(&mut ctx, &mut bad, deadline);
+    assert_eq!(out, HandlerOutcome::Complete);
+    assert_eq!(past_end.load(Ordering::Relaxed), 0);
+    assert_eq!(h.read_count(), 2);
+}
