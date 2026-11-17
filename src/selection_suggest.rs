@@ -28,6 +28,13 @@ pub struct Suggestion {
 // A new cluster starts where the next title runs more than 15% longer than the previous one.
 const CLUSTER_GAP_PERCENT: f64 = 115.0;
 
+// Per-invocation operation counts for deterministic regression tests.
+#[derive(Default)]
+struct Work {
+    #[cfg(test)]
+    shared_calls: usize,
+}
+
 // A title's content as merged `[start, end)` spans per unit; never empty.
 struct Coverage<'a> {
     spans: Vec<(&'a str, u64, u64)>,
@@ -61,7 +68,11 @@ impl<'a> Coverage<'a> {
         })
     }
 
-    fn shared(&self, other: &Self) -> u64 {
+    fn shared(&self, other: &Self, _work: &mut Work) -> u64 {
+        #[cfg(test)]
+        {
+            _work.shared_calls += 1;
+        }
         let mut sum = 0;
         for &(unit, start, end) in &self.spans {
             for &(theirs, other_start, other_end) in &other.spans {
@@ -74,8 +85,8 @@ impl<'a> Coverage<'a> {
     }
 
     // All of `other` is inside `self`, and `self` has more.
-    fn strictly_contains(&self, other: &Self) -> bool {
-        self.weight > other.weight && self.shared(other) == other.weight
+    fn strictly_contains(&self, other: &Self, work: &mut Work) -> bool {
+        self.weight > other.weight && self.shared(other, work) == other.weight
     }
 }
 
@@ -89,6 +100,16 @@ impl SelectionModel {
         audio: &StreamFilter,
         presentation: Option<&str>,
         min_secs: f64,
+    ) -> Suggestion {
+        self.suggest_episodes_with_work(audio, presentation, min_secs, &mut Work::default())
+    }
+
+    fn suggest_episodes_with_work(
+        &self,
+        audio: &StreamFilter,
+        presentation: Option<&str>,
+        min_secs: f64,
+        work: &mut Work,
     ) -> Suggestion {
         let scores = self.scores(audio, presentation);
         let candidates: Vec<usize> = (self.titles.iter())
@@ -113,7 +134,7 @@ impl SelectionModel {
         let mut play_alls = Vec::new();
         loop {
             let found: Vec<usize> = (live.iter().copied())
-                .filter(|&index| play_all(index, &live, &coverage, &self.titles))
+                .filter(|&index| play_all(index, &live, &coverage, &self.titles, work))
                 .collect();
             if found.is_empty() {
                 break;
@@ -138,7 +159,7 @@ impl SelectionModel {
                 let (Some(x), Some(y)) = (&coverage[live[a]], &coverage[live[b]]) else {
                     continue;
                 };
-                if x.shared(y).saturating_mul(2) >= x.weight.min(y.weight) {
+                if x.shared(y, work).saturating_mul(2) >= x.weight.min(y.weight) {
                     let (ra, rb) = (root(&mut group, a), root(&mut group, b));
                     group[ra.max(rb)] = ra.min(rb);
                 }
@@ -272,6 +293,7 @@ fn play_all(
     live: &[usize],
     coverage: &[Option<Coverage>],
     titles: &[SelectionTitle],
+    work: &mut Work,
 ) -> bool {
     let Some(outer) = &coverage[index] else {
         return false;
@@ -283,7 +305,7 @@ fn play_all(
         .filter(|&other| {
             coverage[other]
                 .as_ref()
-                .is_some_and(|inner| outer.strictly_contains(inner))
+                .is_some_and(|inner| outer.strictly_contains(inner, work))
         })
         .collect();
     inner.iter().enumerate().any(|(at, &a)| {
@@ -291,7 +313,7 @@ fn play_all(
             coverage[a]
                 .as_ref()
                 .unwrap()
-                .shared(coverage[b].as_ref().unwrap())
+                .shared(coverage[b].as_ref().unwrap(), work)
                 == 0
         })
     }) || boundary_partition(index, &inner, titles)
@@ -379,5 +401,40 @@ fn language_key(tag: &str) -> String {
     match crate::streams::stream_lang(tag) {
         Some(language) => language.to_639_3().to_string(),
         None => tag.trim().to_ascii_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod work_tests {
+    use super::*;
+    use libfreemkv::DiscTitle;
+    use libfreemkv::disc::ContentSegment;
+
+    #[test]
+    fn nested_presentations_bound_shared_coverage_work() {
+        const N: usize = 256;
+        let titles: Vec<_> = (0..N)
+            .map(|index| {
+                let mut title = DiscTitle::empty();
+                title.duration_secs = 1_000.0;
+                title.selection_evidence.segments = vec![ContentSegment {
+                    unit: "one".into(),
+                    start: 0,
+                    end: 10_000 + index as u64,
+                }];
+                title
+            })
+            .collect();
+        let model = SelectionModel::from_titles(&titles);
+        let mut work = Work::default();
+        let suggestion =
+            model.suggest_episodes_with_work(&StreamFilter::All, None, 600.0, &mut work);
+        assert!(suggestion.play_alls.is_empty());
+        assert!(
+            work.shared_calls <= 4 * N * N,
+            "{} shared computations exceed the {} bound for {N} nested presentations",
+            work.shared_calls,
+            4 * N * N
+        );
     }
 }
