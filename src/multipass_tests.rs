@@ -3427,7 +3427,9 @@ fn the_sweep_start_reports_the_progress_it_resumes_from_only_when_resuming() {
     assert_eq!(first_pass_start_good(Some(false)), 0);
 }
 
-struct TransportDown;
+struct TransportDown {
+    hard: bool,
+}
 impl libfreemkv::SectorSource for TransportDown {
     fn read_sectors(
         &mut self,
@@ -3436,6 +3438,11 @@ impl libfreemkv::SectorSource for TransportDown {
         _buf: &mut [u8],
         _recovery: bool,
     ) -> libfreemkv::Result<usize> {
+        if self.hard {
+            return Err(libfreemkv::Error::IoError {
+                source: std::io::Error::other("boom"),
+            });
+        }
         Err(libfreemkv::Error::ScsiError {
             opcode: libfreemkv::scsi::SCSI_READ_10,
             status: libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
@@ -3461,7 +3468,10 @@ impl crate::PassHost for Recovering {
     }
 }
 
-fn sweep_over_a_dead_transport(cancelled: bool) -> (crate::Result<MultipassResult>, u32) {
+fn sweep_over_a_dead_transport(
+    cancelled: bool,
+    hard: bool,
+) -> (crate::Result<MultipassResult>, u32) {
     let (_dir, iso) = scratch_iso("dead-transport");
     let disc = test_disc(256, vec![]);
     let opts = MultipassOpts {
@@ -3476,7 +3486,7 @@ fn sweep_over_a_dead_transport(cancelled: bool) -> (crate::Result<MultipassResul
         op.cancel();
     }
     let mut host = Recovering {
-        reader: TransportDown,
+        reader: TransportDown { hard },
         calls: 0,
     };
     let r = recover(
@@ -3494,14 +3504,21 @@ fn sweep_over_a_dead_transport(cancelled: bool) -> (crate::Result<MultipassResul
 
 #[test]
 fn a_recovered_transport_is_retried_only_up_to_the_attempt_cap() {
-    let (r, calls) = sweep_over_a_dead_transport(false);
+    let (r, calls) = sweep_over_a_dead_transport(false, false);
     assert!(r.is_err());
     assert_eq!(calls, 2, "one recovery per failed attempt, then the cap");
 }
 
 #[test]
 fn a_stopped_run_does_not_ask_the_host_to_recover_the_transport() {
-    let (r, calls) = sweep_over_a_dead_transport(true);
+    let (r, calls) = sweep_over_a_dead_transport(true, false);
+    assert!(r.is_err());
+    assert_eq!(calls, 0);
+}
+
+#[test]
+fn a_hard_read_failure_is_not_a_transport_to_recover() {
+    let (r, calls) = sweep_over_a_dead_transport(false, true);
     assert!(r.is_err());
     assert_eq!(calls, 0);
 }
