@@ -317,3 +317,46 @@ fn legacy_banked_keys_pass_no_engine_gate() {
         assert!(!iso(n).exists(), "{n}: refused before any output");
     }
 }
+
+#[test]
+fn a_corrupt_mapfile_restarts_the_copy_and_an_unreadable_one_fails_it() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let opts = CopyOptions {
+        decrypt: false,
+        ..Default::default()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("corrupt.iso");
+    let map = fx.disc.mapfile_for(&iso);
+    std::fs::write(&map, [0xff, 0xfe, 0xfd]).unwrap();
+    let r = super::copy(&fx.disc, &mut fx.source(), &iso, &opts).expect("restarts clean");
+    assert!(r.complete);
+
+    let iso = dir.path().join("unreadable.iso");
+    std::fs::create_dir(fx.disc.mapfile_for(&iso)).unwrap();
+    assert!(super::copy(&fx.disc, &mut fx.source(), &iso, &opts).is_err());
+}
+
+#[test]
+fn staged_titles_are_unchecked_without_a_readable_mapfile_verdict() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("x.iso");
+    assert!(super::ensure_titles_staged(&iso, &fx.disc, &[0]).is_ok());
+    std::fs::create_dir(super::mapfile::mapfile_path_for(&iso)).unwrap();
+    assert!(super::ensure_titles_staged(&iso, &fx.disc, &[0]).is_err());
+}
+
+#[test]
+fn only_a_stop_is_not_a_pass_failure() {
+    use super::SendStall;
+    assert!(SendStall::Halted.pass_error().is_none());
+    assert!(matches!(
+        SendStall::Stalled.pass_error(),
+        Some(libfreemkv::Error::PipelineJoinTimeout)
+    ));
+    assert!(matches!(
+        SendStall::ConsumerGone.pass_error(),
+        Some(libfreemkv::Error::PipelineConsumerGone)
+    ));
+}
