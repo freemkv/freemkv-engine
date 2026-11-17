@@ -1648,3 +1648,203 @@ fn a_real_mux_failing_after_its_open_removes_its_output() {
     assert!(matches!(r, RipOutcome::Failed { .. }), "{r:?}");
     assert!(!out.exists(), "the failed title's output is removed");
 }
+
+#[test]
+fn activity_reports_only_real_growth_spaced_apart_unless_last() {
+    let mut a = Activity::new(Duration::from_secs(3600));
+    assert!(!a.due(0, false), "no growth is no progress");
+    assert!(a.due(10, false), "the first growth reports at once");
+    assert!(!a.due(20, false), "too soon after the last report");
+    assert!(a.due(20, true), "the last one is always reported");
+    assert!(!a.due(20, true), "no growth, nothing to report");
+}
+
+#[test]
+fn lock_beat_refreshes_the_mtime_at_most_once_per_interval() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("f");
+    std::fs::write(&path, b"x").unwrap();
+    let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    let old = std::time::UNIX_EPOCH + Duration::from_secs(1_000);
+    file.set_modified(old).unwrap();
+    let mut beat = LockBeat::new(file.try_clone().ok(), Duration::from_secs(3600));
+    beat.progressed();
+    let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert!(first > old, "the first beat refreshes");
+    file.set_modified(old).unwrap();
+    beat.progressed();
+    let second = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(
+        second, old,
+        "a second beat inside the interval does nothing"
+    );
+}
+
+#[test]
+fn the_final_sync_step_is_always_reported() {
+    struct TwoSteps;
+    impl RemuxIo for TwoSteps {
+        fn sync(
+            &self,
+            _f: &std::fs::File,
+            _h: &Halt,
+            on: &mut dyn FnMut(u64, u64),
+        ) -> io::Result<()> {
+            on(5, 10);
+            on(10, 10);
+            Ok(())
+        }
+        fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+            OsRemuxIo.open_read(path)
+        }
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+            OsRemuxIo.create_new(path)
+        }
+        fn timing(&self) -> RemuxTiming {
+            RemuxTiming::default()
+        }
+    }
+    #[derive(Default)]
+    struct Done(Mutex<Vec<u64>>);
+    impl Sink for Done {
+        fn progress(&self, p: &crate::sink::Progress) {
+            self.0.lock().unwrap().push(p.bytes_done);
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p");
+    std::fs::write(&path, b"x").unwrap();
+    let timing = RemuxTiming {
+        activity_every: Duration::from_secs(3600),
+        lock_beat: Duration::from_secs(3600),
+        ..RemuxTiming::default()
+    };
+    let sink = Done::default();
+    let halt = EngineHalt::new(&Halt::new(), None);
+    durable_sync(&TwoSteps, &path, &halt, &sink, timing).unwrap();
+    assert_eq!(*sink.0.lock().unwrap(), [5, 10]);
+}
+
+#[test]
+fn a_stale_partial_is_removed_and_a_missing_one_is_fine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.mkv.partial");
+    std::fs::write(&path, b"x").unwrap();
+    remove_stale_partial(&path).unwrap();
+    assert!(!path.exists());
+    remove_stale_partial(&path).unwrap();
+    let as_dir = dir.path().join("d");
+    std::fs::create_dir(&as_dir).unwrap();
+    assert!(remove_stale_partial(&as_dir).is_err());
+}
+
+#[test]
+fn a_partial_file_guard_removes_its_file_unless_disarmed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.partial");
+    std::fs::write(&path, b"x").unwrap();
+    drop(PartialFile(Some(&path)));
+    assert!(!path.exists());
+    std::fs::write(&path, b"x").unwrap();
+    let mut guard = PartialFile(Some(&path));
+    guard.disarm();
+    drop(guard);
+    assert!(path.exists());
+}
+
+#[test]
+fn the_runtime_slack_edge_is_inclusive() {
+    let probe = libfreemkv::MkvProbe {
+        tracks: vec![libfreemkv::MkvProbeTrack {
+            number: 1,
+            kind: libfreemkv::MkvTrackKind::Video,
+            codec_id: "V_MPEG4/ISO/AVC".into(),
+            language: "und".into(),
+        }],
+        last_cue_secs: Some(110.0),
+        ..Default::default()
+    };
+    assert!(check_probe(Path::new("a"), &title(100.0), probe.clone()).is_ok());
+    let low = libfreemkv::MkvProbe {
+        last_cue_secs: Some(90.0),
+        ..probe
+    };
+    assert!(check_probe(Path::new("a"), &title(100.0), low).is_ok());
+}
+
+#[test]
+fn a_title_index_one_past_the_end_is_out_of_range() {
+    let disc = libfreemkv::Disc {
+        volume_id: String::new(),
+        meta_title: None,
+        format: libfreemkv::DiscFormat::BluRay,
+        capacity_sectors: 1,
+        capacity_bytes: 2048,
+        layers: 1,
+        titles: vec![title(10.0), title(7200.0)],
+        region: libfreemkv::disc::DiscRegion::Free,
+        aacs: None,
+        css: None,
+        encrypted: false,
+        aacs_error: None,
+        css_error: None,
+        layer_map: None,
+        content_format: libfreemkv::ContentFormat::BdTs,
+    };
+    assert!(pick_title(&disc, Some(2), &StreamFilter::All).is_err());
+    assert_eq!(pick_title(&disc, Some(1), &StreamFilter::All).unwrap(), 1);
+}
+
+#[test]
+fn a_replacing_publish_that_hits_an_existing_name_is_a_plain_io_error() {
+    struct Racy;
+    impl RemuxIo for Racy {
+        fn sync(&self, f: &std::fs::File, h: &Halt, p: &mut dyn FnMut(u64, u64)) -> io::Result<()> {
+            OsRemuxIo.sync(f, h, p)
+        }
+        fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>> {
+            OsRemuxIo.open_read(path)
+        }
+        fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
+            OsRemuxIo.create_new(path)
+        }
+        fn timing(&self) -> RemuxTiming {
+            RemuxTiming::default()
+        }
+        fn replace(&self, _landing: &Path, _target: &Path) -> io::Result<()> {
+            Err(io::ErrorKind::AlreadyExists.into())
+        }
+        fn publish(&self, _landing: &Path, _target: &Path) -> io::Result<()> {
+            Err(io::ErrorKind::AlreadyExists.into())
+        }
+    }
+    let target = PathBuf::from("/nowhere/Movie.mkv");
+    let landing = PathBuf::from("/nowhere/Movie.mkv.partial");
+    let replacing = land(&landing, &job(target.clone(), true), &Racy).unwrap_err();
+    assert_eq!(replacing.kind(), io::ErrorKind::AlreadyExists);
+    assert!(!replacing.to_string().starts_with("E9084"), "{replacing}");
+    let publishing = land(&landing, &job(target, false), &Racy).unwrap_err();
+    assert!(publishing.to_string().starts_with("E9084"), "{publishing}");
+}
+
+#[test]
+fn a_refusal_with_no_planned_title_starts_no_title() {
+    let events = Events::default();
+    let dest = |i: usize| format!("t{i}.mkv");
+    let out = refused_up_front(
+        libfreemkv::Error::NoStreams,
+        &MuxPlan::new(Vec::new()),
+        &dest,
+        &events,
+    );
+    assert!(matches!(out, RipOutcome::Failed { .. }));
+    assert!(events.0.lock().unwrap().is_empty());
+    let out = refused_up_front(
+        libfreemkv::Error::NoStreams,
+        &MuxPlan::new(vec![3]),
+        &dest,
+        &events,
+    );
+    assert!(matches!(out, RipOutcome::Failed { title_index: 3, .. }));
+    assert_eq!(*events.0.lock().unwrap(), ["start:3", "done:3:false"]);
+}

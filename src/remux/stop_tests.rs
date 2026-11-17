@@ -1164,3 +1164,36 @@ fn remux_staged_copy_that_fails_verify_keeps_old_target() {
     untouched(&target, mtime);
     assert!(!stage.exists());
 }
+
+#[derive(Default)]
+struct Logs(Mutex<Vec<String>>);
+impl Sink for Logs {
+    fn log(&self, _level: Level, msg: &str) {
+        self.0.lock().unwrap().push(msg.to_string());
+    }
+}
+
+// The folder-sync warning names a Stop only when it was one.
+#[cfg(unix)]
+#[test]
+fn the_folder_sync_warning_names_a_stop_only_when_it_was_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let op = Halt::new();
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Stop(op.clone());
+    let logs = Logs::default();
+    run(&target, &logs, &op, &rio, writes(good(), true)).unwrap();
+    let said = logs.0.lock().unwrap().join("\n");
+    assert!(said.contains("stopped during the folder sync"), "{said}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let (target, _) = old_target(dir.path());
+    let mut rio = FakeIo::new(SyncPlan::default(), ReadPlan::default());
+    rio.dir_sync = DirSync::Fail;
+    let logs = Logs::default();
+    run(&target, &logs, &Halt::new(), &rio, writes(good(), true)).unwrap();
+    let said = logs.0.lock().unwrap().join("\n");
+    assert!(said.contains("folder sync failed"), "{said}");
+    assert!(!said.contains("stopped during"), "{said}");
+}
