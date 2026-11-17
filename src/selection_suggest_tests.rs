@@ -889,6 +889,38 @@ fn shared_boundary_rejects_incomplete_repeated_reordered_and_ambiguous_bodies() 
 }
 
 #[test]
+fn shared_boundary_rejects_locally_ambiguous_complete_partition() {
+    let a = ("00001", 0, 20);
+    let b = ("00002", 0, 20);
+    let c = ("00003", 0, 20);
+    let tail = ("00004", 0, 1);
+    let titles = vec![
+        bd(1, 81.0, &[a, b, a, c, tail], "eng"),
+        bd(2, 41.0, &[a, b, tail], "eng"),
+        bd(3, 21.0, &[a, tail], "eng"),
+        bd(4, 21.0, &[c, tail], "eng"),
+    ];
+    // Greedily choosing AB yields a complete AB+A+C partition, but the opening
+    // also matches A: conservatively reject this locally ambiguous choice.
+    assert!(!suggest(&titles).play_alls.contains(&0));
+}
+
+#[test]
+fn shared_boundary_rejects_reordered_opening_with_matching_coverage() {
+    let intro_one = ("00001", 0, 1);
+    let intro_two = ("00002", 0, 1);
+    let a = ("00003", 0, 40);
+    let b = ("00004", 0, 40);
+    let tail = ("00005", 0, 1);
+    let titles = vec![
+        bd(1, 83.0, &[intro_two, intro_one, a, b, tail], "eng"),
+        bd(2, 43.0, &[intro_one, intro_two, a, tail], "eng"),
+        bd(3, 43.0, &[intro_one, intro_two, b, tail], "eng"),
+    ];
+    assert!(!suggest(&titles).play_alls.contains(&0));
+}
+
+#[test]
 fn shared_boundary_requires_exact_unit_start_and_end_even_when_coverage_contains_it() {
     let a = ("00001", 0, 40);
     let b = ("00002", 0, 40);
