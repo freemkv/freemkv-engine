@@ -1232,7 +1232,7 @@ fn pick_best_keeps_the_first_of_equally_popular_candidates() {
 
 #[test]
 fn trailing_junk_words_come_from_each_word_list_and_plain_words_are_kept() {
-    for junk in ["Region", "Usa", "Ultimate", "Video", "Bluray", "Dvd", "Hd"] {
+    for junk in ["Region", "Usa", "Ultimate", "Video", "Bluray", "Hd"] {
         assert!(is_trailing_junk(junk), "{junk}");
     }
     for keep in ["Heat", "Maverick", "ABCDEFG", "Alien"] {

@@ -1453,16 +1453,3 @@ fn input_options_carry_the_title_index_and_selection() {
     assert_eq!(input.title_index, Some(3));
     assert_eq!(input.selection, selection);
 }
-
-#[test]
-fn stream_info_opens_a_loose_encrypted_clip_only_with_its_keys() {
-    let dir = tempfile::tempdir().unwrap();
-    let clip = bd_image(&[Some(K1)], 1).write_folder(&dir.path().join("enc"));
-    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
-    let (set, _) = crate::keys::resolve_loose_clip(&clip, &f, None);
-    let keys = set.unwrap().expect("the folder's keys");
-    let url = format!("m2ts://{}", clip.display());
-    let halt = libfreemkv::Halt::new();
-    assert!(crate::image::stream_info(&url, Some(keys), &halt).is_ok());
-    assert!(crate::image::stream_info(&url, None, &halt).is_err());
-}

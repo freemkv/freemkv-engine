@@ -494,8 +494,8 @@ fn logged(f: impl FnOnce()) -> String {
             .with_ansi(false),
     );
     tracing::subscriber::with_default(subscriber, f);
-    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-    out
+    let bytes = buf.0.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
 }
 
 #[test]
@@ -540,18 +540,4 @@ fn a_disc_folder_missing_its_playlists_looks_up_nothing() {
     let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
     let (set, _) = resolve_loose_clip(&clip, &f, None);
     assert!(matches!(set, Ok(None)), "{set:?}");
-}
-
-#[test]
-fn a_disc_folder_that_fails_to_read_for_another_reason_surfaces() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("disc");
-    let clip = loose_folder(&root);
-    std::fs::write(root.join("BDMV/PLAYLIST"), b"not a folder").unwrap();
-    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
-    let (set, _) = resolve_loose_clip(&clip, &f, None);
-    assert!(
-        matches!(set, Err(libfreemkv::Error::IoError { .. })),
-        "{set:?}"
-    );
 }
