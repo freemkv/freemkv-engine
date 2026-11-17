@@ -349,3 +349,26 @@ fn only_a_language_preference_resolves_stream_tags() {
     });
     assert_eq!(scored, audio_streams);
 }
+
+#[test]
+fn main_title_keeps_title_zero_on_a_tie_and_switches_on_a_better_score() {
+    for shape in [Shape::Dvd, Shape::Bd] {
+        let model = SelectionModel::from_titles(&titles(shape, BRANCH));
+        assert_eq!(model.main_title(&StreamFilter::All, None), Some(0));
+        assert_eq!(model.main_title(&langs(&["deu"]), None), Some(1));
+    }
+}
+
+#[test]
+fn resolve_explicit_drops_the_index_one_past_the_end() {
+    let model = SelectionModel::from_titles(&titles(Shape::Bd, BRANCH));
+    for episodes in [false, true] {
+        assert_eq!(
+            model.resolve_explicit(&[2, 1], episodes),
+            Resolved::Run {
+                titles: vec![1],
+                episodes
+            }
+        );
+    }
+}

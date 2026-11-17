@@ -1096,3 +1096,22 @@ fn shared_boundary_suggestions_preserve_main_movie_and_explicit_picks() {
     }
     assert_eq!(snapshot, model(&titles));
 }
+
+#[test]
+fn a_wrapper_with_three_segment_boundaries_is_a_play_all() {
+    let a = ("00010", 0, 40);
+    let b = ("00020", 0, 40);
+    let intro = [("00001", 0, 1), ("00002", 0, 1), ("00003", 0, 1)];
+    let outro = [("00030", 0, 1), ("00031", 0, 1), ("00032", 0, 1)];
+    let wrap = [&intro[..], &[a, b], &outro[..]].concat();
+    let first = [&intro[..], &[a], &outro[..]].concat();
+    let second = [&intro[..], &[b], &outro[..]].concat();
+    let titles = vec![
+        bd(1, 84.0, &wrap, "eng"),
+        bd(2, 44.0, &first, "eng"),
+        bd(3, 44.0, &second, "eng"),
+    ];
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.play_alls, vec![0]);
+    assert_eq!(suggestion.suggested, vec![1, 2]);
+}

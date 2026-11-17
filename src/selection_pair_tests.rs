@@ -276,3 +276,36 @@ fn disjoint_pair_crosses_word_boundary_and_excludes_removed_titles() {
     assert_eq!(suggestion.suggested, vec![1, 67]);
     assert_eq!(suggestion.alternates, vec![Alternate { index: 2, of: 1 }]);
 }
+
+fn one_segment(start: u64, end: u64) -> DiscTitle {
+    let mut title = DiscTitle::empty();
+    title.duration_secs = 1_000.0;
+    title.selection_evidence.segments = vec![ContentSegment {
+        unit: "one".into(),
+        start,
+        end,
+    }];
+    title
+}
+
+#[test]
+fn an_empty_span_is_not_coverage() {
+    let model = SelectionModel::from_titles(&[one_segment(5, 5)]);
+    assert!(Coverage::of(&model.titles[0]).is_none());
+}
+
+#[test]
+fn equal_coverage_does_not_strictly_contain() {
+    let model =
+        SelectionModel::from_titles(&[one_segment(0, 10), one_segment(0, 10), one_segment(0, 4)]);
+    let mut work = Work::default();
+    let (a, b, c) = (
+        Coverage::of(&model.titles[0]).unwrap(),
+        Coverage::of(&model.titles[1]).unwrap(),
+        Coverage::of(&model.titles[2]).unwrap(),
+    );
+    assert!(!a.strictly_contains(&b, &mut work));
+    assert!(a.strictly_contains(&c, &mut work));
+    assert!(!c.strictly_contains(&a, &mut work));
+    assert_eq!(work.shared_calls, 1, "only the heavier side is measured");
+}
