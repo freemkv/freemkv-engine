@@ -21,7 +21,7 @@ pub struct Suggestion {
     /// Every cluster of 2+ like titles, ordered by their first title.
     pub clusters: Vec<Vec<usize>>,
     pub alternates: Vec<Alternate>,
-    /// Candidates that play 2+ other, pairwise disjoint candidates, and their aliases.
+    /// Candidates that contain independent programs, and their aliases.
     pub play_alls: Vec<usize>,
 }
 
@@ -82,7 +82,8 @@ impl<'a> Coverage<'a> {
 impl SelectionModel {
     /// A suggested episode set: candidates of at least `min_secs` without exact aliases,
     /// play-alls and partial-overlap variants (kept: the `audio`/`presentation` match, else
-    /// the earlier), clustered by video and primary audio language and by 15% duration gaps.
+    /// canonical scan presentation), clustered by video and primary audio language and
+    /// by 15% duration gaps.
     pub fn suggest_episodes(
         &self,
         audio: &StreamFilter,
@@ -112,7 +113,7 @@ impl SelectionModel {
         let mut play_alls = Vec::new();
         loop {
             let found: Vec<usize> = (live.iter().copied())
-                .filter(|&index| play_all(index, &live, &coverage))
+                .filter(|&index| play_all(index, &live, &coverage, &self.titles))
                 .collect();
             if found.is_empty() {
                 break;
@@ -152,9 +153,11 @@ impl SelectionModel {
                 .filter(|&other| root(&mut group, other) == slot)
                 .map(|other| live[other])
                 .collect();
-            // `live` is in play order, so the first best score is the earlier title.
+            // Match exact-alias ties: keep the canonical scan presentation, then order episodes.
             let best = members.iter().copied().fold(members[0], |best, index| {
-                match scores[index] > scores[best] {
+                match scores[index] > scores[best]
+                    || (scores[index] == scores[best] && index < best)
+                {
                     true => index,
                     false => best,
                 }
@@ -262,18 +265,105 @@ impl SelectionModel {
     }
 }
 
-// Two or more other live candidates lie strictly inside `index`, pairwise disjoint.
-fn play_all(index: usize, live: &[usize], coverage: &[Option<Coverage>]) -> bool {
+// One independent pair establishes a composite; another cut of a constituent cannot
+// veto it. Shared boundary cells need an exact ordered partition, not a size tolerance.
+fn play_all(
+    index: usize,
+    live: &[usize],
+    coverage: &[Option<Coverage>],
+    titles: &[SelectionTitle],
+) -> bool {
     let Some(outer) = &coverage[index] else {
         return false;
     };
-    let inner: Vec<&Coverage> = (live.iter())
-        .filter(|&&other| other != index)
-        .filter_map(|&other| coverage[other].as_ref())
-        .filter(|inner| outer.strictly_contains(inner))
+    let inner: Vec<usize> = live
+        .iter()
+        .copied()
+        .filter(|&other| other != index)
+        .filter(|&other| {
+            coverage[other]
+                .as_ref()
+                .is_some_and(|inner| outer.strictly_contains(inner))
+        })
         .collect();
-    inner.len() >= 2
-        && (inner.iter().enumerate()).all(|(n, a)| inner[n + 1..].iter().all(|b| a.shared(b) == 0))
+    inner.iter().enumerate().any(|(at, &a)| {
+        inner[at + 1..].iter().any(|&b| {
+            coverage[a]
+                .as_ref()
+                .unwrap()
+                .shared(coverage[b].as_ref().unwrap())
+                == 0
+        })
+    }) || boundary_partition(index, &inner, titles)
+}
+
+// Compare authored program bodies with their common opening/closing segments once in
+// the wrapper. Only selection compares these slices: every output retains its full cells.
+fn boundary_partition(outer: usize, inner: &[usize], titles: &[SelectionTitle]) -> bool {
+    if inner.len() < 2 {
+        return false;
+    }
+    let segments = |index: usize| titles[index].evidence.segments.as_slice();
+    let first = segments(inner[0]);
+    if first.is_empty() || inner.iter().any(|&index| segments(index).is_empty()) {
+        return false;
+    }
+    let prefix = (0..first.len())
+        .take_while(|&at| {
+            inner
+                .iter()
+                .all(|&index| segments(index).get(at) == Some(&first[at]))
+        })
+        .count();
+    let suffix = (0..first.len() - prefix)
+        .take_while(|&at| {
+            inner.iter().all(|&index| {
+                let other = segments(index);
+                other.len() > prefix + at
+                    && other[other.len() - 1 - at] == first[first.len() - 1 - at]
+            })
+        })
+        .count();
+    if prefix + suffix == 0 {
+        return false;
+    }
+    let whole = segments(outer);
+    if whole.len() <= prefix + suffix
+        || !whole.starts_with(&first[..prefix])
+        || !whole.ends_with(&first[first.len() - suffix..])
+    {
+        return false;
+    }
+    let mut bodies = Vec::new();
+    for &index in inner {
+        let sequence = segments(index);
+        if sequence.len() <= prefix + suffix {
+            return false;
+        }
+        let body = &sequence[prefix..sequence.len() - suffix];
+        if !bodies.contains(&body) {
+            bodies.push(body);
+        }
+    }
+    let mut remaining = &whole[prefix..whole.len() - suffix];
+    let mut used = vec![false; bodies.len()];
+    let mut count = 0;
+    while !remaining.is_empty() {
+        let mut matches = bodies
+            .iter()
+            .enumerate()
+            .filter(|&(index, body)| !used[index] && remaining.starts_with(body));
+        let Some((index, body)) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        used[index] = true;
+        count += 1;
+        remaining = &remaining[body.len()..];
+    }
+    count >= 2 && used.iter().all(|&used| used)
 }
 
 fn root(group: &mut [usize], mut slot: usize) -> usize {

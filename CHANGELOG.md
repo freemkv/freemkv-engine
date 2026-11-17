@@ -4,6 +4,12 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [Unreleased]
+
+### Fixed
+
+- Shared episode suggestions for CLI, GUI and server callers recognize Play All presentations whose standalone programs retain an identical opening or ending. The comparison requires an exact ordered partition and keeps every selected title's original content. Alternate cuts no longer hide independent constituents, and language-neutral variant choices follow the canonical scan presentation consistently. Suggestions still require operator confirmation.
+
 ## [1.8.9] — 2026-11-11
 
 ### Added
