@@ -278,3 +278,64 @@ fn a_staged_title_with_unread_sectors_is_refused() {
     stage(Some(mapfile::SectorStatus::Finished));
     ensure_titles_staged(&iso, &d, &[0]).expect("a fully staged title passes");
 }
+
+// What a scoped sweep leaves in the map's scope, from a map in the given state.
+fn scope_after(
+    prepare: impl FnOnce(&mut mapfile::Mapfile, u64),
+    resume: bool,
+) -> Option<Vec<(u64, u64)>> {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("s.iso");
+    let sectors = 8192u32;
+    let total = sectors as u64 * 2048;
+    let d = disc(sectors);
+    std::fs::write(&iso, vec![0xAAu8; total as usize]).unwrap();
+    {
+        let mut m = mapfile::Mapfile::create(&d.mapfile_for(&iso), total, "t").unwrap();
+        prepare(&mut m, total);
+        m.flush().unwrap();
+    }
+    sweep_scoped(
+        &d,
+        &mut reader(sectors, |_| None),
+        &iso,
+        &opts(resume, true),
+        &[(6000, 100)],
+    )
+    .unwrap();
+    let m = mapfile::Mapfile::load(&d.mapfile_for(&iso)).unwrap();
+    m.scope().map(<[_]>::to_vec)
+}
+
+#[test]
+fn a_scoped_resume_of_a_whole_disc_map_with_progress_leaves_it_whole() {
+    let scope = scope_after(
+        |m, total| {
+            m.record(0, total / 2, mapfile::SectorStatus::Finished)
+                .unwrap()
+        },
+        true,
+    );
+    assert_eq!(scope, None);
+}
+
+#[test]
+fn a_scoped_sweep_of_an_untouched_map_stages_its_scope() {
+    let scope = scope_after(|_, _| {}, true).expect("the scope is recorded");
+    assert_eq!(scope, [(6000 * 2048, 100 * 2048)]);
+}
+
+#[test]
+fn a_scoped_resume_of_a_staged_map_adds_its_scope_to_the_earlier_one() {
+    let scope = scope_after(
+        |m, total| {
+            m.set_scope(vec![(0, 100 * 2048)]);
+            m.record(0, 100 * 2048, mapfile::SectorStatus::Finished)
+                .unwrap();
+            assert!(total > 0);
+        },
+        true,
+    )
+    .expect("still staged");
+    assert_eq!(scope, [(0, 100 * 2048), (6000 * 2048, 100 * 2048)]);
+}
