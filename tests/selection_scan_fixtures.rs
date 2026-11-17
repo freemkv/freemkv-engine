@@ -25,6 +25,8 @@ struct ScanFixture {
     label: String,
     source: String,
     expected: Vec<usize>,
+    suggested: Vec<usize>,
+    clusters: Vec<Vec<usize>>,
     play_alls: Vec<usize>,
     titles: Vec<ScanTitle>,
 }
@@ -146,11 +148,15 @@ fn check_disc(label: &str, source: &str, expected: &[usize], play_all: usize) {
             },
             "{label} {language:?}"
         );
+        // Authored picks and heuristic suggestions are independent: D3's native
+        // captures resolve its two authored episodes with no suggested cluster.
         let suggestion = model.suggest_episodes(&audio, language, 600.0);
-        assert_eq!(suggestion.suggested, expected, "{label} {language:?}");
         assert_eq!(
-            suggestion.clusters,
-            vec![expected.to_vec()],
+            suggestion.suggested, fixture.suggested,
+            "{label} {language:?}"
+        );
+        assert_eq!(
+            suggestion.clusters, fixture.clusters,
             "{label} {language:?}"
         );
         assert_eq!(suggestion.play_alls, [play_all], "{label} {language:?}");
