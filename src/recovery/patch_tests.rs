@@ -1140,3 +1140,56 @@ fn skipped_damage_does_not_hold_the_bar_short() {
     );
     assert_eq!(*done.lock().unwrap(), Some((3 * 2048, 3 * 2048)));
 }
+
+fn sink_over(dir: &std::path::Path) -> (PatchSink, Arc<Mutex<SharedPatchState>>) {
+    let iso = dir.join("out.iso");
+    std::fs::write(&iso, vec![0u8; 8192]).unwrap();
+    let map = Mapfile::create(&dir.join("out.map"), 8192, "test").unwrap();
+    PatchSink::new(&iso, map, true, None).unwrap()
+}
+
+fn good_bytes(shared: &Mutex<SharedPatchState>) -> u64 {
+    lock_snapshot(shared).stats.bytes_good
+}
+
+#[test]
+fn the_snapshot_follows_the_map_when_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sink, shared) = sink_over(dir.path());
+    assert_eq!(good_bytes(&shared), 0);
+    sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+    assert_eq!(good_bytes(&shared), 0, "recording alone does not publish");
+    sink.publish_now();
+    assert_eq!(good_bytes(&shared), 2048);
+}
+
+#[test]
+fn republishing_is_throttled_unless_forced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sink, shared) = sink_over(dir.path());
+    sink.map.record(0, 2048, SectorStatus::Finished).unwrap();
+    sink.republish(false);
+    assert_eq!(good_bytes(&shared), 2048, "the first one publishes");
+    sink.map.record(2048, 2048, SectorStatus::Finished).unwrap();
+    sink.republish(false);
+    assert_eq!(good_bytes(&shared), 2048, "the next is inside the cadence");
+    sink.republish(true);
+    assert_eq!(good_bytes(&shared), 4096, "a forced one always publishes");
+}
+
+// A device that cannot sync (/dev/null) is never synced, even once the map is due.
+#[cfg(unix)]
+#[test]
+fn a_non_regular_output_is_never_synced() {
+    let dir = tempfile::tempdir().unwrap();
+    let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
+    let (mut sink, _) =
+        PatchSink::new(std::path::Path::new("/dev/null"), map, false, None).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert!(sink.map.persist_due());
+    let item = PatchItem::Recovered {
+        pos: 0,
+        buf: vec![0u8; 2048],
+    };
+    assert!(sink.apply(item).is_ok());
+}
