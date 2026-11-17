@@ -947,3 +947,30 @@ fn the_zone_entry_cooldown_outranks_the_streak_escalation() {
         "the escalation branch must not also run"
     );
 }
+
+#[test]
+fn the_damage_window_holds_exactly_its_cap() {
+    let mut ctx = ReadCtx::for_sweep(32);
+    let cap = ctx.damage_window_max;
+    for n in 1..=cap + 4 {
+        ctx.on_success();
+        assert_eq!(ctx.damage_window.len(), n.min(cap), "after {n} reads");
+    }
+    assert_eq!(ctx.total_reads_ok, cap as u64 + 4);
+}
+
+#[test]
+fn every_error_and_every_jump_is_counted() {
+    let mut ctx = ReadCtx::for_sweep(32);
+    assert!(matches!(
+        handle_read_error(&medium_err(), &mut ctx),
+        ReadAction::JumpAhead { .. }
+    ));
+    assert_eq!((ctx.total_errors, ctx.jumps_taken), (1, 1));
+    ctx.on_success();
+    assert!(matches!(
+        handle_read_error(&hardware_err(), &mut ctx),
+        ReadAction::JumpAhead { .. }
+    ));
+    assert_eq!((ctx.total_errors, ctx.jumps_taken), (2, 2));
+}
