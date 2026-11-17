@@ -468,3 +468,90 @@ fn a_loose_clip_scan_honours_the_stop() {
     assert_eq!(scans.get(), 0, "the stopped scan does no work");
     assert_eq!(calls.len(), 0);
 }
+
+#[derive(Clone, Default)]
+struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// The text `f` logs on this thread.
+fn logged(f: impl FnOnce()) -> String {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    // A second live dispatcher keeps callsite interest from being cached as `never`.
+    let _second = tracing::Dispatch::new(tracing_subscriber::registry());
+    let buf = LogBuf::default();
+    let sink = buf.clone();
+    let subscriber = tracing_subscriber::registry().with(
+        tracing_subscriber::fmt::layer()
+            .with_writer(move || sink.clone())
+            .with_ansi(false),
+    );
+    tracing::subscriber::with_default(subscriber, f);
+    let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+    out
+}
+
+#[test]
+fn a_dropped_key_url_is_warned_and_a_kept_one_is_not() {
+    let url = |u: &str| KeyParams {
+        key_url: Some(u.into()),
+        ..Default::default()
+    };
+    let out = logged(|| warn_dropped_url(&url("http://keys.example.test/k")));
+    assert!(out.contains("key_url dropped"), "{out}");
+    assert!(
+        !out.contains("keys.example.test"),
+        "the URL is never logged: {out}"
+    );
+    let out = logged(|| warn_dropped_url(&url("https://keys.example.test/k")));
+    assert!(!out.contains("key_url dropped"), "{out}");
+}
+
+#[test]
+fn the_resolved_key_status_is_logged_as_counts() {
+    let out = logged(|| log_status(&KeyRing::none(), "disc"));
+    assert!(out.contains("keys: resolved up front"), "{out}");
+    assert!(
+        out.contains("scope=disc") || out.contains("scope=\"disc\""),
+        "{out}"
+    );
+}
+
+// A disc-shaped folder (AACS/ and BDMV/STREAM/) holding a loose clip.
+fn loose_folder(root: &std::path::Path) -> std::path::PathBuf {
+    std::fs::create_dir_all(root.join("AACS")).unwrap();
+    std::fs::create_dir_all(root.join("BDMV/STREAM")).unwrap();
+    let clip = root.join("BDMV/STREAM/00001.m2ts");
+    std::fs::write(&clip, b"").unwrap();
+    clip
+}
+
+#[test]
+fn a_disc_folder_missing_its_playlists_looks_up_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = loose_folder(&dir.path().join("disc"));
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let (set, _) = resolve_loose_clip(&clip, &f, None);
+    assert!(matches!(set, Ok(None)), "{set:?}");
+}
+
+#[test]
+fn a_disc_folder_that_fails_to_read_for_another_reason_surfaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("disc");
+    let clip = loose_folder(&root);
+    std::fs::write(root.join("BDMV/PLAYLIST"), b"not a folder").unwrap();
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let (set, _) = resolve_loose_clip(&clip, &f, None);
+    assert!(
+        matches!(set, Err(libfreemkv::Error::IoError { .. })),
+        "{set:?}"
+    );
+}
