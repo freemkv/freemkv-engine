@@ -1258,3 +1258,40 @@ fn a_selection_needing_review_is_an_error_with_its_candidates() {
         Ok(vec![])
     );
 }
+
+#[test]
+fn error_data_is_the_text_after_the_code() {
+    assert_eq!(
+        error_data(&std::io::Error::other("E7022: abcdef")),
+        "abcdef"
+    );
+    assert_eq!(error_data(&std::io::Error::other("E7022")), "");
+    assert_eq!(error_data(&std::io::Error::other("plain")), "");
+}
+
+#[test]
+fn a_skipped_title_says_whether_it_was_empty() {
+    #[derive(Default)]
+    struct Skips(std::sync::Mutex<Vec<(usize, bool)>>);
+    impl Sink for Skips {
+        fn event(&self, e: &crate::Event<'_>) {
+            if let crate::Event::TitleSkipped { idx, empty } = e {
+                self.0.lock().unwrap().push((*idx, *empty));
+            }
+        }
+    }
+    let skips = Skips::default();
+    let outcome = run_titles_with(&[0, 1, 2], false, &skips, |idx| match idx {
+        1 => Err(TitleError {
+            result: TitleResult::SkippableStub,
+            error: stub_err(),
+        }),
+        2 => Err(TitleError {
+            result: TitleResult::SkippableStub,
+            error: hard_err(),
+        }),
+        _ => Ok(()),
+    });
+    assert_eq!(outcome, RipOutcome::Ok { titles_written: 1 });
+    assert_eq!(*skips.0.lock().unwrap(), [(1, true), (2, false)]);
+}
