@@ -1437,3 +1437,32 @@ fn an_open_whose_halt_is_raised_is_halted() {
     }
     assert_eq!(calls.len(), 0, "no key request");
 }
+
+#[test]
+fn input_options_carry_the_title_index_and_selection() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let src = ImageSource::Iso(fx.write(dir.path(), "d.iso"));
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let opened = open_image_with(&src, OpenImageOptions::resolve(f)).unwrap();
+    let selection = libfreemkv::StreamSelection {
+        audio: libfreemkv::PidFilter::Only(vec![0x1100]),
+        subtitle: libfreemkv::PidFilter::Only(Vec::new()),
+    };
+    let input = opened.input_options(3, selection.clone());
+    assert_eq!(input.title_index, Some(3));
+    assert_eq!(input.selection, selection);
+}
+
+#[test]
+fn stream_info_opens_a_loose_encrypted_clip_only_with_its_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = bd_image(&[Some(K1)], 1).write_folder(&dir.path().join("enc"));
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let (set, _) = crate::keys::resolve_loose_clip(&clip, &f, None);
+    let keys = set.unwrap().expect("the folder's keys");
+    let url = format!("m2ts://{}", clip.display());
+    let halt = libfreemkv::Halt::new();
+    assert!(crate::image::stream_info(&url, Some(keys), &halt).is_ok());
+    assert!(crate::image::stream_info(&url, None, &halt).is_err());
+}

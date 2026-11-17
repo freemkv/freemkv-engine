@@ -212,3 +212,84 @@ fn a_prescanned_non_aacs_disc_matches_its_image_without_a_key_file() {
     let hash = fx.disc.aacs.as_ref().map(|a| a.disc_hash.as_str());
     assert_eq!(fx.disc.intrinsic_id(), hash, "the AACS disc hash");
 }
+
+// Reports a different capacity from the image it wraps.
+struct Capacity<S>(S, u32);
+impl<S: libfreemkv::SectorSource> libfreemkv::SectorSource for Capacity<S> {
+    fn capacity_sectors(&self) -> u32 {
+        self.1
+    }
+    fn read_sectors(
+        &mut self,
+        lba: u32,
+        count: u16,
+        buf: &mut [u8],
+        recovery: bool,
+    ) -> libfreemkv::Result<usize> {
+        self.0.read_sectors(lba, count, buf, recovery)
+    }
+}
+
+#[test]
+fn a_prescanned_disc_larger_than_its_image_is_truncated() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let want = fx.disc.capacity_sectors;
+    let mut short = Capacity(fx.source(), want - 1);
+    let err = check_prescanned(&fx.disc, &mut short, None, None, &[]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::ImageTruncated { have, want: w }
+                if have == (want as u64 - 1) * 2048 && w == want as u64 * 2048
+        ),
+        "{err:?}"
+    );
+    let mut long = Capacity(fx.source(), want + 1);
+    let err = check_prescanned(&fx.disc, &mut long, None, None, &[]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            Error::MapfileInvalid {
+                kind: "disc-mismatch"
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn only_an_unread_key_file_extent_counts_as_unread() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let total = fx.img.image.len() as u64;
+    let inf = *fx.metadata.last().unwrap();
+    let map_with = |tag: &str, lba: u32| {
+        let mut map = Mapfile::create(&dir.path().join(tag), total, "t").unwrap();
+        map.record(0, total, crate::SectorStatus::Finished).unwrap();
+        map.record(lba as u64 * 2048, 2048, crate::SectorStatus::NonTrimmed)
+            .unwrap();
+        map
+    };
+    let mut r = fx.source();
+    let fs = libfreemkv::read_filesystem(&mut r).unwrap();
+    assert!(inf.0 > 8, "the key file is not at the start of the image");
+    let elsewhere = map_with("a.mapfile", 1);
+    assert!(!key_file_unread(Some(&elsewhere), Some(&fs), &mut r).unwrap());
+    let inside = map_with("b.mapfile", inf.0);
+    assert!(key_file_unread(Some(&inside), Some(&fs), &mut r).unwrap());
+    assert!(!key_file_unread(None, Some(&fs), &mut r).unwrap());
+}
+
+#[test]
+fn an_unparseable_sidecar_is_a_mapfile_error_not_an_io_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("d.iso");
+    std::fs::write(crate::mapfile_path_for(&iso), [0xff, 0xfe, 0xfd]).unwrap();
+    let err = load_sidecar(&ImageSource::Iso(iso.clone())).unwrap_err();
+    assert!(
+        matches!(err, Error::MapfileInvalid { kind: "sidecar" }),
+        "{err:?}"
+    );
+    std::fs::remove_file(crate::mapfile_path_for(&iso)).unwrap();
+    assert!(load_sidecar(&ImageSource::Iso(iso)).unwrap().is_none());
+}
