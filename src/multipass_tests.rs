@@ -3315,3 +3315,66 @@ fn the_default_host_never_recovers_a_transport() {
     let mut host = crate::ReaderHost(&mut r);
     assert!(!host.recover_transport(1, &libfreemkv::Error::Halted));
 }
+
+#[test]
+fn patch_passes_are_numbered_from_two() {
+    #[derive(Default)]
+    struct Starts(std::sync::Mutex<Vec<u32>>);
+    impl Sink for Starts {
+        fn event(&self, e: &crate::sink::Event<'_>) {
+            if let crate::sink::Event::Recovery(crate::sink::RecoveryEvent::PassStart {
+                pass,
+                ..
+            }) = e
+            {
+                self.0.lock().unwrap().push(*pass);
+            }
+        }
+    }
+    let (_dir, iso) = scratch_iso("pass-numbers");
+    let sectors = 8192u32;
+    let disc = test_disc(sectors, vec![test_title(0, sectors)]);
+    let mut reader = WedgeOnPatchReader {
+        capacity: sectors,
+        bad_lba: 4000,
+        sweep_done: false,
+    };
+    let opts = MultipassOpts {
+        max_passes: 5,
+        abort_on_lost_secs: 0,
+        is_iso_output: true,
+        ..Default::default()
+    };
+    let sink = Starts::default();
+    multipass_rip(&disc, &mut reader, &iso, &raw_job(&iso), &opts, &sink).unwrap();
+    assert_eq!(*sink.0.lock().unwrap(), [1, 2]);
+}
+
+#[test]
+fn a_stop_that_lands_as_the_last_pass_ends_is_a_halted_result() {
+    let (_dir, iso) = scratch_iso("stop-at-the-end");
+    let sectors = 8192u32;
+    let disc = test_disc(sectors, vec![test_title(0, sectors)]);
+    let mut reader = MultiSpotReader {
+        capacity: sectors,
+        spots: vec![Spot {
+            lba: 4000,
+            heal_after: u32::MAX,
+            attempts: 0,
+        }],
+    };
+    let opts = MultipassOpts {
+        max_passes: 3,
+        abort_on_lost_secs: GENEROUS_TOLERANCE_SECS,
+        is_iso_output: false,
+        ..Default::default()
+    };
+    let sink = HookSink::cancelling("made no progress");
+    let result = multipass_rip(&disc, &mut reader, &iso, &raw_job(&iso), &opts, &sink)
+        .expect("a stop is a partial result");
+    assert!(sink.did_fire(), "the run reached its exhaustion gate");
+    assert!(
+        result.halted,
+        "a Stop at the end still ends the run Stopped"
+    );
+}
