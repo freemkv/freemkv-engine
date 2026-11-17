@@ -4,11 +4,20 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
-## [Unreleased]
+## [1.8.10] — UNRELEASED
+
+### Added
+
+- One-based audio and subtitle stream indices, alongside language filters. Invalid positions on any selected title are rejected before output.
 
 ### Fixed
 
-- Shared episode suggestions for CLI, GUI and server callers recognize Play All presentations whose standalone programs retain an identical opening or ending. The comparison requires an exact ordered partition and keeps every selected title's original content. Alternate cuts no longer hide independent constituents, and language-neutral variant choices follow the canonical scan presentation consistently. Suggestions still require operator confirmation.
+- Episode suggestions recognize exact shared-boundary partitions without trimming selected content. Alternate cuts no longer hide independent constituents, and neutral variant ties use canonical scan order. Suggestions still require operator confirmation.
+- Overlapping title presentations reuse disjointness comparisons during Play All detection.
+
+### Testing
+
+- Added native Blue Planet II selection snapshots for three discs and synthetic shared-boundary, language, ordering and independent forced-subtitle regressions.
 
 ## [1.8.9] — 2026-11-11
 
