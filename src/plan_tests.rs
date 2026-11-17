@@ -1023,3 +1023,133 @@ fn an_image_run_recovery_reports_the_audio_picked_main_title() {
         assert!(sizes.iter().all(|&z| z == german), "{passes:?}: {sizes:?}");
     }
 }
+
+#[test]
+fn key_params_data_round_trips_its_fields_and_reads_cert_credentials() {
+    let data = KeyParamsData {
+        keydb_path: Some("/k/keydb.cfg".into()),
+        key_url: Some("https://keys.example.test/k".into()),
+        key_auth: Some("token".into()),
+        online_only: true,
+        cert_keydb: None,
+    };
+    let p = data.params();
+    assert_eq!(p.keydb_path.as_deref(), Some("/k/keydb.cfg"));
+    assert_eq!(p.key_url.as_deref(), Some("https://keys.example.test/k"));
+    assert_eq!(p.key_auth.as_deref(), Some("token"));
+    assert!(p.online_only);
+    assert!(data.credentials().is_none(), "no cert keydb named");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("keydb.cfg");
+    let with_cert = |p: &std::path::Path| KeyParamsData {
+        cert_keydb: Some(p.display().to_string()),
+        ..KeyParamsData::default()
+    };
+    assert!(with_cert(&path).credentials().is_none(), "unreadable keydb");
+    let hc = format!(
+        "| HC | HOST_PRIV_KEY 0x{} | HOST_CERT 0x{}\n",
+        "00".repeat(20),
+        "00".repeat(92)
+    );
+    std::fs::write(&path, hc).unwrap();
+    assert!(with_cert(&path).credentials().is_some());
+}
+
+#[test]
+fn a_title_run_naming_one_title_twice_is_not_a_single_title() {
+    let fx = bd_image(&[Some(K1), Some(K2)], 2);
+    let p = Plan {
+        titles: crate::Selection::Titles(vec![0, 0]),
+        ..plan("iso:///src.iso", "mkv:///out.mkv")
+    };
+    assert!(title_index(&p, Some(&fx.disc)).is_err());
+    let one = Plan {
+        titles: crate::Selection::Titles(vec![1]),
+        ..plan("iso:///src.iso", "mkv:///out.mkv")
+    };
+    assert_eq!(title_index(&one, Some(&fx.disc)).unwrap(), 1);
+}
+
+#[test]
+fn a_loose_clip_is_keyed_only_when_the_run_needs_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let clip = bd_image(&[Some(K1)], 1).write_folder(&dir.path().join("enc"));
+    let f = factory(&[(Answer::Keydb, &[K1])], &Calls::default());
+    let p = plan(&format!("m2ts://{}", clip.display()), "mkv:///out.mkv");
+    let watch = Watch {
+        sink: &crate::NoopSink,
+        dest: &p.dest,
+        halt: None,
+        events: None,
+    };
+    let (idx, keys, _) = url_source(&p, false, false, &f, &watch).unwrap();
+    assert_eq!(idx, 0);
+    assert!(keys.is_none(), "keys were not asked for");
+    let (_, keys, _) = url_source(&p, true, false, &f, &watch).unwrap();
+    assert!(keys.is_some(), "keys were asked for");
+}
+
+#[test]
+fn an_image_run_measures_the_title_its_plan_names() {
+    #[derive(Default)]
+    struct Sizes(std::sync::Mutex<Vec<Option<u64>>>);
+    impl crate::Sink for Sizes {
+        fn event(&self, e: &crate::Event<'_>) {
+            if let crate::Event::Pass(p) = e {
+                self.0.lock().unwrap().push(p.main_title_size_bytes);
+            }
+        }
+    }
+    let fx = crate::test_fixtures::branch_image();
+    let second = Some(fx.disc.titles[1].size_bytes);
+    assert_ne!(second, Some(fx.disc.titles[0].size_bytes));
+    let dir = tempfile::tempdir().unwrap();
+    let src = fx.write(dir.path(), "src.iso");
+    let dst = dir.path().join("dst.iso");
+    let p = Plan {
+        titles: crate::Selection::Titles(vec![1]),
+        multipass: true,
+        ..plan(
+            &format!("iso://{}", src.display()),
+            &format!("iso://{}", dst.display()),
+        )
+    };
+    let with = RunWith {
+        passes: Some(crate::MultipassOpts {
+            max_passes: 2,
+            ..Default::default()
+        }),
+        ..with(factory(&[(Answer::Keydb, &[K1, K2])], &Calls::default()))
+    };
+    let sink = Sizes::default();
+    run_with(&p, with, &sink).expect("the image copies");
+    let sizes = sink.0.into_inner().unwrap();
+    assert!(!sizes.is_empty());
+    assert!(sizes.iter().all(|&z| z == second), "{sizes:?}");
+}
+
+#[test]
+fn a_stopped_or_wedged_copy_is_never_renamed() {
+    let fx = bd_image(&[Some(K1)], 1);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("x.iso");
+    // A live abandoned writer makes an otherwise-ready AACS image report `Kept`.
+    let writer = crate::Mapfile::create(&crate::mapfile_path_for(&path), 2048, "t").unwrap();
+    writer.disown_handle().disown();
+    let copy = |halted| crate::CopyResult {
+        bytes_total: 0,
+        bytes_good: 0,
+        bytes_unreadable: 0,
+        bytes_pending: 0,
+        recovered_this_pass: 0,
+        complete: false,
+        halted,
+    };
+    let eh = crate::EngineHalt::new(&libfreemkv::Halt::new(), None);
+    assert!(image_names(&copy(true), None, &eh, &path, &fx.disc).is_none());
+    assert!(image_names(&copy(false), None, &eh, &path, &fx.disc).is_some());
+    eh.mark_wedged();
+    assert!(image_names(&copy(false), None, &eh, &path, &fx.disc).is_none());
+    drop(writer);
+}

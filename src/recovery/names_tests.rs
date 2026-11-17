@@ -948,6 +948,28 @@ fn a_1_8_6_pending_undo_is_rolled_back_before_the_folder_rename() {
     assert!(!has_file(&iso, "/SCAA/Unit_Key_RO.bak"));
 }
 
+// A lock the caller already holds is not taken a second time.
+#[test]
+fn a_caller_held_image_lock_is_not_taken_again() {
+    let (fx, _layout, keys) = fixture();
+    let dir = tempfile::tempdir().unwrap();
+    let iso = dir.path().join("held.iso");
+    let mapfile = mapfile_path_for(&iso);
+    let _held =
+        libfreemkv::io::ArtifactLock::acquire(&iso, &[mapfile.as_path()], &libfreemkv::Halt::new())
+            .unwrap();
+    let out = try_rip(
+        &fx,
+        &keys,
+        &iso,
+        Damage::None,
+        |_, _| {},
+        |_, with| with.locked = true,
+        None,
+    );
+    assert!(out.is_ok(), "{out:?}");
+}
+
 mod unit {
     use super::super::*;
     use crate::recovery::mapfile::{Mapfile, SectorStatus, mapfile_path_for};
