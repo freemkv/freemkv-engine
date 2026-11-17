@@ -3378,3 +3378,130 @@ fn a_stop_that_lands_as_the_last_pass_ends_is_a_halted_result() {
         "a Stop at the end still ends the run Stopped"
     );
 }
+
+// First pass-1 start the recovery reports, for a run over `prior` map progress.
+fn first_pass_start_good(resume_sweep: Option<bool>) -> u64 {
+    #[derive(Default)]
+    struct Starts(std::sync::Mutex<Vec<(u32, u64)>>);
+    impl Sink for Starts {
+        fn event(&self, e: &crate::sink::Event<'_>) {
+            if let crate::sink::Event::Recovery(crate::sink::RecoveryEvent::PassStart {
+                pass,
+                good,
+                ..
+            }) = e
+            {
+                self.0.lock().unwrap().push((*pass, *good));
+            }
+        }
+    }
+    let (_dir, iso) = scratch_iso("resume-stats");
+    let sectors = 256u32;
+    let total = sectors as u64 * 2048;
+    let disc = test_disc(sectors, vec![]);
+    std::fs::write(&iso, vec![0u8; total as usize]).unwrap();
+    {
+        let mut map = Mapfile::create(&disc.mapfile_for(&iso), total, "t").unwrap();
+        map.set_raw(true);
+        map.record(0, total / 2, crate::SectorStatus::Finished)
+            .unwrap();
+        map.flush().unwrap();
+    }
+    let opts = MultipassOpts {
+        max_passes: 1,
+        resume_sweep,
+        is_iso_output: true,
+        ..Default::default()
+    };
+    let sink = Starts::default();
+    let mut reader = ZeroReader { capacity: sectors };
+    multipass_rip(&disc, &mut reader, &iso, &raw_job(&iso), &opts, &sink).unwrap();
+    let starts = sink.0.lock().unwrap();
+    assert_eq!(starts[0].0, 1);
+    starts[0].1
+}
+
+#[test]
+fn the_sweep_start_reports_the_progress_it_resumes_from_only_when_resuming() {
+    assert_eq!(first_pass_start_good(None), 128 * 2048);
+    assert_eq!(first_pass_start_good(Some(false)), 0);
+}
+
+struct TransportDown;
+impl libfreemkv::SectorSource for TransportDown {
+    fn read_sectors(
+        &mut self,
+        _lba: u32,
+        _count: u16,
+        _buf: &mut [u8],
+        _recovery: bool,
+    ) -> libfreemkv::Result<usize> {
+        Err(libfreemkv::Error::ScsiError {
+            opcode: libfreemkv::scsi::SCSI_READ_10,
+            status: libfreemkv::scsi::SCSI_STATUS_TRANSPORT_FAILURE,
+            sense: None,
+        })
+    }
+    fn capacity_sectors(&self) -> u32 {
+        256
+    }
+}
+
+struct Recovering {
+    reader: TransportDown,
+    calls: u32,
+}
+impl crate::PassHost for Recovering {
+    fn reader(&mut self) -> &mut dyn libfreemkv::SectorSource {
+        &mut self.reader
+    }
+    fn recover_transport(&mut self, _attempt: u32, _e: &libfreemkv::Error) -> bool {
+        self.calls += 1;
+        true
+    }
+}
+
+fn sweep_over_a_dead_transport(cancelled: bool) -> (crate::Result<MultipassResult>, u32) {
+    let (_dir, iso) = scratch_iso("dead-transport");
+    let disc = test_disc(256, vec![]);
+    let opts = MultipassOpts {
+        max_passes: 2,
+        max_sweep_attempts: 2,
+        is_iso_output: true,
+        ..Default::default()
+    };
+    let op = libfreemkv::Halt::new();
+    let halt = crate::EngineHalt::new(&op, None);
+    if cancelled {
+        op.cancel();
+    }
+    let mut host = Recovering {
+        reader: TransportDown,
+        calls: 0,
+    };
+    let r = recover(
+        &disc,
+        &mut host,
+        &iso,
+        &raw_job(&iso),
+        &opts,
+        None,
+        &crate::sink::NoopSink,
+        &halt,
+    );
+    (r, host.calls)
+}
+
+#[test]
+fn a_recovered_transport_is_retried_only_up_to_the_attempt_cap() {
+    let (r, calls) = sweep_over_a_dead_transport(false);
+    assert!(r.is_err());
+    assert_eq!(calls, 2, "one recovery per failed attempt, then the cap");
+}
+
+#[test]
+fn a_stopped_run_does_not_ask_the_host_to_recover_the_transport() {
+    let (r, calls) = sweep_over_a_dead_transport(true);
+    assert!(r.is_err());
+    assert_eq!(calls, 0);
+}
