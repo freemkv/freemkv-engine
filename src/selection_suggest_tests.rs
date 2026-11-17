@@ -705,3 +705,96 @@ fn explicit_picks_never_collapse_undescribed_titles() {
         }
     );
 }
+
+// Canonical scan order prefers English; authored title numbers put the German cut first.
+#[test]
+fn shared_terminal_cell_preserves_three_episode_presentations() {
+    let a = (1_000, 1_000);
+    let b = (2_000, 1_000);
+    let c = (3_000, 600);
+    let en = (4_000, 400);
+    let de = (5_000, 400);
+    let tail = (6_000, 100);
+    let titles = vec![
+        dvd(2, 144.0, &[a, b, c, en, tail], "eng"),
+        dvd(1, 140.0, &[a, b, c, de, tail], "deu"),
+        dvd(7, 48.0, &[a, tail], "eng"),
+        dvd(4, 48.0, &[a, tail], "deu"),
+        dvd(8, 47.0, &[b, tail], "eng"),
+        dvd(5, 47.0, &[b, tail], "deu"),
+        dvd(9, 47.0, &[c, en, tail], "eng"),
+        dvd(6, 43.0, &[c, de, tail], "deu"),
+    ];
+    let snapshot = model(&titles);
+    for (language, expected) in [
+        (None, vec![2, 4, 6]),
+        (Some("en"), vec![2, 4, 6]),
+        (Some("de"), vec![3, 5, 7]),
+    ] {
+        let suggestion = snapshot.suggest_episodes(&StreamFilter::All, language, MIN_SECS);
+        assert_eq!(suggestion.play_alls, vec![1, 0]);
+        assert_eq!(suggestion.suggested, expected);
+        assert!(
+            matches!(snapshot.resolve_episodes(&StreamFilter::All, language, MIN_SECS), Resolved::Confirm { suggested, .. } if suggested == expected)
+        );
+    }
+    assert_eq!(snapshot, model(&titles));
+    assert!(
+        titles
+            .iter()
+            .all(|title| title.extents.last().unwrap().start_lba == tail.0)
+    );
+}
+
+#[test]
+fn shared_intro_and_outro_are_compared_without_trimming_titles() {
+    let intro = ("00001", 0, 2);
+    let a = ("00002", 0, 42);
+    let b = ("00003", 0, 42);
+    let outro = ("00004", 0, 1);
+    let titles = vec![
+        bd(1, 87.0, &[intro, a, b, outro], "eng"),
+        bd(2, 45.0, &[intro, a, outro], "eng"),
+        bd(3, 45.0, &[intro, b, outro], "eng"),
+    ];
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.play_alls, vec![0]);
+    assert_eq!(suggestion.suggested, vec![1, 2]);
+    assert_eq!(titles[1].selection_evidence.segments.len(), 3);
+    let mut undescribed = titles.clone();
+    undescribed[1].selection_evidence.segments.clear();
+    assert!(suggest(&undescribed).play_alls.is_empty());
+}
+
+#[test]
+fn shared_boundary_requires_the_complete_ordered_program_partition() {
+    let a = ("00001", 0, 44);
+    let b = ("00002", 0, 44);
+    let tail = ("00003", 0, 1);
+    let extra = ("00004", 0, 5);
+    let titles = vec![
+        bd(1, 94.0, &[a, extra, b, tail], "eng"),
+        bd(2, 45.0, &[a, tail], "eng"),
+        bd(3, 45.0, &[b, tail], "eng"),
+    ];
+    assert!(suggest(&titles).play_alls.is_empty());
+    let mut mismatched = titles;
+    mismatched[0].selection_evidence.segments.pop();
+    assert!(suggest(&mismatched).play_alls.is_empty());
+}
+
+#[test]
+fn alternate_constituent_does_not_veto_a_composite() {
+    let a = ("00001", 0, 40);
+    let b = ("00002", 0, 40);
+    let x = ("00003", 0, 4);
+    let titles = vec![
+        bd(1, 84.0, &[a, x, b], "eng"),
+        bd(2, 40.0, &[a], "eng"),
+        bd(3, 44.0, &[a, x], "eng"),
+        bd(4, 40.0, &[b], "eng"),
+    ];
+    let suggestion = suggest(&titles);
+    assert_eq!(suggestion.play_alls, vec![0]);
+    assert_eq!(suggestion.suggested, vec![1, 3]);
+}
