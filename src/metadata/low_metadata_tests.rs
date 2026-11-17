@@ -359,3 +359,32 @@ fn low_lookup_continues_past_a_query_specific_status() {
         assert_eq!(found.unwrap().unwrap().tmdb_id, 9, "{status}");
     }
 }
+
+fn ok_json(body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+#[test]
+fn the_free_functions_return_what_tmdb_answers() {
+    let hit = r#"{"results":[{"media_type":"movie","title":"Heat","release_date":"1995-12-15","id":2,"popularity":1.0}]}"#;
+    let server = serve_once(ok_json(hit));
+    let found = super::lookup("Heat", "KEY").unwrap().unwrap();
+    server.join().unwrap();
+    assert_eq!((found.title.as_str(), found.year), ("Heat", 1995));
+
+    let server = serve_once(ok_json(hit));
+    let found = super::search("Heat", "KEY", 5);
+    server.join().unwrap();
+    assert_eq!(found.len(), 1);
+
+    let season = r#"{"episodes":[{"episode_number":1,"name":"Pilot","runtime":45}]}"#;
+    let server = serve_once(ok_json(season));
+    let eps = super::season_episodes(7, 1, "KEY");
+    server.join().unwrap();
+    assert_eq!(eps.len(), 1);
+    assert_eq!(eps[0].name, "Pilot");
+}

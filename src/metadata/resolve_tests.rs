@@ -343,3 +343,57 @@ fn layout_movie_extension_is_plain() {
         assert_eq!(got, "Film (2001)/Film (2001).mkv", "{hostile:?}");
     }
 }
+
+#[test]
+fn media_kind_conversions_and_display_agree() {
+    assert_eq!(MediaKind::from("tv"), MediaKind::Tv);
+    assert_eq!(MediaKind::from(" TV "), MediaKind::Tv);
+    assert_eq!(MediaKind::from("movie"), MediaKind::Movie);
+    assert_eq!(MediaKind::from(""), MediaKind::Movie);
+    assert_eq!(MediaKind::Tv.to_string(), "tv");
+    assert_eq!(MediaKind::Movie.to_string(), "movie");
+    assert!(MediaKind::Tv == "tv");
+    assert!(MediaKind::Movie == "movie");
+    assert!(!(MediaKind::Tv == "movie"));
+    assert!(!(MediaKind::Movie == "tv"));
+}
+
+#[test]
+fn transport_error_kind_labels_every_variant_without_the_url() {
+    let io = |e: std::io::Error| transport_error_kind(&ureq::Error::Io(e));
+    assert_eq!(
+        transport_error_kind(&ureq::Error::StatusCode(503)),
+        "HTTP 503"
+    );
+    assert_eq!(
+        io(std::io::Error::other("https://secret.example/x")),
+        "io: other error"
+    );
+    let os = io(std::io::Error::from_raw_os_error(2));
+    assert!(os.starts_with("io: ") && os.len() > 4 && !os.contains("other error"));
+    assert_eq!(
+        transport_error_kind(&ureq::Error::Timeout(ureq::Timeout::Global)),
+        "timeout"
+    );
+    assert_eq!(
+        transport_error_kind(&ureq::Error::HostNotFound),
+        "host not found"
+    );
+    assert_eq!(
+        transport_error_kind(&ureq::Error::ConnectionFailed),
+        "connection failed"
+    );
+    assert_eq!(
+        transport_error_kind(&ureq::Error::TooManyRedirects),
+        "too many redirects"
+    );
+    assert_eq!(transport_error_kind(&ureq::Error::Tls("x")), "tls error");
+    assert_eq!(
+        transport_error_kind(&ureq::Error::BodyExceedsLimit(1)),
+        "body exceeds limit"
+    );
+    assert_eq!(
+        transport_error_kind(&ureq::Error::BadUri("u".into())),
+        "transport error"
+    );
+}

@@ -1153,3 +1153,130 @@ fn a_failed_fetch_stops_the_variant_loop() {
     assert_eq!(calls.get(), 1, "one failure must not trigger more requests");
     assert!(matches!(answer, Err(LookupFailed(None))));
 }
+
+#[test]
+fn the_tmdb_body_cap_is_two_mebibytes() {
+    assert_eq!(MAX_TMDB_BYTES, 2_097_152);
+}
+
+#[test]
+fn a_confident_fallback_survives_a_later_failed_variant() {
+    let found = lookup_using("HEAT_UE", |q| match q {
+        "Heat Ue" => Ok(results_for("Heat", "1995-12-15", "movie")),
+        _ => Err(Failure::Stop),
+    });
+    assert_eq!(found.unwrap().unwrap().year, 1995);
+}
+
+fn ranked(items: serde_json::Value, query: &str) -> Vec<String> {
+    rank_search_results(query, items.as_array().unwrap(), 10)
+        .into_iter()
+        .map(|r| r.title)
+        .collect()
+}
+
+#[test]
+fn rank_search_results_does_not_treat_a_dateless_title_as_exact_or_dated() {
+    let items = serde_json::json!([
+        {"media_type": "movie", "title": "Heat", "release_date": "", "popularity": 90.0},
+        {"media_type": "movie", "title": "Heat Wave", "release_date": "2001-01-01",
+         "popularity": 1.0}
+    ]);
+    assert_eq!(ranked(items, "Heat"), ["Heat Wave", "Heat"]);
+}
+
+#[test]
+fn rank_search_results_orders_dated_by_popularity_whatever_the_input_order() {
+    let low = serde_json::json!({"media_type": "movie", "title": "Low",
+        "release_date": "2001-01-01", "popularity": 1.0});
+    let high = serde_json::json!({"media_type": "movie", "title": "High",
+        "release_date": "2002-01-01", "popularity": 50.0});
+    assert_eq!(ranked(serde_json::json!([low, high]), "Q"), ["High", "Low"]);
+    assert_eq!(ranked(serde_json::json!([high, low]), "Q"), ["High", "Low"]);
+}
+
+#[test]
+fn pick_best_does_not_treat_a_dateless_title_as_exact() {
+    let results = serde_json::json!([
+        {"media_type": "movie", "title": "Heat", "release_date": "", "popularity": 10.0},
+        {"media_type": "movie", "title": "Heat Wave", "release_date": "2001-01-01",
+         "popularity": 1.0}
+    ]);
+    let r = pick_best("Heat", results.as_array().unwrap(), false, &[]).unwrap();
+    assert_eq!(r.title, "Heat Wave");
+}
+
+#[test]
+fn pick_best_ranks_an_exact_title_above_a_non_exact_even_when_the_year_differs() {
+    let results = serde_json::json!([
+        {"media_type": "movie", "title": "Heat Wave", "release_date": "1995-01-01",
+         "popularity": 99.0},
+        {"media_type": "movie", "title": "Heat", "release_date": "2001-01-01",
+         "popularity": 1.0}
+    ]);
+    let r = pick_best("Heat", results.as_array().unwrap(), false, &[1995]).unwrap();
+    assert_eq!(r.title, "Heat");
+}
+
+#[test]
+fn pick_best_keeps_the_first_of_equally_popular_candidates() {
+    let results = serde_json::json!([
+        {"media_type": "movie", "title": "First", "release_date": "2001-01-01",
+         "popularity": 5.0},
+        {"media_type": "movie", "title": "Second", "release_date": "2001-01-01",
+         "popularity": 5.0}
+    ]);
+    let r = pick_best("Q", results.as_array().unwrap(), false, &[]).unwrap();
+    assert_eq!(r.title, "First");
+}
+
+#[test]
+fn trailing_junk_words_come_from_each_word_list_and_plain_words_are_kept() {
+    for junk in ["Region", "Usa", "Ultimate", "Video", "Bluray", "Dvd", "Hd"] {
+        assert!(is_trailing_junk(junk), "{junk}");
+    }
+    for keep in ["Heat", "Maverick", "ABCDEFG", "Alien"] {
+        assert!(!is_trailing_junk(keep), "{keep}");
+    }
+}
+
+#[test]
+fn query_variants_of_nothing_are_empty() {
+    assert!(query_variants("").is_empty());
+    assert!(query_variants("___").is_empty());
+}
+
+#[test]
+fn align_accepts_a_disc_that_exactly_fills_the_season() {
+    let eps = season(&[45, 60, 90]);
+    let disc = [45.0 * 60.0, 60.0 * 60.0, 90.0 * 60.0];
+    assert_eq!(align_disc_offset(&disc, &eps, 2), 1);
+}
+
+#[test]
+fn align_ignores_episodes_with_unknown_runtime() {
+    let eps = season(&[45, 45, 0]);
+    let disc = [45.0 * 60.0, 45.0 * 60.0];
+    assert_eq!(align_disc_offset(&disc, &eps, 2), 2);
+}
+
+#[test]
+fn align_compares_average_distance_not_total() {
+    let eps = season(&[31, 32, 0, 33]);
+    let disc = [30.0 * 60.0, 30.0 * 60.0];
+    assert_eq!(align_disc_offset(&disc, &eps, 3), 1);
+}
+
+#[test]
+fn align_keeps_the_earliest_unique_best_when_later_offsets_are_worse() {
+    let eps = season(&[75, 45, 45, 45, 45, 45]);
+    let disc = [74.0 * 60.0, 44.0 * 60.0, 44.0 * 60.0];
+    assert_eq!(align_disc_offset(&disc, &eps, 3), 1);
+}
+
+#[test]
+fn align_ties_at_a_nonzero_distance_resolve_to_the_fallback() {
+    let eps = season(&[45, 60, 45, 60, 45, 60]);
+    let disc = [44.0 * 60.0, 59.0 * 60.0];
+    assert_eq!(align_disc_offset(&disc, &eps, 2), 2);
+}
