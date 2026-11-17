@@ -180,3 +180,84 @@ fn feature_table_includes_aacs_010d() {
         "AACS feature 0x010D must be captured"
     );
 }
+
+struct FakeScsi {
+    status: u8,
+    fill: u8,
+    transferred: usize,
+    fail: bool,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+}
+impl libfreemkv::ScsiTransport for FakeScsi {
+    fn execute(
+        &mut self,
+        cdb: &[u8],
+        _direction: libfreemkv::scsi::DataDirection,
+        data: &mut [u8],
+        _timeout_ms: u32,
+    ) -> libfreemkv::Result<libfreemkv::scsi::ScsiResult> {
+        self.seen.lock().unwrap().push(cdb.to_vec());
+        if self.fail {
+            return Err(libfreemkv::Error::IoError {
+                source: std::io::Error::other("gone"),
+            });
+        }
+        data.fill(self.fill);
+        Ok(libfreemkv::scsi::ScsiResult {
+            status: self.status,
+            bytes_transferred: self.transferred,
+            sense: [0; 32],
+        })
+    }
+}
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+fn session(status: u8, fill: u8, transferred: usize, fail: bool) -> (Drive, Seen) {
+    let seen = Seen::default();
+    let drive = Drive::from_transport(Box::new(FakeScsi {
+        status,
+        fill,
+        transferred,
+        fail,
+        seen: seen.clone(),
+    }));
+    (drive, seen)
+}
+
+#[test]
+fn raw_returns_the_transferred_bytes_only_on_good_status() {
+    use libfreemkv::scsi::DataDirection::FromDevice;
+    let cdb = [0x12u8, 0, 0, 0, 8, 0];
+    let (mut ok, seen) = session(0, 0x5A, 8, false);
+    assert_eq!(raw(&mut ok, &cdb, FromDevice, 8), Some(vec![0x5A; 8]));
+    assert_eq!(seen.lock().unwrap()[0], cdb);
+    let (mut short, _) = session(0, 0x5A, 3, false);
+    assert_eq!(raw(&mut short, &cdb, FromDevice, 8), Some(vec![0x5A; 3]));
+    let (mut over, _) = session(0, 0x5A, 99, false);
+    assert_eq!(raw(&mut over, &cdb, FromDevice, 8), Some(vec![0x5A; 8]));
+    let (mut check, _) = session(2, 0x5A, 8, false);
+    assert_eq!(raw(&mut check, &cdb, FromDevice, 8), None);
+    let (mut dead, _) = session(0, 0x5A, 8, true);
+    assert_eq!(raw(&mut dead, &cdb, FromDevice, 8), None);
+    let (mut write, _) = session(0, 0, 0, false);
+    assert_eq!(
+        raw(&mut write, &KNOCK, libfreemkv::scsi::DataDirection::None, 0),
+        Some(Vec::new())
+    );
+}
+
+#[test]
+fn read_window_sends_a_read_buffer_for_the_window_and_returns_its_bytes() {
+    let (mut s, seen) = session(0, 0xC3, 164, false);
+    let got = read_window(&mut s, RB_B0_04);
+    assert_eq!(got, Some(vec![0xC3; 164]));
+    assert_eq!(
+        seen.lock().unwrap()[0],
+        libfreemkv::scsi::build_read_buffer(0x02, 0xB0, 0x04, 164)
+    );
+    let (mut f4, _) = session(0, 0x01, 256, false);
+    assert_eq!(read_window(&mut f4, RB_F4).map(|v| v.len()), Some(256));
+    let (mut bad, _) = session(2, 0, 164, false);
+    assert_eq!(read_window(&mut bad, RB_B0_04), None);
+}
