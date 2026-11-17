@@ -202,3 +202,73 @@ fn is_wired_unless_only_a_private_token_can_cancel() {
     assert!(EngineHalt::new(&Halt::new(), None).is_wired());
     assert!(EngineHalt::new(&Halt::new(), flag).is_wired());
 }
+
+#[test]
+fn debug_names_the_view() {
+    let h = EngineHalt::new(&Halt::new(), None);
+    assert!(format!("{h:?}").contains("EngineHalt"));
+}
+
+#[test]
+fn op_is_the_callers_token() {
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, None);
+    h.op().cancel();
+    assert!(op.is_cancelled());
+}
+
+#[test]
+fn linked_hands_the_op_token_itself_when_it_is_the_only_input() {
+    let op = Halt::new();
+    let h = EngineHalt::new(&op, None);
+    h.linked(|t| t.cancel());
+    assert!(op.is_cancelled());
+}
+
+#[test]
+fn only_a_stop_outcome_is_stopped() {
+    assert!(!EngineOutcome::Done(1u8).is_stopped());
+    assert!(!EngineOutcome::<u8>::Failed(Error::Halted).is_stopped());
+    assert!(EngineOutcome::<u8>::Stopped(None).is_stopped());
+}
+
+#[derive(Default)]
+struct Seen {
+    logs: std::sync::Mutex<Vec<String>>,
+    titles: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+}
+impl Sink for Seen {
+    fn log(&self, _level: crate::sink::Level, msg: &str) {
+        self.logs.lock().unwrap().push(msg.to_owned());
+    }
+    fn title_opened(&self, _title: &libfreemkv::DiscTitle) {
+        self.titles.fetch_add(1, Ordering::SeqCst);
+    }
+    fn completed(&self, _outcome: &crate::Outcome) {
+        self.completed.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn the_halt_sink_forwards_log_title_and_completion_to_the_inner_sink() {
+    let inner = Seen::default();
+    let halt = EngineHalt::new(&Halt::new(), None);
+    let sink = HaltSink {
+        inner: &inner,
+        halt: &halt,
+    };
+    sink.log(crate::sink::Level::Info, "hello");
+    sink.title_opened(&libfreemkv::DiscTitle::empty());
+    sink.completed(&crate::Outcome {
+        files: Vec::new(),
+        unreadable_bytes: 0,
+        lost_ms: 0.0,
+        severity: crate::DamageSeverity::Clean,
+        elapsed_secs: 0.0,
+        avg_bps: 0,
+    });
+    assert_eq!(*inner.logs.lock().unwrap(), ["hello"]);
+    assert_eq!(inner.titles.load(Ordering::SeqCst), 1);
+    assert_eq!(inner.completed.load(Ordering::SeqCst), 1);
+}
