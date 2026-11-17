@@ -706,16 +706,16 @@ fn explicit_picks_never_collapse_undescribed_titles() {
     );
 }
 
-// Canonical scan order prefers English; authored title numbers put the German cut first.
-#[test]
-fn shared_terminal_cell_preserves_three_episode_presentations() {
+// Synthetic shared-terminal-cell topology: canonical scan order prefers English;
+// authored title numbers put the German cut first.
+fn shared_terminal_titles() -> Vec<DiscTitle> {
     let a = (1_000, 1_000);
     let b = (2_000, 1_000);
     let c = (3_000, 600);
     let en = (4_000, 400);
     let de = (5_000, 400);
     let tail = (6_000, 100);
-    let titles = vec![
+    vec![
         dvd(2, 144.0, &[a, b, c, en, tail], "eng"),
         dvd(1, 140.0, &[a, b, c, de, tail], "deu"),
         dvd(7, 48.0, &[a, tail], "eng"),
@@ -724,7 +724,12 @@ fn shared_terminal_cell_preserves_three_episode_presentations() {
         dvd(5, 47.0, &[b, tail], "deu"),
         dvd(9, 47.0, &[c, en, tail], "eng"),
         dvd(6, 43.0, &[c, de, tail], "deu"),
-    ];
+    ]
+}
+
+#[test]
+fn shared_terminal_cell_preserves_three_episode_presentations() {
+    let titles = shared_terminal_titles();
     let snapshot = model(&titles);
     for (language, expected) in [
         (None, vec![2, 4, 6]),
@@ -742,7 +747,7 @@ fn shared_terminal_cell_preserves_three_episode_presentations() {
     assert!(
         titles
             .iter()
-            .all(|title| title.extents.last().unwrap().start_lba == tail.0)
+            .all(|title| title.extents.last().unwrap().start_lba == 6_000)
     );
 }
 
@@ -797,4 +802,265 @@ fn alternate_constituent_does_not_veto_a_composite() {
     let suggestion = suggest(&titles);
     assert_eq!(suggestion.play_alls, vec![0]);
     assert_eq!(suggestion.suggested, vec![1, 3]);
+}
+
+#[test]
+fn shared_boundary_rejects_incomplete_repeated_reordered_and_ambiguous_bodies() {
+    let a = ("00001", 0, 20);
+    let b = ("00002", 0, 20);
+    let c = ("00003", 0, 20);
+    let d = ("00004", 0, 20);
+    let tail = ("00005", 0, 1);
+    let extra = ("00006", 0, 1);
+    let episodes = vec![vec![a, b, tail], vec![c, d, tail]];
+    for (case, wrapper, bodies) in [
+        (
+            "extra content",
+            vec![a, b, extra, c, d, tail],
+            episodes.clone(),
+        ),
+        (
+            "missing body segment",
+            vec![a, b, c, tail],
+            episodes.clone(),
+        ),
+        (
+            "repeated body",
+            vec![a, b, a, b, c, d, tail],
+            episodes.clone(),
+        ),
+        (
+            "reversed within body",
+            vec![b, a, c, d, tail],
+            episodes.clone(),
+        ),
+        (
+            "interleaved bodies",
+            vec![a, c, b, d, tail],
+            episodes.clone(),
+        ),
+        (
+            "unused contained body",
+            vec![a, b, c, d, tail],
+            vec![vec![a, b, tail], vec![c, d, tail], vec![a, c, tail]],
+        ),
+        (
+            "ambiguous body prefix",
+            vec![a, b, c, tail],
+            vec![vec![a, tail], vec![a, b, tail], vec![c, tail]],
+        ),
+        (
+            "boundary-only title",
+            vec![a, b, c, d, tail],
+            [episodes.clone(), vec![vec![tail]]].concat(),
+        ),
+        (
+            "shared internal segment is not a boundary",
+            vec![a, b, c, d, tail],
+            vec![vec![a, tail, b], vec![c, tail, d]],
+        ),
+    ] {
+        let mut titles = vec![bd(1, 81.0, &wrapper, "eng")];
+        titles.extend(
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(i, body)| bd(i as u16 + 2, 41.0, body, "eng")),
+        );
+        let snapshot = model(&titles);
+        assert!(
+            !snapshot
+                .suggest_episodes(&StreamFilter::All, None, MIN_SECS)
+                .play_alls
+                .contains(&0),
+            "{case}"
+        );
+        assert!(
+            matches!(
+                snapshot.resolve_episodes(&StreamFilter::All, None, MIN_SECS),
+                Resolved::Confirm {
+                    reason: SelectionReviewReason::MissingEpisodeRoster,
+                    ..
+                }
+            ),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn shared_boundary_requires_exact_unit_start_and_end_even_when_coverage_contains_it() {
+    let a = ("00001", 0, 40);
+    let b = ("00002", 0, 40);
+    let tail = ("00003", 1, 2);
+    let titles = vec![
+        bd(1, 81.0, &[a, b, tail], "eng"),
+        bd(2, 41.0, &[a, tail], "eng"),
+        bd(3, 41.0, &[b, tail], "eng"),
+    ];
+    assert_eq!(suggest(&titles).play_alls, vec![0]);
+    for which in [0, 1] {
+        for field in ["unit", "start", "end"] {
+            let mut mismatch = titles.clone();
+            let boundary = mismatch[which]
+                .selection_evidence
+                .segments
+                .last_mut()
+                .unwrap();
+            match field {
+                "unit" => boundary.unit = "different".into(),
+                // Expand the wrapper, or shrink a constituent, by just one tick:
+                // containment still holds, but exact boundary equality does not.
+                "start" if which == 0 => boundary.start -= 1,
+                "start" => boundary.start += 1,
+                "end" if which == 0 => boundary.end += 1,
+                "end" => boundary.end -= 1,
+                _ => unreachable!(),
+            }
+            assert!(suggest(&mismatch).play_alls.is_empty(), "{which} {field}");
+        }
+    }
+}
+
+#[test]
+fn shared_boundaries_accept_prefix_suffix_and_multiple_segments() {
+    let a = ("00010", 0, 40);
+    let b = ("00020", 0, 40);
+    let intro = [("00001", 0, 1), ("00002", 0, 1)];
+    let outro = [("00030", 0, 1), ("00031", 0, 1)];
+    for (prefix, suffix) in [
+        (&intro[..], &[][..]),
+        (&[][..], &outro[..]),
+        (&intro[..], &outro[..]),
+    ] {
+        // Body order in the wrapper need not equal playlist or scan order; each
+        // complete body must occur once and retain its own internal order.
+        for body_order in [[a, b], [b, a]] {
+            let wrap = [prefix, &body_order, suffix].concat();
+            let first = [prefix, &[a], suffix].concat();
+            let second = [prefix, &[b], suffix].concat();
+            let titles = vec![
+                bd(1, 84.0, &wrap, "eng"),
+                bd(2, 44.0, &first, "eng"),
+                bd(3, 44.0, &second, "eng"),
+            ];
+            let suggestion = suggest(&titles);
+            assert_eq!(suggestion.play_alls, vec![0]);
+            assert_eq!(suggestion.suggested, vec![1, 2]);
+            assert_eq!(
+                resolve(&titles),
+                confirm(vec![1, 2], vec![vec![1, 2]], vec![])
+            );
+            assert_eq!(titles[1].clips.len(), prefix.len() + 1 + suffix.len());
+        }
+    }
+}
+
+#[test]
+fn shared_boundary_language_selection_survives_scan_permutations() {
+    let original = shared_terminal_titles();
+    for order in [
+        [0, 1, 2, 3, 4, 5, 6, 7],
+        [7, 6, 5, 4, 3, 2, 1, 0],
+        [3, 0, 7, 4, 1, 6, 5, 2],
+        [2, 3, 4, 5, 6, 7, 0, 1],
+    ] {
+        let titles: Vec<_> = order.iter().map(|&i| original[i].clone()).collect();
+        let snapshot = model(&titles);
+        for (language, ids) in [("en", vec![7, 8, 9]), ("de", vec![4, 5, 6])] {
+            let presentation =
+                snapshot.suggest_episodes(&StreamFilter::All, Some(language), MIN_SECS);
+            assert_eq!(
+                presentation
+                    .suggested
+                    .iter()
+                    .map(|&i| titles[i].playlist_id)
+                    .collect::<Vec<_>>(),
+                ids,
+                "{order:?} {language}"
+            );
+            assert_eq!(
+                presentation
+                    .play_alls
+                    .iter()
+                    .map(|&i| titles[i].playlist_id)
+                    .collect::<Vec<_>>(),
+                vec![1, 2]
+            );
+            let audio = StreamFilter::Langs(vec![language.into()]);
+            assert_eq!(
+                snapshot.suggest_episodes(&audio, None, MIN_SECS),
+                presentation
+            );
+            assert!(matches!(
+                snapshot.resolve_episodes(&audio, None, MIN_SECS),
+                Resolved::Confirm { suggested, .. } if suggested == presentation.suggested
+            ));
+        }
+    }
+}
+
+#[test]
+fn shared_boundary_aliases_keep_one_episode_copy_and_mark_both_wrappers() {
+    let a = ("00001", 0, 40);
+    let b = ("00002", 0, 40);
+    let tail = ("00003", 0, 1);
+    let titles = vec![
+        bd(1, 81.0, &[a, b, tail], "eng"),
+        bd(2, 81.0, &[a, b, tail], "deu"),
+        bd(3, 41.0, &[a, tail], "eng"),
+        bd(4, 41.0, &[a, tail], "deu"),
+        bd(5, 41.0, &[b, tail], "eng"),
+        bd(6, 41.0, &[b, tail], "deu"),
+    ];
+    let snapshot = model(&titles);
+    for (language, expected, alternates) in [
+        (
+            None,
+            vec![2, 4],
+            vec![Alternate { index: 3, of: 2 }, Alternate { index: 5, of: 4 }],
+        ),
+        (
+            Some("de"),
+            vec![3, 5],
+            vec![Alternate { index: 2, of: 3 }, Alternate { index: 4, of: 5 }],
+        ),
+    ] {
+        let suggestion = snapshot.suggest_episodes(&StreamFilter::All, language, MIN_SECS);
+        assert_eq!(suggestion.play_alls, vec![0, 1]);
+        assert_eq!(suggestion.suggested, expected);
+        assert_eq!(suggestion.alternates, alternates);
+    }
+}
+
+#[test]
+fn shared_boundary_suggestions_preserve_main_movie_and_explicit_picks() {
+    let titles = shared_terminal_titles();
+    let snapshot = model(&titles);
+    for (language, expected_main) in [(None, 0), (Some("en"), 0), (Some("de"), 1)] {
+        let audio = StreamFilter::All;
+        assert_eq!(
+            snapshot.select(&Selection::MainMovie, &audio, language),
+            Ok(vec![expected_main])
+        );
+        assert_eq!(
+            snapshot.main_or_episodes(&audio, language),
+            Ok(vec![expected_main])
+        );
+        // The operator may still deliberately choose a wrapper and an episode.
+        assert_eq!(
+            snapshot.select(&Selection::Titles(vec![6, 0, 1]), &audio, language),
+            Ok(vec![6, 0, 1])
+        );
+    }
+    for episodes in [false, true] {
+        assert_eq!(
+            snapshot.resolve_explicit(&[6, 0, 1], episodes),
+            Resolved::Run {
+                titles: vec![6, 0, 1],
+                episodes
+            }
+        );
+    }
+    assert_eq!(snapshot, model(&titles));
 }
