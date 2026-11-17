@@ -1295,3 +1295,13 @@ fn a_skipped_title_says_whether_it_was_empty() {
     assert_eq!(outcome, RipOutcome::Ok { titles_written: 1 });
     assert_eq!(*skips.0.lock().unwrap(), [(1, true), (2, false)]);
 }
+
+#[test]
+fn scan_options_carry_the_open_token() {
+    let halt = libfreemkv::Halt::new();
+    let opts = scan_options_with(false, &halt);
+    let carried = opts.halt.expect("the token is carried");
+    assert!(!carried.is_cancelled());
+    halt.cancel();
+    assert!(carried.is_cancelled(), "it is the same token, not a copy");
+}
