@@ -3245,3 +3245,73 @@ fn progress_of_a_selection_needing_review_is_its_first_candidate() {
     assert!(crate::resolve_selection(&disc, &job.selection, &job.streams.audio, None).is_err());
     assert_eq!(progress_main_title(&disc, &job), Some(1));
 }
+
+fn video_title(
+    resolution: libfreemkv::Resolution,
+    secondary: bool,
+    format: libfreemkv::ContentFormat,
+) -> libfreemkv::DiscTitle {
+    let mut t = libfreemkv::DiscTitle::empty();
+    t.content_format = format;
+    t.streams = vec![libfreemkv::Stream::Video(libfreemkv::VideoStream {
+        pid: 0x1011,
+        codec: libfreemkv::Codec::H264,
+        resolution,
+        frame_rate: libfreemkv::FrameRate::F23_976,
+        hdr: libfreemkv::HdrFormat::Sdr,
+        color_space: libfreemkv::ColorSpace::Bt709,
+        display_aspect: None,
+        secondary,
+        label: String::new(),
+        measured_cicp: None,
+    })];
+    t
+}
+
+#[test]
+fn estimated_rates_follow_the_video_class_and_ignore_secondary_video() {
+    use libfreemkv::{ContentFormat as F, Resolution as R};
+    let rate = |t: &libfreemkv::DiscTitle| title_bytes_per_sec(t);
+    assert_eq!(rate(&video_title(R::R2160p, false, F::BdTs)), 7_500_000.0);
+    assert_eq!(rate(&video_title(R::R1080p, false, F::MpegPs)), 3_750_000.0);
+    assert_eq!(rate(&video_title(R::R480p, false, F::BdTs)), 750_000.0);
+    assert_eq!(rate(&video_title(R::Unknown, false, F::BdTs)), 3_750_000.0);
+    assert_eq!(rate(&video_title(R::Unknown, false, F::DvdPs)), 750_000.0);
+    // A secondary video stream does not classify the title: falls to the container.
+    assert_eq!(rate(&video_title(R::R2160p, true, F::BdTs)), 3_750_000.0);
+    assert_eq!(rate(&video_title(R::R480p, true, F::BdTs)), 3_750_000.0);
+}
+
+#[test]
+fn title_rate_takes_size_from_extents_and_duration_from_clips() {
+    let mut t = libfreemkv::DiscTitle::empty();
+    t.extents = vec![libfreemkv::disc::Extent {
+        start_lba: 0,
+        sector_count: 1000,
+    }];
+    t.duration_secs = 2.0;
+    assert_eq!(title_bytes_per_sec(&t), 1_024_000.0);
+
+    let clip = |secs: f64| libfreemkv::Clip {
+        marks_on_pes_clock: true,
+        clip_id: "00001".into(),
+        in_time: 0,
+        out_time: 1,
+        duration_secs: secs,
+        source_packets: 0,
+        feed_span: None,
+    };
+    let mut t = libfreemkv::DiscTitle::empty();
+    t.size_bytes = 1_000_000;
+    t.duration_secs = 0.0;
+    t.clips = vec![clip(30.0), clip(f64::NAN), clip(70.0)];
+    assert_eq!(title_bytes_per_sec(&t), 10_000.0);
+}
+
+#[test]
+fn the_default_host_never_recovers_a_transport() {
+    use crate::PassHost as _;
+    let mut r = ZeroReader { capacity: 1 };
+    let mut host = crate::ReaderHost(&mut r);
+    assert!(!host.recover_transport(1, &libfreemkv::Error::Halted));
+}
