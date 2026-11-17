@@ -4,6 +4,7 @@
 use super::{SelectionModel, SelectionTitle, VideoSignature};
 use crate::StreamFilter;
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// A candidate folded into a kept title: an exact alias or a partial-overlap variant
 /// (recap, commentary playlist). Listed unticked.
@@ -33,6 +34,8 @@ const CLUSTER_GAP_PERCENT: f64 = 115.0;
 struct Work {
     #[cfg(test)]
     shared_calls: usize,
+    #[cfg(test)]
+    bitmap_words: usize,
 }
 
 // A title's content as merged `[start, end)` spans per unit; never empty.
@@ -90,6 +93,64 @@ impl<'a> Coverage<'a> {
     }
 }
 
+// Immutable disjointness over the initial representatives; removed titles are excluded
+// by rebuilding the contained-title mask. Rows stay empty until their first edge.
+struct DisjointPairs {
+    slots: HashMap<usize, usize>,
+    rows: Vec<Vec<u64>>,
+    mask: Vec<u64>,
+}
+
+impl DisjointPairs {
+    fn new(live: &[usize], coverage: &[Option<Coverage>], work: &mut Work) -> Self {
+        let words = live.len().div_ceil(64);
+        let mut rows = vec![Vec::new(); live.len()];
+        for a in 0..live.len() {
+            for b in a + 1..live.len() {
+                let (Some(x), Some(y)) = (&coverage[live[a]], &coverage[live[b]]) else {
+                    continue;
+                };
+                if x.shared(y, work) == 0 {
+                    rows[a].resize(words, 0);
+                    rows[b].resize(words, 0);
+                    rows[a][b / 64] |= 1 << (b % 64);
+                    rows[b][a / 64] |= 1 << (a % 64);
+                }
+            }
+        }
+        Self {
+            slots: live
+                .iter()
+                .enumerate()
+                .map(|(slot, &index)| (index, slot))
+                .collect(),
+            rows,
+            mask: vec![0; words],
+        }
+    }
+
+    fn has_pair(&mut self, inner: &[usize], _work: &mut Work) -> bool {
+        self.mask.fill(0);
+        for index in inner {
+            let slot = self.slots[index];
+            self.mask[slot / 64] |= 1 << (slot % 64);
+        }
+        inner.iter().any(|index| {
+            // Empty rows visit no words, including for entirely overlapping families.
+            self.rows[self.slots[index]]
+                .iter()
+                .zip(&self.mask)
+                .any(|(&neighbors, &contained)| {
+                    #[cfg(test)]
+                    {
+                        _work.bitmap_words += 1;
+                    }
+                    neighbors & contained != 0
+                })
+        })
+    }
+}
+
 impl SelectionModel {
     /// A suggested episode set: candidates of at least `min_secs` without exact aliases,
     /// play-alls and partial-overlap variants (kept: the `audio`/`presentation` match, else
@@ -129,12 +190,13 @@ impl SelectionModel {
             .collect();
         self.sort_play_order(&mut live);
         let coverage: Vec<Option<Coverage>> = self.titles.iter().map(Coverage::of).collect();
+        let mut pairs = DisjointPairs::new(&live, &coverage, work);
 
         // Remove play-alls until none remain, so a play-all of play-alls goes too.
         let mut play_alls = Vec::new();
         loop {
             let found: Vec<usize> = (live.iter().copied())
-                .filter(|&index| play_all(index, &live, &coverage, &self.titles, work))
+                .filter(|&index| play_all(index, &live, &coverage, &self.titles, &mut pairs, work))
                 .collect();
             if found.is_empty() {
                 break;
@@ -293,6 +355,7 @@ fn play_all(
     live: &[usize],
     coverage: &[Option<Coverage>],
     titles: &[SelectionTitle],
+    pairs: &mut DisjointPairs,
     work: &mut Work,
 ) -> bool {
     let Some(outer) = &coverage[index] else {
@@ -308,15 +371,7 @@ fn play_all(
                 .is_some_and(|inner| outer.strictly_contains(inner, work))
         })
         .collect();
-    inner.iter().enumerate().any(|(at, &a)| {
-        inner[at + 1..].iter().any(|&b| {
-            coverage[a]
-                .as_ref()
-                .unwrap()
-                .shared(coverage[b].as_ref().unwrap(), work)
-                == 0
-        })
-    }) || boundary_partition(index, &inner, titles)
+    pairs.has_pair(&inner, work) || boundary_partition(index, &inner, titles)
 }
 
 // Compare authored program bodies with their common opening/closing segments once in
@@ -405,36 +460,5 @@ fn language_key(tag: &str) -> String {
 }
 
 #[cfg(test)]
-mod work_tests {
-    use super::*;
-    use libfreemkv::DiscTitle;
-    use libfreemkv::disc::ContentSegment;
-
-    #[test]
-    fn nested_presentations_bound_shared_coverage_work() {
-        const N: usize = 256;
-        let titles: Vec<_> = (0..N)
-            .map(|index| {
-                let mut title = DiscTitle::empty();
-                title.duration_secs = 1_000.0;
-                title.selection_evidence.segments = vec![ContentSegment {
-                    unit: "one".into(),
-                    start: 0,
-                    end: 10_000 + index as u64,
-                }];
-                title
-            })
-            .collect();
-        let model = SelectionModel::from_titles(&titles);
-        let mut work = Work::default();
-        let suggestion =
-            model.suggest_episodes_with_work(&StreamFilter::All, None, 600.0, &mut work);
-        assert!(suggestion.play_alls.is_empty());
-        assert!(
-            work.shared_calls <= 4 * N * N,
-            "{} shared computations exceed the {} bound for {N} nested presentations",
-            work.shared_calls,
-            4 * N * N
-        );
-    }
-}
+#[path = "selection_pair_tests.rs"]
+mod pair_tests;
