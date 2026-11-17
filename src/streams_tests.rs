@@ -678,6 +678,39 @@ fn indices_select_source_order_and_include_forced_positions() {
 }
 
 #[test]
+fn split_forced_indices_use_complete_subtitle_range() {
+    let t = forced_title();
+    let selected = resolve_stream_selection_forced(
+        &t,
+        &StreamFilter::None,
+        &SubtitleFilter::split(StreamFilter::None, StreamFilter::Indices(vec![6])),
+    )
+    .unwrap();
+    assert_eq!(selected.subtitle, PidFilter::Only(vec![0x1212]));
+
+    for normal in [StreamFilter::None, StreamFilter::Indices(vec![2])] {
+        for requested in [0, 7, usize::MAX] {
+            assert_eq!(
+                resolve_stream_selection_forced(
+                    &t,
+                    &StreamFilter::None,
+                    &SubtitleFilter::split(
+                        normal.clone(),
+                        StreamFilter::Indices(vec![6, requested]),
+                    ),
+                ),
+                Err(StreamSelError::IndexOutOfRange {
+                    class: "subtitle",
+                    requested,
+                    count: 6,
+                }),
+                "normal={normal:?}, forced index={requested}",
+            );
+        }
+    }
+}
+
+#[test]
 fn indices_refuse_partial_matches_and_empty_classes() {
     for requested in [0, 99, usize::MAX] {
         assert_eq!(

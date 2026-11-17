@@ -439,7 +439,6 @@ fn resolve_subtitles(
     // when the disc carries no forced subtitle at all.
     let count = title.subtitle_streams().count();
     validate_indices(&sel.normal, "subtitle", count)?;
-    validate_indices(&sel.forced, "subtitle", count)?;
     let normal = Wanted::compile(&sel.normal)?;
     let forced = Wanted::compile(&sel.forced)?;
     Ok(PidFilter::Only(
