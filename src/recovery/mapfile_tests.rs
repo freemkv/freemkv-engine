@@ -1589,3 +1589,74 @@ fn stats_consistent_after_split_record() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+#[test]
+fn subtract_never_emits_empty_pieces() {
+    assert_eq!(subtract(&[(10, 5)], &[(10, 2)]), [(12, 3)]);
+    assert_eq!(subtract(&[(10, 5)], &[(13, 2)]), [(10, 3)]);
+    assert_eq!(subtract(&[(10, 5)], &[(12, 1)]), [(10, 2), (13, 2)]);
+    assert_eq!(subtract(&[(10, 5)], &[(10, 5)]), []);
+}
+
+#[test]
+fn parent_dir_names_the_containing_directory() {
+    assert_eq!(parent_dir(Path::new("/a/b")), Some(Path::new("/a")));
+    assert_eq!(parent_dir(Path::new("b")), Some(Path::new(".")));
+}
+
+#[test]
+fn a_mapfile_debug_names_its_fields() {
+    let p = tmpfile("debug");
+    let mf = Mapfile::create(&p, 0x800, "test").unwrap();
+    let text = format!("{mf:?}");
+    assert!(
+        text.contains("Mapfile") && text.contains("total_size"),
+        "{text}"
+    );
+    drop(mf);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn persist_is_due_only_after_the_flush_interval() {
+    let p = tmpfile("persist_due");
+    let mf = Mapfile::create(&p, 0x800, "test").unwrap();
+    assert!(!mf.persist_due());
+    std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(50));
+    assert!(mf.persist_due());
+    drop(mf);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn an_invalid_disc_hash_leaves_the_recorded_one_alone() {
+    let p = tmpfile("disc_hash");
+    let mut mf = Mapfile::create(&p, 0x800, "test").unwrap();
+    let hash = "ab".repeat(20);
+    mf.set_disc_hash(&hash);
+    mf.set_disc_hash("not a hash");
+    assert_eq!(mf.disc_hash(), Some(hash.as_str()));
+    drop(mf);
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn disowning_prunes_only_dead_writers_and_tracks_the_live_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = |n: &str| dir.path().join(n);
+    let dead = Mapfile::create(&path("dead.mapfile"), 0x800, "t").unwrap();
+    dead.disown_handle().disown();
+    drop(dead);
+    let live = Mapfile::create(&path("live.mapfile"), 0x800, "t").unwrap();
+    live.disown_handle().disown();
+    let other = Mapfile::create(&path("other.mapfile"), 0x800, "t").unwrap();
+    other.disown_handle().disown();
+    let table = ABANDONED.lock().unwrap();
+    let listed = |p: PathBuf| table.iter().any(|(q, _)| *q == canonical(&p));
+    assert!(!listed(path("dead.mapfile")), "a dead writer is pruned");
+    assert!(listed(path("live.mapfile")), "a live writer stays listed");
+    drop(table);
+    assert!(abandoned_writer_alive(&path("live.mapfile")));
+    assert!(!abandoned_writer_alive(&path("never.mapfile")));
+    drop((live, other));
+}
