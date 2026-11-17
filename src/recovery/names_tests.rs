@@ -947,3 +947,161 @@ fn a_1_8_6_pending_undo_is_rolled_back_before_the_folder_rename() {
     assert!(renamed(&iso));
     assert!(!has_file(&iso, "/SCAA/Unit_Key_RO.bak"));
 }
+
+mod unit {
+    use super::super::*;
+    use crate::recovery::mapfile::{Mapfile, SectorStatus, mapfile_path_for};
+
+    fn rec(lba: u32, fill: bool, status: SectorStatus, planned: u8, bytes: u8) -> Record {
+        Record {
+            lba,
+            fill,
+            status,
+            planned: Box::new([planned; SECTOR as usize]),
+            bytes: Box::new([bytes; SECTOR as usize]),
+        }
+    }
+
+    #[test]
+    fn without_cuts_single_sectors_out_of_ranges() {
+        assert_eq!(without(&[(10, 5)], &[]), [(10, 5)]);
+        assert_eq!(without(&[(10, 5)], &[12]), [(10, 2), (13, 2)]);
+        assert_eq!(without(&[(10, 5)], &[10]), [(11, 4)]);
+        assert_eq!(without(&[(10, 5)], &[14]), [(10, 4)]);
+        assert_eq!(without(&[(10, 5)], &[9, 15]), [(10, 5)]);
+        assert_eq!(without(&[(10, 5)], &[20]), [(10, 5)]);
+        assert_eq!(without(&[(10, 5)], &[13, 11]), [(10, 1), (12, 1), (14, 1)]);
+        assert_eq!(without(&[(10, 1)], &[10]), []);
+        assert_eq!(
+            without(&[(0, 2), (10, 3)], &[1, 11]),
+            [(0, 1), (10, 1), (12, 1)]
+        );
+    }
+
+    #[test]
+    fn fnv_is_fnv_1a_64() {
+        assert_eq!(fnv(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    // An undo header with `count` records claimed and a valid checksum, no record bytes.
+    fn header(magic: &[u8; 8], state: u8, count: u32) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(magic);
+        buf.push(state);
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&count.to_le_bytes());
+        buf.extend_from_slice(&[0; 8]);
+        let sum = checksum(&buf);
+        buf[HEADER - 8..HEADER].copy_from_slice(&sum.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn parse_undo_accepts_exactly_a_header_and_rejects_every_malformation() {
+        assert!(parse_undo(&[]).is_none());
+        assert!(parse_undo(b"FMKV").is_none());
+        let ok = parse_undo(&header(MAGIC, PENDING, 0)).expect("a bare header parses");
+        assert_eq!((ok.0, ok.1, ok.2.len()), (PENDING, 0, 0));
+        assert!(parse_undo(&header(MAGIC, COMMITTED, 0)).is_some());
+        assert!(parse_undo(&header(MAGIC, COMMITTED + 1, 0)).is_none());
+        assert!(parse_undo(&header(b"XXXXXXXX", PENDING, 0)).is_none());
+        assert!(parse_undo(&header(MAGIC, PENDING, 1)).is_none());
+        let mut bad_sum = header(MAGIC, PENDING, 0);
+        bad_sum[HEADER - 1] ^= 1;
+        assert!(parse_undo(&bad_sum).is_none());
+    }
+
+    #[test]
+    fn remove_undo_ignores_a_missing_file_and_reports_other_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(remove_undo(&dir.path().join("none.names-undo")).is_ok());
+        let as_dir = dir.path().join("dir.names-undo");
+        std::fs::create_dir(&as_dir).unwrap();
+        assert!(remove_undo(&as_dir).is_err());
+        let file = dir.path().join("f.names-undo");
+        std::fs::write(&file, b"x").unwrap();
+        assert!(remove_undo(&file).is_ok() && !file.exists());
+    }
+
+    // A 4-sector image whose sector 1 holds `now`, and a pending undo that restores `orig`.
+    fn image_with_undo(now: u8, orig: u8) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("x.iso");
+        let mut bytes = vec![0u8; 4 * SECTOR as usize];
+        bytes[SECTOR as usize..2 * SECTOR as usize].fill(now);
+        std::fs::write(&iso, &bytes).unwrap();
+        let records = [rec(1, false, SectorStatus::Finished, now, orig)];
+        write_undo(&names_undo_path(&iso), bytes.len() as u64, &records).unwrap();
+        (dir, iso)
+    }
+
+    fn sector_one(iso: &Path) -> u8 {
+        std::fs::read(iso).unwrap()[SECTOR as usize]
+    }
+
+    #[test]
+    fn a_pending_undo_rolls_the_image_back_and_a_committed_one_does_not() {
+        let (_dir, iso) = image_with_undo(0xBB, 0xAA);
+        assert_eq!(settle_names_undo(&iso), Settled::Done);
+        assert_eq!(sector_one(&iso), 0xAA);
+        assert!(!names_undo_path(&iso).exists());
+
+        let (_dir, iso) = image_with_undo(0xBB, 0xAA);
+        commit_undo(&names_undo_path(&iso)).unwrap();
+        assert_eq!(settle_names_undo(&iso), Settled::Done);
+        assert_eq!(sector_one(&iso), 0xBB, "a committed rename is kept");
+        assert!(!names_undo_path(&iso).exists());
+    }
+
+    #[test]
+    fn settling_distinguishes_a_missing_undo_from_an_unreadable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("x.iso");
+        assert_eq!(settle_names_undo(&iso), Settled::Done);
+        std::fs::create_dir(names_undo_path(&iso)).unwrap();
+        assert_eq!(settle_names_undo(&iso), Settled::Unknown);
+    }
+
+    #[test]
+    fn status_at_finds_the_entry_holding_the_sector() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.mapfile");
+        let mut map = Mapfile::create(&path, 200 * SECTOR, "t").unwrap();
+        map.record(2 * SECTOR, 2 * SECTOR, SectorStatus::Finished)
+            .unwrap();
+        assert_eq!(status_at(&map, 3), SectorStatus::Finished);
+        assert_eq!(status_at(&map, 2), SectorStatus::Finished);
+        assert_eq!(status_at(&map, 4), SectorStatus::NonTried);
+        assert_eq!(status_at(&map, 100), SectorStatus::NonTried);
+        assert_eq!(status_at(&map, 1), SectorStatus::NonTried);
+    }
+
+    #[test]
+    fn reset_fills_only_resets_unfinished_rebuilt_sectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("x.iso");
+        let path = mapfile_path_for(&iso);
+        let mut map = Mapfile::create(&path, 4 * SECTOR, "t").unwrap();
+        map.record(0, 4 * SECTOR, SectorStatus::Finished).unwrap();
+        map.flush().unwrap();
+        drop(map);
+        let a = rec(1, true, SectorStatus::NonTried, 0, 0);
+        let b = rec(2, false, SectorStatus::NonTried, 0, 0);
+        let c = rec(3, true, SectorStatus::Finished, 0, 0);
+        reset_fills(&iso, &[&a, &b, &c]).unwrap();
+        let map = Mapfile::load(&path).unwrap();
+        assert_eq!(status_at(&map, 1), SectorStatus::NonTried);
+        assert_eq!(status_at(&map, 2), SectorStatus::Finished);
+        assert_eq!(status_at(&map, 3), SectorStatus::Finished);
+    }
+
+    #[test]
+    fn reset_fills_without_a_mapfile_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("x.iso");
+        let a = rec(1, true, SectorStatus::NonTried, 0, 0);
+        assert!(reset_fills(&iso, &[&a]).is_ok());
+    }
+}
