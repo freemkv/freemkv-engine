@@ -328,7 +328,10 @@ fn boundary_partition(outer: usize, inner: &[usize], titles: &[SelectionTitle]) 
         return false;
     }
     let whole = segments(outer);
-    if whole.len() <= prefix + suffix || !whole.ends_with(&first[first.len() - suffix..]) {
+    if whole.len() <= prefix + suffix
+        || !whole.starts_with(&first[..prefix])
+        || !whole.ends_with(&first[first.len() - suffix..])
+    {
         return false;
     }
     let mut bodies = Vec::new();
@@ -353,6 +356,9 @@ fn boundary_partition(outer: usize, inner: &[usize], titles: &[SelectionTitle]) 
         let Some((index, body)) = matches.next() else {
             return false;
         };
+        if matches.next().is_some() {
+            return false;
+        }
         used[index] = true;
         count += 1;
         remaining = &remaining[body.len()..];
