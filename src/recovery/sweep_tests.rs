@@ -502,10 +502,12 @@ fn drive_sweep_sink(
     };
     let map = Mapfile::create(&dir.join("bench.map"), total, "bench").unwrap();
     let (mut sink, _rx) = SweepSink::new(img.clone(), map, true);
+    let pool = crate::recovery::BufPool::new(4, BENCH_BATCH as usize);
+    sink.recycle_into(pool.returner());
     let t0 = std::time::Instant::now();
     for i in 0..batches {
         pace(t0, i * BENCH_BATCH, rate);
-        let buf = vec![0x5Au8; BENCH_BATCH as usize];
+        let buf = pool.take();
         let pos = i * BENCH_BATCH;
         sink.apply(WorkItem::Good { pos, buf }).unwrap();
     }
@@ -611,4 +613,46 @@ fn the_sweep_queue_holds_about_eight_mib() {
         "huge batches keep the floor"
     );
     assert_eq!(sweep_queue_depth(0), 128);
+}
+
+// A written Good buffer goes back to the producer's pool and is the next one it reads into.
+#[test]
+fn a_written_batch_buffer_comes_back_for_the_next_read() {
+    use crate::recovery::BufPool;
+    let dir = scratch("recycle");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    let pool = BufPool::new(2, B as usize);
+    sink.recycle_into(pool.returner());
+    let buf = pool.take();
+    let ptr = buf.as_ptr();
+    sink.apply(WorkItem::Good { pos: 0, buf }).unwrap();
+    let back = pool.take();
+    assert_eq!(back.as_ptr(), ptr, "the same allocation came back");
+    assert_eq!(back.len(), B as usize);
+    sink.close().unwrap();
+    assert!(img.state().durable[..B as usize].iter().all(|&b| b == 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The pool hands out `size` bytes (new or recycled, any length back), copies exactly, and
+// keeps at most `cap` spares: extra returns are dropped, never queued.
+#[test]
+fn the_buffer_pool_sizes_copies_and_bounds_its_spares() {
+    use crate::recovery::BufPool;
+    let pool = BufPool::new(1, 8);
+    assert_eq!(pool.take(), vec![0u8; 8]);
+    let back = pool.returner();
+    back.give(vec![7u8; 3]);
+    back.give(vec![9u8; 3]);
+    let reused = pool.take();
+    assert_eq!(reused.len(), 8);
+    assert_eq!(&reused[..3], &[7, 7, 7], "the first return was kept");
+    assert_eq!(
+        pool.take(),
+        vec![0u8; 8],
+        "the second was dropped, not queued"
+    );
+    back.give(vec![1u8; 64]);
+    assert_eq!(pool.copy_of(&[4, 5]), vec![4, 5]);
+    crate::recovery::BufReturn::default().give(vec![1]);
 }

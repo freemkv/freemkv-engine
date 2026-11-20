@@ -89,9 +89,16 @@ pub(super) struct SweepSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     zero: Box<[u8; ZERO_CHUNK]>,
     /// Sync-and-persist cadence ([`super::IMAGE_PERSIST_INTERVAL`]; tests shorten it).
     persist_every: std::time::Duration,
+    /// Where a written `Good` buffer goes back to the producer for its next read.
+    recycle: super::BufReturn,
 }
 
 impl<F: ImageFile> SweepSink<F> {
+    /// Return each written `Good` buffer through `recycle` instead of dropping it.
+    pub(super) fn recycle_into(&mut self, recycle: super::BufReturn) {
+        self.recycle = recycle;
+    }
+
     // Every record goes through here, a fill's included: whichever record persists the map
     // must sync the image first, or earlier Finished records would outrun their data.
     fn record(&mut self, run: (u64, u64, SectorStatus)) -> Result<(), Error> {
@@ -115,6 +122,7 @@ impl<F: ImageFile> SweepSink<F> {
             prog_tx,
             zero: Box::new([0u8; ZERO_CHUNK]),
             persist_every: super::IMAGE_PERSIST_INTERVAL,
+            recycle: super::BufReturn::default(),
         };
         (sink, prog_rx)
     }
@@ -138,6 +146,7 @@ impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
+                self.recycle.give(buf);
                 self.record((pos, len, SectorStatus::Finished))?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {

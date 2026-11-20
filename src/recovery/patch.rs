@@ -40,6 +40,8 @@ struct PatchRecoverySink<'a> {
     /// to observe a Stop at all: `WRITE_THROUGH_DEPTH` is 1, so a consumer
     /// stalled inside its write parks the producer in `send` indefinitely.
     halt: &'a libfreemkv::halt::Halt,
+    /// Buffers the consumer handed back, so a span's copy reuses one.
+    pool: &'a super::BufPool,
 }
 
 impl RecoverySink for PatchRecoverySink<'_> {
@@ -48,7 +50,7 @@ impl RecoverySink for PatchRecoverySink<'_> {
             self.pipe,
             PatchItem::Recovered {
                 pos,
-                buf: buf.to_vec(),
+                buf: self.pool.copy_of(buf),
             },
             self.halt,
         ) {
@@ -172,6 +174,8 @@ pub(super) struct PatchSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     last_republish: Option<std::time::Instant>,
     /// Sync-and-persist cadence ([`super::IMAGE_PERSIST_INTERVAL`]; tests shorten it).
     persist_every: std::time::Duration,
+    /// Where a written span's buffer goes back to the producer.
+    recycle: super::BufReturn,
 }
 
 /// Minimum interval between per-record snapshot republishes.
@@ -210,8 +214,14 @@ impl<F: ImageFile> PatchSink<F> {
             title,
             last_republish: None,
             persist_every: super::IMAGE_PERSIST_INTERVAL,
+            recycle: super::BufReturn::default(),
         };
         (sink, shared_clone)
+    }
+
+    /// Return each written span's buffer through `recycle` instead of dropping it.
+    pub(super) fn recycle_into(&mut self, recycle: super::BufReturn) {
+        self.recycle = recycle;
     }
 
     // Every record goes through here: whichever one persists the map syncs the image first.
@@ -265,6 +275,7 @@ impl<F: ImageFile> Sink<PatchItem> for PatchSink<F> {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
+                self.recycle.give(buf);
                 self.record((pos, len, SectorStatus::Finished))?;
             }
             PatchItem::NonTrimmed { pos, len } => {
@@ -623,6 +634,8 @@ struct PatchCtx<'a, 'o> {
     disc: &'a libfreemkv::Disc,
     reader: &'a mut dyn SectorSource,
     pipe: &'a Pipeline<PatchItem, PatchSummary>,
+    // Recycled span buffers the consumer returns.
+    pool: &'a super::BufPool,
     shared: &'a Mutex<SharedPatchState>,
     opts: &'a PatchOptions<'o>,
     // Index into `disc.titles` of the title progress reports as the main one; `None`: title 0.
@@ -984,6 +997,7 @@ impl PatchCtx<'_, '_> {
         let mut sink = PatchRecoverySink {
             pipe: self.pipe,
             halt: &pass_halt,
+            pool: self.pool,
         };
 
         let bad_before = bad.total_len();
@@ -1383,12 +1397,15 @@ fn patch_linked(
     // snapshot lets producer callbacks read consumer effects. Disown taken
     // BEFORE the move so abandoned teardown can still stop a stale mapfile write.
     let map_disown = map.disown_handle();
-    let (sink, shared) = PatchSink::new(
+    let (mut sink, shared) = PatchSink::new(
         path,
         map,
         is_regular,
         super::progress_title(disc, main_title).cloned(),
     )?;
+    // Spans are at most one handler read (64 KiB); a few spares cover the depth-1 queue.
+    let pool = super::BufPool::new(WRITE_THROUGH_DEPTH + 2, 0);
+    sink.recycle_into(pool.returner());
     // WRITE_THROUGH_DEPTH (=1): patch reads one sector per recovery decision and
     // checks consumer-published stats inline. Sweep's depth-4 default would let
     // recovered sectors queue between decisions, breaking this per-sector lockstep.
@@ -1441,6 +1458,7 @@ fn patch_linked(
         disc,
         reader,
         pipe: &pipe,
+        pool: &pool,
         shared: &shared,
         opts,
         main_title,

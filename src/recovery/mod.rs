@@ -441,6 +441,56 @@ pub(crate) fn sweep_queue_depth(batch_bytes: usize) -> usize {
     (SWEEP_QUEUE_BYTES / batch_bytes.max(1)).clamp(floor, 128.max(floor))
 }
 
+/// Recycles a pass's batch buffers: the consumer hands each written buffer back and the
+/// producer fills it again, so a steady pass allocates nothing per batch. Buffers beyond
+/// the pool's capacity are dropped, which bounds the memory it holds.
+pub(crate) struct BufPool {
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    tx: std::sync::mpsc::SyncSender<Vec<u8>>,
+    size: usize,
+}
+
+impl BufPool {
+    /// A pool keeping up to `cap` spare buffers of `size` bytes.
+    pub(crate) fn new(cap: usize, size: usize) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel(cap);
+        Self { rx, tx, size }
+    }
+
+    /// A `size`-byte buffer, recycled when one is back (its bytes are stale), else new.
+    pub(crate) fn take(&self) -> Vec<u8> {
+        let mut buf = self.rx.try_recv().unwrap_or_default();
+        buf.resize(self.size, 0);
+        buf
+    }
+
+    /// A buffer holding a copy of `data`, recycled when one is back.
+    pub(crate) fn copy_of(&self, data: &[u8]) -> Vec<u8> {
+        let mut buf = self.rx.try_recv().unwrap_or_default();
+        buf.clear();
+        buf.extend_from_slice(data);
+        buf
+    }
+
+    /// The handle a consumer returns written buffers through.
+    pub(crate) fn returner(&self) -> BufReturn {
+        BufReturn(Some(self.tx.clone()))
+    }
+}
+
+/// A consumer's way back into a [`BufPool`]; the default returns nothing (buffers drop).
+#[derive(Default)]
+pub(crate) struct BufReturn(Option<std::sync::mpsc::SyncSender<Vec<u8>>>);
+
+impl BufReturn {
+    /// Hand `buf` back for reuse; dropped when the pool is full or gone.
+    pub(crate) fn give(&self, buf: Vec<u8>) {
+        if let Some(tx) = &self.0 {
+            let _ = tx.try_send(buf);
+        }
+    }
+}
+
 // Deadline for ONE producer→consumer handoff (T9): re-armed per send, so already stall-shaped.
 // Reuses `JOIN_TIMEOUT_SECS`, since ST-L2 `finish_with_halt`'s 600 s no-progress window (T7).
 const SEND_DEADLINE: std::time::Duration =
@@ -1103,8 +1153,11 @@ fn sweep_linked(
     // `map_disown` is taken BEFORE `map` moves into the sink: it's the only way left
     // to stop an abandoned consumer writing a stale mapfile over a resumed pass.
     let map_disown = map.disown_handle();
-    let (sink, prog_rx) = SweepSink::new(file, map, is_regular);
+    let (mut sink, prog_rx) = SweepSink::new(file, map, is_regular);
     let depth = sweep_queue_depth(batch as usize * 2048);
+    // Enough spares for every queued batch plus the two in hand; more are dropped.
+    let pool = BufPool::new(depth + 2, batch as usize * 2048);
+    sink.recycle_into(pool.returner());
     let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
         Pipeline::spawn_named("freemkv-sweep-consumer", depth, sink)?;
 
@@ -1115,7 +1168,9 @@ fn sweep_linked(
     let send =
         |item: WorkItem| send_bounded(&pipe, item, &send_halt).map_err(SendStall::pass_error);
 
-    let mut buf = vec![0u8; batch as usize * 2048];
+    // The batch being read. A good one moves to the consumer whole (no copy) and the pool
+    // hands back a written buffer for the next read; a failed read keeps this one.
+    let mut buf = pool.take();
     // POSITION: how far the producer's cursor has advanced, good bytes and
     // zero-filled damage alike. Drives `work_done` and the pending remainder.
     let mut bytes_done = 0u64;
@@ -1240,8 +1295,10 @@ fn sweep_linked(
 
                     // Plaintext: the whole-disc reader decrypted in place during the read.
 
-                    // Fresh owned Vec into the channel; producer's `buf` is reused.
-                    let send_buf = buf[..block_bytes as usize].to_vec();
+                    // The read buffer itself moves on, cut to the block; the next read gets
+                    // a recycled one (stale bytes, which `require_full_read` never lets out).
+                    let mut send_buf = std::mem::replace(&mut buf, pool.take());
+                    send_buf.truncate(block_bytes as usize);
                     if let Err(e) = send(WorkItem::Good { pos, buf: send_buf }) {
                         (halt_requested, producer_err) = (e.is_none(), e);
                         break 'outer;
