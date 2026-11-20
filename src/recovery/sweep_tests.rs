@@ -732,3 +732,57 @@ fn a_fresh_sized_image_reads_zero_where_a_fill_skipped_its_write() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// A stats reply carries the damage ranges only when they changed since the last delivered;
+// a reply that could not be delivered does not count as delivered.
+#[test]
+fn stats_replies_carry_damage_only_when_it_changed() {
+    let dir = scratch("stats-epoch");
+    let img = MemImage::filled(8 * B as usize, 0);
+    let map = Mapfile::create(&dir.join("out.map"), 8 * B, "test").unwrap();
+    let (mut sink, rx) = SweepSink::new(img, map, true);
+    let ask = |sink: &mut SweepSink<MemImage>| {
+        sink.apply(WorkItem::StatsRequest).unwrap();
+        try_recv_progress(&rx).map(|s| s.bad_ranges)
+    };
+    assert_eq!(
+        ask(&mut sink),
+        Some(Some(vec![])),
+        "the first reply has the set"
+    );
+    assert_eq!(ask(&mut sink), Some(None), "unchanged");
+    let good = batch(0);
+    sink.apply(WorkItem::Good { pos: 0, buf: good }).unwrap();
+    assert_eq!(ask(&mut sink), Some(None), "good data is not damage");
+    sink.apply(WorkItem::SkipFill { pos: B, len: B }).unwrap();
+    // The channel holds one reply: a second request before a drain is dropped.
+    sink.apply(WorkItem::StatsRequest).unwrap();
+    sink.apply(WorkItem::StatsRequest).unwrap();
+    let snap = try_recv_progress(&rx).unwrap();
+    assert_eq!(snap.bad_ranges, Some(vec![(B, B)]));
+    assert_eq!(ask(&mut sink), Some(None));
+    sink.apply(WorkItem::SkipFill { pos: 2 * B, len: B })
+        .unwrap();
+    assert_eq!(ask(&mut sink), Some(Some(vec![(B, 2 * B)])));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Drained together, a newer reply without ranges keeps the older reply's ranges.
+#[test]
+fn a_drain_keeps_the_newest_ranges_it_saw() {
+    let (tx, rx) = std::sync::mpsc::sync_channel(2);
+    let stats = crate::recovery::mapfile::MapStats::default();
+    let ranges = Some(vec![(1, 2)]);
+    let first = ProgressSnapshot {
+        stats,
+        bad_ranges: ranges.clone(),
+    };
+    tx.send(first).unwrap();
+    tx.send(ProgressSnapshot {
+        stats,
+        bad_ranges: None,
+    })
+    .unwrap();
+    assert_eq!(try_recv_progress(&rx).unwrap().bad_ranges, ranges);
+    assert!(try_recv_progress(&rx).is_none());
+}

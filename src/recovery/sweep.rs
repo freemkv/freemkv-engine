@@ -50,7 +50,9 @@ pub(super) enum WorkItem {
 /// callback.
 pub(super) struct ProgressSnapshot {
     pub stats: MapStats,
-    pub bad_ranges: Vec<(u64, u64)>,
+    /// The damage ranges, or `None` when unchanged since the last snapshot delivered:
+    /// the producer then keeps what it derived from the earlier ones.
+    pub bad_ranges: Option<Vec<(u64, u64)>>,
 }
 
 /// Final summary returned by the consumer thread on shutdown — what
@@ -61,11 +63,15 @@ pub(super) struct ConsumerSummary {
 }
 
 /// Drain any pending progress snapshots from the consumer. Returns
-/// the most recent one, if any. The producer caches it and uses it
+/// the most recent one, if any, carrying the newest damage ranges among
+/// those drained when it has none of its own. The producer caches it
 /// for subsequent progress callbacks until a fresh one arrives.
 pub(super) fn try_recv_progress(rx: &Receiver<ProgressSnapshot>) -> Option<ProgressSnapshot> {
-    let mut latest = None;
-    while let Ok(snap) = rx.try_recv() {
+    let mut latest: Option<ProgressSnapshot> = None;
+    while let Ok(mut snap) = rx.try_recv() {
+        if snap.bad_ranges.is_none() {
+            snap.bad_ranges = latest.and_then(|s| s.bad_ranges);
+        }
         latest = Some(snap);
     }
     latest
@@ -95,6 +101,8 @@ pub(super) struct SweepSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     /// This pass created the image empty (truncated, then sized), so a byte no write of
     /// this sink reached reads as zero, and a fill over a NonTried range needs no write.
     fresh_image: bool,
+    /// The map's damage epoch when damage ranges last reached the producer.
+    sent_epoch: Option<u64>,
 }
 
 impl<F: ImageFile> SweepSink<F> {
@@ -134,6 +142,7 @@ impl<F: ImageFile> SweepSink<F> {
             persist_every: super::IMAGE_PERSIST_INTERVAL,
             recycle: super::BufReturn::default(),
             fresh_image: false,
+            sent_epoch: None,
         };
         (sink, prog_rx)
     }
@@ -193,14 +202,20 @@ impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
                 // DAMAGE only — NOT NonTried (unread remainder ahead of the
                 // sweep head): including it made the live drilldown treat the
                 // whole unread disc as damage at sweep start, melting to 0.
-                let bad_ranges = self
-                    .map
-                    .ranges_with(&crate::recovery::mapfile::damage_sector_statuses());
+                let epoch = self.map.damage_epoch();
+                let bad_ranges = (self.sent_epoch != Some(epoch)).then(|| {
+                    self.map
+                        .ranges_with(&crate::recovery::mapfile::damage_sector_statuses())
+                });
+                let carries = bad_ranges.is_some();
                 // Best-effort: drop on backpressure; producer's cache
                 // stays current enough.
-                let _ = self
+                let sent = self
                     .prog_tx
                     .try_send(ProgressSnapshot { stats, bad_ranges });
+                if sent.is_ok() && carries {
+                    self.sent_epoch = Some(epoch);
+                }
             }
         }
         Ok(Flow::Continue)

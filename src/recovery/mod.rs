@@ -1423,10 +1423,11 @@ fn sweep_linked(
             iter_count += 1;
 
             // Drain any consumer-side stats snapshot.
+            // A snapshot without ranges means the damage is unchanged: keep what was derived.
             if let Some(snap) = try_recv_progress(&prog_rx) {
-                if let Some(t) = main_title {
-                    cached_main_title_bad = bytes_bad_in_title(t, &snap.bad_ranges);
-                    cached_located = locate_ranges(&snap.bad_ranges, t);
+                if let (Some(t), Some(ranges)) = (main_title, &snap.bad_ranges) {
+                    cached_main_title_bad = bytes_bad_in_title(t, ranges);
+                    cached_located = locate_ranges(ranges, t);
                 }
                 cached_snapshot = Some(snap);
             }

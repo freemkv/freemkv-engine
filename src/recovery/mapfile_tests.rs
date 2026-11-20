@@ -1715,6 +1715,41 @@ fn a_crash_before_the_rename_leaves_the_last_persist_intact() {
 }
 
 #[test]
+fn the_damage_epoch_moves_only_when_damage_or_scope_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mf = Mapfile::create(&dir.path().join("e.mapfile"), 0x4000, "test").unwrap();
+    let e0 = mf.damage_epoch();
+    mf.record_unpersisted(0, 0x800, SectorStatus::Finished)
+        .unwrap();
+    assert_eq!(mf.damage_epoch(), e0, "good data over unread bytes");
+    mf.record_unpersisted(0x800, 0x800, SectorStatus::NonTrimmed)
+        .unwrap();
+    let e1 = mf.damage_epoch();
+    assert!(e1 > e0, "new damage");
+    mf.record_unpersisted(0x800, 0x800, SectorStatus::NonTrimmed)
+        .unwrap();
+    assert_eq!(
+        mf.damage_epoch(),
+        e1,
+        "the same damage again changes nothing"
+    );
+    mf.record_unpersisted(0x800, 0x400, SectorStatus::Finished)
+        .unwrap();
+    let e2 = mf.damage_epoch();
+    assert!(e2 > e1, "recovered damage");
+    mf.promote(&[SectorStatus::NonTrimmed], SectorStatus::Unreadable)
+        .unwrap();
+    let e3 = mf.damage_epoch();
+    assert!(e3 > e2, "promotion");
+    mf.set_scope(vec![(0, 0x1000)]);
+    assert!(mf.damage_epoch() > e3, "scope");
+    let e4 = mf.damage_epoch();
+    mf.clear_scope();
+    assert!(mf.damage_epoch() > e4);
+    mf.dirty = false;
+}
+
+#[test]
 fn is_all_holds_only_for_a_range_wholly_in_one_status() {
     let dir = tempfile::tempdir().unwrap();
     let mut mf = Mapfile::create(&dir.path().join("m.mapfile"), 0x4000, "test").unwrap();

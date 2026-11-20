@@ -176,6 +176,8 @@ pub(super) struct PatchSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     persist_every: std::time::Duration,
     /// Where a written span's buffer goes back to the producer.
     recycle: super::BufReturn,
+    /// The map's damage epoch the shared snapshot's drilldown was built at.
+    published_epoch: Option<u64>,
 }
 
 /// Minimum interval between per-record snapshot republishes.
@@ -206,6 +208,7 @@ impl<F: ImageFile> PatchSink<F> {
     ) -> (Self, Arc<Mutex<SharedPatchState>>) {
         let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map, title.as_ref())));
         let shared_clone = shared.clone();
+        let published_epoch = Some(map.damage_epoch());
         let sink = Self {
             file,
             map,
@@ -215,6 +218,7 @@ impl<F: ImageFile> PatchSink<F> {
             last_republish: None,
             persist_every: super::IMAGE_PERSIST_INTERVAL,
             recycle: super::BufReturn::default(),
+            published_epoch,
         };
         (sink, shared_clone)
     }
@@ -245,10 +249,17 @@ impl<F: ImageFile> PatchSink<F> {
         self.publish_now();
     }
 
-    fn publish_now(&self) {
+    fn publish_now(&mut self) {
+        // Damage unchanged since the last publish: only the stats can have moved.
+        let epoch = self.map.damage_epoch();
+        if self.published_epoch == Some(epoch) {
+            lock_snapshot(&self.shared).stats = self.map.stats();
+            return;
+        }
         // Build outside the lock (it walks the whole damage set), then swap.
         let next = SharedPatchState::from_map(&self.map, self.title.as_ref());
         *lock_snapshot(&self.shared) = next;
+        self.published_epoch = Some(epoch);
     }
 }
 

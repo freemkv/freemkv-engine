@@ -255,6 +255,8 @@ pub struct Mapfile {
     /// has been abandoned; once set, no further write reaches the path. See
     /// [`MapfileDisown`].
     disowned: Arc<AtomicBool>,
+    /// See [`Mapfile::damage_epoch`].
+    damage_epoch: u64,
     /// How many times this mapfile reached disk (tests and benches count persists).
     #[cfg(test)]
     pub(crate) persists: usize,
@@ -302,6 +304,7 @@ impl Mapfile {
             scope: None,
             raw: None,
             disowned: Arc::new(AtomicBool::new(false)),
+            damage_epoch: 0,
             #[cfg(test)]
             persists: 0,
         };
@@ -454,6 +457,7 @@ impl Mapfile {
             scope,
             raw,
             disowned: Arc::new(AtomicBool::new(false)),
+            damage_epoch: 0,
             #[cfg(test)]
             persists: 0,
         })
@@ -520,6 +524,7 @@ impl Mapfile {
         if !hit {
             return Ok(());
         }
+        self.damage_epoch += 1;
         self.stats = Self::compute_stats(&self.entries, self.total_size);
         self.changed()
     }
@@ -751,13 +756,21 @@ impl Mapfile {
     pub fn set_scope(&mut self, mut ranges: Vec<(u64, u64)>) {
         self.scope = Some(merge_byte_ranges(&mut ranges));
         self.dirty = true;
+        self.damage_epoch += 1;
     }
 
     /// Widen a scoped image back to the whole disc: its unread rest becomes pending.
     pub fn clear_scope(&mut self) {
         if self.scope.take().is_some() {
             self.dirty = true;
+            self.damage_epoch += 1;
         }
+    }
+
+    /// A counter that moves whenever the damage set ([`damage_sector_statuses`]) or the
+    /// scope may have changed: a snapshot taken at an equal value is still current.
+    pub(crate) fn damage_epoch(&self) -> u64 {
+        self.damage_epoch
     }
 
     // Replaces the entries overlapping or touching `[pos, end)` with their split remainders,
@@ -808,6 +821,10 @@ impl Mapfile {
         let mut merged: Vec<MapEntry> = Vec::with_capacity(pieces.len());
         for e in pieces {
             push_coalesced(&mut merged, e);
+        }
+        let is_damage = |e: &MapEntry| damage_sector_statuses().contains(&e.status);
+        if merged.as_slice() != window && window.iter().chain(&merged).any(is_damage) {
+            self.damage_epoch += 1;
         }
         for e in window {
             tally(&mut self.stats, e, false);

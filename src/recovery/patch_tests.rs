@@ -860,7 +860,7 @@ fn a_poisoned_snapshot_lock_does_not_cascade_the_panic() {
     let iso = dir.path().join("out.iso");
     std::fs::write(&iso, vec![0u8; 8192]).unwrap();
     let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
-    let (sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
+    let (mut sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
     let poisoner = shared.clone();
     let _ = std::thread::spawn(move || {
         let _g = poisoner.lock().unwrap();
@@ -1116,7 +1116,7 @@ fn skipped_damage_does_not_hold_the_bar_short() {
         .unwrap();
     map.record(2048, 2048, mapfile::SectorStatus::NonTrimmed)
         .unwrap();
-    let (sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
+    let (mut sink, shared) = PatchSink::new(&iso, map, true, None).unwrap();
     sink.publish_now();
     let done = std::sync::Mutex::new(None);
     let reporter = |e: &libfreemkv::Event<'_>| {
@@ -1266,6 +1266,32 @@ fn a_patch_crash_after_any_item_finds_no_finished_range_without_its_data() {
         Mapfile::load(&map_path).unwrap().stats().bytes_good,
         8 * 2048
     );
+}
+
+// A publish rebuilds the drilldown only when the damage moved; the stats always follow.
+#[test]
+fn a_publish_rebuilds_the_damage_view_only_when_damage_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sink, _img) = mem_patch_sink(dir.path(), 4 * 2048);
+    let shared = Arc::clone(&sink.shared);
+    let damage = |s: &Mutex<SharedPatchState>| lock_snapshot(s).damage_in_scope;
+    sink.map
+        .record_unpersisted(2048, 2048, SectorStatus::NonTrimmed)
+        .unwrap();
+    sink.publish_now();
+    assert_eq!(damage(&shared), 2048, "new damage rebuilds the view");
+    lock_snapshot(&shared).damage_in_scope = 7;
+    sink.map
+        .record_unpersisted(0, 2048, SectorStatus::Finished)
+        .unwrap();
+    sink.publish_now();
+    assert_eq!(damage(&shared), 7, "unchanged damage keeps the view");
+    assert_eq!(good_bytes(&shared), 2048, "the stats still follow");
+    sink.map
+        .record_unpersisted(2048, 2048, SectorStatus::Finished)
+        .unwrap();
+    sink.publish_now();
+    assert_eq!(damage(&shared), 0, "recovered damage rebuilds it");
 }
 
 // A recovered span whose write fails part-way leaves the map on disk without it.
