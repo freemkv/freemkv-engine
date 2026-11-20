@@ -1713,3 +1713,22 @@ fn a_crash_before_the_rename_leaves_the_last_persist_intact() {
         "the stray tmp was replaced"
     );
 }
+
+#[test]
+fn is_all_holds_only_for_a_range_wholly_in_one_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mf = Mapfile::create(&dir.path().join("m.mapfile"), 0x4000, "test").unwrap();
+    mf.record_unpersisted(0x1000, 0x800, SectorStatus::Finished)
+        .unwrap();
+    let nt = SectorStatus::NonTried;
+    assert!(mf.is_all(0, 0x1000, nt), "the whole leading run");
+    assert!(mf.is_all(0x1800, 0x2800, nt), "the trailing run to the end");
+    assert!(mf.is_all(0x800, 0x400, nt), "inside a run");
+    assert!(!mf.is_all(0x800, 0x1000, nt), "it crosses the Finished run");
+    assert!(mf.is_all(0x1000, 0x800, SectorStatus::Finished));
+    assert!(!mf.is_all(0x3000, 0x2000, nt), "past the map's coverage");
+    assert!(!mf.is_all(0x5000, 0x10, nt), "wholly past it");
+    assert!(!mf.is_all(u64::MAX, 2, nt), "an overflowing range");
+    assert!(mf.is_all(0x1000, 0, nt), "an empty range");
+    mf.dirty = false;
+}

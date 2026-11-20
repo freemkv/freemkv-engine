@@ -671,6 +671,28 @@ impl Mapfile {
         None
     }
 
+    /// Whether every byte of `[pos, pos + size)` is recorded as `status`. A range reaching
+    /// past the map's coverage is not (its tail is unknown); an empty range is.
+    pub(crate) fn is_all(&self, pos: u64, size: u64, status: SectorStatus) -> bool {
+        let Some(end) = pos.checked_add(size) else {
+            return false;
+        };
+        let mut at = pos;
+        let first = self
+            .entries
+            .partition_point(|e| e.pos.saturating_add(e.size) <= pos);
+        for e in &self.entries[first..] {
+            if at >= end {
+                break;
+            }
+            if e.pos > at || e.status != status {
+                return false;
+            }
+            at = e.pos.saturating_add(e.size);
+        }
+        at >= end
+    }
+
     /// All ranges matching one of the given statuses, in position order.
     pub fn ranges_with(&self, statuses: &[SectorStatus]) -> Vec<(u64, u64)> {
         self.entries

@@ -656,3 +656,79 @@ fn the_buffer_pool_sizes_copies_and_bounds_its_spares() {
     assert_eq!(pool.copy_of(&[4, 5]), vec![4, 5]);
     crate::recovery::BufReturn::default().give(vec![1]);
 }
+
+// On a fresh image a fill over still-NonTried bytes only records: any write would fail here.
+#[test]
+fn a_fill_on_a_fresh_image_records_without_writing() {
+    let dir = scratch("fresh-fill");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    sink.image_is_fresh();
+    img.state().fail_after = Some(0);
+    sink.apply(WorkItem::GapFill { pos: B, len: 2 * B })
+        .unwrap();
+    img.state().fail_after = None;
+    sink.close().unwrap();
+    let on_disk = Mapfile::load(&dir.join("out.map")).unwrap();
+    assert_eq!(
+        on_disk.ranges_with(&[SectorStatus::NonTrimmed]),
+        vec![(B, 2 * B)]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A fill over bytes this sink already wrote still writes zeros, fresh image or not; only
+// the untouched NonTried part is left as it is.
+#[test]
+fn a_fill_over_written_bytes_still_writes_zeros_on_a_fresh_image() {
+    let dir = scratch("fresh-written");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    sink.image_is_fresh();
+    sink.apply(WorkItem::Good {
+        pos: 0,
+        buf: batch(0),
+    })
+    .unwrap();
+    sink.apply(WorkItem::SkipFill { pos: 0, len: 2 * B })
+        .unwrap();
+    sink.apply(WorkItem::SkipFill { pos: 2 * B, len: B })
+        .unwrap();
+    sink.close().unwrap();
+    let durable = img.state().durable.clone();
+    let at = |r: std::ops::Range<u64>| durable[r.start as usize..r.end as usize].to_vec();
+    assert!(at(0..2 * B).iter().all(|&b| b == 0), "written bytes zeroed");
+    // A real fresh image reads zero there; this mock's 0xAA shows no write happened.
+    assert!(at(2 * B..3 * B).iter().all(|&b| b == 0xAA));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// The premise, on the real filesystem: an image truncated and sized by `set_len` reads zero
+// wherever a fresh-image fill skipped its write, so the image is byte-identical to before.
+#[test]
+fn a_fresh_sized_image_reads_zero_where_a_fill_skipped_its_write() {
+    let dir = scratch("fresh-real");
+    let iso = dir.join("out.iso");
+    std::fs::write(&iso, vec![0xAAu8; 64]).unwrap();
+    let total = 3 * ZERO_CHUNK as u64;
+    let f = std::fs::File::create(&iso).unwrap();
+    f.set_len(total).unwrap();
+    let wf = libfreemkv::io::WritebackFile::new(f).unwrap();
+    let map = Mapfile::create(&dir.join("out.map"), total, "test").unwrap();
+    let (mut sink, _rx) = SweepSink::new(wf, map, true);
+    sink.image_is_fresh();
+    let good = vec![0x5Au8; 2048];
+    sink.apply(WorkItem::Good { pos: 0, buf: good }).unwrap();
+    sink.apply(WorkItem::GapFill {
+        pos: 2048,
+        len: total - 2048,
+    })
+    .unwrap();
+    sink.close().unwrap();
+    let got = std::fs::read(&iso).unwrap();
+    assert_eq!(got.len() as u64, total);
+    assert!(got[..2048].iter().all(|&b| b == 0x5A));
+    assert!(
+        got[2048..].iter().all(|&b| b == 0),
+        "a skipped fill must read zero"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

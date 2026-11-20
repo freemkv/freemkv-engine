@@ -28,8 +28,9 @@ pub(super) enum WorkItem {
     Good { pos: u64, buf: Vec<u8> },
 
     /// Whole-batch zero-fill (failed batch on `SkipBlock`, or the
-    /// failed batch portion of `JumpAhead`). Consumer streams zeros
-    /// across `[pos, pos+len)` and records the range as `NonTrimmed`.
+    /// failed batch portion of `JumpAhead`). Consumer makes `[pos, pos+len)` zero
+    /// (writing zeros unless a fresh image already reads zero there) and records
+    /// the range as `NonTrimmed`.
     SkipFill { pos: u64, len: u64 },
 
     /// Gap fill following a `JumpAhead`. Same effect as `SkipFill`;
@@ -91,12 +92,21 @@ pub(super) struct SweepSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     persist_every: std::time::Duration,
     /// Where a written `Good` buffer goes back to the producer for its next read.
     recycle: super::BufReturn,
+    /// This pass created the image empty (truncated, then sized), so a byte no write of
+    /// this sink reached reads as zero, and a fill over a NonTried range needs no write.
+    fresh_image: bool,
 }
 
 impl<F: ImageFile> SweepSink<F> {
     /// Return each written `Good` buffer through `recycle` instead of dropping it.
     pub(super) fn recycle_into(&mut self, recycle: super::BufReturn) {
         self.recycle = recycle;
+    }
+
+    /// Declare the image newly created empty by this pass (truncated and sized, never
+    /// written since): fills over still-NonTried ranges then only record.
+    pub(super) fn image_is_fresh(&mut self) {
+        self.fresh_image = true;
     }
 
     // Every record goes through here, a fill's included: whichever record persists the map
@@ -123,6 +133,7 @@ impl<F: ImageFile> SweepSink<F> {
             zero: Box::new([0u8; ZERO_CHUNK]),
             persist_every: super::IMAGE_PERSIST_INTERVAL,
             recycle: super::BufReturn::default(),
+            fresh_image: false,
         };
         (sink, prog_rx)
     }
@@ -148,6 +159,13 @@ impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
                 self.file.write_all(&buf).map_err(lost)?;
                 self.recycle.give(buf);
                 self.record((pos, len, SectorStatus::Finished))?;
+            }
+            WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len }
+                if self.fresh_image && self.map.is_all(pos, len, SectorStatus::NonTried) =>
+            {
+                // Already zero: this pass created the image empty and nothing wrote here
+                // (every write this sink makes is recorded non-NonTried right after).
+                self.record((pos, len, SectorStatus::NonTrimmed))?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
                 let map = &self.map;

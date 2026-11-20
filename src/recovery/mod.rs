@@ -1084,20 +1084,21 @@ fn sweep_linked(
         IsoLen::Missing => None,
         IsoLen::Len(n) => Some(n),
     };
-    let (file, is_regular) = if resume && existing_len.is_some_and(|len| len > 0) {
+    // `fresh`: a regular image this pass truncated and sized, so it reads zero until written.
+    let (file, is_regular, fresh) = if resume && existing_len.is_some_and(|len| len > 0) {
         let f = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
             .map_err(Error::from)?;
         let reg = output_is_regular(f.metadata());
-        (f, reg)
+        (f, reg, false)
     } else {
         let f = std::fs::File::create(path).map_err(Error::from)?;
         let reg = output_is_regular(f.metadata());
         if reg {
             f.set_len(total_bytes).map_err(Error::from)?;
         }
-        (f, reg)
+        (f, reg, reg)
     };
 
     // Wrap the raw `File` in our bounded-cache `WritebackFile` (drains dirty
@@ -1154,6 +1155,9 @@ fn sweep_linked(
     // to stop an abandoned consumer writing a stale mapfile over a resumed pass.
     let map_disown = map.disown_handle();
     let (mut sink, prog_rx) = SweepSink::new(file, map, is_regular);
+    if fresh {
+        sink.image_is_fresh();
+    }
     let depth = sweep_queue_depth(batch as usize * 2048);
     // Enough spares for every queued batch plus the two in hand; more are dropped.
     let pool = BufPool::new(depth + 2, batch as usize * 2048);
