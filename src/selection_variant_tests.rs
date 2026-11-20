@@ -331,7 +331,7 @@ fn only_a_language_preference_resolves_stream_tags() {
     assert!(audio_streams > 0);
     let all = StreamFilter::All;
     let none = lookups(&|| {
-        let model = SelectionModel::from_titles(&scanned);
+        let model = SelectionModel::from_titles(&titles);
         for selection in [
             Selection::All,
             Selection::Titles(vec![1]),
@@ -344,7 +344,7 @@ fn only_a_language_preference_resolves_stream_tags() {
     assert_eq!(none, 0);
     let de = StreamFilter::Langs(vec!["de".into()]);
     let scored = lookups(&|| {
-        let model = SelectionModel::from_titles(&scanned);
+        let model = SelectionModel::from_titles(&titles);
         assert_eq!(model.main_title(&de, None), Some(1));
     });
     assert_eq!(scored, audio_streams);
