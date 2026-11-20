@@ -347,7 +347,7 @@ fn mem_sink(dir: &std::path::Path, total: u64) -> (SweepSink<MemImage>, MemImage
 }
 
 fn batch(i: u64) -> Vec<u8> {
-    vec![i as u8 + 1; B as usize]
+    vec![(i as u8).wrapping_add(1); B as usize]
 }
 
 #[test]
