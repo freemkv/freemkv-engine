@@ -384,6 +384,63 @@ fn staged_copy_refuses_to_overwrite_an_existing_partial() {
     assert_eq!(std::fs::read(&destination).unwrap(), b"other writer");
 }
 
+// The staged copy is exact both ways, the kernel path (a plain file) and the writer path,
+// over a source longer than a buffer and not a multiple of one; progress ends at the total.
+#[test]
+fn the_staged_copy_is_exact_through_a_file_and_through_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("s.mkv");
+    let data: Vec<u8> = (0..(3 << 20) + 12_345).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&source, &data).unwrap();
+    for (n, as_file) in [true, false].into_iter().enumerate() {
+        let out = dir.path().join(format!("d{n}.partial"));
+        let file = create_new_file(&out).unwrap();
+        let mut dst = match as_file {
+            true => StagedDst::File(file),
+            false => StagedDst::Writer(Box::new(file)),
+        };
+        let (copied, quit) = (AtomicU64::new(0), AtomicBool::new(false));
+        let mut src = std::fs::File::open(&source).unwrap();
+        let n = copy_all(&mut src, &mut dst, &copied, &quit).unwrap();
+        drop(dst);
+        assert_eq!(n, data.len() as u64);
+        assert_eq!(copied.load(Ordering::Relaxed), n);
+        assert!(std::fs::read(&out).unwrap() == data, "file path {as_file}");
+    }
+}
+
+// A copy the caller gave up on stops before writing anything more, on either path.
+#[test]
+fn a_quit_staged_copy_stops_halted() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("s.mkv");
+    std::fs::write(&source, b"bytes").unwrap();
+    for (n, as_file) in [true, false].into_iter().enumerate() {
+        let out = dir.path().join(format!("q{n}.partial"));
+        let file = create_new_file(&out).unwrap();
+        let mut dst = match as_file {
+            true => StagedDst::File(file),
+            false => StagedDst::Writer(Box::new(file)),
+        };
+        let (copied, quit) = (AtomicU64::new(0), AtomicBool::new(true));
+        let mut src = std::fs::File::open(&source).unwrap();
+        let e = copy_all(&mut src, &mut dst, &copied, &quit).unwrap_err();
+        assert!(libfreemkv::is_halt(&e), "{e}");
+        drop(dst);
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 0);
+    }
+}
+
+#[test]
+fn the_os_remux_io_hands_the_copy_a_plain_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("f.partial");
+    assert!(OsRemuxIo.create_new_file(&out).unwrap().is_some());
+    let again = OsRemuxIo.create_new_file(&out).unwrap_err();
+    assert_eq!(again.kind(), io::ErrorKind::AlreadyExists);
+    assert!(DroppingIo.create_new_file(&out).unwrap().is_none());
+}
+
 // A destination that accepts writes but keeps no bytes: the copy counts `total`, the file holds 0.
 struct DroppingIo;
 impl RemuxIo for DroppingIo {

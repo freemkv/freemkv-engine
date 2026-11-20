@@ -811,6 +811,11 @@ pub(crate) trait RemuxIo: Sync {
     fn open_read(&self, path: &Path) -> io::Result<Box<dyn ReadSeek>>;
     /// Create `path` for the staged copy; an existing file is refused, never truncated.
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>>;
+    /// [`RemuxIo::create_new`] as a plain file, which the copy can hand to the kernel
+    /// (`copy_file_range`); `None` (the default) copies through `create_new`'s writer.
+    fn create_new_file(&self, _path: &Path) -> io::Result<Option<std::fs::File>> {
+        Ok(None)
+    }
     fn timing(&self) -> RemuxTiming;
     /// Move `landing` to `target` only if `target` is absent.
     fn publish(&self, landing: &Path, target: &Path) -> io::Result<()> {
@@ -850,16 +855,24 @@ impl RemuxIo for OsRemuxIo {
     }
 
     fn create_new(&self, path: &Path) -> io::Result<Box<dyn Write + Send>> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
-        Ok(Box::new(file))
+        Ok(Box::new(create_new_file(path)?))
+    }
+
+    fn create_new_file(&self, path: &Path) -> io::Result<Option<std::fs::File>> {
+        create_new_file(path).map(Some)
     }
 
     fn timing(&self) -> RemuxTiming {
         RemuxTiming::default()
     }
+}
+
+// `path` created for writing; an existing file is refused, never truncated.
+fn create_new_file(path: &Path) -> io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 // Mux (via `mux`, given the partial file's sink URL), verify, and move into place.
@@ -999,7 +1012,10 @@ fn copy_staged(
 ) -> io::Result<()> {
     let mut src = std::fs::File::open(source)?;
     let total = src.metadata()?.len();
-    let mut dst = rio.create_new(destination)?;
+    let mut dst = match rio.create_new_file(destination)? {
+        Some(file) => StagedDst::File(file),
+        None => StagedDst::Writer(rio.create_new(destination)?),
+    };
     let copied = Arc::new(AtomicU64::new(0));
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1007,7 +1023,7 @@ fn copy_staged(
     std::thread::Builder::new()
         .name("freemkv-remux-copy".into())
         .spawn(move || {
-            let result = copy_all(&mut src, &mut *dst, &count, &stop);
+            let result = copy_all(&mut src, &mut dst, &count, &stop);
             drop((src, dst));
             let _ = tx.send(result);
         })?;
@@ -1052,8 +1068,57 @@ fn copy_staged(
     Ok(())
 }
 
-// The copy worker's loop; `copied` is its progress, `quit` set once the caller gave up.
+// Where the staged copy writes: a plain file (kernel copy on Linux) or any writer.
+enum StagedDst {
+    File(std::fs::File),
+    Writer(Box<dyn Write + Send>),
+}
+
+// Bytes per kernel copy call: progress and `quit` are checked between calls.
+#[cfg(target_os = "linux")]
+const KERNEL_COPY_CHUNK: u64 = 16 << 20;
+
+// The copy worker; `copied` is its progress, `quit` set once the caller gave up.
 fn copy_all(
+    src: &mut std::fs::File,
+    dst: &mut StagedDst,
+    copied: &AtomicU64,
+    quit: &AtomicBool,
+) -> io::Result<u64> {
+    match dst {
+        #[cfg(target_os = "linux")]
+        StagedDst::File(file) => copy_kernel(src, file, copied, quit),
+        #[cfg(not(target_os = "linux"))]
+        StagedDst::File(file) => copy_buffered(src, file, copied, quit),
+        StagedDst::Writer(w) => copy_buffered(src, &mut **w, copied, quit),
+    }
+}
+
+// File to file in the kernel (std's `io::copy` uses `copy_file_range`, falling back to
+// sendfile or a buffer itself), no userspace copy; same progress and stop checks per chunk.
+#[cfg(target_os = "linux")]
+fn copy_kernel(
+    src: &mut std::fs::File,
+    dst: &mut std::fs::File,
+    copied: &AtomicU64,
+    quit: &AtomicBool,
+) -> io::Result<u64> {
+    let mut done = 0u64;
+    loop {
+        if quit.load(Ordering::Relaxed) {
+            return Err(libfreemkv::Error::Halted.into());
+        }
+        let n = io::copy(&mut Read::take(&mut *src, KERNEL_COPY_CHUNK), &mut *dst)?;
+        if n == 0 {
+            return Ok(done);
+        }
+        done += n;
+        copied.store(done, Ordering::Relaxed);
+    }
+}
+
+// The portable loop through a 1 MiB buffer.
+fn copy_buffered(
     src: &mut std::fs::File,
     dst: &mut dyn Write,
     copied: &AtomicU64,
