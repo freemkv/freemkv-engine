@@ -1165,8 +1165,10 @@ fn remux_staged_copy_that_fails_verify_keeps_old_target() {
     assert!(!stage.exists());
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct Logs(Mutex<Vec<String>>);
+#[cfg(unix)]
 impl Sink for Logs {
     fn log(&self, _level: Level, msg: &str) {
         self.0.lock().unwrap().push(msg.to_string());
