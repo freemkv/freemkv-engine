@@ -883,7 +883,9 @@ impl Mapfile {
                     .write(true)
                     .create_new(true)
                     .open(tmp)?;
-                let mut w = std::io::BufWriter::new(file);
+                // About 36 bytes an entry plus the headers: one write for most maps.
+                let size = 512 + 36 * self.entries.len();
+                let mut w = std::io::BufWriter::with_capacity(size.min(4 << 20), file);
                 writeln!(w, "# Rescue Logfile. Created by {}", self.version)?;
                 // Identity lines (KU §4.1): a disc hash and fingerprints only, never a key
                 // byte or a raw VID (J6); a legacy file is scrubbed on this first write.
@@ -897,11 +899,12 @@ impl Mapfile {
                     writeln!(w, "# freemkv-legacy-keyfp: {}", hex_lower(fp))?;
                 }
                 if let Some(scope) = &self.scope {
-                    let list: Vec<String> = scope
-                        .iter()
-                        .map(|(p, n)| format!("0x{p:x}+0x{n:x}"))
-                        .collect();
-                    writeln!(w, "# freemkv-scope: {}", list.join(","))?;
+                    write!(w, "# freemkv-scope: ")?;
+                    for (i, (p, n)) in scope.iter().enumerate() {
+                        let sep = if i == 0 { "" } else { "," };
+                        write!(w, "{sep}0x{p:x}+0x{n:x}")?;
+                    }
+                    writeln!(w)?;
                 }
                 if let Some(raw) = self.raw {
                     writeln!(w, "# freemkv-raw: {}", u8::from(raw))?;

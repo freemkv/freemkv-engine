@@ -1767,3 +1767,24 @@ fn is_all_holds_only_for_a_range_wholly_in_one_status() {
     assert!(mf.is_all(0x1000, 0, nt), "an empty range");
     mf.dirty = false;
 }
+
+// The scope header is written range by range in the exact text the old joined form had.
+#[test]
+fn the_scope_header_keeps_its_exact_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("s.mapfile");
+    let mut mf = Mapfile::create(&p, 0x4000, "test").unwrap();
+    mf.set_scope(vec![(0x2000, 0x800), (0, 0x800)]);
+    mf.flush().unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(
+        text.contains("\n# freemkv-scope: 0x0+0x800,0x2000+0x800\n"),
+        "{text}"
+    );
+    mf.set_scope(vec![(0x1000, 0x10)]);
+    mf.flush().unwrap();
+    let text = std::fs::read_to_string(&p).unwrap();
+    assert!(text.contains("\n# freemkv-scope: 0x1000+0x10\n"), "{text}");
+    let back = Mapfile::load(&p).unwrap();
+    assert_eq!(back.scope(), Some(&[(0x1000, 0x10)][..]));
+}
