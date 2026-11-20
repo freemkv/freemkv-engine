@@ -1306,6 +1306,35 @@ fn scan_options_carry_the_open_token() {
     assert!(carried.is_cancelled(), "it is the same token, not a copy");
 }
 
+// Under a run whose watcher already polls the sink, the mux watcher asks it only once, before
+// the mux starts; it still drains progress.
+#[test]
+fn a_run_polled_sink_is_asked_once_by_the_mux_watcher() {
+    #[derive(Default)]
+    struct Asks {
+        asks: AtomicUsize,
+        ticks: AtomicUsize,
+    }
+    impl Sink for Asks {
+        fn should_cancel(&self) -> bool {
+            self.asks.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        fn progress(&self, _p: &crate::sink::Progress) {
+            self.ticks.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let sink = Asks::default();
+    let halt = libfreemkv::Halt::new();
+    with_mux_watcher_for(&sink, "mkv:///o.mkv", Some(halt), true, None, |ctx| {
+        ctx.events
+            .event(&libfreemkv::Event::BytesWritten { bytes: 1, total: 2 });
+        std::thread::sleep(std::time::Duration::from_millis(350));
+    });
+    assert_eq!(sink.asks.load(Ordering::SeqCst), 1, "only the pre-check");
+    assert_eq!(sink.ticks.load(Ordering::SeqCst), 1);
+}
+
 // Per-frame ticks overwrite one slot: a take sees only the newest, and nothing until the next.
 #[test]
 fn the_latest_write_tick_is_taken_once() {

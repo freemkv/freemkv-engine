@@ -23,6 +23,8 @@ pub struct EngineHalt<'a> {
     extra: Option<Arc<AtomicBool>>,
     // §4.2: "The sink probe is an internal `pub(crate)` field of `EngineHalt`".
     pub(crate) sink: Option<&'a dyn Sink>,
+    // A run watcher already mirrors `sink` into `op` or `extra`, so `linked` needs no bridge.
+    sink_watched: bool,
     // A cancel once observed stays observed: a non-sticky `should_cancel` stays a Stop.
     seen: AtomicBool,
     // A pass ended on a transport fault (a one-pass copy reports no `wedged` of its own).
@@ -50,6 +52,7 @@ impl EngineHalt<'static> {
             op_private: false,
             extra,
             sink: None,
+            sink_watched: false,
             seen: AtomicBool::new(false),
             wedged: AtomicBool::new(false),
         }
@@ -62,6 +65,7 @@ impl EngineHalt<'static> {
             op_private: true,
             extra,
             sink: None,
+            sink_watched: false,
             seen: AtomicBool::new(false),
             wedged: AtomicBool::new(false),
         }
@@ -79,8 +83,21 @@ impl<'a> EngineHalt<'a> {
             op_private: self.op_private,
             extra: self.extra,
             sink: Some(sink),
+            sink_watched: false,
             seen: self.seen,
             wedged: self.wedged,
+        }
+    }
+
+    // `with_sink` for a `sink` whose `should_cancel` a run watcher already mirrors into the
+    // op token or `extra`: `is_cancelled` still asks it, but `linked` spawns no bridge for it.
+    pub(crate) fn with_watched_sink<'b>(self, sink: &'b dyn Sink) -> EngineHalt<'b>
+    where
+        'a: 'b,
+    {
+        EngineHalt {
+            sink_watched: true,
+            ..self.with_sink(sink)
         }
     }
 
@@ -137,7 +154,8 @@ impl<'a> EngineHalt<'a> {
     // One libfreemkv `Halt` that is cancelled once `self` is: the token itself when it is the
     // only input, else a child a bridge thread cancels within one `WAIT_SLICE`.
     pub(crate) fn linked<R>(&self, f: impl FnOnce(&Halt) -> R) -> R {
-        match (&self.extra, self.sink, self.op_private) {
+        let sink = self.sink.filter(|_| !self.sink_watched);
+        match (&self.extra, sink, self.op_private) {
             (None, None, _) => f(&self.op),
             (Some(extra), None, true) => f(&Halt::from_arc(extra.clone())),
             _ => self.bridged(f),

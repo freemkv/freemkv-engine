@@ -449,7 +449,7 @@ pub(crate) fn log_mux_start(
 // The Sink↔libfreemkv bridge every mux runs inside, lifted out of the mux paths so it's
 // testable against a closure without real media.
 fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::Ctx) -> T) -> T {
-    with_mux_watcher_for(sink, dest, None, None, f)
+    with_mux_watcher_for(sink, dest, None, false, None, f)
 }
 
 /// The latest write-progress tick, overwritten per frame (no queue, no allocation): the
@@ -480,11 +480,13 @@ impl LatestWritten {
 }
 
 // [`with_mux_watcher`] under a front end's own stop token `halt` (else a fresh one) and with
-// its own listener `extra` hearing every library event beside the bridge.
+// its own listener `extra` hearing every library event beside the bridge. `sink_polled`: a
+// run's watcher already mirrors `should_cancel` into `halt`, so this one only drains progress.
 pub(crate) fn with_mux_watcher_for<T>(
     sink: &dyn Sink,
     dest: &str,
     halt: Option<libfreemkv::Halt>,
+    sink_polled: bool,
     extra: Option<Arc<dyn libfreemkv::Events>>,
     f: impl FnOnce(&libfreemkv::Ctx) -> T,
 ) -> T {
@@ -583,7 +585,7 @@ pub(crate) fn with_mux_watcher_for<T>(
                 if finished {
                     break;
                 }
-                if sink.should_cancel() {
+                if !sink_polled && sink.should_cancel() {
                     watcher_halt.cancel();
                 }
                 std::thread::park_timeout(std::time::Duration::from_millis(100));

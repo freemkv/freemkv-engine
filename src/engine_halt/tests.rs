@@ -272,3 +272,22 @@ fn the_halt_sink_forwards_log_title_and_completion_to_the_inner_sink() {
     assert_eq!(inner.titles.load(Ordering::SeqCst), 1);
     assert_eq!(inner.completed.load(Ordering::SeqCst), 1);
 }
+
+// A watched sink stays a cancel input of `is_cancelled`, but `linked` hands out the op token
+// itself (no bridge thread): the run's watcher is what turns the sink's cancel into the token.
+#[test]
+fn a_watched_sink_is_asked_but_never_bridged() {
+    let op = Halt::new();
+    let sink = Cancels(AtomicBool::new(true));
+    let h = EngineHalt::new(&op, None).with_watched_sink(&sink);
+    assert!(h.is_cancelled(), "the sink is still asked");
+    h.linked(|lib| {
+        assert!(!lib.is_cancelled(), "no bridge mirrored the sink");
+        op.cancel();
+        assert!(lib.is_cancelled(), "the op token itself, not a child");
+    });
+    let flag = Arc::new(AtomicBool::new(false));
+    let legacy = EngineHalt::legacy(Some(flag.clone())).with_watched_sink(&sink);
+    legacy.linked(|lib| assert!(Arc::ptr_eq(lib.as_arc(), &flag)));
+    assert!(legacy.is_wired());
+}

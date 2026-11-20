@@ -471,7 +471,7 @@ fn image(
         keys,
         ..crate::Job::new(plan.source.clone(), path.display().to_string())
     };
-    let eh = crate::EngineHalt::new(halt, None).with_sink(sink);
+    let eh = crate::EngineHalt::new(halt, None).with_watched_sink(sink);
     let (copied, recovery) = match passes {
         Some(opts) => {
             let r = match &mut reading {
@@ -900,10 +900,12 @@ impl Watch<'_> {
         hint: u64,
         f: impl FnOnce(&libfreemkv::Ctx) -> std::io::Result<libfreemkv::MuxOutcome>,
     ) -> std::io::Result<libfreemkv::MuxOutcome> {
+        // The run's token: `run_with`'s watcher already polls this sink into it.
         crate::mux::with_mux_watcher_for(
             self.sink,
             self.dest,
             self.halt.clone(),
+            self.halt.is_some(),
             self.events.clone(),
             |ctx| {
                 crate::mux::log_mux_start(self.sink, label, self.dest, hint);

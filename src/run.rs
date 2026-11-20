@@ -186,7 +186,7 @@ pub fn recover_to_iso(
             keys: job.keys.clone(),
         };
         // The Sink probe makes every progress report a `should_cancel()` check.
-        let halt = crate::EngineHalt::legacy(opts.halt.clone()).with_sink(sink);
+        let halt = crate::EngineHalt::legacy(opts.halt.clone()).with_watched_sink(sink);
         let main_title = crate::multipass::progress_main_title(disc, job);
         recovery::copy_titled(disc, reader, iso_path, &opts, &halt, main_title)
     })
