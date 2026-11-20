@@ -173,7 +173,7 @@ fn audio(pid: u16, lang: &str) -> Stream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: libfreemkv::LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 fn sub(pid: u16, lang: &str) -> Stream {

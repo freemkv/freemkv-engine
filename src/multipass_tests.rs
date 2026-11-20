@@ -2891,7 +2891,7 @@ fn audio_title(
             sample_rate: libfreemkv::SampleRate::S48,
             secondary: false,
             purpose: libfreemkv::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     title
 }
@@ -3262,7 +3262,7 @@ fn video_title(
         color_space: libfreemkv::ColorSpace::Bt709,
         display_aspect: None,
         secondary,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })];
     t

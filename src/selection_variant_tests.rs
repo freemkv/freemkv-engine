@@ -69,7 +69,7 @@ fn titles(shape: Shape, layout: Layout) -> Vec<DiscTitle> {
                         sample_rate: libfreemkv::SampleRate::S48,
                         secondary: false,
                         purpose: libfreemkv::LabelPurpose::Normal,
-                        label: String::new(),
+                        label: Default::default(),
                     }));
             }
             title

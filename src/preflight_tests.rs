@@ -321,7 +321,7 @@ fn title_with_audio(langs: &[&str]) -> libfreemkv::DiscTitle {
                 sample_rate: libfreemkv::SampleRate::S48,
                 secondary: false,
                 purpose: libfreemkv::LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }));
     }
     t

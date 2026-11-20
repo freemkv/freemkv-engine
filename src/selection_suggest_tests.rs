@@ -21,7 +21,7 @@ fn video(codec: Codec, resolution: Resolution, frame_rate: FrameRate) -> Stream 
         color_space: ColorSpace::Bt709,
         display_aspect: None,
         secondary: false,
-        label: String::new(),
+        label: Default::default(),
         measured_cicp: None,
     })
 }
@@ -35,7 +35,7 @@ fn audio(language: &str) -> Stream {
         sample_rate: SampleRate::S48,
         secondary: false,
         purpose: LabelPurpose::Normal,
-        label: String::new(),
+        label: Default::default(),
     })
 }
 

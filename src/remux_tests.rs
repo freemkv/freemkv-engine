@@ -992,7 +992,7 @@ fn remux_main_title_honors_an_equivalent_audio_language_presentation() {
             sample_rate: libfreemkv::SampleRate::S48,
             secondary: false,
             purpose: libfreemkv::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     let mut german = english.clone();
     if let Some(libfreemkv::Stream::Audio(a)) = german.streams.first_mut() {

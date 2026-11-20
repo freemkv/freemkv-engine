@@ -262,7 +262,7 @@ fn partial_conflicting_invalid_and_sliced_rosters_fail_closed() {
                 if let EpisodeEvidence::Authored { roster, .. } =
                     &mut titles[0].selection_evidence.episodes
                 {
-                    roster.clear();
+                    *roster = "".into();
                 }
                 SelectionReviewReason::InvalidEpisodeRoster
             }

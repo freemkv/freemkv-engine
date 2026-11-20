@@ -58,13 +58,13 @@ impl ScanTitle {
             .segments
             .iter()
             .map(|(unit, start, end)| ContentSegment {
-                unit: unit.clone(),
+                unit: unit.as_str().into(),
                 start: *start,
                 end: *end,
             })
             .collect();
         title.selection_evidence.episodes = EpisodeEvidence::Authored {
-            roster: self.roster.clone(),
+            roster: self.roster.as_str().into(),
             title_count: self.title_count,
             ordinal: self.ordinal,
         };
@@ -91,18 +91,18 @@ impl ScanTitle {
                 color_space: ColorSpace::Bt709,
                 display_aspect: None,
                 secondary: false,
-                label: String::new(),
+                label: Default::default(),
                 measured_cicp: None,
             }),
             Stream::Audio(AudioStream {
                 pid: 0x1100,
                 codec: Codec::Ac3,
                 channels: AudioChannels::Stereo,
-                language: self.primary_audio.clone(),
+                language: self.primary_audio.as_str().into(),
                 sample_rate: SampleRate::S48,
                 secondary: false,
                 purpose: LabelPurpose::Normal,
-                label: String::new(),
+                label: Default::default(),
             }),
         ];
         title

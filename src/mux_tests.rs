@@ -52,7 +52,7 @@ fn audio_title(lang: &str, start: u32) -> libfreemkv::DiscTitle {
             sample_rate: libfreemkv::SampleRate::S48,
             secondary: false,
             purpose: libfreemkv::LabelPurpose::Normal,
-            label: String::new(),
+            label: Default::default(),
         }));
     t.selection_evidence.segments = ContentSegment::from_cell_extents(&t.extents);
     t
@@ -157,7 +157,7 @@ fn regression_missing_or_invalid_identity_never_equates_presentations() {
                 a.extents.clear();
             }
             1 => a.clips.clear(),
-            2 => a.clips[0].clip_id.clear(),
+            2 => a.clips[0].clip_id = "".into(),
             3 => a.clips[0].out_time = a.clips[0].in_time,
             _ => {
                 a.clips.clear();

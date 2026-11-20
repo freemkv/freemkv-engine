@@ -228,20 +228,23 @@ fn check_class(
 // stream of the class, so "no tracks" stays distinguishable from "no tagged".
 fn class_languages(title: &libfreemkv::DiscTitle, class: StreamClass) -> Vec<String> {
     match class {
-        StreamClass::Audio => title.audio_streams().map(|a| a.language.clone()).collect(),
+        StreamClass::Audio => title
+            .audio_streams()
+            .map(|a| a.language.to_string())
+            .collect(),
         StreamClass::Subtitle => title
             .subtitle_streams()
             .filter(|s| !s.forced)
-            .map(|s| s.language.clone())
+            .map(|s| s.language.to_string())
             .collect(),
         StreamClass::SubtitleForced => title
             .subtitle_streams()
             .filter(|s| s.forced)
-            .map(|s| s.language.clone())
+            .map(|s| s.language.to_string())
             .collect(),
         StreamClass::SubtitleAny => title
             .subtitle_streams()
-            .map(|s| s.language.clone())
+            .map(|s| s.language.to_string())
             .collect(),
     }
 }

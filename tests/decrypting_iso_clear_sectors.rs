@@ -294,7 +294,7 @@ fn disc(fx: &Fixture) -> Disc {
 fn multi_cps_disc(fx: &Fixture) -> Disc {
     let mut d = disc(fx);
     let aacs = d.aacs.as_mut().unwrap();
-    aacs.uk_ro = unit_key_ro(2);
+    aacs.uk_ro = unit_key_ro(2).into();
     d
 }
 
@@ -318,7 +318,7 @@ fn keyed(d: &Disc, reader: &mut MemDisc) -> libfreemkv::Result<KeyRing> {
 }
 
 fn keyed_over(d: &Disc, reader: &mut MemDisc, scope: KeyScope) -> libfreemkv::Result<KeyRing> {
-    let two = d.aacs.as_ref().is_some_and(|a| a.uk_ro == unit_key_ro(2));
+    let two = d.aacs.as_ref().is_some_and(|a| *a.uk_ro == *unit_key_ro(2));
     let pool = if two {
         vec![(1, UNIT_KEY), (2, SECOND_KEY)]
     } else {
@@ -587,7 +587,7 @@ fn a_refused_copy_leaves_a_scoped_mapfile_untouched() {
 fn an_unprovable_non_title_stream_file_refuses_up_front() {
     let fx = bd(Some((&FOREIGN_KEY, false)));
     let mut no_ukro = disc(&fx);
-    no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::new();
+    no_ukro.aacs.as_mut().unwrap().uk_ro = Vec::<u8>::new().into();
     let mut fmts = disc(&fx);
     fmts.format = DiscFormat::Fmts;
     for (d, lazy) in [
