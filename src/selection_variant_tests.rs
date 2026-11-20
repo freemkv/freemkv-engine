@@ -331,7 +331,7 @@ fn only_a_language_preference_resolves_stream_tags() {
     assert!(audio_streams > 0);
     let all = StreamFilter::All;
     let none = lookups(&|| {
-        let model = SelectionModel::from_titles(&titles);
+        let model = SelectionModel::from_titles(&scanned);
         for selection in [
             Selection::All,
             Selection::Titles(vec![1]),
@@ -344,7 +344,7 @@ fn only_a_language_preference_resolves_stream_tags() {
     assert_eq!(none, 0);
     let de = StreamFilter::Langs(vec!["de".into()]);
     let scored = lookups(&|| {
-        let model = SelectionModel::from_titles(&titles);
+        let model = SelectionModel::from_titles(&scanned);
         assert_eq!(model.main_title(&de, None), Some(1));
     });
     assert_eq!(scored, audio_streams);
@@ -353,7 +353,8 @@ fn only_a_language_preference_resolves_stream_tags() {
 #[test]
 fn main_title_keeps_title_zero_on_a_tie_and_switches_on_a_better_score() {
     for shape in [Shape::Dvd, Shape::Bd] {
-        let model = SelectionModel::from_titles(&titles(shape, BRANCH));
+        let scanned = titles(shape, BRANCH);
+        let model = SelectionModel::from_titles(&scanned);
         assert_eq!(model.main_title(&StreamFilter::All, None), Some(0));
         assert_eq!(model.main_title(&langs(&["deu"]), None), Some(1));
     }
@@ -361,7 +362,8 @@ fn main_title_keeps_title_zero_on_a_tie_and_switches_on_a_better_score() {
 
 #[test]
 fn resolve_explicit_drops_the_index_one_past_the_end() {
-    let model = SelectionModel::from_titles(&titles(Shape::Bd, BRANCH));
+    let scanned = titles(Shape::Bd, BRANCH);
+    let model = SelectionModel::from_titles(&scanned);
     for episodes in [false, true] {
         assert_eq!(
             model.resolve_explicit(&[2, 1], episodes),

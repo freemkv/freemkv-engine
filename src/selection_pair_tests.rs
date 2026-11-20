@@ -39,7 +39,7 @@ fn finite_titles(masks: &[u8]) -> Vec<DiscTitle> {
             title.selection_evidence.segments = (0..4)
                 .filter(|&atom| mask & (1 << atom) != 0)
                 .map(|atom| ContentSegment {
-                    unit: format!("atom{atom}"),
+                    unit: format!("atom{atom}").into(),
                     start: 0,
                     end: 1,
                 })
@@ -231,7 +231,7 @@ fn disjoint_pair_crosses_word_boundary_and_excludes_removed_titles() {
     for marker in 0..64 {
         let mut title = finite_titles(&[3]).remove(0);
         title.selection_evidence.segments.push(ContentSegment {
-            unit: format!("marker{marker:02}"),
+            unit: format!("marker{marker:02}").into(),
             start: 0,
             end: 1,
         });
