@@ -481,3 +481,19 @@ fn a_decrypting_multipass_job_runs() {
     assert!(r.complete, "{r:?}");
     assert_eq!(std::fs::metadata(&iso).unwrap().len(), 64 * 2048);
 }
+
+// A helper thread is named, returns its value, and runs on the small stack.
+#[test]
+fn a_small_helper_thread_is_named_and_joins_with_its_value() {
+    let got = std::thread::scope(|s| {
+        spawn_small(s, "freemkv-test-helper", || {
+            let name = std::thread::current().name().map(str::to_owned);
+            let probe = [7u8; 64 << 10];
+            (name, probe.iter().map(|&b| b as u32).sum::<u32>())
+        })
+        .join()
+        .unwrap()
+    });
+    assert_eq!(got.0.as_deref(), Some("freemkv-test-helper"));
+    assert_eq!(got.1, 7 * (64 << 10));
+}

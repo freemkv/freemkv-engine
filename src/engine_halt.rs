@@ -170,7 +170,7 @@ impl<'a> EngineHalt<'a> {
         }
         let done = AtomicBool::new(false);
         std::thread::scope(|s| {
-            let bridge = s.spawn(|| {
+            let bridge = crate::run::spawn_small(s, "freemkv-halt-bridge", || {
                 while !done.load(Ordering::Acquire) {
                     if self.is_cancelled() {
                         child.cancel();

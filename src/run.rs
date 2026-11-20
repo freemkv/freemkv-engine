@@ -17,6 +17,24 @@ pub(crate) fn ctx(halt: &libfreemkv::Halt) -> libfreemkv::Ctx {
     libfreemkv::Ctx::new(halt.clone()).with_diag(libfreemkv::Diag::from_env())
 }
 
+/// Stack for the engine's small helper threads (cancel pollers, the staged copy): they run a
+/// Sink's `should_cancel` or a flat loop. The 2 MiB default is address space a 32-bit target
+/// (the armv7 server image) runs short of, most of all for workers a Stop leaves running.
+pub(crate) const SMALL_STACK: usize = 256 << 10;
+
+// A named scoped thread on a [`SMALL_STACK`]. Panics like `Scope::spawn` if the OS refuses.
+pub(crate) fn spawn_small<'scope, 'env, T: Send + 'scope>(
+    s: &'scope std::thread::Scope<'scope, 'env>,
+    name: &str,
+    f: impl FnOnce() -> T + Send + 'scope,
+) -> std::thread::ScopedJoinHandle<'scope, T> {
+    std::thread::Builder::new()
+        .name(name.into())
+        .stack_size(SMALL_STACK)
+        .spawn_scoped(s, f)
+        .expect("failed to spawn thread")
+}
+
 // Sets `done` on every exit path, including a panic unwind, since a plain `store(true)` placed
 // after the call is skipped by an unwind and the join would hang forever. Release: a watcher
 // that Acquire-loads `true` sees everything the work sent before it returned.
@@ -59,7 +77,7 @@ pub(crate) fn with_cancel_watcher<T>(
     std::thread::scope(|s| {
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
-        let watcher = s.spawn(move || {
+        let watcher = spawn_small(s, "freemkv-cancel-watch", move || {
             while !watcher_done.load(Ordering::Acquire) {
                 if sink.should_cancel() {
                     watcher_halt.store(true, Ordering::Relaxed);

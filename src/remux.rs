@@ -1022,6 +1022,7 @@ fn copy_staged(
     let (count, stop) = (copied.clone(), quit.clone());
     std::thread::Builder::new()
         .name("freemkv-remux-copy".into())
+        .stack_size(crate::run::SMALL_STACK)
         .spawn(move || {
             let result = copy_all(&mut src, &mut dst, &count, &stop);
             drop((src, dst));

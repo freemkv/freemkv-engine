@@ -257,7 +257,7 @@ fn with_run_halt<T>(
     }
     let done = AtomicBool::new(false);
     std::thread::scope(|s| {
-        let watcher = s.spawn(|| {
+        let watcher = crate::run::spawn_small(s, "freemkv-run-watch", || {
             while !done.load(Ordering::Acquire) {
                 if sink.should_cancel() {
                     halt.cancel();
