@@ -2718,8 +2718,8 @@ fn a_decrypting_multipass_job_runs() {
 }
 
 // engine_halt.rs: every production cancellation read goes through `EngineHalt::is_cancelled`.
-// `recover`'s halt always carries the Sink probe (`with_sink`), so a direct
-// `sink.should_cancel()` there only double-polls the sink and bypasses the sticky latch.
+// `recover`'s halt always carries the Sink probe (`with_sink`, or `with_watched_sink` under a
+// run watcher), so a direct `sink.should_cancel()` only double-polls and bypasses the latch.
 #[test]
 fn recover_reads_cancellation_only_through_the_engine_halt() {
     let src = include_str!("multipass.rs");
@@ -2735,17 +2735,14 @@ fn recover_reads_cancellation_only_through_the_engine_halt() {
         "fixture: the body parsed"
     );
     assert!(!body.contains("should_cancel()"), "a direct sink read");
-    for entry in [
-        "pub fn multipass_rip(",
-        "pub fn multipass_rip_with(",
-        "pub fn multipass_rip_staged(",
+    for (entry, probe) in [
+        ("pub fn multipass_rip(", ".with_watched_sink(sink)"),
+        ("pub fn multipass_rip_with(", ".with_sink(sink)"),
+        ("pub fn multipass_rip_staged(", ".with_watched_sink(sink)"),
     ] {
         let at = src.split_once(entry).expect(entry).1;
         let call = at.split_once("recover(").expect("calls recover").0;
-        assert!(
-            call.contains(".with_sink(sink)"),
-            "{entry} wires the Sink probe"
-        );
+        assert!(call.contains(probe), "{entry} wires the Sink probe");
     }
     let plan = include_str!("plan.rs");
     let at = plan.split_once("crate::multipass::recover(").unwrap().0;
