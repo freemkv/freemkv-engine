@@ -86,7 +86,7 @@ fn dvd(id: u16, minutes: f64, cells: &[(u32, u32)], language: &str) -> DiscTitle
     t
 }
 
-fn model(titles: &[DiscTitle]) -> SelectionModel {
+fn model(titles: &[DiscTitle]) -> SelectionModel<'_> {
     SelectionModel::from_titles(titles)
 }
 
