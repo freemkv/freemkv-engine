@@ -31,8 +31,8 @@ pub enum Level {
 pub struct Progress {
     /// Stable key of the current pass, for a front-end to localize: `"sweep"`,
     /// `"patch-scrape"`, `"patch-trim"`, `"mux"`, `"sync"`, `"verify"`, `"copy"`.
-    /// `Cow` so the fixed keys cost no allocation: `ProgressBridge::report` runs
-    /// once per batch (400k-1.6M times per rip).
+    /// `Cow` so the fixed keys cost no allocation: `ProgressBridge::report` runs on
+    /// every pass tick (about 4 a second).
     pub pass: std::borrow::Cow<'static, str>,
     /// Bytes completed in the current operation.
     pub bytes_done: u64,
