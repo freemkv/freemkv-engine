@@ -52,7 +52,10 @@ fn sources_quiet(p: &KeyParams) -> Vec<Box<dyn freemkv_keysources::KeySource>> {
     if !p.online_only
         && let Some(path) = &p.keydb_path
     {
-        sources.push(Box::new(freemkv_keysources::KeydbSource::new(path.clone())));
+        // One parsed keydb per path for the whole process, reused by every acquire.
+        sources.push(Box::new(freemkv_keysources::KeydbSource::shared(
+            path.clone(),
+        )));
     }
 
     if let (Some(url), None) = (&p.key_url, key_url_rejection(p)) {
@@ -330,7 +333,7 @@ pub(crate) fn scope_keyed(set: &KeyRing, disc: &libfreemkv::Disc, scope: &KeySco
 /// The drive handshake's host certificates from the keydb at `path`; `None` when it
 /// yields none (missing, unreadable, or certificate-free).
 pub fn drive_credentials(path: &std::path::Path) -> Option<libfreemkv::DriveCredentials> {
-    let host_certs = freemkv_keysources::KeydbSource::new(path).host_certs();
+    let host_certs = freemkv_keysources::KeydbSource::shared(path).host_certs();
     (!host_certs.is_empty()).then_some(libfreemkv::DriveCredentials { host_certs })
 }
 
