@@ -1295,12 +1295,9 @@ fn sweep_linked(
                             "Exited damage zone; restoring max read speed"
                         );
                     }
-                    // bridge_degradation_count already reset inside on_success() above.
-
-                    // Plaintext: the whole-disc reader decrypted in place during the read.
-
-                    // The read buffer itself moves on, cut to the block; the next read gets
-                    // a recycled one (stale bytes, which `require_full_read` never lets out).
+                    // on_success() above reset bridge_degradation_count. The plaintext read
+                    // buffer moves on, cut to the block; the next read gets a recycled one
+                    // (stale bytes, which `require_full_read` never lets out).
                     let mut send_buf = std::mem::replace(&mut buf, pool.take());
                     send_buf.truncate(block_bytes as usize);
                     if let Err(e) = send(WorkItem::Good { pos, buf: send_buf }) {
