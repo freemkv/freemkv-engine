@@ -6,7 +6,7 @@
 //! a depth-1 channel ([`libfreemkv::io::pipeline::WRITE_THROUGH_DEPTH`]) so
 //! back-pressure kicks in immediately.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::sync::{Arc, Mutex};
 
 use libfreemkv::error::{Error, Result};

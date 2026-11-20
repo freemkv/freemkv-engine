@@ -6,7 +6,7 @@
 //! `Sink` impl; the producer-side state machine stays with the producer —
 //! `sweep_internal` in `recovery/mod.rs`.
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 
 use libfreemkv::error::Error;
