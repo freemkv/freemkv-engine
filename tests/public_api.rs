@@ -184,9 +184,9 @@ fn selection_resolvers_return_the_review() {
     type Resolved = Result<Vec<usize>, SelectionReview>;
     let _: fn(&libfreemkv::Disc, &Selection, &StreamFilter, Option<&str>) -> Resolved =
         freemkv_engine::resolve_selection;
-    let _: fn(&SelectionModel, &Selection, &StreamFilter, Option<&str>) -> Resolved =
+    let _: fn(&SelectionModel<'static>, &Selection, &StreamFilter, Option<&str>) -> Resolved =
         SelectionModel::select;
-    let _: fn(&SelectionModel, &StreamFilter, Option<&str>) -> Option<usize> =
+    let _: fn(&SelectionModel<'static>, &StreamFilter, Option<&str>) -> Option<usize> =
         SelectionModel::main_title;
     let _: fn(SelectionReview) -> libfreemkv::Error = libfreemkv::Error::from;
 }
