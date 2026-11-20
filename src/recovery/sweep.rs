@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use libfreemkv::error::Error;
 use libfreemkv::io::{Flow, Sink};
 
+use super::ImageFile;
 use super::mapfile::{MapStats, Mapfile, SectorStatus};
 
 /// Reusable zero buffer for SkipFill / GapFill writes.
@@ -72,8 +73,8 @@ pub(super) fn try_recv_progress(rx: &Receiver<ProgressSnapshot>) -> Option<Progr
 // `Sink<WorkItem>` for sweep. Owns the writeback file + mapfile +
 // progress back-channel. `apply` does the file-write + mapfile.record
 // per item; `close` drains, fsyncs, and flushes the mapfile.
-pub(super) struct SweepSink {
-    file: libfreemkv::io::WritebackFile,
+pub(super) struct SweepSink<F: ImageFile = libfreemkv::io::WritebackFile> {
+    file: F,
     map: Mapfile,
     /// `sync_all`-on-failure-is-an-error iff the output is a regular
     /// file. `/dev/null` and pipes always fail `sync_all`; that's not
@@ -88,12 +89,12 @@ pub(super) struct SweepSink {
     zero: Box<[u8; ZERO_CHUNK]>,
 }
 
-impl SweepSink {
+impl<F: ImageFile> SweepSink<F> {
     /// Construct a new `SweepSink` plus the matching progress
     /// receiver. Channel depth on the back-channel is `1` — the
     /// producer's cache is the source of truth between snapshots.
     pub(super) fn new(
-        file: libfreemkv::io::WritebackFile,
+        file: F,
         map: Mapfile,
         is_regular: bool,
     ) -> (Self, Receiver<ProgressSnapshot>) {
@@ -112,7 +113,7 @@ impl SweepSink {
 // No `close_stopped` override (the default `close`): this sink renames nothing, and a
 // data-less mapfile flush would claim sectors not yet durable. T8: "halted: **Stopped**
 // (not a failure)" after one 5 s grace; the disowned mapfile keeps the resumable record.
-impl Sink<WorkItem> for SweepSink {
+impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
     type Output = ConsumerSummary;
 
     fn apply(&mut self, item: WorkItem) -> Result<Flow, Error> {

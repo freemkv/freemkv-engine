@@ -1305,3 +1305,20 @@ fn scan_options_carry_the_open_token() {
     halt.cancel();
     assert!(carried.is_cancelled(), "it is the same token, not a copy");
 }
+
+// Bench (run with `--release -- --ignored bench_`): the cost of one per-frame write-progress
+// event through the watcher bridge; a 2 h UHD title emits about 10M of them.
+#[test]
+#[ignore = "bench"]
+fn bench_mux_progress_events() {
+    const N: u64 = 10_000_000;
+    let ns = with_mux_watcher(&NoopSink, "mkv:///o.mkv", |ctx| {
+        let t0 = std::time::Instant::now();
+        for bytes in 0..N {
+            ctx.events
+                .event(&libfreemkv::Event::BytesWritten { bytes, total: N });
+        }
+        t0.elapsed().as_nanos() as f64 / N as f64
+    });
+    eprintln!("bench_mux_progress_events: {N} events, {ns:.1} ns/event");
+}

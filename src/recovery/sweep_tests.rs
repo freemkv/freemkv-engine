@@ -334,3 +334,106 @@ fn a_fill_stops_when_disowned_mid_way() {
     assert!(len < FILL, "the fill ran on past the disown ({len} bytes)");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// Benches: run with `--release -- --ignored bench_`. They print figures and never assert.
+const BENCH_BATCH: u64 = 64 * 1024;
+
+// Pushes `batches` 64 KiB `Good` items through a sink over a `NullImage` whose syncs take
+// `sync_cost`, paced at `rate` bytes/s (0: flat out). Returns (MB/s, syncs, map persists).
+fn drive_sweep_sink(
+    dir: &std::path::Path,
+    batches: u64,
+    rate: u64,
+    sync_cost: std::time::Duration,
+) -> (f64, usize, usize) {
+    use crate::recovery::test_images::NullImage;
+    let total = batches * BENCH_BATCH;
+    let img = NullImage {
+        sync_cost,
+        ..Default::default()
+    };
+    let map = Mapfile::create(&dir.join("bench.map"), total, "bench").unwrap();
+    let (mut sink, _rx) = SweepSink::new(img.clone(), map, true);
+    let t0 = std::time::Instant::now();
+    for i in 0..batches {
+        pace(t0, i * BENCH_BATCH, rate);
+        let buf = vec![0x5Au8; BENCH_BATCH as usize];
+        let pos = i * BENCH_BATCH;
+        sink.apply(WorkItem::Good { pos, buf }).unwrap();
+    }
+    let persists = sink.map.persists;
+    let secs = t0.elapsed().as_secs_f64();
+    sink.close().unwrap();
+    (total as f64 / secs / 1e6, img.counts().1, persists)
+}
+
+// Sleeps until `done` bytes are due at `rate` bytes/s since `t0` (a drive's steady pace).
+fn pace(t0: std::time::Instant, done: u64, rate: u64) {
+    if rate == 0 {
+        return;
+    }
+    let due = std::time::Duration::from_secs_f64(done as f64 / rate as f64);
+    if let Some(wait) = due.checked_sub(t0.elapsed()) {
+        std::thread::sleep(wait);
+    }
+}
+
+#[test]
+#[ignore = "bench"]
+fn bench_sweep_sink_throughput() {
+    let dir = scratch("bench-throughput");
+    let (mbs, syncs, persists) = drive_sweep_sink(&dir, 8192, 0, std::time::Duration::ZERO);
+    eprintln!("bench_sweep_sink_throughput: {mbs:.0} MB/s, {syncs} syncs, {persists} persists");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// 12 s at a BD drive's 50 MB/s against a 20 ms fsync: how often the consumer syncs and persists.
+#[test]
+#[ignore = "bench"]
+fn bench_sweep_sink_flushes_at_drive_speed() {
+    let dir = scratch("bench-flushes");
+    let rate = 50_000_000;
+    let batches = 12 * rate / BENCH_BATCH;
+    let cost = std::time::Duration::from_millis(20);
+    let (mbs, syncs, persists) = drive_sweep_sink(&dir, batches, rate, cost);
+    eprintln!(
+        "bench_sweep_sink_flushes_at_drive_speed: {mbs:.1} MB/s, {syncs} syncs, {persists} persists in 12 s"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A paced producer feeds the real pipeline while every image sync takes 200 ms: the time
+// it spends blocked in `send` is time the drive would sit idle.
+#[test]
+#[ignore = "bench"]
+fn bench_sweep_pipeline_producer_stall() {
+    use crate::recovery::test_images::NullImage;
+    let dir = scratch("bench-stall");
+    let rate = 50_000_000u64;
+    let batches = 12 * rate / BENCH_BATCH;
+    let img = NullImage {
+        sync_cost: std::time::Duration::from_millis(200),
+        ..Default::default()
+    };
+    let map = Mapfile::create(&dir.join("bench.map"), batches * BENCH_BATCH, "bench").unwrap();
+    let (sink, _rx) = SweepSink::new(img.clone(), map, true);
+    let depth = libfreemkv::io::DEFAULT_PIPELINE_DEPTH;
+    let pipe = libfreemkv::io::Pipeline::spawn_named("bench-sweep", depth, sink).unwrap();
+    let t0 = std::time::Instant::now();
+    let mut blocked = std::time::Duration::ZERO;
+    for i in 0..batches {
+        pace(t0, i * BENCH_BATCH, rate);
+        let buf = vec![0x5Au8; BENCH_BATCH as usize];
+        let sent = std::time::Instant::now();
+        let pos = i * BENCH_BATCH;
+        assert!(pipe.send(WorkItem::Good { pos, buf }).is_ok());
+        blocked += sent.elapsed();
+    }
+    let total = t0.elapsed();
+    pipe.finish().unwrap();
+    let syncs = img.counts().1;
+    eprintln!(
+        "bench_sweep_pipeline_producer_stall: depth {depth}, blocked {blocked:?} of {total:?}, {syncs} syncs"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

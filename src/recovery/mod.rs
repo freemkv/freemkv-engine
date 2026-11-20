@@ -546,6 +546,19 @@ pub(crate) fn image_write_failed(map: &mapfile::Mapfile, e: std::io::Error) -> E
     Error::from(e)
 }
 
+/// The image a sweep or patch consumer writes: positioned writes plus a durable sync.
+/// Production uses [`libfreemkv::io::WritebackFile`]; tests and benches use mocks.
+pub(crate) trait ImageFile: std::io::Write + std::io::Seek + Send + 'static {
+    /// Make every byte written so far durable (drain, then fsync).
+    fn sync_all(&mut self) -> std::io::Result<()>;
+}
+
+impl ImageFile for libfreemkv::io::WritebackFile {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        libfreemkv::io::WritebackFile::sync_all(self)
+    }
+}
+
 // Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive consumer gets a
 // grace spin, then is abandoned, instead of blocking `finish` forever.
 pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(
@@ -1641,6 +1654,8 @@ mod patch;
 mod read_error;
 mod section_recover;
 mod sweep;
+#[cfg(test)]
+mod test_images;
 mod whole_disc;
 pub(crate) use mapfile::abandoned_writer_alive;
 pub(crate) use names::finish_image_names;

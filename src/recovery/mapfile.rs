@@ -255,6 +255,9 @@ pub struct Mapfile {
     /// has been abandoned; once set, no further write reaches the path. See
     /// [`MapfileDisown`].
     disowned: Arc<AtomicBool>,
+    /// How many times this mapfile reached disk (tests and benches count persists).
+    #[cfg(test)]
+    pub(crate) persists: usize,
 }
 
 impl std::fmt::Debug for Mapfile {
@@ -299,6 +302,8 @@ impl Mapfile {
             scope: None,
             raw: None,
             disowned: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            persists: 0,
         };
         // Eager initial persist so a resume can pick this up even if
         // `record()` is never called.
@@ -449,6 +454,8 @@ impl Mapfile {
             scope,
             raw,
             disowned: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            persists: 0,
         })
     }
 
@@ -527,9 +534,19 @@ impl Mapfile {
     fn changed(&mut self) -> io::Result<()> {
         self.dirty = true;
         if self.last_flushed.elapsed() >= FLUSH_INTERVAL {
-            self.write_to_disk()?;
-            self.dirty = false;
-            self.last_flushed = Instant::now();
+            self.persist()?;
+        }
+        Ok(())
+    }
+
+    // Writes the map now and restarts the persist interval.
+    fn persist(&mut self) -> io::Result<()> {
+        self.write_to_disk()?;
+        self.dirty = false;
+        self.last_flushed = Instant::now();
+        #[cfg(test)]
+        {
+            self.persists += 1;
         }
         Ok(())
     }
@@ -552,9 +569,7 @@ impl Mapfile {
     /// `record()` to guarantee state is durable before returning.
     pub fn flush(&mut self) -> io::Result<()> {
         if self.dirty {
-            self.write_to_disk()?;
-            self.dirty = false;
-            self.last_flushed = Instant::now();
+            self.persist()?;
         }
         Ok(())
     }
