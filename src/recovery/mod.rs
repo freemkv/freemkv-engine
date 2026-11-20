@@ -430,6 +430,17 @@ pub(crate) fn sweep_batch_sectors(
     }
 }
 
+/// Bytes the sweep queue holds between the drive and the image writer: about 0.15 s of a BD
+/// drive, so a slow fsync or writeback stall does not park the drive.
+const SWEEP_QUEUE_BYTES: usize = 8 << 20;
+
+// Sweep queue depth for batches of `batch_bytes`: about `SWEEP_QUEUE_BYTES`, never below
+// libfreemkv's default depth nor above 128 items.
+pub(crate) fn sweep_queue_depth(batch_bytes: usize) -> usize {
+    let floor = libfreemkv::io::DEFAULT_PIPELINE_DEPTH;
+    (SWEEP_QUEUE_BYTES / batch_bytes.max(1)).clamp(floor, 128.max(floor))
+}
+
 // Deadline for ONE producer→consumer handoff (T9): re-armed per send, so already stall-shaped.
 // Reuses `JOIN_TIMEOUT_SECS`, since ST-L2 `finish_with_halt`'s 600 s no-progress window (T7).
 const SEND_DEADLINE: std::time::Duration =
@@ -897,7 +908,7 @@ fn sweep_linked(
     lib: &libfreemkv::Halt,
     main_title: Option<usize>,
 ) -> Result<CopyResult> {
-    use libfreemkv::io::{DEFAULT_PIPELINE_DEPTH, Pipeline};
+    use libfreemkv::io::Pipeline;
     use sweep::{ProgressSnapshot, SweepSink, WorkItem, try_recv_progress};
 
     // Pre-flight decrypt gate, also enforced in `copy` but re-checked here so a
@@ -1093,8 +1104,9 @@ fn sweep_linked(
     // to stop an abandoned consumer writing a stale mapfile over a resumed pass.
     let map_disown = map.disown_handle();
     let (sink, prog_rx) = SweepSink::new(file, map, is_regular);
+    let depth = sweep_queue_depth(batch as usize * 2048);
     let pipe: Pipeline<WorkItem, sweep::ConsumerSummary> =
-        Pipeline::spawn_named("freemkv-sweep-consumer", DEFAULT_PIPELINE_DEPTH, sink)?;
+        Pipeline::spawn_named("freemkv-sweep-consumer", depth, sink)?;
 
     // Halt token for `send_bounded` below: the op's; with none wired, a never-cancelled
     // token keeps SEND_DEADLINE as the only bound.

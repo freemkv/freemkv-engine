@@ -550,8 +550,8 @@ fn bench_sweep_sink_flushes_at_drive_speed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// A paced producer feeds the real pipeline while every image sync takes 200 ms: the time
-// it spends blocked in `send` is time the drive would sit idle.
+// A paced producer feeds the real pipeline while every image sync (one a second here)
+// takes 100 ms: the time it spends blocked in `send` is time the drive would sit idle.
 #[test]
 #[ignore = "bench"]
 fn bench_sweep_pipeline_producer_stall() {
@@ -559,29 +559,56 @@ fn bench_sweep_pipeline_producer_stall() {
     let dir = scratch("bench-stall");
     let rate = 50_000_000u64;
     let batches = 12 * rate / BENCH_BATCH;
-    let img = NullImage {
-        sync_cost: std::time::Duration::from_millis(200),
-        ..Default::default()
-    };
-    let map = Mapfile::create(&dir.join("bench.map"), batches * BENCH_BATCH, "bench").unwrap();
-    let (sink, _rx) = SweepSink::new(img.clone(), map, true);
-    let depth = libfreemkv::io::DEFAULT_PIPELINE_DEPTH;
-    let pipe = libfreemkv::io::Pipeline::spawn_named("bench-sweep", depth, sink).unwrap();
-    let t0 = std::time::Instant::now();
-    let mut blocked = std::time::Duration::ZERO;
-    for i in 0..batches {
-        pace(t0, i * BENCH_BATCH, rate);
-        let buf = vec![0x5Au8; BENCH_BATCH as usize];
-        let sent = std::time::Instant::now();
-        let pos = i * BENCH_BATCH;
-        assert!(pipe.send(WorkItem::Good { pos, buf }).is_ok());
-        blocked += sent.elapsed();
+    let old = libfreemkv::io::DEFAULT_PIPELINE_DEPTH;
+    for depth in [
+        old,
+        crate::recovery::sweep_queue_depth(BENCH_BATCH as usize),
+    ] {
+        let img = NullImage {
+            sync_cost: std::time::Duration::from_millis(100),
+            ..Default::default()
+        };
+        let total = batches * BENCH_BATCH;
+        let map = Mapfile::create(&dir.join("bench.map"), total, "bench").unwrap();
+        let (mut sink, _rx) = SweepSink::new(img.clone(), map, true);
+        sink.persist_every = std::time::Duration::from_secs(1);
+        let pipe = libfreemkv::io::Pipeline::spawn_named("bench-sweep", depth, sink).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut blocked = std::time::Duration::ZERO;
+        for i in 0..batches {
+            pace(t0, i * BENCH_BATCH, rate);
+            let buf = vec![0x5Au8; BENCH_BATCH as usize];
+            let sent = std::time::Instant::now();
+            let pos = i * BENCH_BATCH;
+            assert!(pipe.send(WorkItem::Good { pos, buf }).is_ok());
+            blocked += sent.elapsed();
+        }
+        let took = t0.elapsed();
+        pipe.finish().unwrap();
+        let syncs = img.counts().1;
+        eprintln!(
+            "bench_sweep_pipeline_producer_stall: depth {depth}, blocked {blocked:?} of {took:?}, {syncs} syncs"
+        );
     }
-    let total = t0.elapsed();
-    pipe.finish().unwrap();
-    let syncs = img.counts().1;
-    eprintln!(
-        "bench_sweep_pipeline_producer_stall: depth {depth}, blocked {blocked:?} of {total:?}, {syncs} syncs"
-    );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// About 8 MiB of batches at the multipass batch size, bounded at both ends.
+#[test]
+fn the_sweep_queue_holds_about_eight_mib() {
+    use crate::recovery::sweep_queue_depth;
+    let floor = libfreemkv::io::DEFAULT_PIPELINE_DEPTH;
+    assert_eq!(sweep_queue_depth(64 * 1024), 128);
+    assert_eq!(sweep_queue_depth(120 * 1024), (8 << 20) / (120 * 1024));
+    assert_eq!(
+        sweep_queue_depth(2048),
+        128,
+        "small batches cap at 128 items"
+    );
+    assert_eq!(
+        sweep_queue_depth(64 << 20),
+        floor,
+        "huge batches keep the floor"
+    );
+    assert_eq!(sweep_queue_depth(0), 128);
 }
