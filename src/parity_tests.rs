@@ -87,6 +87,72 @@ fn plan(titles: &[usize], raw: bool) -> MuxPlan {
     }
 }
 
+// Mux title 0 of the two-clip image at `iso` (keys K1, K2), reading `batch` sectors at a
+// time; returns the MKV's bytes.
+fn mkv_with_batch(iso: &Path, batch: u16) -> Vec<u8> {
+    let f = factory(&[(Answer::Keydb, &[K1, K2][..])], &Calls::default());
+    let opts = OpenImageOptions {
+        scope: Some(KeyScope::Titles(vec![0, 1])),
+        ..OpenImageOptions::resolve(f)
+    };
+    let opened = open_image_with(&ImageSource::Iso(iso.to_path_buf()), opts).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("t0.mkv");
+    let plan = MuxPlan {
+        mux: crate::mux_options_batched(false, batch),
+        ..MuxPlan::new(vec![0])
+    };
+    let dest = |_: usize| format!("mkv://{}", out.display());
+    let outcome = crate::mux_image_titles(&opened, &plan, &dest, &NoopSink);
+    assert_eq!(outcome, crate::RipOutcome::Ok { titles_written: 1 });
+    std::fs::read(&out).unwrap()
+}
+
+// The read batch is a buffer size, never an output choice: the old 16 MiB batch, the new
+// default and batches far smaller than a clip all write the same MKV.
+#[test]
+fn the_mux_batch_size_never_changes_the_mkv() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = crate::test_fixtures::bd_image_sized(&[(Some(K1), 600), (Some(K2), 600)], 2);
+    let iso = fx.write(dir.path(), "big.iso");
+    let old = mkv_with_batch(&iso, 8192);
+    for batch in [crate::DEFAULT_MUX_BATCH_SECTORS, 96, 3] {
+        assert!(
+            mkv_with_batch(&iso, batch) == old,
+            "batch {batch} changed the MKV"
+        );
+    }
+}
+
+#[test]
+fn mux_batches_round_down_to_whole_aacs_units() {
+    assert_eq!(crate::mux_options(false).batch_sectors, 1536);
+    assert_eq!(crate::mux_options_batched(true, 2048).batch_sectors, 2046);
+    assert!(crate::mux_options_batched(true, 2048).raw);
+    assert_eq!(crate::mux_options_batched(false, 0).batch_sectors, 3);
+    assert_eq!(crate::mux_options_batched(false, 8192).batch_sectors, 8190);
+}
+
+// Bench (run with `--release -- --ignored bench_`): image mux wall time per read batch
+// size over a ~120 MB title. RAM is about three batches.
+#[test]
+#[ignore = "bench"]
+fn bench_image_mux_batch_sizes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fx = crate::test_fixtures::bd_image_sized(&[(Some(K1), 20_000), (Some(K2), 10)], 2);
+    let iso = fx.write(dir.path(), "bench.iso");
+    for batch in [8192, 4096, crate::DEFAULT_MUX_BATCH_SECTORS, 384] {
+        let t0 = std::time::Instant::now();
+        let mkv = mkv_with_batch(&iso, batch);
+        let secs = t0.elapsed().as_secs_f64();
+        let mb = mkv.len() as f64 / 1e6;
+        let buf_mib = (batch as usize * 2048) >> 20;
+        eprintln!(
+            "bench_image_mux_batch_sizes: batch {batch} ({buf_mib} MiB x3): {mb:.0} MB in {secs:.2} s"
+        );
+    }
+}
+
 #[test]
 fn parity_engine_image_mux() {
     let mut g = golden("parity_engine_image_mux");

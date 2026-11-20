@@ -24,11 +24,22 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+/// Sectors per image mux read: 3 MiB, a whole number of 3-sector AACS units. libfreemkv keeps
+/// three batches in flight, so this sets the mux's read-buffer RAM (about 9 MiB; 16 MiB
+/// batches held 48 MiB). A sequential file read gets OS readahead, so larger gains nothing.
+pub const DEFAULT_MUX_BATCH_SECTORS: u16 = 1536;
+
 /// The mux options every front-end rips with; `raw` passes ciphertext through.
 pub fn mux_options(raw: bool) -> libfreemkv::MuxOptions {
+    mux_options_batched(raw, DEFAULT_MUX_BATCH_SECTORS)
+}
+
+/// [`mux_options`] reading an image `batch_sectors` at a time (rounded down to whole AACS
+/// units, at least one): the knob for a front end trading read-buffer RAM for batch size.
+pub fn mux_options_batched(raw: bool, batch_sectors: u16) -> libfreemkv::MuxOptions {
     libfreemkv::MuxOptions {
         skip_errors: false,
-        batch_sectors: libfreemkv::mux::resolve::ISO_MUX_BATCH_SECTORS,
+        batch_sectors: (batch_sectors / 3).max(1) * 3,
         raw,
         // Per title from `MuxPlan::streams` (an `iso://` title) or `InputOptions` (`dir://`).
         selection: libfreemkv::StreamSelection::default(),
