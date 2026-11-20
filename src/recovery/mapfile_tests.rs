@@ -1621,9 +1621,10 @@ fn a_mapfile_debug_names_its_fields() {
 fn persist_is_due_only_after_the_flush_interval() {
     let p = tmpfile("persist_due");
     let mf = Mapfile::create(&p, 0x800, "test").unwrap();
-    assert!(!mf.persist_due());
+    assert!(!mf.persist_due_after(FLUSH_INTERVAL));
     std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(50));
-    assert!(mf.persist_due());
+    assert!(mf.persist_due_after(FLUSH_INTERVAL));
+    assert!(!mf.persist_due_after(FLUSH_INTERVAL * 60));
     drop(mf);
     let _ = std::fs::remove_file(&p);
 }
@@ -1659,4 +1660,56 @@ fn disowning_prunes_only_dead_writers_and_tracks_the_live_one() {
     assert!(abandoned_writer_alive(&path("live.mapfile")));
     assert!(!abandoned_writer_alive(&path("never.mapfile")));
     drop((live, other));
+}
+
+// An unpersisted record never reaches disk on its own, however long ago the last persist was;
+// only `flush` writes it. Its range contract matches `record`'s.
+#[test]
+fn an_unpersisted_record_waits_for_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("out.mapfile");
+    let mut mf = Mapfile::create(&p, 0x10000, "test").unwrap();
+    std::thread::sleep(FLUSH_INTERVAL + Duration::from_millis(50));
+    mf.record_unpersisted(0, 0x800, SectorStatus::Finished)
+        .unwrap();
+    assert_eq!(Mapfile::load(&p).unwrap().stats().bytes_good, 0);
+    assert_eq!(mf.stats().bytes_good, 0x800, "the change is in memory");
+    mf.record_unpersisted(0x800, 0, SectorStatus::Finished)
+        .unwrap();
+    assert!(
+        mf.record_unpersisted(u64::MAX, 2, SectorStatus::Finished)
+            .is_err()
+    );
+    mf.flush().unwrap();
+    assert_eq!(Mapfile::load(&p).unwrap().stats().bytes_good, 0x800);
+    assert_eq!(mf.persists, 1);
+}
+
+// A crash between the tmp write and the rename leaves a stray tmp: the map on disk is still
+// the last complete persist, and the next persist replaces the tmp.
+#[test]
+fn a_crash_before_the_rename_leaves_the_last_persist_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path().join("out.mapfile");
+    let mut mf = Mapfile::create(&p, 0x10000, "test").unwrap();
+    mf.record_unpersisted(0, 0x800, SectorStatus::Finished)
+        .unwrap();
+    mf.flush().unwrap();
+    let mut tmp = p.clone().into_os_string();
+    tmp.push(".tmp");
+    std::fs::write(&tmp, "0x0 0x10000 +\ntruncated garb").unwrap();
+    let on_disk = Mapfile::load(&p).unwrap();
+    assert_eq!(
+        on_disk.ranges_with(&[SectorStatus::Finished]),
+        vec![(0, 0x800)]
+    );
+    drop(on_disk);
+    mf.record_unpersisted(0x800, 0x800, SectorStatus::Finished)
+        .unwrap();
+    mf.flush().unwrap();
+    assert_eq!(Mapfile::load(&p).unwrap().stats().bytes_good, 0x1000);
+    assert!(
+        !std::path::Path::new(&tmp).exists(),
+        "the stray tmp was replaced"
+    );
 }

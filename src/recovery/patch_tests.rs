@@ -1185,11 +1185,101 @@ fn a_non_regular_output_is_never_synced() {
     let map = Mapfile::create(&dir.path().join("out.map"), 8192, "test").unwrap();
     let (mut sink, _) =
         PatchSink::new(std::path::Path::new("/dev/null"), map, false, None).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(1100));
-    assert!(sink.map.persist_due());
+    sink.persist_every = std::time::Duration::ZERO;
+    assert!(sink.map.persist_due_after(sink.persist_every));
     let item = PatchItem::Recovered {
         pos: 0,
         buf: vec![0u8; 2048],
     };
     assert!(sink.apply(item).is_ok());
+}
+
+// Durability over an in-memory image, whose `durable` copy is what a crash would keep.
+fn mem_patch_sink(
+    dir: &std::path::Path,
+    total: u64,
+) -> (
+    PatchSink<crate::recovery::test_images::MemImage>,
+    crate::recovery::test_images::MemImage,
+) {
+    let img = crate::recovery::test_images::MemImage::filled(total as usize, 0);
+    let map = Mapfile::create(&dir.join("out.map"), total, "test").unwrap();
+    let (sink, _shared) = PatchSink::over(img.clone(), map, true, None);
+    (sink, img)
+}
+
+// A NonTrimmed record can be the one that persists the map: it syncs the recovered bytes
+// recorded before it, so a crash never finds them Finished but volatile.
+#[test]
+fn a_non_trimmed_record_that_persists_the_map_syncs_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_path = dir.path().join("out.map");
+    let (mut sink, img) = mem_patch_sink(dir.path(), 4 * 2048);
+    let item = PatchItem::Recovered {
+        pos: 0,
+        buf: vec![0x5Au8; 2048],
+    };
+    sink.apply(item).unwrap();
+    assert_eq!(
+        img.state().syncs,
+        0,
+        "inside the interval nothing is synced"
+    );
+    sink.persist_every = std::time::Duration::ZERO;
+    sink.apply(PatchItem::NonTrimmed {
+        pos: 2048,
+        len: 2048,
+    })
+    .unwrap();
+    assert_eq!(img.state().syncs, 1);
+    let mut expected = vec![0u8; 4 * 2048];
+    expected[..2048].fill(0x5A);
+    crate::recovery::test_images::assert_crash_safe(&map_path, &img, &expected);
+    let on_disk = Mapfile::load(&map_path).unwrap();
+    assert_eq!(
+        on_disk.ranges_with(&[SectorStatus::Finished]),
+        vec![(0, 2048)]
+    );
+}
+
+// A crash after any recovered span finds only durable spans Finished; close syncs the rest.
+#[test]
+fn a_patch_crash_after_any_item_finds_no_finished_range_without_its_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let map_path = dir.path().join("out.map");
+    let (mut sink, img) = mem_patch_sink(dir.path(), 8 * 2048);
+    let mut expected = vec![0u8; 8 * 2048];
+    for i in 0..8u64 {
+        if i == 3 {
+            sink.persist_every = std::time::Duration::ZERO;
+        }
+        let buf = vec![i as u8 + 1; 2048];
+        let at = (i * 2048) as usize..((i + 1) * 2048) as usize;
+        expected[at].copy_from_slice(&buf);
+        sink.apply(PatchItem::Recovered { pos: i * 2048, buf })
+            .unwrap();
+        crate::recovery::test_images::assert_crash_safe(&map_path, &img, &expected);
+    }
+    sink.close().unwrap();
+    assert!(img.state().durable == expected);
+    assert_eq!(
+        Mapfile::load(&map_path).unwrap().stats().bytes_good,
+        8 * 2048
+    );
+}
+
+// A recovered span whose write fails part-way leaves the map on disk without it.
+#[test]
+fn a_partial_patch_write_leaves_no_unsynced_range_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sink, img) = mem_patch_sink(dir.path(), 4 * 2048);
+    img.state().fail_after = Some(100);
+    let item = PatchItem::Recovered {
+        pos: 0,
+        buf: vec![0x5Au8; 2048],
+    };
+    assert!(sink.apply(item).is_err());
+    drop(sink);
+    let on_disk = Mapfile::load(&dir.path().join("out.map")).unwrap();
+    assert!(on_disk.ranges_with(&[SectorStatus::Finished]).is_empty());
 }

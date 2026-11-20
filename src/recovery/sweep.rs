@@ -87,9 +87,18 @@ pub(super) struct SweepSink<F: ImageFile = libfreemkv::io::WritebackFile> {
     /// Reusable zero buffer for SkipFill / GapFill. Held in the sink
     /// so each apply call doesn't reallocate.
     zero: Box<[u8; ZERO_CHUNK]>,
+    /// Sync-and-persist cadence ([`super::IMAGE_PERSIST_INTERVAL`]; tests shorten it).
+    persist_every: std::time::Duration,
 }
 
 impl<F: ImageFile> SweepSink<F> {
+    // Every record goes through here, a fill's included: whichever record persists the map
+    // must sync the image first, or earlier Finished records would outrun their data.
+    fn record(&mut self, run: (u64, u64, SectorStatus)) -> Result<(), Error> {
+        let every = self.persist_every;
+        super::record_durably(&mut self.file, &mut self.map, self.is_regular, every, run)
+    }
+
     /// Construct a new `SweepSink` plus the matching progress
     /// receiver. Channel depth on the back-channel is `1` — the
     /// producer's cache is the source of truth between snapshots.
@@ -105,6 +114,7 @@ impl<F: ImageFile> SweepSink<F> {
             is_regular,
             prog_tx,
             zero: Box::new([0u8; ZERO_CHUNK]),
+            persist_every: super::IMAGE_PERSIST_INTERVAL,
         };
         (sink, prog_rx)
     }
@@ -128,10 +138,7 @@ impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
-                if self.map.persist_due() && self.is_regular {
-                    self.file.sync_all().map_err(lost)?;
-                }
-                self.map.record(pos, len, SectorStatus::Finished)?;
+                self.record((pos, len, SectorStatus::Finished))?;
             }
             WorkItem::SkipFill { pos, len } | WorkItem::GapFill { pos, len } => {
                 let map = &self.map;
@@ -152,7 +159,7 @@ impl<F: ImageFile> Sink<WorkItem> for SweepSink<F> {
                         .map_err(|e| super::image_write_failed(&self.map, e))?;
                     filled += chunk as u64;
                 }
-                self.map.record(pos, len, SectorStatus::NonTrimmed)?;
+                self.record((pos, len, SectorStatus::NonTrimmed))?;
             }
             WorkItem::StatsRequest => {
                 let stats = self.map.stats();

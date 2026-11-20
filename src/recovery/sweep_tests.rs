@@ -1,4 +1,5 @@
 use super::*;
+use crate::recovery::test_images::{MemImage, assert_crash_safe};
 use std::io::Read;
 
 /// Build a `SweepSink` over a scratch ISO pre-filled with `0xAA`, plus a
@@ -332,6 +333,153 @@ fn a_fill_stops_when_disowned_mid_way() {
     drop(sink);
     let len = std::fs::metadata(&iso).unwrap().len();
     assert!(len < FILL, "the fill ran on past the disown ({len} bytes)");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Durability over an in-memory image, whose `durable` copy is what a crash would keep.
+const B: u64 = 4096;
+
+fn mem_sink(dir: &std::path::Path, total: u64) -> (SweepSink<MemImage>, MemImage) {
+    let img = MemImage::filled(total as usize, 0xAA);
+    let map = Mapfile::create(&dir.join("out.map"), total, "test").unwrap();
+    let (sink, _rx) = SweepSink::new(img.clone(), map, true);
+    (sink, img)
+}
+
+fn batch(i: u64) -> Vec<u8> {
+    vec![i as u8 + 1; B as usize]
+}
+
+#[test]
+fn the_persist_interval_is_at_least_ten_seconds() {
+    assert!(crate::recovery::IMAGE_PERSIST_INTERVAL >= std::time::Duration::from_secs(10));
+}
+
+// A crash after any item, at any persist cadence, finds no Finished range whose bytes are
+// not durable; after close the whole image is durable and fully recorded.
+#[test]
+fn a_crash_after_any_item_finds_no_finished_range_without_its_data() {
+    let hour = std::time::Duration::from_secs(3600);
+    for (n, every) in [std::time::Duration::ZERO, hour].into_iter().enumerate() {
+        let dir = scratch(&format!("crash-any-{n}"));
+        let map_path = dir.join("out.map");
+        let total = 16 * B;
+        let (mut sink, img) = mem_sink(&dir, total);
+        sink.persist_every = every;
+        let mut expected = vec![0xAAu8; total as usize];
+        for i in 0..16 {
+            let (pos, at) = (i * B, (i * B) as usize..((i + 1) * B) as usize);
+            if i % 5 == 4 {
+                sink.apply(WorkItem::SkipFill { pos, len: B }).unwrap();
+                expected[at].fill(0);
+            } else {
+                sink.apply(WorkItem::Good { pos, buf: batch(i) }).unwrap();
+                expected[at].copy_from_slice(&batch(i));
+            }
+            assert_crash_safe(&map_path, &img, &expected);
+        }
+        sink.close().unwrap();
+        assert_crash_safe(&map_path, &img, &expected);
+        assert!(img.state().durable == expected, "close left data unsynced");
+        let on_disk = Mapfile::load(&map_path).unwrap();
+        assert_eq!(on_disk.stats().bytes_good, 13 * B);
+        assert_eq!(on_disk.stats().bytes_nontried, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// The fill hole: a fill's record can be the one that persists the map, and it must sync the
+// Good data recorded before it, or that data is persisted Finished while still volatile.
+#[test]
+fn a_fill_that_persists_the_map_syncs_the_good_data_before_it() {
+    let dir = scratch("fill-persists");
+    let map_path = dir.join("out.map");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    sink.apply(WorkItem::Good {
+        pos: 0,
+        buf: batch(0),
+    })
+    .unwrap();
+    assert_eq!(
+        img.state().syncs,
+        0,
+        "inside the interval nothing is synced"
+    );
+    sink.persist_every = std::time::Duration::ZERO;
+    sink.apply(WorkItem::SkipFill { pos: B, len: B }).unwrap();
+    assert_eq!(img.state().syncs, 1, "the persisting fill synced first");
+    let on_disk = Mapfile::load(&map_path).unwrap();
+    assert_eq!(on_disk.ranges_with(&[SectorStatus::Finished]), vec![(0, B)]);
+    let mut expected = vec![0xAAu8; 4 * B as usize];
+    expected[..B as usize].copy_from_slice(&batch(0));
+    expected[B as usize..2 * B as usize].fill(0);
+    assert_crash_safe(&map_path, &img, &expected);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Inside one interval a stream of batches costs no image sync and no map persist; close
+// does both exactly once.
+#[test]
+fn the_consumer_syncs_and_persists_at_most_once_per_interval() {
+    let dir = scratch("cadence");
+    let n = 1000;
+    let (mut sink, img) = mem_sink(&dir, n * B);
+    let t0 = std::time::Instant::now();
+    for i in 0..n {
+        let buf = batch(i);
+        sink.apply(WorkItem::Good { pos: i * B, buf }).unwrap();
+    }
+    if t0.elapsed() < crate::recovery::IMAGE_PERSIST_INTERVAL {
+        assert_eq!(img.state().syncs, 0);
+        assert_eq!(sink.map.persists, 0);
+    }
+    sink.close().unwrap();
+    assert_eq!(img.state().syncs, 1);
+    let on_disk = Mapfile::load(&dir.join("out.map")).unwrap();
+    assert_eq!(on_disk.stats().bytes_good, n * B);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A write that fails part-way disowns the map: neither it nor the earlier, unsynced batch
+// ever reaches the map on disk as Finished.
+#[test]
+fn a_partial_write_leaves_no_unsynced_range_finished() {
+    let dir = scratch("partial-write");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    sink.apply(WorkItem::Good {
+        pos: 0,
+        buf: batch(0),
+    })
+    .unwrap();
+    img.state().fail_after = Some(1000);
+    let r = sink.apply(WorkItem::Good {
+        pos: B,
+        buf: batch(1),
+    });
+    assert!(r.is_err(), "the partial write must fail the item");
+    assert!(sink.map.is_disowned());
+    drop(sink);
+    let on_disk = Mapfile::load(&dir.join("out.map")).unwrap();
+    assert!(on_disk.ranges_with(&[SectorStatus::Finished]).is_empty());
+    assert_eq!(on_disk.stats().bytes_nontried, 4 * B);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A sync that fails at a persist keeps the map off disk, now and when the sink drops.
+#[test]
+fn a_failed_sync_at_a_persist_keeps_the_map_off_disk() {
+    let dir = scratch("sync-fails-at-persist");
+    let (mut sink, img) = mem_sink(&dir, 4 * B);
+    sink.persist_every = std::time::Duration::ZERO;
+    img.state().fail_sync = true;
+    let r = sink.apply(WorkItem::Good {
+        pos: 0,
+        buf: batch(0),
+    });
+    assert!(r.is_err(), "a failed sync must fail the item");
+    drop(sink);
+    let on_disk = Mapfile::load(&dir.join("out.map")).unwrap();
+    assert!(on_disk.ranges_with(&[SectorStatus::Finished]).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

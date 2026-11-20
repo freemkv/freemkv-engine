@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use libfreemkv::error::{Error, Result};
 use libfreemkv::io::pipeline::{Flow, Sink};
 
+use super::ImageFile;
 use super::mapfile::{self, MapStats, Mapfile, SectorStatus};
 use super::section_recover::{
     Bisect, CachePrime, Direction, HandlerCtx, HandlerOutcome, HandlerScoreboard, Jump, Linear,
@@ -151,8 +152,8 @@ pub(super) struct PatchSummary {
 // Consumer-side of the patch pipeline. Owns the ISO writeback file and the
 // mapfile; publishes a shared snapshot after every record so the producer
 // can read `bytes_good` for stall detection and progress reporting.
-pub(super) struct PatchSink {
-    file: libfreemkv::io::WritebackFile,
+pub(super) struct PatchSink<F: ImageFile = libfreemkv::io::WritebackFile> {
+    file: F,
     map: Mapfile,
     /// Whether the output is a regular file (so a `sync_all` failure
     /// is real). `/dev/null` etc. always fail `sync_all`; ignore those.
@@ -169,6 +170,8 @@ pub(super) struct PatchSink {
     /// whole damage set every call, so the per-record path throttles to a time
     /// cadence (`REPUBLISH_CADENCE`); the final close always forces a publish.
     last_republish: Option<std::time::Instant>,
+    /// Sync-and-persist cadence ([`super::IMAGE_PERSIST_INTERVAL`]; tests shorten it).
+    persist_every: std::time::Duration,
 }
 
 /// Minimum interval between per-record snapshot republishes.
@@ -185,19 +188,36 @@ impl PatchSink {
         title: Option<libfreemkv::DiscTitle>,
     ) -> Result<(Self, Arc<Mutex<SharedPatchState>>)> {
         let file = libfreemkv::io::WritebackFile::open(path).map_err(Error::from)?;
+        Ok(PatchSink::over(file, map, is_regular, title))
+    }
+}
+
+impl<F: ImageFile> PatchSink<F> {
+    // A sink writing `file` (the image `new` opens, or a test's in-memory one).
+    pub(super) fn over(
+        file: F,
+        map: Mapfile,
+        is_regular: bool,
+        title: Option<libfreemkv::DiscTitle>,
+    ) -> (Self, Arc<Mutex<SharedPatchState>>) {
         let shared = Arc::new(Mutex::new(SharedPatchState::from_map(&map, title.as_ref())));
         let shared_clone = shared.clone();
-        Ok((
-            Self {
-                file,
-                map,
-                is_regular,
-                shared,
-                title,
-                last_republish: None,
-            },
-            shared_clone,
-        ))
+        let sink = Self {
+            file,
+            map,
+            is_regular,
+            shared,
+            title,
+            last_republish: None,
+            persist_every: super::IMAGE_PERSIST_INTERVAL,
+        };
+        (sink, shared_clone)
+    }
+
+    // Every record goes through here: whichever one persists the map syncs the image first.
+    fn record(&mut self, run: (u64, u64, SectorStatus)) -> Result<()> {
+        let every = self.persist_every;
+        super::record_durably(&mut self.file, &mut self.map, self.is_regular, every, run)
     }
 
     /// Republish the shared snapshot. When `force` is false the update is
@@ -231,7 +251,7 @@ fn lock_snapshot(m: &Mutex<SharedPatchState>) -> std::sync::MutexGuard<'_, Share
 // No `close_stopped` override (the default `close`): this sink renames nothing, and a
 // data-less mapfile flush would claim sectors not yet durable. T8: "halted: **Stopped**
 // (not a failure)" after one 5 s grace; the disowned mapfile keeps the resumable record.
-impl Sink<PatchItem> for PatchSink {
+impl<F: ImageFile> Sink<PatchItem> for PatchSink<F> {
     type Output = PatchSummary;
 
     fn apply(&mut self, item: PatchItem) -> std::result::Result<Flow, Error> {
@@ -245,17 +265,10 @@ impl Sink<PatchItem> for PatchSink {
                 let lost = |e| super::image_write_failed(&self.map, e);
                 self.file.seek(SeekFrom::Start(pos)).map_err(lost)?;
                 self.file.write_all(&buf).map_err(lost)?;
-                if self.map.persist_due() && self.is_regular {
-                    self.file.sync_all().map_err(lost)?;
-                }
-                self.map
-                    .record(pos, len, SectorStatus::Finished)
-                    .map_err(Error::from)?;
+                self.record((pos, len, SectorStatus::Finished))?;
             }
             PatchItem::NonTrimmed { pos, len } => {
-                self.map
-                    .record(pos, len, SectorStatus::NonTrimmed)
-                    .map_err(Error::from)?;
+                self.record((pos, len, SectorStatus::NonTrimmed))?;
             }
         }
         self.republish(false);

@@ -559,6 +559,30 @@ impl ImageFile for libfreemkv::io::WritebackFile {
     }
 }
 
+/// How often a sweep or patch consumer makes the image durable and persists the map. A
+/// crash re-reads at most this much drive time; pass end and `close` always persist.
+pub(crate) const IMAGE_PERSIST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+// Records `[pos, pos + len)` as `status` in memory. Once `every` has passed since the last
+// persist, it syncs the image and only then persists the map, so a saved map never marks
+// unsynced bytes Finished. `is_regular: false` (`/dev/null`, a pipe) persists without a sync.
+pub(crate) fn record_durably<F: ImageFile>(
+    file: &mut F,
+    map: &mut mapfile::Mapfile,
+    is_regular: bool,
+    every: std::time::Duration,
+    (pos, len, status): (u64, u64, mapfile::SectorStatus),
+) -> Result<()> {
+    map.record_unpersisted(pos, len, status)?;
+    if map.persist_due_after(every) {
+        if is_regular {
+            file.sync_all().map_err(|e| image_write_failed(map, e))?;
+        }
+        map.flush()?;
+    }
+    Ok(())
+}
+
 // Halt-aware teardown, join-side sibling of `send_bounded`: a wedged-but-alive consumer gets a
 // grace spin, then is abandoned, instead of blocking `finish` forever.
 pub(crate) fn finish_bounded<I: Send + 'static, R: Send + 'static>(

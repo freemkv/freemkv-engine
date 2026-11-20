@@ -524,10 +524,28 @@ impl Mapfile {
         self.changed()
     }
 
-    /// Whether the next [`Mapfile::record`] persists the map: a consumer makes the image's
-    /// data durable first, so the saved map never marks unsynced sectors Finished.
-    pub(crate) fn persist_due(&self) -> bool {
-        self.last_flushed.elapsed() >= FLUSH_INTERVAL
+    /// [`Mapfile::record`] without its timed persist: the change stays in memory until
+    /// [`Mapfile::flush`]. A recovery consumer syncs the image before each such flush.
+    pub(crate) fn record_unpersisted(
+        &mut self,
+        pos: u64,
+        size: u64,
+        status: SectorStatus,
+    ) -> io::Result<()> {
+        if size == 0 {
+            return Ok(());
+        }
+        let Some(end) = pos.checked_add(size) else {
+            return Err(invalid("range"));
+        };
+        self.splice(pos, end, status);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Whether `every` has passed since the map last reached disk (or was created/loaded).
+    pub(crate) fn persist_due_after(&self, every: Duration) -> bool {
+        self.last_flushed.elapsed() >= every
     }
 
     // Marks in-memory state dirty and persists it once `FLUSH_INTERVAL` has elapsed.
