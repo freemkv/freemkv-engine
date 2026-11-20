@@ -1,32 +1,64 @@
-//! Owned selection snapshot shared by scan/UI, planners, and execution.
+//! Selection view of scanned titles shared by scan/UI, planners, and execution.
 
 use crate::presentation::PresentationIdentity;
 use crate::{Selection, StreamFilter};
 use libfreemkv::DiscTitle;
-use libfreemkv::disc::{EpisodeEvidence, TitleSelectionEvidence};
+use libfreemkv::disc::{EpisodeEvidence, Extent, TitleSelectionEvidence};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 #[path = "selection_suggest.rs"]
 mod suggest;
 pub use suggest::{Alternate, Suggestion};
 
-/// Lightweight title data; indices refer to the original canonical scan order.
+/// Lightweight title data, borrowed from the scanned titles (owned after
+/// [`SelectionModel::into_owned`]); indices refer to the original canonical scan order.
 #[derive(Debug, Clone, PartialEq)]
-struct SelectionTitle {
+struct SelectionTitle<'a> {
     index: usize,
     playlist_id: u16,
     duration_secs: f64,
-    presentation: Option<PresentationIdentity>,
+    presentation: Option<PresentationIdentity<'a>>,
     // Raw tags: resolved only when a language preference scores them.
-    audio_tags: Vec<String>,
-    evidence: TitleSelectionEvidence,
+    audio_tags: Vec<Cow<'a, str>>,
+    evidence: Cow<'a, TitleSelectionEvidence>,
     // DVD titles are compared and ordered by sector extents, others by segments.
     dvd: bool,
-    // Sector ranges `[start, end)` in play order.
-    extents: Vec<(u64, u64)>,
+    // Sector extents in play order; empty ones are skipped where they are read.
+    extents: Cow<'a, [Extent]>,
     video: Option<VideoSignature>,
     // Raw tag of the first non-secondary audio stream, resolved only when suggesting.
-    primary_audio: Option<String>,
+    primary_audio: Option<Cow<'a, str>>,
+}
+
+impl SelectionTitle<'_> {
+    // Sector ranges `[start, end)` of the non-empty extents, in play order.
+    fn sector_ranges(&self) -> impl Iterator<Item = (u64, u64)> {
+        (self.extents.iter())
+            .filter(|extent| extent.sector_count > 0)
+            .map(|extent| {
+                let start = u64::from(extent.start_lba);
+                (start, start + u64::from(extent.sector_count))
+            })
+    }
+
+    fn into_owned(self) -> SelectionTitle<'static> {
+        fn owned(tag: Cow<'_, str>) -> Cow<'static, str> {
+            Cow::Owned(tag.into_owned())
+        }
+        SelectionTitle {
+            index: self.index,
+            playlist_id: self.playlist_id,
+            duration_secs: self.duration_secs,
+            presentation: self.presentation.map(PresentationIdentity::into_owned),
+            audio_tags: self.audio_tags.into_iter().map(owned).collect(),
+            evidence: Cow::Owned(self.evidence.into_owned()),
+            dvd: self.dvd,
+            extents: Cow::Owned(self.extents.into_owned()),
+            video: self.video,
+            primary_audio: self.primary_audio.map(owned),
+        }
+    }
 }
 
 /// The primary video stream's shape, one half of an episode set's signature.
@@ -53,9 +85,11 @@ pub enum Resolved {
     },
 }
 
+/// The selection view of a disc's titles. It borrows them, so building one per call
+/// copies no title data; [`SelectionModel::into_owned`] detaches one a front end keeps.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SelectionModel {
-    titles: Vec<SelectionTitle>,
+pub struct SelectionModel<'a> {
+    titles: Vec<SelectionTitle<'a>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,8 +128,9 @@ impl From<SelectionReview> for libfreemkv::Error {
     }
 }
 
-impl SelectionModel {
-    pub fn from_titles(titles: &[DiscTitle]) -> Self {
+impl<'a> SelectionModel<'a> {
+    /// The model of `titles`, borrowing them.
+    pub fn from_titles(titles: &'a [DiscTitle]) -> Self {
         Self {
             titles: titles
                 .iter()
@@ -107,17 +142,11 @@ impl SelectionModel {
                     presentation: crate::presentation::identity(title),
                     audio_tags: title
                         .audio_streams()
-                        .map(|audio| audio.language.clone())
+                        .map(|audio| Cow::Borrowed(audio.language.as_str()))
                         .collect(),
-                    evidence: title.selection_evidence.clone(),
+                    evidence: Cow::Borrowed(&title.selection_evidence),
                     dvd: title.content_format == libfreemkv::ContentFormat::DvdPs,
-                    extents: (title.extents.iter())
-                        .filter(|extent| extent.sector_count > 0)
-                        .map(|extent| {
-                            let start = u64::from(extent.start_lba);
-                            (start, start + u64::from(extent.sector_count))
-                        })
-                        .collect(),
+                    extents: Cow::Borrowed(&title.extents),
                     video: (title.video_streams())
                         .find(|video| !video.secondary)
                         .map(|video| VideoSignature {
@@ -127,8 +156,20 @@ impl SelectionModel {
                         }),
                     primary_audio: (title.audio_streams())
                         .find(|audio| !audio.secondary)
-                        .map(|audio| audio.language.clone()),
+                        .map(|audio| Cow::Borrowed(audio.language.as_str())),
                 })
+                .collect(),
+        }
+    }
+
+    /// This model holding its own copy of the title data, free of the titles it was built
+    /// from: for a front end that keeps the model beside (or after) the scan.
+    pub fn into_owned(self) -> SelectionModel<'static> {
+        SelectionModel {
+            titles: self
+                .titles
+                .into_iter()
+                .map(SelectionTitle::into_owned)
                 .collect(),
         }
     }

@@ -334,7 +334,10 @@ fn excluded_equivalent_cannot_supply_audio_to_an_authored_episode() {
 #[test]
 fn owned_model_preserves_audio_and_explicit_choices() {
     let titles = vec![title(0, "a", 100.0, "eng"), title(1, "a", 200.0, "deu")];
-    let model = SelectionModel::from_titles(&titles);
+    let borrowed = SelectionModel::from_titles(&titles);
+    let model = borrowed.clone().into_owned();
+    assert_eq!(model, borrowed, "owning changes no title data");
+    drop(borrowed);
     drop(titles);
     let audio = StreamFilter::Langs(vec!["de".into()]);
     assert_eq!(

@@ -290,14 +290,15 @@ fn one_segment(start: u64, end: u64) -> DiscTitle {
 
 #[test]
 fn an_empty_span_is_not_coverage() {
-    let model = SelectionModel::from_titles(&[one_segment(5, 5)]);
+    let titles = [one_segment(5, 5)];
+    let model = SelectionModel::from_titles(&titles);
     assert!(Coverage::of(&model.titles[0]).is_none());
 }
 
 #[test]
 fn equal_coverage_does_not_strictly_contain() {
-    let model =
-        SelectionModel::from_titles(&[one_segment(0, 10), one_segment(0, 10), one_segment(0, 4)]);
+    let titles = [one_segment(0, 10), one_segment(0, 10), one_segment(0, 4)];
+    let model = SelectionModel::from_titles(&titles);
     let mut work = Work::default();
     let (a, b, c) = (
         Coverage::of(&model.titles[0]).unwrap(),

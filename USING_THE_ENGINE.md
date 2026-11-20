@@ -44,7 +44,8 @@ freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", ta
 
 ## Selection
 
-Build an owned `SelectionModel::from_titles(&disc.titles)` at scan time and carry
+Build `SelectionModel::from_titles(&disc.titles)` at scan time (it borrows the titles;
+`.into_owned()` gives a model to keep beyond them) and carry
 it to the UI. Call `model.select(&selection, &audio, presentation)` whenever preferences
 change; planners and rippers use the same model, not a separate language/role pool.
 `presentation` (e.g. `Some("de")`) chooses a content presentation independently of

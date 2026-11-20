@@ -46,10 +46,10 @@ struct Coverage<'a> {
 
 impl<'a> Coverage<'a> {
     // DVD: sector extents (one address space). Others: authored segments. `None`: undescribed.
-    fn of(title: &'a SelectionTitle) -> Option<Self> {
+    fn of(title: &'a SelectionTitle<'_>) -> Option<Self> {
         let mut spans: Vec<(&str, u64, u64)> = match title.dvd {
-            true => (title.extents.iter())
-                .map(|&(start, end)| ("", start, end))
+            true => (title.sector_ranges())
+                .map(|(start, end)| ("", start, end))
                 .collect(),
             false => (title.evidence.segments.iter())
                 .map(|s| (s.unit.as_str(), s.start, s.end))
@@ -151,7 +151,7 @@ impl DisjointPairs {
     }
 }
 
-impl SelectionModel {
+impl SelectionModel<'_> {
     /// A suggested episode set: candidates of at least `min_secs` without exact aliases,
     /// play-alls and partial-overlap variants (kept: the `audio`/`presentation` match, else
     /// canonical scan presentation), clustered by video and primary audio language and
@@ -333,7 +333,7 @@ impl SelectionModel {
             };
             let extent = match title.dvd {
                 true => None,
-                false => title.extents.first().map(|&(start, _)| start),
+                false => title.sector_ranges().next().map(|(start, _)| start),
             };
             (
                 segment.is_none(),

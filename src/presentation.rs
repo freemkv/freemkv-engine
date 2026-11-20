@@ -2,19 +2,25 @@
 
 use libfreemkv::DiscTitle;
 use libfreemkv::disc::ContentSegment;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 /// Exact ordered authored content segments, never duration/size similarity. Format-neutral:
-/// the scanner describes every format's titles as segments.
+/// the scanner describes every format's titles as segments. Borrows the title's own.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct PresentationIdentity(Vec<ContentSegment>);
+pub(crate) struct PresentationIdentity<'a>(Cow<'a, [ContentSegment]>);
 
-pub(crate) fn identity(title: &DiscTitle) -> Option<PresentationIdentity> {
+pub(crate) fn identity(title: &DiscTitle) -> Option<PresentationIdentity<'_>> {
     let segments = &title.selection_evidence.segments;
-    (!segments.is_empty()).then(|| PresentationIdentity(segments.clone()))
+    (!segments.is_empty()).then(|| PresentationIdentity(Cow::Borrowed(segments)))
 }
 
-impl PresentationIdentity {
+impl PresentationIdentity<'_> {
+    // This identity holding its own segments, free of the title it came from.
+    pub(crate) fn into_owned(self) -> PresentationIdentity<'static> {
+        PresentationIdentity(Cow::Owned(self.0.into_owned()))
+    }
+
     // Another cut of the same programme: the content both share appears in the same order
     // in each and is more than half of each. Exact aliases share everything.
     pub(crate) fn branch_variant(&self, other: &Self) -> bool {
