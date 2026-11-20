@@ -1306,6 +1306,36 @@ fn scan_options_carry_the_open_token() {
     assert!(carried.is_cancelled(), "it is the same token, not a copy");
 }
 
+// Per-frame ticks overwrite one slot: a take sees only the newest, and nothing until the next.
+#[test]
+fn the_latest_write_tick_is_taken_once() {
+    let w = LatestWritten::default();
+    assert_eq!(w.take(), None, "no tick yet");
+    w.store(1, 10);
+    w.store(2, 10);
+    w.store(3, 12);
+    assert_eq!(w.take(), Some((3, 12)));
+    assert_eq!(w.take(), None, "taken already");
+    w.store(4, 12);
+    assert_eq!(w.take(), Some((4, 12)));
+}
+
+// A burst of ticks between two watcher drains reaches the sink as its newest value.
+#[test]
+fn a_burst_of_write_ticks_reaches_the_sink_as_the_newest() {
+    let sink = RecordingSink::default();
+    with_mux_watcher(&sink, "mkv:///o.mkv", |ctx| {
+        for bytes in 1..=1000u64 {
+            ctx.events
+                .event(&libfreemkv::Event::BytesWritten { bytes, total: 1000 });
+        }
+    });
+    let ticks = sink.ticks.lock().unwrap();
+    let last = ticks.last().expect("a tick was recorded");
+    assert_eq!((last.bytes_done, last.bytes_total), (1000, 1000));
+    assert!(ticks.windows(2).all(|w| w[0].bytes_done < w[1].bytes_done));
+}
+
 // Bench (run with `--release -- --ignored bench_`): the cost of one per-frame write-progress
 // event through the watcher bridge; a 2 h UHD title emits about 10M of them.
 #[test]

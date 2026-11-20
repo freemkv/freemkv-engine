@@ -11,7 +11,7 @@
 use crate::job::{Selection, StreamFilter};
 use crate::sink::{Level, Sink};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Human-readable byte count for a diagnostic line — GB/MB/KB, so a rip size
 /// reads "~51.7 GB" instead of "~55460235264 bytes". A value that would round
@@ -452,6 +452,33 @@ fn with_mux_watcher<T>(sink: &dyn Sink, dest: &str, f: impl FnOnce(&libfreemkv::
     with_mux_watcher_for(sink, dest, None, None, f)
 }
 
+/// The latest write-progress tick, overwritten per frame (no queue, no allocation): the
+/// watcher only ever reports the newest one. `fresh` marks a tick not yet taken.
+#[derive(Default)]
+struct LatestWritten {
+    bytes: AtomicU64,
+    total: AtomicU64,
+    fresh: AtomicBool,
+}
+
+impl LatestWritten {
+    fn store(&self, bytes: u64, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
+        self.fresh.store(true, Ordering::Release);
+    }
+
+    // The newest tick since the last take, if one arrived. A tick racing this read may be
+    // taken now and again next time; the watcher drops such a repeat.
+    fn take(&self) -> Option<(u64, u64)> {
+        if !self.fresh.swap(false, Ordering::Acquire) {
+            return None;
+        }
+        let bytes = self.bytes.load(Ordering::Relaxed);
+        Some((bytes, self.total.load(Ordering::Relaxed)))
+    }
+}
+
 // [`with_mux_watcher`] under a front end's own stop token `halt` (else a fresh one) and with
 // its own listener `extra` hearing every library event beside the bridge.
 pub(crate) fn with_mux_watcher_for<T>(
@@ -470,14 +497,14 @@ pub(crate) fn with_mux_watcher_for<T>(
     if sink.should_cancel() {
         halt.cancel();
     }
-    let (tx, rx) = mpsc::channel::<(u64, u64)>();
+    let written = Arc::new(LatestWritten::default());
     let (opened_tx, opened_rx) = mpsc::channel::<(libfreemkv::DiscTitle, Option<(u64, u64)>)>();
     let (flush_tx, flush_rx) = mpsc::channel::<(u64, u64)>();
 
-    // Forwards write progress, the output opening and flush progress over channels.
-    // Owned + 'static (holds only Senders), so it fits the `Ctx`'s `Arc<dyn Events>`.
+    // Forwards write progress (latest value only), the output opening and flush progress.
+    // Owned + 'static (an Arc and Senders), so it fits the `Ctx`'s `Arc<dyn Events>`.
     struct ChannelEvents {
-        tx: mpsc::Sender<(u64, u64)>,
+        written: Arc<LatestWritten>,
         opened: mpsc::Sender<(libfreemkv::DiscTitle, Option<(u64, u64)>)>,
         flush: mpsc::Sender<(u64, u64)>,
         extra: Option<Arc<dyn libfreemkv::Events>>,
@@ -489,7 +516,7 @@ pub(crate) fn with_mux_watcher_for<T>(
             }
             match *e {
                 libfreemkv::Event::BytesWritten { bytes, total } => {
-                    let _ = self.tx.send((bytes, total));
+                    self.written.store(bytes, total);
                 }
                 libfreemkv::Event::OutputOpened { title, file } => {
                     let _ = self.opened.send((title.clone(), file));
@@ -515,10 +542,12 @@ pub(crate) fn with_mux_watcher_for<T>(
         // scope; `done` is a shared Arc the main thread sets when mux returns.
         let watcher_halt = halt.clone();
         let watcher_done = done.clone();
+        let latest_written = written.clone();
         let watcher = s.spawn(move || {
             // The engine's ONE speed/ETA derivation for the mux stage. Owned by
             // this single watcher thread, so a plain `mut` — no lock needed.
             let mut speed = crate::speed::SpeedEstimator::new();
+            let mut last_tick = None;
             loop {
                 // Read `done` BEFORE draining (Acquire pairs with SignalDone's Release): once
                 // it reads true, the drain below sees every send, and the loop ends after it.
@@ -527,14 +556,11 @@ pub(crate) fn with_mux_watcher_for<T>(
                 while let Ok((title, file)) = opened_rx.try_recv() {
                     opened(&title, file);
                 }
-                // Coalesce queued progress ticks to the LATEST, sample ONCE:
-                // sampling per-message would measure `dt` in microseconds
-                // against a ~100ms byte-delta, yielding absurd multi-GB/s speeds.
-                let mut latest = None;
-                while let Ok(m) = rx.try_recv() {
-                    latest = Some(m);
-                }
-                if let Some((done_b, total_b)) = latest {
+                // Only the LATEST tick since the last drain, sampled ONCE: sampling per
+                // frame would measure `dt` in microseconds, yielding absurd speeds.
+                let tick = latest_written.take().filter(|&t| Some(t) != last_tick);
+                if let Some((done_b, total_b)) = tick {
+                    last_tick = tick;
                     let (speed_bps, eta_secs) = speed.sample(done_b, total_b);
                     let p = crate::sink::Progress {
                         pass: std::borrow::Cow::Borrowed("mux"),
@@ -567,7 +593,7 @@ pub(crate) fn with_mux_watcher_for<T>(
         let _wake = crate::run::WakeOnDrop(watcher.thread().clone());
 
         let ctx = crate::run::ctx(&halt).with_events(Arc::new(ChannelEvents {
-            tx,
+            written,
             opened: opened_tx,
             flush: flush_tx,
             extra,
