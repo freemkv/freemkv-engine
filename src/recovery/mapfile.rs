@@ -822,8 +822,13 @@ impl Mapfile {
         for e in pieces {
             push_coalesced(&mut merged, e);
         }
-        let is_damage = |e: &MapEntry| damage_sector_statuses().contains(&e.status);
-        if merged.as_slice() != window && window.iter().chain(&merged).any(is_damage) {
+        // The window takes in touching neighbours, so compare only its damage runs.
+        let is_damage = |e: &&MapEntry| damage_sector_statuses().contains(&e.status);
+        if !window
+            .iter()
+            .filter(is_damage)
+            .eq(merged.iter().filter(is_damage))
+        {
             self.damage_epoch += 1;
         }
         for e in window {
