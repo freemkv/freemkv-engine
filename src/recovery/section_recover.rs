@@ -1004,7 +1004,17 @@ impl HandlerScoreboard {
     // Record one attempt: `recovered` bytes over `elapsed`. A barren attempt decays the score
     // DOWN, letting an exhausted early winner lose its lead.
     fn record(&mut self, name: &str, recovered: u64, elapsed: std::time::Duration) {
-        let e = self.stats.entry(name.to_string()).or_default();
+        // The key is allocated only on a handler's first attempt.
+        match self.stats.get_mut(name) {
+            Some(e) => Self::fold(e, recovered, elapsed),
+            None => {
+                let e = self.stats.entry(name.to_string()).or_default();
+                Self::fold(e, recovered, elapsed);
+            }
+        }
+    }
+
+    fn fold(e: &mut ScoreStat, recovered: u64, elapsed: std::time::Duration) {
         e.recovered = e.recovered.saturating_add(recovered);
         e.nanos = e.nanos.saturating_add(elapsed.as_nanos());
         e.attempts += 1;
@@ -1064,7 +1074,7 @@ pub(super) fn run_handlers(
     section_deadline_for: impl Fn(&SubRanges) -> Instant,
 ) -> HandlerOutcome {
     // Best-first by recovery rate so far; untried handlers rank top (calibrate).
-    handlers.sort_by_key(|h| std::cmp::Reverse(scoreboard.rank(&h.name())));
+    handlers.sort_by_cached_key(|h| std::cmp::Reverse(scoreboard.rank(&h.name())));
     for handler in handlers.iter_mut() {
         if bad.is_empty() {
             return HandlerOutcome::Complete;
