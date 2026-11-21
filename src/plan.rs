@@ -699,7 +699,8 @@ fn title(
                     url_source(plan, need_keys, need_title, sources, &watch)?;
                 let keys = keys.or(found);
                 let mux = opts(idx, scanned.as_ref())?;
-                watch.mux(&plan.source, 0, |ctx| {
+                let hint = scanned.as_ref().map_or(0, |t| t.size_bytes);
+                watch.mux(&plan.source, hint, |ctx| {
                     libfreemkv::mux_url(&plan.source, keys.as_ref(), &plan.dest, &mux, ctx)
                 })
             }

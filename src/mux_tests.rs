@@ -1381,3 +1381,13 @@ fn bench_mux_progress_events() {
     });
     eprintln!("bench_mux_progress_events: {N} events, {ns:.1} ns/event");
 }
+
+// An unknown size (a URL source the run never scanned) is left out, not logged as "~0 B".
+#[test]
+fn mux_start_line_omits_an_unknown_size() {
+    assert_eq!(size_hint(0), "");
+    assert_eq!(
+        size_hint(2_205_064_145),
+        format!(" (~{})", human_bytes(2_205_064_145))
+    );
+}

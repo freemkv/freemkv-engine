@@ -418,7 +418,7 @@ pub(crate) fn mux_iso_title(
         let line = iso_mux_line(path, &title.title.playlist);
         sink.log(
             Level::Info,
-            &format!("{line} -> {} (~{})", log_safe(dest), human_bytes(hint)),
+            &format!("{line} -> {}{}", log_safe(dest), size_hint(hint)),
         );
         let source = libfreemkv::Source::from_image(path, title);
         libfreemkv::mux_with_keys(source, Some(keys), dest, mux_opts, ctx)
@@ -440,10 +440,18 @@ pub(crate) fn log_mux_start(
     sink.log(
         Level::Info,
         &log_safe(&format!(
-            "mux: {source_label} -> {dest} (~{})",
-            human_bytes(total_bytes_hint)
+            "mux: {source_label} -> {dest}{}",
+            size_hint(total_bytes_hint)
         )),
     );
+}
+
+// " (~2.1 GB)", or nothing when the size is unknown.
+fn size_hint(bytes: u64) -> String {
+    match bytes {
+        0 => String::new(),
+        n => format!(" (~{})", human_bytes(n)),
+    }
 }
 
 // The Sink↔libfreemkv bridge every mux runs inside, lifted out of the mux paths so it's
