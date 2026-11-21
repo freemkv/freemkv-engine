@@ -203,7 +203,7 @@ const HALT_LATCH: (&str, &str) = ("recovery/section_recover.rs", "h");
 
 // Production atomic loads that are not a halt, as (file, receiver); list a new one here.
 // remux.rs `quit` is the copy worker's give-up flag, set by its halt-aware watcher.
-const NOT_A_HALT: [(&str, &str); 8] = [
+const NOT_A_HALT: [(&str, &str); 10] = [
     ("run.rs", "watcher_done"),
     ("plan.rs", "done"),
     ("mux.rs", "watcher_done"),
@@ -213,6 +213,9 @@ const NOT_A_HALT: [(&str, &str); 8] = [
     ("recovery/mapfile.rs", "disowned"),
     // Warning throttle timestamp, not a cancellation flag.
     ("metadata/tmdb.rs", "last_warn"),
+    // The mux write-progress counters a watcher drains, not cancellation flags.
+    ("mux.rs", "bytes"),
+    ("mux.rs", "total"),
 ];
 
 // Files of the modules declared `#[cfg(test)] mod name;` anywhere under `src/`.
