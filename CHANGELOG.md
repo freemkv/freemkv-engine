@@ -4,6 +4,30 @@ All notable changes to `freemkv-engine` are documented here. The format is
 based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project follows semantic versioning.
 
+## [1.8.11] — UNRELEASED
+
+### Changed
+
+- Built against libfreemkv's `Lang`, `ClipId`, Cow labels and `Arc` fields. `SelectionModel` borrows the scanned titles instead of copying them.
+- Image reads for muxing are 3 MiB at a time, and front ends can choose the size.
+- Sweep images and the mapfile sync every 10 s instead of every second.
+
+### Fixed
+
+- The mux log uses the scanned title's size for URL sources and omits an unknown size instead of showing about 0 B.
+
+### Performance
+
+- Sweep and patch batch buffers are recycled, the sweep queue is about 8 MiB, and zeros are not written into a sweep image that already reads zero.
+- Mux write progress goes through atomics instead of a message per frame.
+- Damage snapshots are rebuilt only when the damage changes. Keydb sources are shared per path across key acquisitions.
+- A staged remux file is copied in the kernel on Linux. Cancel pollers a run watcher already covers are dropped, and the rest run on small stacks.
+- Handler names and mapfile scope headers are no longer allocated on every lookup or write.
+
+### Testing
+
+- Added parser fuzz targets, a 90 percent coverage requirement, sweep and mux bridge benches, and many pinning tests.
+
 ## [1.8.10] — 2026-11-17
 
 ### Added
