@@ -2750,7 +2750,7 @@ fn recover_reads_cancellation_only_through_the_engine_halt() {
         at.rsplit_once("let eh = ")
             .unwrap()
             .1
-            .contains(".with_sink(sink)")
+            .contains(".with_watched_sink(sink)")
     );
 }
 
